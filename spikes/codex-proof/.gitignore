@@ -1,0 +1,9 @@
+sandbox/*
+!sandbox/.gitkeep
+node_modules/
+outbox.jsonl
+*.log
+agent-start.json
+agent-start.err
+planner-start.json
+planner-start.err
