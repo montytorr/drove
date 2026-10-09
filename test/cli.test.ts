@@ -1,12 +1,23 @@
 import assert from 'node:assert/strict'
-import { test } from 'node:test'
+import { beforeEach, test } from 'node:test'
 import { COMMANDS, main } from '../src/cli.ts'
+import type { ProcessPlan } from '../src/commands.ts'
+import { tmp } from './p3-helpers.ts'
 
-const capture = () => {
+const capture = (stdin = '') => {
   const out: string[] = []
   const err: string[] = []
-  return { out, err, io: { out: (text: string) => out.push(text), err: (text: string) => err.push(text), stdin: async () => '' } }
+  const launched: ProcessPlan[] = []
+  return {
+    out, err, launched,
+    io: { out: (text: string) => out.push(text), err: (text: string) => err.push(text), stdin: async () => stdin, launch: async (plan: ProcessPlan) => (launched.push(plan), 7) },
+  }
 }
+
+beforeEach(async () => {
+  for (const key of ['DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_AGENT', 'HERDR_PANE_ID']) delete process.env[key]
+  process.env.DROVE_HOME = await tmp('cli-home')
+})
 
 test('cli knows the commands from the design', () => {
   assert.deepEqual(Object.keys(COMMANDS), ['plan', 'spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'board', 'down', 'up', 'budget', 'guard', 'mcp'])
@@ -16,6 +27,7 @@ test('cli --help prints usage and exits 0', async () => {
   const { out, io } = capture()
   assert.equal(await main(['--help'], io), 0)
   assert.match(out.join('\n'), /drove spawn <seat>/)
+  assert.match(out.join('\n'), /drove up \[--run ID\] \[--seat SEAT\]/)
 })
 
 test('cli rejects an unknown command with 2', async () => {
@@ -24,14 +36,46 @@ test('cli rejects an unknown command with 2', async () => {
   assert.match(err.join('\n'), /unknown command nope/)
 })
 
-test('cli reports a usage error with 2', async () => {
-  const { err, io } = capture()
-  assert.equal(await main(['spawn', 'w-api'], io), 2)
-  assert.match(err.join('\n'), /missing --brief/)
+test('cli reports usage errors with 2', async () => {
+  for (const argv of [['spawn', 'w-api'], ['send', 'w-api', '--kind', 'brief', 'x'], ['budget'], ['guard', 'nonsense'], ['promote', 'w-api', '--model', 'm'], ['spawn', '--bogus']]) {
+    const { err, io } = capture()
+    assert.equal(await main(argv, io), 2, argv.join(' '))
+    assert.ok(err.join('\n').length > 0)
+  }
 })
 
-test('cli dispatches to the stubs (exit 70 until they land)', async () => {
+test('a command that fails prints code: text on stderr and exits 1', async () => {
   const { err, io } = capture()
-  assert.equal(await main(['roster'], io), 70)
-  assert.match(err.join('\n'), /not implemented: commands\.defaultDeps/)
+  assert.equal(await main(['roster', '--run', 'no-such-run'], io), 1)
+  assert.match(err.join('\n'), /^no-run: no run named no-such-run/)
+})
+
+test('drove guard with no Drove identity allows silently', async () => {
+  const { out, err, io } = capture('{"tool_name":"Bash","tool_input":{"command":"ls"}}')
+  assert.equal(await main(['guard', 'pre-tool-use'], io), 0)
+  assert.deepEqual([out, err], [[], []])
+})
+
+test('drove plan prints the run line and hands the exec plan to the launcher, returning its exit code', async () => {
+  process.env.HERDR_PANE_ID = 'w1:p5'
+  const { out, launched, io } = capture()
+  assert.equal(await main(['plan', '--kind', 'codex', '--goal', 'Do the goal'], io), 7)
+  assert.match(out.join('\n'), /^Run .* is up; starting the codex planner\./)
+  assert.equal(launched.length, 1)
+  assert.equal(launched[0]?.argv[0], 'codex')
+  assert.equal(launched[0]?.argv.at(-1), 'Do the goal')
+  assert.equal(launched[0]?.env.DROVE_ROLE, 'planner')
+})
+
+test('drove plan outside herdr fails with not-in-herdr and launches nothing', async () => {
+  const { err, launched, io } = capture()
+  assert.equal(await main(['plan'], io), 1)
+  assert.match(err.join('\n'), /not-in-herdr/)
+  assert.equal(launched.length, 0)
+})
+
+test('stdin feeds the text argument -', async () => {
+  const sent = capture('body from stdin')
+  assert.equal(await main(['send', 'w-api', '--kind', 'message', '-'], sent.io), 1)
+  assert.match(sent.err.join('\n'), /no-run|no Drove run/)
 })

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
@@ -11,7 +12,7 @@ import { CONTROL_KINDS } from './protocol.ts'
 import type { AgentKind, CommandResult, Effort, HookEventName, Role, SendRequest } from './types.ts'
 
 type Values = Record<string, string | boolean | undefined>
-type Io = { out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string> }
+type Io = { out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number> }
 type Handler = (values: Values, positionals: string[], io: Io) => Promise<number>
 type Spec = { usage: string; why: string; options?: ParseArgsConfig['options']; run: Handler }
 
@@ -38,6 +39,25 @@ const print = (result: CommandResult, io: Io): number => {
   return 1
 }
 
+const launchProcess = (plan: commands.ProcessPlan): Promise<number> =>
+  new Promise(resolve => {
+    const [command = '', ...args] = plan.argv
+    const child = spawn(command, args, { cwd: plan.cwd, env: { ...process.env, ...plan.env }, stdio: 'inherit' })
+    process.on('SIGINT', () => child.kill('SIGINT'))
+    process.on('SIGTERM', () => child.kill('SIGTERM'))
+    child.on('error', error => {
+      process.stderr.write(`${error.message}\n`)
+      resolve(127)
+    })
+    child.on('exit', (code, signal) => resolve(code ?? (signal ? 1 : 0)))
+  })
+
+const printThenLaunch = async (result: CommandResult, io: Io): Promise<number> => {
+  const code = print(result, io)
+  const plan = result.ok ? (result.data as commands.ProcessPlan | undefined) : undefined
+  return plan?.argv ? (io.launch ?? launchProcess)(plan) : code
+}
+
 const runRef = (values: Values) => ({ run: str(values, 'run'), repo: process.cwd() })
 
 const textArg = async (positionals: string[], from: number, io: Io): Promise<string> => {
@@ -51,7 +71,7 @@ export const COMMANDS: Record<string, Spec> = {
     why: 'start a planner in this pane',
     options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, goal: { type: 'string' }, run: { type: 'string' } },
     run: async (values, _positionals, io) =>
-      print(
+      printThenLaunch(
         await commands.plan(commands.defaultDeps(), {
           repo: process.cwd(),
           kind: (str(values, 'kind') ?? 'claude') as AgentKind,
@@ -162,7 +182,7 @@ export const COMMANDS: Record<string, Spec> = {
     usage: 'drove up [--run ID] [--seat SEAT]',
     why: 'resume a stopped run (or one dead seat)',
     options: { run: { type: 'string' }, seat: { type: 'string' } },
-    run: async (values, _positionals, io) => print(await commands.up(commands.defaultDeps(), runRef(values), str(values, 'seat')), io),
+    run: async (values, _positionals, io) => printThenLaunch(await commands.up(commands.defaultDeps(), runRef(values), str(values, 'seat')), io),
   },
   budget: {
     usage: 'drove budget <n> [--run ID]',

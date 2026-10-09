@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import * as commands from './commands.ts'
 import * as deliver from './deliver.ts'
 import * as detect from './detect.ts'
 import * as herdr from './herdr.ts'
@@ -41,6 +42,7 @@ export type WatchPorts = {
   codexQueueArgv: typeof deliver.codexQueueArgv
   deliverControl: typeof deliver.deliverControl
   flushPending: typeof deliver.flushPending
+  applyPendingPromotes: typeof commands.applyPendingPromotes
   nudgeText: typeof prompts.nudgeText
 }
 
@@ -66,6 +68,7 @@ export const defaultWatchPorts: WatchPorts = {
   codexQueueArgv: deliver.codexQueueArgv,
   deliverControl: deliver.deliverControl,
   flushPending: deliver.flushPending,
+  applyPendingPromotes: commands.applyPendingPromotes,
   nudgeText: prompts.nudgeText,
 }
 
@@ -420,6 +423,9 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         await ports.flushPending(deps, run, seat.name)
       })
     }
+    await guarded('promote-pending', async () => {
+      await ports.applyPendingPromotes(deps, run)
+    })
   }
 
   const due = (last: number | undefined, every: number) => last === undefined || clockMs() - last >= every
@@ -442,6 +448,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const takePending = () =>
     serial(async () => {
       const run = await currentRun()
+      await guarded('ingest', () => ingest(run))
       const reports = await unackedReports(deps, run, ports)
       await ackReports(deps, run, ports, reports)
       for (const report of reports) await emit('report.delivered', report.seat, report.id, { via: 'piggyback' })
