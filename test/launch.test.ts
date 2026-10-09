@@ -11,7 +11,7 @@ const HOME = '/home/cal/.drove'
 const RUN = 'drove-20261009-1042-a3f1'
 const TOKEN = 'tok-0123456789abcdef'
 const ENTRY = '/opt/drove/src/cli.ts'
-const ROLE = 'You are a worker.\nQuote: "yes" and \\ backslash'
+const ROLE = 'You are a worker.\nQuote: "yes" and \\ backslash with `ticks`'
 
 const worker: Identity = { home: HOME, run: RUN, role: 'worker', seat: 'w-api', token: TOKEN }
 const planner: Identity = { home: HOME, run: RUN, role: 'planner', seat: 'planner' }
@@ -24,7 +24,7 @@ const request = (overrides: Partial<LaunchRequest>): LaunchRequest => ({
   model: 'claude-sonnet-5-5',
   effort: 'medium',
   roleText: ROLE,
-  initialPrompt: 'Build the thing.\n\n(You are worker `w-api`.)',
+  initialPrompt: 'Build the thing. (You are worker `w-api`.)',
   droveEntry: ENTRY,
   ...overrides,
 })
@@ -166,6 +166,55 @@ test('writeLaunchFiles writes the files with their modes', async () => {
     assert.equal(statSync(file.path).mode & 0o777, 0o600)
   }
   assert.ok(spec.files[0]?.path.startsWith(join(dir, 'runs', RUN, 'seats', 'w-api')))
+})
+
+test('isShellSafeArg rejects newlines, C0 control characters and DEL, and accepts quotes, backticks and unicode', () => {
+  for (const bad of ['a\nb', 'a\rb', 'a\tb', 'a\u0000b', 'a\u001bb', 'a\u007fb']) assert.equal(launch.isShellSafeArg(bad), false, JSON.stringify(bad))
+  for (const good of ['', 'plain', `it's "quoted" {a=b} \`tick\` $(x) \\`, 'é → ⟦drove⟧']) assert.equal(launch.isShellSafeArg(good), true, good)
+  assert.throws(() => launch.assertShellSafeArgs(['ok', 'two\nlines']), /launch argument 1/)
+})
+
+test('every spec builder passes the shell-safety check, with and without a prompt, for fresh and resumed launches', () => {
+  const variants: Partial<LaunchRequest>[] = [{}, { initialPrompt: undefined }, { resumeId: 'abc' }, { roleText: '' }, { initialPrompt: '- dash first' }]
+  for (const identity of [worker, planner]) {
+    for (const kind of ['claude', 'codex'] as const) {
+      for (const variant of variants) {
+        const spec = launch.specFor(request({ identity, kind, channel: true, ...variant }))
+        assert.doesNotThrow(() => launch.assertShellSafeArgs(spec.argv), `${kind} ${identity.role} ${JSON.stringify(variant)}`)
+      }
+    }
+  }
+})
+
+test('a worker spec refuses a multi-line prompt, a planner spec lets its exec-ed prompt carry newlines', () => {
+  for (const kind of ['claude', 'codex'] as const) {
+    assert.throws(() => launch.specFor(request({ kind, initialPrompt: 'line one\nline two' })), /newline or control character/)
+    assert.doesNotThrow(() => launch.specFor(request({ kind, identity: planner, initialPrompt: 'line one\nline two' })))
+  }
+})
+
+test('the claude role text travels in a role.md file, never in argv', () => {
+  for (const identity of [worker, planner]) {
+    const spec = launch.specFor(request({ identity }))
+    const flag = spec.argv.indexOf('--append-system-prompt-file')
+    const file = spec.files.find(entry => entry.path.endsWith('/role.md'))
+    assert.ok(flag >= 0 && file)
+    assert.equal(spec.argv[flag + 1], file.path)
+    assert.equal(file.content, `${ROLE}\n`)
+    assert.equal(file.mode, 0o600)
+    assert.ok(!spec.argv.includes('--append-system-prompt'))
+    assert.ok(!spec.argv.some(arg => arg.includes('You are a worker')))
+  }
+  const bare = launch.claudeWorkerSpec(request({ roleText: '' }))
+  assert.ok(!bare.argv.includes('--append-system-prompt-file'))
+  assert.ok(!bare.files.some(entry => entry.path.endsWith('/role.md')))
+})
+
+test('the codex developer_instructions override escapes newlines as two characters', () => {
+  const spec = launch.codexWorkerSpec(request({ kind: 'codex' }))
+  const override = spec.argv.find(arg => arg.startsWith('developer_instructions='))
+  assert.equal(override, 'developer_instructions="You are a worker.\\nQuote: \\"yes\\" and \\\\ backslash with `ticks`"')
+  assert.ok(!/[\u0000-\u001f]/.test(override ?? ''))
 })
 
 test('execArgv puts the agent binary first', () => {

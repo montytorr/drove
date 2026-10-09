@@ -30,6 +30,8 @@ export const makeClock = (start = '2026-10-09T10:00:00.000Z') => {
 export const result = (stdout = '', code = 0, stderr = ''): ExecResult => ({ code, stdout, stderr })
 export const herdrFail = (code: string, message = code): ExecResult => result('', 1, JSON.stringify({ error: { code, message } }))
 
+const UNSAFE_AGENT_ARG = /[\u0000-\u001f\u007f]/
+
 export type FakeAgent = { name: string; paneId: string; tabId: string; status: HerdrStatus; sessionId?: string }
 
 export type FakeHerdrOptions = { git?: boolean; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number }
@@ -148,6 +150,7 @@ export class FakeHerdr {
     }
     const name = argv[3] ?? ''
     const paneId = argv[argv.indexOf('--pane') + 1] ?? ''
+    if (argv.slice(argv.indexOf('--') + 1).some(arg => UNSAFE_AGENT_ARG.test(arg))) return herdrFail('invalid_agent_argument', 'agent arguments cannot be encoded safely for the target shell')
     if (this.startFails) {
       if (this.startFails === 'agent_not_ready') this.agents.set(name, { name, paneId, tabId: `w1:t${this.counter}`, status: 'blocked' })
       return herdrFail(this.startFails)

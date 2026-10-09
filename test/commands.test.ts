@@ -42,7 +42,8 @@ test('spawn creates the worktree, opens the tab, then starts the agent, in that 
   assert.equal(start[3], 'w-api')
   assert.equal(start[start.indexOf('--kind') + 1], 'claude')
   assert.ok(start.includes('--session-id'))
-  assert.match(start.at(-1) ?? '', /^Build the widget\.\n\n\(You are worker `w-api`\. Your Cairn task is DROVE-5/)
+  assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-api`\. Your Cairn task is DROVE-5/)
+  assert.equal(fake.prompts.length, 0)
   const tab = fake.find('herdr', 'tab', 'create') ?? []
   assert.ok(tab.includes('_CC_ACCT_PINNED=1'))
   assert.ok(tab.some(arg => arg.startsWith('DROVE_TOKEN=')))
@@ -148,7 +149,44 @@ test('DROVE_ROLE_IN_BRIEF=1 moves a codex worker role from developer_instruction
   await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
   const start = fake.find('herdr', 'agent', 'start') ?? []
   assert.ok(!start.some(arg => arg.startsWith('developer_instructions')))
-  assert.match(start.at(-1) ?? '', /# Worker mode[\s\S]*Build the widget/)
+  assert.ok(!start.some(arg => arg.includes('# Worker mode')))
+  assert.match(fake.prompts[0]?.text ?? '', /# Worker mode[\s\S]*Build the widget/)
+})
+
+test('a single-line brief stays a launch argument; the role text is a file, not an argument', async () => {
+  const { fake, deps, identity } = await setup()
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief: '  Build the widget.  ' })
+  assert.equal(spawned.ok, true, spawned.text)
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-api`\.\s/)
+  assert.equal(fake.prompts.length, 0)
+  const roleFlag = start.indexOf('--append-system-prompt-file')
+  assert.equal(start[roleFlag + 1], join(seatDir(deps.home, RUN, 'w-api'), 'role.md'))
+  assert.match(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'role.md'), 'utf8'), /^# Worker mode\n/)
+  assert.ok(!start.includes('--append-system-prompt'))
+  assert.ok(start.slice(start.indexOf('--') + 1).every(arg => !/[\u0000-\u001f\u007f]/.test(arg)))
+})
+
+test('a multi-line brief starts the agent without it and arrives as the first herdr prompt', async () => {
+  const multi = 'Build the widget.\n\n## Rules\n- one\n- two with `ticks`'
+  for (const kind of ['claude', 'codex'] as const) {
+    const { fake, deps, identity } = await setup()
+    const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind, cairn: 'DROVE-5', brief: multi })
+    assert.equal(spawned.ok, true, `${kind}: ${spawned.text}`)
+    const start = fake.find('herdr', 'agent', 'start') ?? []
+    assert.ok(!start.some(arg => arg.includes('Build the widget')), kind)
+    assert.ok(start.slice(start.indexOf('--') + 1).every(arg => !/[\u0000-\u001f\u007f]/.test(arg)), kind)
+    assert.equal(fake.prompts.length, 1, kind)
+    assert.match(fake.prompts[0]?.text ?? '', /kind=brief[\s\S]*Build the widget\.\n\n## Rules\n- one\n- two with `ticks`[\s\S]*Your Cairn task is DROVE-5/)
+  }
+})
+
+test('the fake herdr refuses a start whose argv has a newline, with the real error code', async () => {
+  const fake = new FakeHerdr()
+  const refused = await fake.exec(['herdr', 'agent', 'start', 'w-x', '--kind', 'claude', '--pane', 'w1:p1', '--timeout', '1', '--', 'claude', 'two\nlines'])
+  assert.equal(refused.code, 1)
+  assert.match(refused.stderr, /invalid_agent_argument.*cannot be encoded safely for the target shell/)
+  assert.equal(fake.agents.size, 0)
 })
 
 test('spawn refuses a full budget with the human-run hint, and a taken or bad name', async () => {
@@ -280,7 +318,9 @@ test('promote on a settled Claude worker restarts it with --resume and the new m
   assert.equal(restart[restart.indexOf('--model') + 1], 'claude-opus-5-5')
   assert.equal(restart[restart.indexOf('--effort') + 1], 'high')
   assert.ok(!restart.includes('--session-id'))
-  assert.match(restart.at(-1) ?? '', /kind=promote model=claude-opus-5-5 effort=high/)
+  assert.ok(!restart.some(arg => arg.includes('kind=promote')))
+  assert.equal(fake.prompts.length, 2)
+  assert.match(fake.prompts[1]?.text ?? '', /kind=promote model=claude-opus-5-5 effort=high/)
   const seat = (await loadRoster(deps.home, RUN)).seats[0]
   assert.deepEqual([seat?.model, seat?.effort, seat?.state, seat?.owes], ['claude-opus-5-5', 'high', 'working', 'none'])
 })
