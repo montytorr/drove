@@ -32,9 +32,9 @@ export const herdrFail = (code: string, message = code): ExecResult => result(''
 
 const UNSAFE_AGENT_ARG = /[\u0000-\u001f\u007f]/
 
-export type FakeAgent = { name: string; paneId: string; tabId: string; status: HerdrStatus; sessionId?: string }
+export type FakeAgent = { name: string; paneId: string; tabId: string; status: HerdrStatus; sessionId?: string; kind?: string }
 
-export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number }
+export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number; startLeavesAgent?: boolean; promptTimesOut?: boolean }
 
 export class FakeHerdr {
   calls: string[][] = []
@@ -47,6 +47,8 @@ export class FakeHerdr {
   startSession: string | undefined
   startStatus: HerdrStatus = 'working'
   busyStarts = 0
+  startLeavesAgent = false
+  promptTimesOut = false
   queueFails = false
   onStart: ((name: string) => Promise<void>) | undefined
   agentReadFails = false
@@ -60,6 +62,8 @@ export class FakeHerdr {
     this.startSession = options.startSession
     this.startStatus = options.startStatus ?? 'working'
     this.busyStarts = options.busyStarts ?? 0
+    this.startLeavesAgent = options.startLeavesAgent ?? false
+    this.promptTimesOut = options.promptTimesOut ?? false
     this.agentReadFails = options.agentReadFails ?? false
   }
 
@@ -120,7 +124,7 @@ export class FakeHerdr {
   private lookup = (target: string): FakeAgent | undefined => this.agents.get(target) ?? [...this.agents.values()].find(agent => agent.paneId === target)
 
   private wire = (agent: FakeAgent) => ({
-    agent: 'claude',
+    agent: agent.kind ?? 'claude',
     ...(agent.sessionId ? { agent_session: { value: agent.sessionId } } : {}),
     agent_status: agent.status,
     name: agent.name,
@@ -146,7 +150,7 @@ export class FakeHerdr {
       this.prompts.push({ target, text })
       if (text === '/exit' || text === '/quit') this.agents.delete(agent.name)
       else agent.status = 'working'
-      return this.json({ result: {} })
+      return this.promptTimesOut && text !== '/exit' && text !== '/quit' ? herdrFail('timeout') : this.json({ result: {} })
     }
     return herdrFail('unknown_command')
   }
@@ -161,13 +165,14 @@ export class FakeHerdr {
     if (argv.slice(argv.indexOf('--') + 1).some(arg => UNSAFE_AGENT_ARG.test(arg))) return herdrFail('invalid_agent_argument', 'agent arguments cannot be encoded safely for the target shell')
     if (this.startFails) {
       if (this.startFails === 'agent_not_ready') this.agents.set(name, { name, paneId, tabId: `w1:t${this.counter}`, status: 'blocked' })
+      else if (this.startLeavesAgent) this.agents.set(name, { name, paneId, tabId: `w1:t${this.counter}`, status: this.startStatus, kind: argv[argv.indexOf('--kind') + 1] ?? 'claude' })
       return herdrFail(this.startFails)
     }
     const tabId = [...this.tabs].at(-1) ?? 'w1:t1'
     await this.onStart?.(name)
     const failure = await this.claudeCreatesWorktree(paneId, argv)
     if (failure) return failure
-    this.agents.set(name, { name, paneId, tabId, status: this.startStatus, ...(this.startSession ? { sessionId: this.startSession } : {}) })
+    this.agents.set(name, { name, paneId, tabId, status: this.startStatus, kind: argv[argv.indexOf('--kind') + 1] ?? 'claude', ...(this.startSession ? { sessionId: this.startSession } : {}) })
     return this.json({ result: { agent: this.wire(this.agents.get(name) as FakeAgent) } })
   }
 
