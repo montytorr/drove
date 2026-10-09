@@ -1,20 +1,475 @@
-import type { Deps, Report, RunMeta } from './types.ts'
-
-const todo = (name: string): never => {
-  throw new Error(`not implemented: watch.${name}`)
-}
+import { join } from 'node:path'
+import * as deliver from './deliver.ts'
+import * as detect from './detect.ts'
+import * as herdr from './herdr.ts'
+import * as paths from './paths.ts'
+import * as prompts from './prompts.ts'
+import * as protocol from './protocol.ts'
+import * as roster from './roster.ts'
+import * as store from './store.ts'
+import type { Attention, Control, Delivery, Deps, DroveConfig, DroveEvent, DroveEventType, HerdrAgent, HookRecord, Report, RunMeta, Seat } from './types.ts'
 
 export const TICK_MS = 3_000
 export const HERDR_POLL_MS = 5_000
 export const BATCH_MS = 2_000
+export const IDLE_WAKE_MS = 5_000
+export const WAKE_RETRY_MS = 15_000
+export const LOOP_MS = 1_000
+const HOOK_WINDOW = 50
+const WAIT = 'wait: '
+const KEPT_ATTENTION: readonly Attention['reason'][] = ['budget', 'pending-delivery']
+
+export type WatchPorts = {
+  runDir: typeof paths.runDir
+  seatDir: typeof paths.seatDir
+  plannerDir: typeof paths.plannerDir
+  readJson: typeof store.readJson
+  writeJsonAtomic: typeof store.writeJsonAtomic
+  appendJsonl: typeof store.appendJsonl
+  readJsonlFrom: typeof store.readJsonlFrom
+  readToken: typeof store.readToken
+  loadRun: typeof roster.loadRun
+  loadRoster: typeof roster.loadRoster
+  updateRoster: typeof roster.updateRoster
+  openSeats: typeof roster.openSeats
+  renderReports: typeof protocol.renderReports
+  deriveState: typeof detect.deriveState
+  needsNudge: typeof detect.needsNudge
+  listAgents: typeof herdr.listAgents
+  agentPromptArgv: typeof herdr.agentPromptArgv
+  agentReadArgv: typeof herdr.agentReadArgv
+  codexQueueArgv: typeof deliver.codexQueueArgv
+  deliverControl: typeof deliver.deliverControl
+  flushPending: typeof deliver.flushPending
+  nudgeText: typeof prompts.nudgeText
+}
+
+export const defaultWatchPorts: WatchPorts = {
+  runDir: paths.runDir,
+  seatDir: paths.seatDir,
+  plannerDir: paths.plannerDir,
+  readJson: store.readJson,
+  writeJsonAtomic: store.writeJsonAtomic,
+  appendJsonl: store.appendJsonl,
+  readJsonlFrom: store.readJsonlFrom,
+  readToken: store.readToken,
+  loadRun: roster.loadRun,
+  loadRoster: roster.loadRoster,
+  updateRoster: roster.updateRoster,
+  openSeats: roster.openSeats,
+  renderReports: protocol.renderReports,
+  deriveState: detect.deriveState,
+  needsNudge: detect.needsNudge,
+  listAgents: herdr.listAgents,
+  agentPromptArgv: herdr.agentPromptArgv,
+  agentReadArgv: herdr.agentReadArgv,
+  codexQueueArgv: deliver.codexQueueArgv,
+  deliverControl: deliver.deliverControl,
+  flushPending: deliver.flushPending,
+  nudgeText: prompts.nudgeText,
+}
+
+export type WatchOptions = {
+  ports?: WatchPorts
+  channel?: (content: string, meta: Record<string, string>) => void
+  modWake?: (text: string) => Promise<boolean>
+  onError?: (error: unknown, step: string) => void
+  loop?: boolean
+}
 
 export type Watcher = {
   tick: () => Promise<void>
   takePending: () => Promise<Report[]>
+  piggyback: (text: string) => Promise<string>
+  start: () => void
   stop: () => void
 }
 
-export const readNewReports = async (deps: Deps, run: RunMeta): Promise<Report[]> => todo('readNewReports')
-export const shouldWake = (report: Report): boolean => todo('shouldWake')
-export const piggyback = async (deps: Deps, run: RunMeta, text: string): Promise<string> => todo('piggyback')
-export const createWatcher = (deps: Deps, run: RunMeta): Watcher => todo('createWatcher')
+type Cursors = Record<string, store.Cursor>
+type Ledger = { t: 'add'; report: Report } | { t: 'ack'; ids: string[] }
+
+const isEnoent = (error: unknown): boolean => (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
+
+const readFrom = async <T>(ports: WatchPorts, path: string, cursor: store.Cursor): Promise<{ items: T[]; cursor: store.Cursor }> => {
+  try {
+    return await ports.readJsonlFrom<T>(path, cursor)
+  } catch (error) {
+    if (isEnoent(error)) return { items: [], cursor }
+    throw error
+  }
+}
+
+const cursorsPath = (ports: WatchPorts, deps: Deps, run: RunMeta) => join(ports.plannerDir(deps.home, run.id), 'cursors.json')
+const ledgerPath = (ports: WatchPorts, deps: Deps, run: RunMeta) => join(ports.plannerDir(deps.home, run.id), 'pending.jsonl')
+
+const isReportShape = (value: unknown): value is Report => {
+  const item = value as Partial<Report> | null
+  return typeof item === 'object' && item !== null && item.v === 1 && typeof item.id === 'string' && typeof item.seat === 'string' && typeof item.token === 'string' && typeof item.summary === 'string' && protocol.REPORT_KINDS.includes(item.kind as Report['kind'])
+}
+
+type Scan = { reports: Report[]; rejected: { seat: string; id?: string; why: string }[]; commit: () => Promise<void> }
+
+const scanOutboxes = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promise<Scan> => {
+  const known = await ports.loadRoster(deps.home, run.id)
+  const cursors = (await ports.readJson<Cursors>(cursorsPath(ports, deps, run))) ?? {}
+  const next: Cursors = { ...cursors }
+  const reports: Report[] = []
+  const rejected: Scan['rejected'] = []
+  for (const seat of known.seats) {
+    const dir = ports.seatDir(deps.home, run.id, seat.name)
+    const read = await readFrom<unknown>(ports, join(dir, 'outbox.jsonl'), cursors[seat.name] ?? { offset: 0 })
+    next[seat.name] = read.cursor
+    if (read.items.length === 0) continue
+    const token = await ports.readToken(join(dir, 'token'))
+    for (const item of read.items) {
+      const id = (item as Partial<Report> | null)?.id
+      if (!isReportShape(item)) rejected.push({ seat: seat.name, id, why: 'malformed report' })
+      else if (item.run !== run.id || item.seat !== seat.name) rejected.push({ seat: seat.name, id, why: 'run or seat does not match the outbox' })
+      else if (!token || item.token !== token) rejected.push({ seat: seat.name, id, why: 'token mismatch' })
+      else reports.push(item)
+    }
+  }
+  const commit = async () => {
+    await ports.writeJsonAtomic(cursorsPath(ports, deps, run), next)
+  }
+  return { reports, rejected, commit }
+}
+
+export const readNewReports = async (deps: Deps, run: RunMeta, ports: WatchPorts = defaultWatchPorts): Promise<Report[]> => {
+  const scan = await scanOutboxes(deps, run, ports)
+  await scan.commit()
+  return scan.reports
+}
+
+export const shouldWake = (report: Report): boolean => report.kind !== 'progress'
+
+const readLedger = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promise<{ open: Report[]; seen: Set<string> }> => {
+  const { items } = await readFrom<Ledger>(ports, ledgerPath(ports, deps, run), { offset: 0 })
+  const open = new Map<string, Report>()
+  const seen = new Set<string>()
+  for (const line of items) {
+    if (line.t === 'add') {
+      open.set(line.report.id, line.report)
+      seen.add(line.report.id)
+    } else for (const id of line.ids) open.delete(id)
+  }
+  return { open: [...open.values()], seen }
+}
+
+const unackedReports = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promise<Report[]> => (await readLedger(deps, run, ports)).open
+
+const ackReports = async (deps: Deps, run: RunMeta, ports: WatchPorts, reports: readonly Report[]): Promise<void> => {
+  if (reports.length === 0) return
+  await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'ack', ids: reports.map((report) => report.id) } satisfies Ledger)
+}
+
+const withReports = (text: string, rendered: string, count: number): string =>
+  `${text}\n\n— Drove: ${count} worker report${count === 1 ? '' : 's'} arrived while you were busy. Act on ${count === 1 ? 'it' : 'them'} now —\n${rendered}`
+
+export const piggyback = async (deps: Deps, run: RunMeta, text: string, ports: WatchPorts = defaultWatchPorts): Promise<string> => {
+  const reports = await unackedReports(deps, run, ports)
+  if (reports.length === 0) return text
+  await ackReports(deps, run, ports, reports)
+  const config = await ports.readJson<Partial<DroveConfig>>(join(deps.home, 'config.json'))
+  return withReports(text, ports.renderReports(reports, config?.humanName ?? 'the human'), reports.length)
+}
+
+const attentionLine = (item: Attention) => `⚠ ${item.seat}: ${item.reason}: ${item.detail}`
+
+const clip = (text: string, max = 300) => (text.length > max ? `${text.slice(0, max)}…` : text)
+
+export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOptions = {}): Watcher => {
+  const ports = options.ports ?? defaultWatchPorts
+  const onError = options.onError ?? (() => {})
+  const clockMs = () => deps.clock.now().getTime()
+  let chain: Promise<unknown> = Promise.resolve()
+  let timer: NodeJS.Timeout | undefined
+  let batchStartedAt: number | undefined
+  let lastWakeFailAt: number | undefined
+  let lastWakeReason = ''
+  let lastFlushAt: number | undefined
+  let lastPollAt: number | undefined
+  let plannerStatus: { status: HerdrAgent['status']; since: number } | undefined
+  const notedPending = new Set<string>()
+  let knownAttention = new Set<string>()
+  let freshAttention: Attention[] = []
+  const hookWindows = new Map<string, { cursor: store.Cursor; records: HookRecord[] }>()
+  let humanName: string | undefined
+  const plannerHooks: { cursor: store.Cursor; sessionId?: string } = { cursor: { offset: 0 } }
+  let plannerAgentSession: string | undefined
+
+  const serial = <T>(work: () => Promise<T>): Promise<T> => {
+    const result = chain.then(work, work)
+    chain = result.catch(() => {})
+    return result
+  }
+
+  const guarded = async (step: string, work: () => Promise<void>) => {
+    try {
+      await work()
+    } catch (error) {
+      onError(error, step)
+    }
+  }
+
+  const emit = async (type: DroveEventType, seat?: string, id?: string, data?: Record<string, unknown>) => {
+    const event: DroveEvent = { at: deps.clock.now().toISOString(), type, ...(seat ? { seat } : {}), ...(id ? { id } : {}), ...(data ? { data } : {}) }
+    await ports.appendJsonl(join(ports.runDir(deps.home, initial.id), 'events.jsonl'), event)
+  }
+
+  const currentRun = async (): Promise<RunMeta> => (await ports.loadRun(deps.home, initial.id)) ?? initial
+
+  const render = async (reports: readonly Report[]): Promise<string> => {
+    humanName ??= (await ports.readJson<Partial<DroveConfig>>(join(deps.home, 'config.json')))?.humanName ?? 'the human'
+    return ports.renderReports(reports, humanName)
+  }
+
+  const attentionText = (): string => (freshAttention.length === 0 ? '' : `\n\nNeeds the human:\n${freshAttention.map(attentionLine).join('\n')}`)
+
+  const ingest = async (run: RunMeta) => {
+    const scan = await scanOutboxes(deps, run, ports)
+    if (scan.reports.length === 0 && scan.rejected.length === 0) return
+    for (const item of scan.rejected) await emit('attention', item.seat, item.id, { reason: 'report-rejected', why: item.why })
+    const { seen } = await readLedger(deps, run, ports)
+    await ports.updateRoster(deps.home, run.id, (current) => ({
+      ...current,
+      seats: current.seats.map((seat) => {
+        const mine = scan.reports.filter((report) => report.seat === seat.name)
+        const last = mine.at(-1)
+        if (!last) return seat
+        const owing = mine.filter((report) => report.kind !== 'progress').at(-1)
+        return {
+          ...seat,
+          lastReport: { id: last.id, kind: last.kind, expects: last.expects, summary: last.summary, at: last.at },
+          owes: owing ? owing.expects : seat.owes,
+        }
+      }),
+      updatedAt: deps.clock.now().toISOString(),
+    }))
+    for (const report of scan.reports) {
+      await emit('report', report.seat, report.id, { kind: report.kind, expects: report.expects, summary: clip(report.summary) })
+      if (!shouldWake(report) || seen.has(report.id)) continue
+      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'add', report } satisfies Ledger)
+    }
+    await scan.commit()
+  }
+
+  const plannerThread = async (run: RunMeta): Promise<string | undefined> => {
+    if (run.planner.sessionId) return run.planner.sessionId
+    const read = await readFrom<HookRecord>(ports, join(ports.plannerDir(deps.home, run.id), 'hooks.jsonl'), plannerHooks.cursor)
+    plannerHooks.cursor = read.cursor
+    plannerHooks.sessionId = read.items.filter((record) => record.event === 'session-start' && record.sessionId).at(-1)?.sessionId ?? plannerHooks.sessionId
+    return plannerHooks.sessionId ?? plannerAgentSession
+  }
+
+  const wakeTransports = (run: RunMeta, text: string, reports: readonly Report[]): { name: string; attempt: () => Promise<Delivery | undefined> }[] => {
+    const planner = run.planner
+    return [
+      {
+        name: 'mod',
+        attempt: async () => (planner.viaMod && options.modWake ? ((await options.modWake(text)) ? { ok: true, via: 'mod' } : { ok: false, queued: true, reason: 'mod refused the wake' }) : undefined),
+      },
+      {
+        name: 'codex-queue',
+        attempt: async () => {
+          if (planner.kind !== 'codex') return undefined
+          const thread = await plannerThread(run)
+          if (!thread) return { ok: false, queued: true, reason: `${WAIT}the Codex planner thread is not known yet` }
+          const result = await deps.exec(ports.codexQueueArgv(thread, text))
+          return result.code === 0 ? { ok: true, via: 'codex-queue' } : { ok: false, queued: true, reason: `codex queue failed: ${clip(result.stderr.trim() || result.stdout.trim())}` }
+        },
+      },
+      {
+        name: 'channel',
+        attempt: async () => {
+          if (planner.kind !== 'claude' || !options.channel) return undefined
+          options.channel(text, { kind: 'report', count: String(reports.length) })
+          return { ok: true, via: 'channel' }
+        },
+      },
+      {
+        name: 'herdr-prompt',
+        attempt: async () => {
+          if (planner.kind !== 'claude' || !planner.paneId) return undefined
+          const status = plannerStatus
+          if (!status || (status.status !== 'idle' && status.status !== 'done')) return { ok: false, queued: true, reason: `${WAIT}planner pane is ${status?.status ?? 'not observed yet'}` }
+          if (clockMs() - status.since < IDLE_WAKE_MS) return { ok: false, queued: true, reason: `${WAIT}planner pane has not been idle for 5 s yet` }
+          const result = await deps.exec(ports.agentPromptArgv(planner.paneId, text))
+          return result.code === 0 ? { ok: true, via: 'herdr-prompt' } : { ok: false, queued: true, reason: `herdr agent prompt failed: ${clip(result.stderr.trim() || result.stdout.trim())}` }
+        },
+      },
+    ]
+  }
+
+  const wake = async (run: RunMeta) => {
+    const reports = await unackedReports(deps, run, ports)
+    if (reports.length === 0) {
+      batchStartedAt = undefined
+      lastWakeFailAt = undefined
+      return
+    }
+    const now = clockMs()
+    batchStartedAt ??= now
+    if (now - batchStartedAt < BATCH_MS) return
+    if (lastWakeFailAt !== undefined && now - lastWakeFailAt < WAKE_RETRY_MS && !lastWakeReason.includes(WAIT)) return
+    const text = `${await render(reports)}${attentionText()}`
+    const failures: string[] = []
+    let delivered: Delivery | undefined
+    for (const transport of wakeTransports(run, text, reports)) {
+      const outcome = await transport.attempt()
+      if (!outcome) continue
+      if (outcome.ok) {
+        delivered = outcome
+        break
+      }
+      failures.push(`${transport.name}: ${outcome.reason}`)
+    }
+    if (delivered?.ok) {
+      await ackReports(deps, run, ports, reports)
+      for (const report of reports) await emit('report.delivered', report.seat, report.id, { via: delivered.via })
+      batchStartedAt = undefined
+      lastWakeFailAt = undefined
+      lastWakeReason = ''
+      freshAttention = []
+      return
+    }
+    lastWakeFailAt = now
+    lastWakeReason = failures.at(-1) ?? 'no wake transport applies'
+    for (const report of reports) {
+      if (notedPending.has(report.id)) continue
+      notedPending.add(report.id)
+      await emit('report.pending', report.seat, report.id, { reason: failures.join('; ') || lastWakeReason })
+    }
+  }
+
+  const hooksFor = async (run: RunMeta, seat: string): Promise<HookRecord[]> => {
+    const window = hookWindows.get(seat) ?? { cursor: { offset: 0 }, records: [] }
+    const read = await readFrom<HookRecord>(ports, join(ports.seatDir(deps.home, run.id, seat), 'hooks.jsonl'), window.cursor)
+    window.cursor = read.cursor
+    window.records = [...window.records, ...read.items].slice(-HOOK_WINDOW)
+    hookWindows.set(seat, window)
+    return window.records
+  }
+
+  const poll = async (run: RunMeta) => {
+    const now = deps.clock.now()
+    const listed = await ports.listAgents(deps.exec)
+    if (!listed.ok) return
+    const planner = run.planner.paneId ? listed.value.find((agent) => agent.paneId === run.planner.paneId) : undefined
+    if (planner) plannerStatus = plannerStatus?.status === planner.status ? plannerStatus : { status: planner.status, since: now.getTime() }
+    else plannerStatus = undefined
+    plannerAgentSession = planner?.sessionId ?? plannerAgentSession
+    const current = await ports.loadRoster(deps.home, run.id)
+    const derived = new Map<string, { state: Seat['state']; attention: Attention[] }>()
+    for (const seat of ports.openSeats(current)) {
+      const agent = listed.value.find((candidate) => candidate.name === seat.name) ?? listed.value.find((candidate) => seat.paneId !== undefined && candidate.paneId === seat.paneId)
+      let screen: string | undefined
+      if (agent?.status === 'blocked') {
+        const read = await deps.exec(ports.agentReadArgv(seat.name, 40, 'detection'))
+        screen = read.code === 0 ? read.stdout : undefined
+      }
+      const result = ports.deriveState(seat, { herdr: agent, hooks: await hooksFor(run, seat.name), lastReport: seat.lastReport, screen }, now)
+      derived.set(seat.name, result)
+    }
+    if (derived.size === 0) return
+    const at = now.toISOString()
+    const transitions: { seat: string; from: Seat['state']; to: Seat['state'] }[] = []
+    const updated = await ports.updateRoster(deps.home, run.id, (latest) => ({
+      ...latest,
+      seats: latest.seats.map((seat) => {
+        const result = derived.get(seat.name)
+        if (!result || roster.CLOSED_STATES.has(seat.state)) return seat
+        const changed = result.state !== seat.state
+        if (changed) transitions.push({ seat: seat.name, from: seat.state, to: result.state })
+        return {
+          ...seat,
+          state: result.state,
+          stateAt: changed ? at : seat.stateAt,
+          attention: [...seat.attention.filter((item) => KEPT_ATTENTION.includes(item.reason)), ...result.attention],
+          ...(result.state === 'working' ? { lastWorkingAt: at } : {}),
+          ...(result.state === 'working' && seat.state !== 'working' ? { hasNudged: false } : {}),
+        }
+      }),
+      updatedAt: at,
+    }))
+    for (const move of transitions) await emit('seat.state', move.seat, undefined, { from: move.from, to: move.to })
+    const live = new Set<string>()
+    for (const result of derived.values()) {
+      for (const item of result.attention) {
+        const key = `${item.seat}|${item.reason}`
+        live.add(key)
+        if (knownAttention.has(key)) continue
+        freshAttention.push(item)
+        await emit('attention', item.seat, undefined, { reason: item.reason, detail: item.detail })
+      }
+    }
+    knownAttention = live
+    for (const seat of updated.seats) {
+      if (!derived.has(seat.name) || !ports.needsNudge(seat, now)) continue
+      const control: Control = { v: 1, id: `c-nudge-${seat.name}-${now.getTime()}`, run: run.id, from: 'planner', to: seat.name, kind: 'nudge', expects: 'answer', body: ports.nudgeText(), at }
+      await guarded('nudge', async () => {
+        await ports.deliverControl(deps, run, control)
+      })
+      await ports.updateRoster(deps.home, run.id, (latest) => ({ ...latest, seats: latest.seats.map((item) => (item.name === seat.name ? { ...item, hasNudged: true } : item)) }))
+    }
+  }
+
+  const flush = async (run: RunMeta) => {
+    for (const seat of ports.openSeats(await ports.loadRoster(deps.home, run.id))) {
+      await guarded('flush-pending', async () => {
+        await ports.flushPending(deps, run, seat.name)
+      })
+    }
+  }
+
+  const due = (last: number | undefined, every: number) => last === undefined || clockMs() - last >= every
+
+  const tick = () =>
+    serial(async () => {
+      const run = await currentRun()
+      await guarded('ingest', () => ingest(run))
+      if (due(lastPollAt, HERDR_POLL_MS)) {
+        lastPollAt = clockMs()
+        await guarded('poll', () => poll(run))
+      }
+      await guarded('wake', () => wake(run))
+      if (due(lastFlushAt, TICK_MS)) {
+        lastFlushAt = clockMs()
+        await guarded('flush', () => flush(run))
+      }
+    })
+
+  const takePending = () =>
+    serial(async () => {
+      const run = await currentRun()
+      const reports = await unackedReports(deps, run, ports)
+      await ackReports(deps, run, ports, reports)
+      for (const report of reports) await emit('report.delivered', report.seat, report.id, { via: 'piggyback' })
+      if (reports.length > 0) batchStartedAt = undefined
+      return reports
+    })
+
+  const piggybackText = async (text: string) => {
+    const reports = await takePending()
+    const attention = attentionText()
+    freshAttention = []
+    if (reports.length === 0) return `${text}${attention}`
+    return `${withReports(text, await render(reports), reports.length)}${attention}`
+  }
+
+  const start = () => {
+    if (timer) return
+    timer = setInterval(() => void tick().catch((error) => onError(error, 'tick')), LOOP_MS)
+    timer.unref()
+    void tick().catch((error) => onError(error, 'tick'))
+  }
+
+  const stop = () => {
+    if (timer) clearInterval(timer)
+    timer = undefined
+  }
+
+  const watcher: Watcher = { tick, takePending, piggyback: piggybackText, start, stop }
+  if (options.loop !== false) start()
+  return watcher
+}
