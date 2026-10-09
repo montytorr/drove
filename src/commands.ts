@@ -7,14 +7,14 @@ import { applyDerived, deriveState, matchDialog } from './detect.ts'
 import { BUSY_RETRY_MS, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
-import { execArgv, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
+import { execArgv, isShellSafeArg, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
 import { branchName, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, worktreePath } from './paths.ts'
 import { approvedText, briefFooter, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
-  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HookRecord, Identity, LaunchRequest, PromoteRequest, RunMeta, Seat, SendRequest, SpawnRequest,
+  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HookRecord, Identity, LaunchRequest, PromoteRequest, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
 export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string }
@@ -341,11 +341,13 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const token = mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
   const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
-  const footer = `${brief}${briefFooter(seat.name, request.cairn)}`
-  const isViaPrompt = process.env.DROVE_BRIEF_VIA === 'herdr-prompt'
+  const isBriefInline = isShellSafeArg(brief.trim())
+  const footer = isBriefInline ? `${brief.trim()} ${briefFooter(seat.name, request.cairn).trimStart()}` : `${brief}${briefFooter(seat.name, request.cairn)}`
   const isRoleInBrief = kind === 'codex' && process.env.DROVE_ROLE_IN_BRIEF === '1'
   const roleText = workerRole(seat, run, config)
-  const initialPrompt = isViaPrompt ? undefined : isRoleInBrief ? `${roleText}\n\n${footer}` : footer
+  const briefText = isRoleInBrief ? `${roleText}\n\n${footer}` : footer
+  const isViaPrompt = process.env.DROVE_BRIEF_VIA === 'herdr-prompt' || !isShellSafeArg(briefText)
+  const initialPrompt = isViaPrompt ? undefined : briefText
   const spec = specFor(
     launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: worktree, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}) }, config),
   )
@@ -371,7 +373,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     const attention = dialog ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at: iso }
     await updateRoster(deps.home, run.id, current => upsertSeat(current, { ...seat, paneId, state: 'blocked', attention: [attention] }))
     await recordEvent(deps, run.id, { type: 'attention', seat: seat.name, data: { reason: attention.reason } })
-    if (isViaPrompt) await queueBrief(deps, run, seat.name, footer)
+    if (isViaPrompt) await queueBrief(deps, run, seat.name, briefText)
     return ok(`Worker ${seat.name} started in pane ${paneId} but stopped on a dialog (${attention.reason}): ${attention.detail} ${isViaPrompt ? 'The brief is queued.' : 'The brief is part of its launch and runs once the dialog is answered.'}`, { state: 'blocked', paneId })
   }
   if (!started.ok && !isRecovered) {
@@ -390,7 +392,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     }),
   )
   await recordEvent(deps, run.id, { type: 'seat.spawn', seat: seat.name, data: { kind, model, effort, pane: paneId, worktree, branch, cairn: request.cairn } })
-  const via = isViaPrompt ? await queueBrief(deps, run, seat.name, footer) : 'launch-arg'
+  const via = isViaPrompt ? await queueBrief(deps, run, seat.name, briefText) : 'launch-arg'
   if (!isViaPrompt) await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, data: { kind: 'brief', via: 'launch-arg' } })
   return ok(`Worker ${seat.name} (${kind}${model ? ` ${model}` : ''} ${effort}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.`, { paneId, worktree, branch })
 }
@@ -503,8 +505,10 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
 
   const updated: Seat = { ...seat, ...change, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
   const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+  const controlText = formatControl(control, token)
+  const isInline = isShellSafeArg(controlText)
   const spec = specFor(
-    launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: workerRole(updated, run, config), resumeId: seat.sessionId, initialPrompt: formatControl(control, token) }, config),
+    launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: workerRole(updated, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: controlText } : {}) }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -513,9 +517,15 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
     return failed('restart', `${seat.name} exited but did not come back: ${clip(started.output)}. Relaunch it with \`drove up --seat ${seat.name}\`.`)
   }
+  const typed = isInline ? undefined : await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(seat.paneId, controlText), BUSY_RETRY_MS)
+  const via: Transport = isInline ? 'launch-arg' : 'herdr-prompt'
+  if (typed && !typed.ok && typed.code !== 'timeout') {
+    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'idle', owes: 'none', hasNudged: false }))
+    return failed('delivery', `${seat.name} restarted on ${model || 'the default model'} at ${request.effort} effort, but herdr could not type the ${control.kind} notice into it: ${clip(typed.output)}`)
+  }
   await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'working', lastWorkingAt: deps.clock.now().toISOString(), owes: 'none', hasNudged: false }))
-  await appendJsonl(join(seatDir(deps.home, run.id, seat.name), 'sent.jsonl'), { id: control.id, via: 'launch-arg', at: deps.clock.now().toISOString() })
-  await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: 'launch-arg', model, effort: request.effort } })
+  await appendJsonl(join(seatDir(deps.home, run.id, seat.name), 'sent.jsonl'), { id: control.id, via, at: deps.clock.now().toISOString() })
+  await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via, model, effort: request.effort } })
   return ok(`${seat.name} restarted with resume on ${model || 'the default model'} at ${request.effort} effort.`)
 }
 

@@ -33,7 +33,7 @@
     "-c",
     "mcp_servers.drove.default_tools_approval_mode=\"approve\"",
     "-c",
-    "developer_instructions=\"You are a worker.\\nQuote: \\\"yes\\\" and \\\\ backslash\"",
+    "developer_instructions=\"You are a worker.\\nQuote: \\\"yes\\\" and \\\\ backslash with `ticks`\"",
     "-c",
     "hooks.PreToolUse=[{matcher=\"Bash|shell|exec_command|apply_patch\", hooks=[{type=\"command\", command=\"node /opt/drove/src/cli.ts guard pre-tool-use\", timeout=10}]}]",
     "-c",

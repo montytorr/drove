@@ -31,6 +31,15 @@ export const tomlString = (value: string): string => {
 const tomlArray = (values: readonly string[]): string => `[${values.map(tomlString).join(', ')}]`
 const tomlTable = (entries: Record<string, string>): string => `{${Object.entries(entries).map(([key, value]) => `${key}=${tomlString(value)}`).join(', ')}}`
 
+const UNSAFE_ARG = /[\u0000-\u001f\u007f]/
+
+export const isShellSafeArg = (arg: string): boolean => !UNSAFE_ARG.test(arg)
+
+export const assertShellSafeArgs = (argv: readonly string[]): void => {
+  const index = argv.findIndex(arg => !isShellSafeArg(arg))
+  if (index >= 0) throw new Error(`launch argument ${index} has a newline or control character, which herdr cannot type into the pane's shell: ${JSON.stringify(argv[index]?.slice(0, 60))}`)
+}
+
 const shellQuote = (value: string): string => (/^[A-Za-z0-9_\/.:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`)
 
 const hookCommand = (droveEntry: string, event: string): string => `node ${shellQuote(droveEntry)} guard ${event}`
@@ -68,6 +77,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
   const isWorker = identity.role === 'worker'
   const mcpPath = `${dir}/mcp.json`
   const settingsPath = `${dir}/settings.json`
+  const rolePath = `${dir}/role.md`
   const prompt = request.initialPrompt
   const argv = [
     ...(isWorker ? ['--dangerously-skip-permissions'] : []),
@@ -77,17 +87,22 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     ...(request.resumeId ? ['--resume', request.resumeId] : request.sessionId ? ['--session-id', request.sessionId] : []),
     '--mcp-config', mcpPath,
     '--settings', settingsPath,
-    '--append-system-prompt', request.roleText,
+    ...(request.roleText ? ['--append-system-prompt-file', rolePath] : []),
     ...(!isWorker && request.channel ? [CHANNEL_FLAG, 'server:drove'] : []),
     ...(prompt ? (prompt.startsWith('-') ? ['--', prompt] : [prompt]) : []),
   ]
+  assertShellSafeArgs(isWorker || !prompt ? argv : argv.slice(0, -1))
   return {
     kind: 'claude',
     role: identity.role,
     cwd: request.cwd,
     env: { ...(isWorker ? { _CC_ACCT_PINNED: '1' } : {}), ...identityEnv(identity), DROVE_AGENT: 'claude', ...(!isWorker && request.channel ? { DROVE_CHANNEL: '1' } : {}) },
     argv,
-    files: [jsonFile(mcpPath, claudeMcpConfig(request.droveEntry, identityEnv(identity))), jsonFile(settingsPath, claudeSettings(request.droveEntry, identity.role))],
+    files: [
+      jsonFile(mcpPath, claudeMcpConfig(request.droveEntry, identityEnv(identity))),
+      jsonFile(settingsPath, claudeSettings(request.droveEntry, identity.role)),
+      ...(request.roleText ? [{ path: rolePath, content: `${request.roleText}\n`, mode: 0o600 }] : []),
+    ],
   }
 }
 
@@ -125,6 +140,7 @@ const codexSpec = (request: LaunchRequest): LaunchSpec => {
     ...(request.bypassHookTrust ? ['--dangerously-bypass-hook-trust'] : []),
     ...(request.initialPrompt ? [request.initialPrompt] : []),
   ]
+  assertShellSafeArgs(isWorker || !request.initialPrompt ? argv : argv.slice(0, -1))
   return { kind: 'codex', role: identity.role, cwd: request.cwd, env: { ...env, DROVE_AGENT: 'codex' }, argv, files: [] }
 }
 
