@@ -29,7 +29,7 @@
     "-c",
     "mcp_servers.drove.args=[\"/opt/drove/src/cli.ts\", \"mcp\"]",
     "-c",
-    "mcp_servers.drove.env={DROVE_HOME=\"/home/cal/.drove\", DROVE_RUN=\"drove-20261009-1042-a3f1\", DROVE_ROLE=\"planner\", DROVE_SEAT=\"planner\"}",
+    "mcp_servers.drove.env_vars=[\"DROVE_HOME\", \"DROVE_RUN\", \"DROVE_ROLE\", \"DROVE_SEAT\"]",
     "-c",
     "mcp_servers.drove.default_tools_approval_mode=\"approve\"",
     "-c",

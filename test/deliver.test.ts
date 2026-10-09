@@ -178,12 +178,31 @@ test('a stalled prompt that turned into activity counts as delivered', async () 
   assert.equal((await deliver.deliverControl(deps, run, control('w-ui'))).ok, true)
 })
 
-test('a herdr wait timeout means the text was submitted', async () => {
+test('a herdr wait timeout after typing is delivered-unconfirmed: recorded as sent, never queued or retried', async () => {
   const fake = new FakeHerdr()
   const base = fake.exec
-  fake.exec = async argv => (argv[2] === 'prompt' ? herdrFail('timeout') : base(argv))
+  let prompts = 0
+  fake.exec = async argv => (argv[2] === 'prompt' ? (prompts++, herdrFail('timeout', 'timed out waiting for agent status')) : base(argv))
   const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt', unconfirmed: true })
+  assert.deepEqual(await lines(join(seatDir(deps.home, run.id, 'w-ui'), 'pending.jsonl')), [])
+  const events = await lines(join(deps.home, 'runs', run.id, 'events.jsonl'))
+  assert.deepEqual(events.at(-1)?.data, { kind: 'message', via: 'herdr-prompt', unconfirmed: true })
+  assert.equal(events.at(-1)?.type, 'control.sent')
   assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
+  assert.equal(prompts, 1)
+})
+
+test('failures before typing (agent_blocked, agent_not_found) queue the control', async () => {
+  for (const code of ['agent_blocked', 'agent_not_found']) {
+    const fake = new FakeHerdr()
+    const base = fake.exec
+    fake.exec = async argv => (argv[2] === 'prompt' ? herdrFail(code) : base(argv))
+    const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+    const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+    assert.equal(!delivery.ok && delivery.queued, true, code)
+    assert.equal((await lines(join(seatDir(deps.home, run.id, 'w-ui'), 'pending.jsonl'))).length, 1, code)
+  }
 })
 
 test('a failing codex queue is an explicit failure: not queued, recorded, retried only by flush', async () => {

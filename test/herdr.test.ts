@@ -89,3 +89,10 @@ test('readScreen returns the text field, or the raw output when the shape is unk
   const raw = await herdr.readScreen(async () => result('{"result":{"weird":"Background server has incompatible feature settings"}}'), 'x', 10)
   assert.match(raw.ok ? raw.value : '', /Background server/)
 })
+
+test('isPromptUnconfirmed recognises only the wait timeout, and the read source accepts visible', () => {
+  assert.equal(herdr.isPromptUnconfirmed(JSON.stringify({ error: { code: 'timeout', message: 'timed out waiting for agent status' } })), true)
+  assert.equal(herdr.isPromptUnconfirmed(JSON.stringify({ error: { code: 'agent_blocked', message: 'x' } })), false)
+  assert.deepEqual(herdr.agentReadArgv('w-api', 40, 'visible'), ['herdr', 'agent', 'read', 'w-api', '--source', 'visible', '--lines', '40'])
+  assert.deepEqual(herdr.paneReadArgv('w1:p2', 60, 'visible'), ['herdr', 'pane', 'read', 'w1:p2', '--source', 'visible', '--lines', '60'])
+})

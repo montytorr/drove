@@ -12,6 +12,7 @@ const config: DroveConfig = {
   promotedModel: { claude: 'claude-opus-5-5', codex: 'gpt-5' },
   budget: 5,
   codexBypassHookTrust: false,
+  codexWorkerSandbox: 'bypass',
   claudeChannel: false,
 }
 
@@ -71,6 +72,16 @@ test('worker role covers rules, cairn, questions and reporting', () => {
   assert.match(text, /`done`/)
   assert.match(text, /`progress`/)
   assert.doesNotMatch(text, /mcp__orchestrator__|\bcal\b/)
+})
+
+test('planner files one task per worker with --no-start and never hands over a task it holds', () => {
+  const text = prompts.plannerRole(run, config, 'claude')
+  assert.match(text, /one Cairn task per piece \(`cairn add [^`]*--no-start/)
+  assert.match(text, /Never hand a worker a task you hold yourself/)
+})
+
+test('worker reports a refused claim once', () => {
+  assert.match(prompts.workerRole(seat, run, config), /claim is refused[^.]*send one `blocked` report[^.]*do not repeat it/)
 })
 
 test('brief footer names the seat and the cairn task', () => {

@@ -22,6 +22,8 @@ const plannerIdleSince = new Map<string, number>()
 
 export const codexQueueArgv = (thread: string, text: string): string[] => ['codex', 'queue', '--thread', thread, '--message', text]
 
+export type UnconfirmedDelivery = { ok: true; via: Transport; unconfirmed: true }
+
 const targetOf = (seat: Seat): string => seat.paneId ?? seat.name
 const clip = (text: string, max = 300): string => text.replace(/\s+/g, ' ').trim().slice(0, max)
 
@@ -32,11 +34,13 @@ export const recordEvent = async (deps: Deps, run: string, event: Omit<DroveEven
 export const herdrPromptAdapter = (deps: Deps): DeliveryAdapter => ({
   transport: 'herdr-prompt',
   canDeliver: seat => Boolean(seat.paneId ?? seat.name),
-  deliver: async (seat, text) => {
+  deliver: async (seat, text): Promise<Delivery | UnconfirmedDelivery> => {
     const target = targetOf(seat)
     const ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
-    if (ran.ok || ran.code === 'timeout') return { ok: true, via: 'herdr-prompt' }
+    if (ran.ok) return { ok: true, via: 'herdr-prompt' }
+    if (ran.code === 'timeout') return { ok: true, via: 'herdr-prompt', unconfirmed: true }
     if (ran.code === 'agent_blocked') return { ok: false, queued: true, reason: 'agent_blocked: the pane is waiting at a dialog' }
+    if (ran.code === 'agent_not_found' || ran.code === 'agent_pane_busy') return { ok: false, queued: true, reason: `${ran.code}: ${clip(ran.output)}` }
     if (ran.code === 'agent_prompt_stalled') {
       const live = await getAgent(deps.exec, target)
       if (live.ok && (live.value.status === 'working' || live.value.status === 'blocked')) return { ok: true, via: 'herdr-prompt' }
@@ -119,7 +123,8 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
   const delivery = await adapter.deliver(seat, formatControl(control, token))
   if (delivery.ok) {
     await appendJsonl(sentFile(deps, run, seat.name), { id: control.id, via: delivery.via, at: deps.clock.now().toISOString() } satisfies Sent)
-    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via } })
+    const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
+    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
     attempts.delete(control.id)
   }
   return delivery

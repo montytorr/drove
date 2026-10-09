@@ -94,7 +94,7 @@ export const fakePorts = (overrides: Partial<WatchPorts> & { agents?: () => Herd
     needsNudge: () => false,
     codexQueueArgv: (thread, text) => ['codex', 'queue', '--thread', thread, '--message', text],
     agentPromptArgv: (target, text) => ['herdr', 'agent', 'prompt', target, text],
-    agentReadArgv: (target, lines) => ['herdr', 'agent', 'read', target, '--lines', String(lines)],
+    agentReadArgv: (target, lines, source) => ['herdr', 'agent', 'read', target, '--source', source ?? 'recent-unwrapped', '--lines', String(lines)],
     deliverControl: async (_deps, _run, control) => {
       controls.push(control)
       return { ok: true, via: 'herdr-prompt' }
