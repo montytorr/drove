@@ -1,0 +1,24 @@
+{
+  "name": "drove",
+  "version": "0.0.0",
+  "private": true,
+  "description": "A small cross-agent orchestrator on herdr: one planner, Claude Code or Codex workers, one worktree each.",
+  "type": "module",
+  "bin": {
+    "drove": "src/cli.ts"
+  },
+  "exports": {
+    "./mod": "./src/mod.ts"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test --disable-warning=ExperimentalWarning 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "typescript": "^7.0.2"
+  }
+}
