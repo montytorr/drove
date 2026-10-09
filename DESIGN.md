@@ -159,6 +159,8 @@ Risk with keystroke wake (2): it types into the human's own pane, and could land
 
 All launches follow the same steps. Create or reuse the run tab: `herdr tab create … --env …` for the first worker, then `herdr pane split` into the grid slot (the mod's `gridSlot`). Then run `herdr agent start <seat> --kind <kind> --pane <pane> --timeout 60000 -- <argv>`. Files are written under `seats/<seat>/` first.
 
+Launch argv must be free of control characters (newline, C0, DEL): herdr types it into the pane's shell and refuses it otherwise (`invalid_agent_argument`). Drove checks every worker spec (`assertShellSafeArgs`); a multi-line brief, or any unsafe prompt, is launched without the prompt argument and goes through `herdr agent prompt` automatically. A planner is exec-ed directly, so its goal may span lines.
+
 ### Claude worker
 
 ```
@@ -170,7 +172,7 @@ argv: --dangerously-skip-permissions                      [proven]
       --session-id <uuid minted by drove>                 [docs] (so resume needs no discovery)
       --mcp-config <run>/seats/<seat>/mcp.json            [docs]
       --settings <run>/seats/<seat>/settings.json         [docs: launch-only, merged, writes no file]
-      --append-system-prompt "<worker role text>"         [docs]
+      --append-system-prompt-file <run>/seats/<seat>/role.md  [docs: works interactively; no role text in argv]
       "<brief + footer>"                                  [docs; verify with herdr agent start]
 ```
 
@@ -201,7 +203,7 @@ The MCP env is passed explicitly because the spike did that; whether Codex MCP s
 
 ### Planners
 
-- **Claude planner** (`drove plan --kind claude`): `exec claude --model <opus> --effort <high> --session-id <uuid> --mcp-config planner/mcp.json --settings planner/settings.json --append-system-prompt "<planner role>" [--dangerously-load-development-channels server:drove] ["<goal>"]`. No bypass of permissions: the human answers prompts in their own pane.
+- **Claude planner** (`drove plan --kind claude`): `exec claude --model <opus> --effort <high> --session-id <uuid> --mcp-config planner/mcp.json --settings planner/settings.json --append-system-prompt-file planner/role.md [--dangerously-load-development-channels server:drove] ["<goal>"]`. No bypass of permissions: the human answers prompts in their own pane.
 - **Codex planner** (`drove plan --kind codex`): `exec codex -s workspace-write -C <repo> --add-dir <repo>/.git --add-dir $DROVE_HOME/runs/<run> -c sandbox_workspace_write.network_access=true -c mcp_servers.drove…(DROVE_ROLE=planner) -c developer_instructions=… -c hooks.PreToolUse=[…] "<goal or 'Read the roster and wait for the human.'>"`. The initial prompt exists so that the planner has a thread id at once, which the wake needs.
 
 ### Hook trust (Codex)
@@ -244,6 +246,18 @@ The mod's `bashReason` regex-scans the whole raw command for `$(…)` and backti
 The `--help` and `--version` exception fixes a real annoyance: the mod denied `claude --help` to this worker while it wrote this design.
 
 The writable roots (`isInside`) are resolved after `realpath`, so `/tmp/../repo` does not count as `/tmp`.
+
+Stricter planner denials added in P2:
+
+- `eval`, `source` and `.` (they run text the guard cannot see)
+- `find` with `-exec`, `-delete` or `-fprint`
+- `xargs` with an unwrapped command
+- a command name taken from a variable or a substitution
+- an absolute-path script inside a writable root
+- a bare `> file` redirect
+- nesting deeper than 6 levels
+- `apply_patch` heredocs, checked against the writable roots
+- redirect targets containing `$` or a backtick
 
 ## 7. State detection
 
