@@ -195,6 +195,53 @@ test('Claude planner: keystroke wake only after 5 s idle, never when blocked', a
   assert.match(await watcher.piggyback('r'), /blocked planner/)
 })
 
+const TIMEOUT_STDERR = JSON.stringify({ error: { code: 'timeout', message: 'timed out waiting for agent status' }, id: 'cli' })
+
+test('Claude planner: a keystroke wake that times out after typing is delivered-unconfirmed, not pending', async () => {
+  const ctx = await setup({ planner: { kind: 'claude' }, respond: (argv) => (argv[2] === 'prompt' ? { code: 1, stderr: TIMEOUT_STDERR } : {}) })
+  const { ports } = fakePorts({ agents: () => [{ paneId: 'p-planner', status: 'idle' }] })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await fileReport(ctx, 'w-api', 'done', 'type me once')
+  await watcher.tick()
+  for (let i = 0; i < 6; i++) {
+    ctx.clock.advance(5000)
+    await watcher.tick()
+  }
+  assert.equal(prompted(ctx.calls).length, 1, 'typed once, never retried')
+  const events = await eventsOf(ctx)
+  assert.ok(events.some((event) => event.type === 'report.delivered' && event.data?.via === 'herdr-prompt-unconfirmed'))
+  assert.ok(!events.some((event) => event.type === 'report.pending'))
+  assert.doesNotMatch(await watcher.piggyback('r'), /type me once/)
+})
+
+test('Claude planner: a prompt failure before typing stays pending and is retried', async () => {
+  const blocked = JSON.stringify({ error: { code: 'agent_blocked', message: 'blocked' } })
+  const ctx = await setup({ planner: { kind: 'claude' }, respond: (argv) => (argv[2] === 'prompt' ? { code: 1, stderr: blocked } : {}) })
+  const { ports } = fakePorts({ agents: () => [{ paneId: 'p-planner', status: 'idle' }] })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await fileReport(ctx, 'w-api', 'done', 'not typed')
+  await watcher.tick()
+  for (let i = 0; i < 6; i++) {
+    ctx.clock.advance(5000)
+    await watcher.tick()
+  }
+  const events = await eventsOf(ctx)
+  assert.ok(events.some((event) => event.type === 'report.pending'))
+  assert.ok(!events.some((event) => event.type === 'report.delivered'))
+  assert.match(await watcher.piggyback('r'), /not typed/)
+})
+
+test('an idle seat that has fired no hook yet has its visible screen read for a startup dialog', async () => {
+  const ctx = await setup({ respond: (argv) => (argv[2] === 'read' ? { stdout: '1 hook needs review before it can run' } : {}) })
+  const { ports } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'idle' }], deriveState })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  assert.ok(ctx.calls.some((argv) => argv[2] === 'read' && argv[3] === 'w-api' && argv[5] === 'visible'))
+  const roster = await rosterOf(ctx)
+  assert.equal(roster.seats[0]?.state, 'blocked')
+  assert.equal(roster.seats[0]?.attention[0]?.reason, 'hook-trust')
+})
+
 test('modWake is tried first when the planner runs the mod', async () => {
   const ctx = await setup({ planner: { kind: 'claude', viaMod: true } })
   const { ports } = fakePorts()

@@ -272,7 +272,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     return plannerHooks.sessionId ?? plannerAgentSession
   }
 
-  const wakeTransports = (run: RunMeta, text: string, reports: readonly Report[]): { name: string; attempt: () => Promise<Delivery | undefined> }[] => {
+  const wakeTransports = (run: RunMeta, text: string, reports: readonly Report[]): { name: string; attempt: () => Promise<(Delivery | deliver.UnconfirmedDelivery) | undefined> }[] => {
     const planner = run.planner
     return [
       {
@@ -305,7 +305,10 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
           if (!status || (status.status !== 'idle' && status.status !== 'done')) return { ok: false, queued: true, reason: `${WAIT}planner pane is ${status?.status ?? 'not observed yet'}` }
           if (clockMs() - status.since < IDLE_WAKE_MS) return { ok: false, queued: true, reason: `${WAIT}planner pane has not been idle for 5 s yet` }
           const result = await deps.exec(ports.agentPromptArgv(planner.paneId, text))
-          return result.code === 0 ? { ok: true, via: 'herdr-prompt' } : { ok: false, queued: true, reason: `herdr agent prompt failed: ${clip(result.stderr.trim() || result.stdout.trim())}` }
+          if (result.code === 0) return { ok: true, via: 'herdr-prompt' }
+          const output = result.stderr.trim() || result.stdout.trim()
+          if (herdr.isPromptUnconfirmed(output)) return { ok: true, via: 'herdr-prompt', unconfirmed: true }
+          return { ok: false, queued: true, reason: `herdr agent prompt failed: ${clip(output)}` }
         },
       },
     ]
@@ -336,7 +339,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     }
     if (delivered?.ok) {
       await ackReports(deps, run, ports, reports)
-      for (const report of reports) await emit('report.delivered', report.seat, report.id, { via: delivered.via })
+      const via = 'unconfirmed' in delivered && delivered.unconfirmed ? `${delivered.via}-unconfirmed` : delivered.via
+      for (const report of reports) await emit('report.delivered', report.seat, report.id, { via })
       batchStartedAt = undefined
       lastWakeFailAt = undefined
       lastWakeReason = ''
@@ -373,12 +377,13 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     const derived = new Map<string, { state: Seat['state']; attention: Attention[] }>()
     for (const seat of ports.openSeats(current).filter((open) => open.state !== 'closing')) {
       const agent = listed.value.find((candidate) => candidate.name === seat.name) ?? listed.value.find((candidate) => seat.paneId !== undefined && candidate.paneId === seat.paneId)
+      const hooks = await hooksFor(run, seat.name)
       let screen: string | undefined
-      if (agent?.status === 'blocked') {
-        const read = await deps.exec(ports.agentReadArgv(seat.name, 40, 'detection'))
+      if (detect.shouldReadScreen(agent, hooks)) {
+        const read = await deps.exec(ports.agentReadArgv(seat.name, 40, 'visible'))
         screen = read.code === 0 ? read.stdout : undefined
       }
-      const result = ports.deriveState(seat, { herdr: agent, hooks: await hooksFor(run, seat.name), lastReport: seat.lastReport, screen }, now)
+      const result = ports.deriveState(seat, { herdr: agent, hooks, lastReport: seat.lastReport, screen }, now)
       derived.set(seat.name, result)
     }
     if (derived.size === 0) return

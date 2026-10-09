@@ -117,10 +117,22 @@ test('a codex worker is launched with the codex spec and an initial prompt', asy
   assert.equal(spawned.ok, true, spawned.text)
   const start = fake.find('herdr', 'agent', 'start') ?? []
   assert.equal(start[start.indexOf('--kind') + 1], 'codex')
-  assert.ok(start.includes('--add-dir'))
+  assert.ok(start.includes('--dangerously-bypass-approvals-and-sandbox'))
+  assert.ok(!start.includes('--add-dir') && !start.includes('-s'))
   assert.ok(start.includes('model_reasoning_effort="high"'))
   assert.ok(!start.includes('-m'))
   assert.match(start.at(-1) ?? '', /Build the widget/)
+})
+
+test('codexWorkerSandbox "workspace-write" restores the sandboxed codex worker spec', async () => {
+  const { fake, deps, identity } = await setup()
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ codexWorkerSandbox: 'workspace-write' }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', cairn: 'DROVE-6', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.ok(!start.includes('--dangerously-bypass-approvals-and-sandbox'))
+  assert.deepEqual(start.slice(start.indexOf('-s'), start.indexOf('-s') + 2), ['-s', 'workspace-write'])
+  assert.ok(start.includes('--add-dir'))
 })
 
 test('a failed agent start closes the new tab, removes the seat and the fresh worktree', async () => {
@@ -158,10 +170,13 @@ test('a failed start saves the pane output, logs seat.start_failed and hints at 
   assert.match(spawned.text, /Hint: Claude is asking to trust the folder\./)
   const file = join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt')
   assert.match(spawned.text, new RegExp(file.replaceAll('.', '\\.')))
-  assert.equal(await readFile(file, 'utf8'), FOLDER_TRUST_SCREEN)
+  assert.equal(await readFile(file, 'utf8'), `== visible screen ==\n${FOLDER_TRUST_SCREEN.trimEnd()}\n\n== recent output ==\n${FOLDER_TRUST_SCREEN.trimEnd()}\n`)
   assert.equal((await stat(file)).mode & 0o777, 0o600)
-  const read = fake.find('herdr', 'agent', 'read') ?? []
-  assert.deepEqual(read.slice(3), ['w-api', '--source', 'recent-unwrapped', '--lines', '60'])
+  const reads = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'read')
+  assert.deepEqual(reads.map(call => call.slice(3)), [
+    ['w-api', '--source', 'visible', '--lines', '60'],
+    ['w-api', '--source', 'recent-unwrapped', '--lines', '60'],
+  ])
   assert.ok(fake.calls.findIndex(call => call[2] === 'read') < fake.calls.findIndex(call => call[1] === 'tab' && call[2] === 'close'))
   const event = (await readEvents(deps)).find(item => item.type === 'seat.start_failed')
   assert.equal(event?.seat, 'w-api')
@@ -176,7 +191,7 @@ test('the failure capture falls back to a pane read and omits the hint when no d
   assert.equal(spawned.ok, false)
   assert.doesNotMatch(spawned.text, /Hint:/)
   assert.ok(fake.find('herdr', 'pane', 'read', 'w1:p1'))
-  assert.equal(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt'), 'utf8'), 'command not found: claude\n')
+  assert.equal(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt'), 'utf8'), '== visible screen ==\ncommand not found: claude\n\n== recent output ==\ncommand not found: claude\n')
   const event = (await readEvents(deps)).find(item => item.type === 'seat.start_failed')
   assert.equal(event?.data?.reason, undefined)
 })
@@ -187,7 +202,7 @@ test('a startup dialog on a claude worker also saves the capture', async () => {
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
   assert.equal(spawned.ok, true)
   assert.match(spawned.text, /\(trust\)/)
-  assert.equal(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt'), 'utf8'), FOLDER_TRUST_SCREEN)
+  assert.match(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt'), 'utf8'), /^== visible screen ==\n Do you trust the files in this folder\?/)
   assert.equal((await readEvents(deps)).filter(item => item.type === 'seat.start_failed').length, 1)
 })
 

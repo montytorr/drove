@@ -140,6 +140,8 @@ The Codex thread id is the seat's `sessionId`. It comes from the Drove `session-
 
 **Guarded send.** Before any keystroke-based delivery (`herdr agent prompt`), check `herdr agent get <seat>`. If the state is `blocked`, or the seat's hooks report needs-input, do not type: append the control to `seats/<seat>/pending.jsonl`, raise an attention item, and retry on every watcher tick (3 s) until the pane is not blocked. herdr itself also rejects with `agent_blocked` [proven], and that error takes the same queue path. `codex queue` does not type into the pane, so it is allowed while the pane is busy (mid-turn messages queue [proven]). It is still deferred while the pane is `blocked`, because the queued turn would sit behind a dialog that nobody sees. `agent_pane_busy` from a fresh pane is retried for up to 45 s, as in the mod's `retryWhileBusy`. `agent_prompt_stalled` is not resent blindly: the mod's rule applies (check the state first).
 
+**Unconfirmed delivery.** `herdr agent prompt --wait` types the text and then waits for the agent's status to change. When that wait fails with `timeout` ("timed out waiting for agent status"), the text was already typed, so Drove records it as delivered-unconfirmed and does not queue it or retry: `control.sent` gets `unconfirmed: true`, and a worker-to-planner wake emits `report.delivered` with `via: "herdr-prompt-unconfirmed"` (and the report leaves the pending ledger, so the piggyback does not repeat it). Only failures before anything is typed queue: `agent_blocked`, `agent_not_found`, and a pane that stays `agent_pane_busy` past the retry window. (Seen in run rig-lab-20261009-1152-ab03, where a timed-out wake was queued and then delivered a second time by piggyback.)
+
 ### Worker to planner
 
 All reports go through the outbox. Only the wake differs:
@@ -189,16 +191,14 @@ argv: --dangerously-skip-permissions                      [proven]
 
 ```
 env:  DROVE_HOME DROVE_RUN DROVE_ROLE=worker DROVE_SEAT DROVE_TOKEN
-argv: -s workspace-write                                               [proven]
+argv: --dangerously-bypass-approvals-and-sandbox   (default; see below) [proven: openai/codex codex-rs/utils/cli/src/shared_options.rs]
       -C <worktree>                                                    [proven]
-      --add-dir <repo>/.git            (commits from a worktree write the common git dir)  [verify]
       -m <model> -c model_reasoning_effort="<effort>"                  [verify the key name]
       -c check_for_update_on_startup=false                             [proven]
-      -c sandbox_workspace_write.network_access=true  (cairn, package installs)           [verify]
       -c 'projects."<worktree>".trust_level="trusted"'                 [proven]
       -c mcp_servers.drove.command="node"                              [proven pattern]
       -c 'mcp_servers.drove.args=["<drove>/src/cli.ts","mcp"]'
-      -c 'mcp_servers.drove.env={DROVE_HOME="…",DROVE_RUN="…",DROVE_ROLE="worker",DROVE_SEAT="…",DROVE_TOKEN="…"}'  [proven pattern]
+      -c 'mcp_servers.drove.env_vars=["DROVE_HOME","DROVE_RUN","DROVE_ROLE","DROVE_SEAT","DROVE_TOKEN"]'  [source: codex-rs/config/src/mcp_types.rs, rmcp-client/src/utils.rs]
       -c mcp_servers.drove.default_tools_approval_mode="approve"       [proven]
       -c 'developer_instructions="<worker role text>"'                 [verify; fallback: role text at the top of the brief]
       -c 'hooks.PreToolUse=[{matcher="Bash|shell|exec_command|apply_patch", hooks=[{type="command", command="drove guard pre-tool-use", timeout=10}]}]'   [verify]
@@ -206,7 +206,9 @@ argv: -s workspace-write                                               [proven]
       "<brief + footer>"                                               [verify]
 ```
 
-The MCP env is passed explicitly because the spike did that; whether Codex MCP servers inherit the TUI's env is unverified.
+**Sandbox (decision, Cal, 2026-10-09; DROVE-14).** Codex workers run with approvals and the sandbox bypassed, like Claude workers' `--dangerously-skip-permissions`: `--dangerously-bypass-approvals-and-sandbox` (alias `--yolo`) replaces `-s workspace-write`, and the extra writable dir and the network override are dropped because they are moot. Drove's `PreToolUse` guard hook still runs and still denies pushes, in both modes. The config key `codexWorkerSandbox` in `~/.drove/config.json` (`"bypass"`, the default, or `"workspace-write"`) restores the old spec: `-s workspace-write`, `--add-dir <repo>/.git` and `-c sandbox_workspace_write.network_access=true`. The Codex planner keeps normal approvals and the workspace-write sandbox.
+
+**Identity env.** The `DROVE_*` identity is already in the pane env (`herdr --env`). Codex forwards named parent env vars to a stdio MCP server through `mcp_servers.<name>.env_vars = [...]` (read from Codex's own process env; only Codex-internal names are filtered), so the launch passes the names, not the values. The token is therefore not typed into the shell and does not appear in the pane scrollback. This applies to the Codex planner too.
 
 ### Planners
 
@@ -289,15 +291,19 @@ Signals, by freshness:
 - a gone pane;
 - a budget request.
 
-**Dialog detection.** When `agent start` returns `agent_not_ready`, or a seat turns `blocked`, `detect.ts` reads `herdr agent read <seat> --source detection --lines 40` and matches a regex table:
+**Dialog detection.** When `agent start` returns `agent_not_ready`, when a seat turns `blocked`, or when a seat is not `working` and no `session-start` or `user-prompt-submit` hook has fired yet (the Codex hook-review dialog shows as `idle`, not `blocked`), Drove reads `herdr agent read <seat> --source visible --lines 40` and matches a regex table. The visible screen is used because Codex draws on the alternate screen, which never reaches the scrollback sources:
 
 | Pattern | Attention reason |
 |---|---|
 | `/Background server has incompatible feature settings/` | `codex-version-mismatch` |
 | `/trust (this\|the files in this) folder\|project you created or one you trust/i` | `trust` (Claude: "Do you trust the files in this folder?") |
+| `/hooks? needs? review\|hooks? (is\|are) new or changed/i` | `hook-trust` (Codex: "1 hook needs review before it can run"; hint: approve Drove's hooks once in the pane, Codex remembers them) |
 | `/hook.*trust/i` | `hook-trust` |
+| `/trust the contents of this directory/i` (added to the folder-trust row) | `trust` (older Codex folder trust) |
+| `/Update available\|Update now \(runs/` | `dialog` (Codex update prompt; choose Skip) |
+| `/Codex just got an upgrade\|Try new model/` | `dialog` (Codex model migration) |
 
-**Start failures.** Whenever `herdr agent start` fails or times out (in `spawn`, `promote` and `up`), before any rollback closes the pane, Drove runs `herdr agent read <seat> --source recent-unwrapped --lines 60` (falling back to `herdr pane read <pane>`), saves it to `seats/<seat>/start-failure.txt` (mode 600), appends a `seat.start_failed` event with the herdr error code and the first matching dialog reason from this table, and puts a one-line hint in the error ("Claude is asking to trust the folder") with the file path.
+**Start failures.** Whenever `herdr agent start` fails or times out (in `spawn`, `promote` and `up`), before any rollback closes the pane, Drove reads the pane twice, `herdr agent read <seat> --source visible --lines 60` and `--source recent-unwrapped --lines 60` (each falling back to `herdr pane read <pane>`), and saves both to `seats/<seat>/start-failure.txt` (mode 600) under `== visible screen ==` and `== recent output ==` headings, appends a `seat.start_failed` event with the herdr error code and the first matching dialog reason from this table, and puts a one-line hint in the error ("Claude is asking to trust the folder") with the file path.
 
 `codex-version-mismatch` carries the detail "Codex CLI and app-server daemon versions differ (`codex --version` vs the daemon); align them. Drove will not answer the dialog". Drove never answers a dialog itself.
 

@@ -27,6 +27,12 @@ test('dialog table: folder trust, hook trust, channel confirm, and no match', ()
   assert.equal(detect.findDialog('Do you trust the files in this folder?')?.hint, 'Claude is asking to trust the folder')
   assert.equal(detect.matchDialog('s', '2 hooks need trust before they run', NOW)?.reason, 'hook-trust')
   assert.equal(detect.matchDialog('s', 'Loading development channels', NOW)?.reason, 'channel-confirm')
+  assert.equal(detect.matchDialog('s', '1 hook needs review before it can run.', NOW)?.reason, 'hook-trust')
+  assert.equal(detect.matchDialog('s', 'Hooks need review\n2 hooks are new or changed.', NOW)?.reason, 'hook-trust')
+  assert.equal(detect.findDialog('1 hook needs review before it can run')?.hint, "approve Drove's hooks once in the pane; Codex remembers them")
+  assert.equal(detect.matchDialog('s', 'Update available! Update now (runs `npm i -g @openai/codex`)', NOW)?.reason, 'dialog')
+  assert.equal(detect.matchDialog('s', 'Codex just got an upgrade. Introducing gpt-x.', NOW)?.reason, 'dialog')
+  assert.equal(detect.matchDialog('s', 'Do you trust the contents of this directory?', NOW)?.reason, 'trust')
   assert.equal(detect.matchDialog('s', 'just a normal prompt', NOW), undefined)
 })
 
@@ -155,4 +161,20 @@ test('applyDerived stamps state changes, resets nudges on working and keeps fore
   assert.deepEqual(next.attention.map(item => item.reason), ['pending-delivery'])
   const same = detect.applyDerived(next, { state: 'working', attention: [] }, new Date(NOW.getTime() + 5000))
   assert.equal(same.stateAt, NOW.toISOString())
+})
+
+test('shouldReadScreen: blocked always, otherwise only until the first hook fires', () => {
+  const started = [hook('session-start', 5)]
+  assert.equal(detect.shouldReadScreen(undefined, []), false)
+  assert.equal(detect.shouldReadScreen(live('blocked'), started), true)
+  assert.equal(detect.shouldReadScreen(live('idle'), []), true)
+  assert.equal(detect.shouldReadScreen(live('unknown'), []), true)
+  assert.equal(detect.shouldReadScreen(live('working'), []), false)
+  assert.equal(detect.shouldReadScreen(live('idle'), started), false)
+})
+
+test('a Codex hook-review dialog on an idle pane with no hooks yet blocks the seat as hook-trust', () => {
+  const derived = detect.deriveState(seatOf({ state: 'starting' }), { herdr: live('idle'), hooks: [], screen: '1 hook needs review before it can run' }, NOW)
+  assert.equal(derived.state, 'blocked')
+  assert.equal(derived.attention[0]?.reason, 'hook-trust')
 })

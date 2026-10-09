@@ -4,11 +4,11 @@ import { existsSync } from 'node:fs'
 import { chmod, mkdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { applyDerived, deriveState, findDialog, matchDialog } from './detect.ts'
+import { applyDerived, deriveState, findDialog, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
-import { execArgv, isShellSafeArg, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
+import { type CodexLaunchRequest, execArgv, isShellSafeArg, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
 import { branchName, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, worktreePath } from './paths.ts'
 import { approvedText, briefFooter, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl } from './protocol.ts'
@@ -38,6 +38,7 @@ export const DEFAULT_CONFIG: DroveConfig = {
   promotedModel: { claude: 'claude-opus-5-5', codex: '' },
   budget: 5,
   codexBypassHookTrust: false,
+  codexWorkerSandbox: 'bypass',
   claudeChannel: false,
 }
 
@@ -148,9 +149,10 @@ const launchRequest = (
   deps: Deps,
   parts: Pick<LaunchRequest, 'identity' | 'kind' | 'repo' | 'cwd' | 'model' | 'effort' | 'roleText'> & Partial<LaunchRequest>,
   config: DroveConfig,
-): LaunchRequest => ({
+): CodexLaunchRequest => ({
   droveEntry: DROVE_ENTRY,
   bypassHookTrust: parts.kind === 'codex' && config.codexBypassHookTrust,
+  bypassSandbox: config.codexWorkerSandbox !== 'workspace-write',
   ...parts,
 })
 
@@ -161,14 +163,18 @@ const writeLaunchJson = async (deps: Deps, run: string, seat: string, spec: Para
 const START_FAILURE_LINES = 60
 
 const captureStartFailure = async (deps: Deps, run: RunMeta, seat: string, paneId: string | undefined, failure: { code: string; output: string }): Promise<{ hint?: string; file: string }> => {
-  const byAgent = await herdr.readScreen(deps.exec, seat, START_FAILURE_LINES)
-  const screen = byAgent.ok || !paneId ? byAgent : await herdr.readPane(deps.exec, paneId, START_FAILURE_LINES)
-  const text = screen.ok ? screen.value : `(could not read the pane: ${screen.code})\n${screen.output}`
+  const readBoth = async (source: herdr.ReadSource) => {
+    const byAgent = await herdr.readScreen(deps.exec, seat, START_FAILURE_LINES, source)
+    return byAgent.ok || !paneId ? byAgent : await herdr.readPane(deps.exec, paneId, START_FAILURE_LINES, source)
+  }
+  const section = (title: string, read: herdr.HerdrResult<string>): string => `== ${title} ==\n${read.ok ? read.value : `(could not read the pane: ${read.code})\n${read.output}`}`.trimEnd()
+  const visible = await readBoth('visible')
+  const recent = await readBoth('recent-unwrapped')
   const file = join(seatDir(deps.home, run.id, seat), 'start-failure.txt')
   await mkdir(dirname(file), { recursive: true, mode: 0o700 })
-  await writeFile(file, text.endsWith('\n') ? text : `${text}\n`, { mode: 0o600 })
+  await writeFile(file, `${section('visible screen', visible)}\n\n${section('recent output', recent)}\n`, { mode: 0o600 })
   await chmod(file, 0o600)
-  const dialog = screen.ok ? findDialog(text) : undefined
+  const dialog = [visible, recent].map(read => (read.ok ? findDialog(read.value) : undefined)).find(hit => hit !== undefined)
   await recordEvent(deps, run.id, { type: 'seat.start_failed', seat, data: { code: failure.code, ...(dialog ? { reason: dialog.reason } : {}), ...(paneId ? { pane: paneId } : {}), file } })
   return { ...(dialog ? { hint: dialog.hint } : {}), file }
 }
@@ -184,7 +190,7 @@ export const refreshRoster = async (deps: Deps, run: RunMeta): Promise<void> => 
     seats.map(async seat => {
       const live = listed.value.find(agent => (seat.paneId ? agent.paneId === seat.paneId : agent.name === seat.name))
       const hooks = await hooksOf(deps, run.id, seat.name)
-      const screen = live?.status === 'blocked' ? await herdr.readScreen(deps.exec, seat.paneId ?? seat.name, 40, 'detection') : undefined
+      const screen = shouldReadScreen(live, hooks) ? await herdr.readScreen(deps.exec, seat.paneId ?? seat.name, 40, 'visible') : undefined
       const sessionId = live?.sessionId ?? [...hooks].reverse().find(hook => hook.event === 'session-start' && hook.sessionId)?.sessionId
       return { seat, sessionId, derived: deriveState(seat, { herdr: live, hooks, ...(seat.lastReport ? { lastReport: seat.lastReport } : {}), ...(screen?.ok ? { screen: screen.value } : {}) }, now) }
     }),
@@ -400,7 +406,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const captured = started.ok ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
 
   if (!started.ok && started.code === 'agent_not_ready') {
-    const screen = await herdr.readScreen(deps.exec, seat.name, 40, 'detection')
+    const screen = await herdr.readScreen(deps.exec, seat.name, 40, 'visible')
     const dialog = screen.ok ? matchDialog(seat.name, screen.value, now) : undefined
     const attention = dialog ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at: iso }
     await updateRoster(deps.home, run.id, current => upsertSeat(current, { ...seat, paneId, state: 'blocked', attention: [attention] }))

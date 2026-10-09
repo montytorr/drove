@@ -27,6 +27,7 @@ export type DroveConfig = {
   promotedModel: Record<AgentKind, string>
   budget: number
   codexBypassHookTrust: boolean
+  codexWorkerSandbox: 'bypass' | 'workspace-write'
   claudeChannel: boolean
 }
 

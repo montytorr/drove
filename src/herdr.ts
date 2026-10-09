@@ -2,6 +2,8 @@ import type { AgentKind, Exec, ExecResult, HerdrAgent, HerdrStatus } from './typ
 
 export type HerdrResult<T> = { ok: true; value: T } | { ok: false; code: string; output: string }
 
+export type ReadSource = 'visible' | 'recent-unwrapped' | 'detection'
+
 export const BUSY_RETRY_INTERVAL_MS = 500
 export const DEFAULT_START_TIMEOUT_MS = 60_000
 export const DEFAULT_PROMPT_TIMEOUT_MS = 8_000
@@ -27,11 +29,11 @@ export const agentPromptArgv = (target: string, text: string, timeoutMs = DEFAUL
 
 export const agentTypeArgv = (target: string, text: string): string[] => ['herdr', 'agent', 'prompt', target, text]
 
-export const agentReadArgv = (target: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): string[] => [
+export const agentReadArgv = (target: string, lines: number, source: ReadSource = 'recent-unwrapped'): string[] => [
   'herdr', 'agent', 'read', target, '--source', source, '--lines', String(lines),
 ]
 
-export const paneReadArgv = (paneId: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): string[] => [
+export const paneReadArgv = (paneId: string, lines: number, source: ReadSource = 'recent-unwrapped'): string[] => [
   'herdr', 'pane', 'read', paneId, '--source', source, '--lines', String(lines),
 ]
 
@@ -60,6 +62,8 @@ export const herdrError = (output: string): string | undefined => {
   const match = /"code"\s*:\s*"([a-z_]+)"/.exec(output) ?? /\b(agent_[a-z_]+|pane_[a-z_]+|invalid_[a-z_]+|timeout)\b/.exec(output)
   return match?.[1]
 }
+
+export const isPromptUnconfirmed = (output: string): boolean => herdrError(output) === 'timeout'
 
 const STATUSES: ReadonlySet<string> = new Set<HerdrStatus>(['idle', 'working', 'blocked', 'done', 'unknown'])
 
@@ -127,10 +131,10 @@ const readOutput = async (exec: Exec, argv: readonly string[]): Promise<HerdrRes
   return { ok: true, value: text ?? ran.value }
 }
 
-export const readScreen = (exec: Exec, target: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): Promise<HerdrResult<string>> =>
+export const readScreen = (exec: Exec, target: string, lines: number, source: ReadSource = 'recent-unwrapped'): Promise<HerdrResult<string>> =>
   readOutput(exec, agentReadArgv(target, lines, source))
 
-export const readPane = (exec: Exec, paneId: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): Promise<HerdrResult<string>> =>
+export const readPane = (exec: Exec, paneId: string, lines: number, source: ReadSource = 'recent-unwrapped'): Promise<HerdrResult<string>> =>
   readOutput(exec, paneReadArgv(paneId, lines, source))
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))

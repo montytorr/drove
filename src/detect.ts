@@ -1,4 +1,4 @@
-import type { Attention, Derived, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
+import type { Attention, Derived, HerdrAgent, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
 
 export const DIALOGS: readonly { pattern: RegExp; reason: Attention['reason']; detail: string; hint: string }[] = [
   {
@@ -8,12 +8,30 @@ export const DIALOGS: readonly { pattern: RegExp; reason: Attention['reason']; d
     hint: 'Codex CLI and its app-server daemon versions differ',
   },
   {
-    pattern: /trust (this|the files in this) folder|project you created or one you trust/i,
+    pattern: /trust (this|the files in this) folder|trust the contents of this directory|project you created or one you trust/i,
     reason: 'trust',
     detail: 'A folder-trust prompt is waiting in the pane.',
     hint: 'Claude is asking to trust the folder',
   },
+  {
+    pattern: /hooks? needs? review|hooks? (is|are) new or changed/i,
+    reason: 'hook-trust',
+    detail: "Codex is asking to review the Drove hooks before they can run; approve them once in the pane and Codex remembers them. Drove will not answer it.",
+    hint: "approve Drove's hooks once in the pane; Codex remembers them",
+  },
   { pattern: /hook.*trust/i, reason: 'hook-trust', detail: 'A hook-trust prompt is waiting in the pane.', hint: 'the agent is asking to trust the Drove hooks' },
+  {
+    pattern: /Update available|Update now \(runs/,
+    reason: 'dialog',
+    detail: 'Codex is offering an update at startup; choose Skip in the pane. Drove will not answer it.',
+    hint: 'Codex is offering an update; choose Skip in the pane',
+  },
+  {
+    pattern: /Codex just got an upgrade|Try new model/,
+    reason: 'dialog',
+    detail: 'Codex is offering a model migration at startup; pick an option in the pane. Drove will not answer it.',
+    hint: 'Codex is offering a new model; pick an option in the pane',
+  },
   { pattern: /development channels?/i, reason: 'channel-confirm', detail: 'A development-channel confirmation is waiting in the pane.', hint: 'Claude is asking to confirm the development channel' },
 ]
 
@@ -27,6 +45,12 @@ const PERMISSION_NOTICE = /permission|approv|elicitation|dialog|trust/i
 const ms = (at: string | undefined): number => (at ? Date.parse(at) : Number.NaN)
 
 export const findDialog = (screen: string): (typeof DIALOGS)[number] | undefined => DIALOGS.find(({ pattern }) => pattern.test(screen))
+
+export const shouldReadScreen = (agent: HerdrAgent | undefined, hooks: readonly HookRecord[]): boolean => {
+  if (!agent) return false
+  if (agent.status === 'blocked') return true
+  return agent.status !== 'working' && !hooks.some(hook => hook.event === 'session-start' || hook.event === 'user-prompt-submit')
+}
 
 export const matchDialog = (seat: string, screen: string, at: Date): Attention | undefined => {
   const hit = findDialog(screen)
