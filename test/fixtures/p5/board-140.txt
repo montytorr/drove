@@ -1,0 +1,20 @@
+drove drove-20261009-1000-a3f1 · up · 5/5 seats · planner claude opus 5.5·h
+goal: Build Drove v1 pieces P1 to P5 in parallel
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ATTENTION 2
+! w-guard codex-version-mismatch: Codex CLI and app-server daemon versions differ (codex --version vs the daemon); align them. Drove will n…
+! w-store idle-without-report: went idle at 10:20 with no report
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+✓ w-core         claude sonnet 5.5·m DROVE-3    7m    done: P1 core state and protocol finished, 48 tests green                       review
+■ w-guard        codex  gpt-5.5·x    DROVE-4    4m    -                                                                               -
+● w-runtime      claude sonnet 5.5·m DROVE-5    30m   progress: herdr wrapper and launch specs written                                -
+○ w-store        codex  gpt-5.5·h    DROVE-6    22m   -                                                                               -
+? w-board        claude sonnet 5.5·m DROVE-7    now   question: Need a types change for the color flag?                               answer
+· w-old          claude sonnet 5.5·m -          1h42  -                                                                               -
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+RECENT
+10:00 run.up
+10:01 seat.spawn w-core
+10:35 report w-core P1 finished
+10:38 attention w-guard codex-version-mismatch
+10:41 report.pending w-board
