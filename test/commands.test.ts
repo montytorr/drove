@@ -1,11 +1,502 @@
-import { test } from 'node:test'
+import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
+import { readFile, realpath, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
-import { assertExports, assertStub } from './helpers.ts'
+import { seatDir } from '../src/paths.ts'
+import { approvedText } from '../src/prompts.ts'
+import { loadRoster, loadRun } from '../src/roster.ts'
+import type { Deps, Identity, RunMeta } from '../src/types.ts'
+import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun } from './p3-helpers.ts'
 
-test('commands exports its interface', () => {
-  assertExports(commands, ['defaultDeps', 'identityOrPlanner', 'plan', 'spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'down', 'up', 'budget'])
+beforeEach(() => {
+  Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20 })
+  for (const key of ['DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_BRIEF_VIA', 'DROVE_ROLE_IN_BRIEF', 'HERDR_PANE_ID']) delete process.env[key]
 })
 
-test('commands stubs throw until P3 lands', async () => {
-  await assertStub(() => commands.defaultDeps({}), 'commands.defaultDeps')
+const planner = (deps: Deps): Identity => ({ home: deps.home, run: RUN, role: 'planner', seat: 'planner' })
+
+const setup = async (fake = new FakeHerdr(), overrides: Partial<RunMeta> = {}) => {
+  const repo = await makeRepo()
+  const deps = await makeDeps(fake)
+  const run = await seedRun(deps, repo, [], overrides)
+  return { fake, repo, deps, run, identity: planner(deps) }
+}
+
+const brief = 'Build the widget.'
+
+test('spawn creates the worktree, opens the tab, then starts the agent, in that order', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const order = fake.calls.map(call => (call[0] === 'git' ? 'git' : call.slice(1, 3).join(' ')))
+  assert.ok(order.indexOf('git') < order.indexOf('tab create'))
+  assert.ok(order.indexOf('tab create') < order.indexOf('agent start'))
+  const worktree = join(repo, '.claude', 'worktrees', 'w-api')
+  assert.ok(existsSync(worktree))
+  assert.equal(await git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD'), 'drove/w-api')
+  assert.equal(await git(repo, 'for-each-ref', '--format=%(upstream:short)', 'refs/heads/drove/w-api'), '')
+
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.equal(start[3], 'w-api')
+  assert.equal(start[start.indexOf('--kind') + 1], 'claude')
+  assert.ok(start.includes('--session-id'))
+  assert.match(start.at(-1) ?? '', /^Build the widget\.\n\n\(You are worker `w-api`\. Your Cairn task is DROVE-5/)
+  const tab = fake.find('herdr', 'tab', 'create') ?? []
+  assert.ok(tab.includes('_CC_ACCT_PINNED=1'))
+  assert.ok(tab.some(arg => arg.startsWith('DROVE_TOKEN=')))
+  assert.equal(tab[tab.indexOf('--workspace') + 1], 'w1')
+
+  const roster = await loadRoster(deps.home, RUN)
+  assert.equal(roster.seats[0]?.state, 'working')
+  assert.equal(roster.seats[0]?.paneId, 'w1:p1')
+  assert.equal((await loadRun(deps.home, RUN))?.tabId, 'w1:t1')
+  const token = await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'token'), 'utf8')
+  const launch = await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'launch.json'), 'utf8')
+  assert.ok(!launch.includes(token.trim()))
+  assert.ok(existsSync(join(seatDir(deps.home, RUN, 'w-api'), 'mcp.json')))
+})
+
+test('the second worker splits into the grid instead of opening another tab', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await commands.spawn(deps, identity, { seat: 'w-b', kind: 'codex', brief })
+  await commands.spawn(deps, identity, { seat: 'w-c', kind: 'claude', brief })
+  const splits = fake.calls.filter(call => call[1] === 'pane' && call[2] === 'split')
+  assert.equal(fake.calls.filter(call => call[1] === 'tab' && call[2] === 'create').length, 1)
+  assert.equal(splits.length, 2)
+  assert.deepEqual([splits[0]?.[splits[0].indexOf('--direction') + 1], splits[1]?.[splits[1].indexOf('--direction') + 1]], ['right', 'down'])
+  assert.equal(splits[0]?.[splits[0].indexOf('--pane') + 1], 'w1:p1')
+})
+
+test('a codex worker is launched with the codex spec and an initial prompt', async () => {
+  const { fake, deps, identity } = await setup()
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', cairn: 'DROVE-6', brief, effort: 'high' })
+  assert.equal(spawned.ok, true, spawned.text)
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.equal(start[start.indexOf('--kind') + 1], 'codex')
+  assert.ok(start.includes('--add-dir'))
+  assert.ok(start.includes('model_reasoning_effort="high"'))
+  assert.ok(!start.includes('-m'))
+  assert.match(start.at(-1) ?? '', /Build the widget/)
+})
+
+test('a failed agent start closes the new tab, removes the seat and the fresh worktree', async () => {
+  const { fake, deps, identity, repo } = await setup(new FakeHerdr({ startFails: 'agent_start_failed' }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, false)
+  assert.match(spawned.text, /no worker exists/)
+  const order = fake.herdrCalls()
+  assert.deepEqual(order.filter(item => ['tab create', 'agent start', 'tab close'].includes(item)), ['tab create', 'agent start', 'tab close'])
+  assert.equal(fake.tabs.size, 0)
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
+  assert.equal(existsSync(join(repo, '.claude', 'worktrees', 'w-api')), false)
+  assert.equal(await git(repo, 'branch', '--list', 'drove/w-api'), '')
+  assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
+})
+
+test('a failed start into an existing grid closes only that pane', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  fake.startFails = 'agent_start_failed'
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-b', kind: 'claude', brief })
+  assert.equal(spawned.ok, false)
+  assert.ok(fake.herdrCalls().includes('pane close'))
+  assert.ok(!fake.herdrCalls().includes('tab close'))
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats.map(seat => seat.name), ['w-a'])
+})
+
+test('agent_pane_busy on a fresh pane is retried', async () => {
+  const fake = new FakeHerdr({ busyStarts: 2 })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal(fake.calls.filter(call => call[2] === 'agent' || call[1] === 'agent').filter(call => call[2] === 'start').length, 3)
+})
+
+test('a startup dialog keeps the pane and turns the version-mismatch text into an attention item', async () => {
+  const fake = new FakeHerdr({ startFails: 'agent_not_ready', screen: 'Background server has incompatible feature settings' })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(spawned.ok, true)
+  assert.match(spawned.text, /codex-version-mismatch/)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.state, 'blocked')
+  assert.equal(seat?.attention[0]?.reason, 'codex-version-mismatch')
+  assert.ok(!fake.herdrCalls().includes('pane close'))
+  assert.ok(!fake.herdrCalls().includes('tab close'))
+  assert.ok(!fake.calls.some(call => call.includes('/exit')))
+})
+
+test('DROVE_BRIEF_VIA=herdr-prompt starts without the prompt and sends the brief with herdr agent prompt', async () => {
+  process.env.DROVE_BRIEF_VIA = 'herdr-prompt'
+  const { fake, deps, identity } = await setup()
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.ok(!start.some(arg => arg.includes('Build the widget')))
+  assert.equal(fake.prompts.length, 1)
+  assert.match(fake.prompts[0]?.text ?? '', /kind=brief/)
+  assert.match(fake.prompts[0]?.text ?? '', /Build the widget/)
+})
+
+test('DROVE_ROLE_IN_BRIEF=1 moves a codex worker role from developer_instructions to the brief', async () => {
+  process.env.DROVE_ROLE_IN_BRIEF = '1'
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.ok(!start.some(arg => arg.startsWith('developer_instructions')))
+  assert.match(start.at(-1) ?? '', /# Worker mode[\s\S]*Build the widget/)
+})
+
+test('spawn refuses a full budget with the human-run hint, and a taken or bad name', async () => {
+  const { fake, deps, identity } = await setup(new FakeHerdr(), { budget: 1 })
+  assert.equal((await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })).ok, true)
+  const full = await commands.spawn(deps, identity, { seat: 'w-b', kind: 'claude', brief })
+  assert.equal(!full.ok && full.code, 'over-budget')
+  assert.match(full.text, /ask the human to run `drove budget 2`/)
+  const taken = await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  assert.equal(!taken.ok && taken.code, 'seat-taken')
+  const bad = await commands.spawn(deps, identity, { seat: 'Bad Name', kind: 'claude', brief })
+  assert.equal(!bad.ok && bad.code, 'usage')
+  const worker = await commands.spawn(deps, { ...identity, role: 'worker' }, { seat: 'w-z', kind: 'claude', brief })
+  assert.equal(!worker.ok && worker.code, 'forbidden')
+  assert.equal(fake.calls.filter(call => call[2] === 'start' || call[3] === 'w-b').length, 1)
+})
+
+test('send verdict approve puts the approval text in once and types the envelope', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  fake.setStatus('w-api', 'idle')
+  const sent = await commands.send(deps, identity, { seat: 'w-api', kind: 'verdict', verdict: 'approve', body: '' })
+  assert.equal(sent.ok, true, sent.text)
+  const text = fake.prompts[0]?.text ?? ''
+  assert.match(text, /kind=verdict verdict=approve expects=none/)
+  assert.equal(text.split(approvedText()).length, 2)
+  const again = await commands.send(deps, identity, { seat: 'w-api', kind: 'verdict', verdict: 'approve', body: approvedText() })
+  assert.equal(again.ok, true)
+  assert.equal((fake.prompts[1]?.text ?? '').split(approvedText()).length, 2)
+})
+
+test('send changes needs notes and expects a review; answers clear what the seat is owed', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  fake.setStatus('w-api', 'idle')
+  const noNotes = await commands.send(deps, identity, { seat: 'w-api', kind: 'verdict', verdict: 'changes', body: ' ' })
+  assert.equal(!noNotes.ok && noNotes.code, 'usage')
+  const { updateRoster } = await import('../src/roster.ts')
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, owes: 'answer' as const })) }))
+  const changes = await commands.send(deps, identity, { seat: 'w-api', kind: 'verdict', verdict: 'changes', body: 'rename x' })
+  assert.equal(changes.ok, true)
+  assert.match(fake.prompts.at(-1)?.text ?? '', /expects=review/)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.owes, 'none')
+  const missing = await commands.send(deps, identity, { seat: 'ghost', kind: 'message', body: 'x' })
+  assert.equal(!missing.ok && missing.code, 'no-seat')
+})
+
+test('send to a blocked seat queues and reports it without typing', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  fake.setStatus('w-api', 'blocked')
+  const sent = await commands.send(deps, identity, { seat: 'w-api', kind: 'message', body: 'hello' })
+  assert.equal(sent.ok, true)
+  assert.match(sent.text, /Queued message/)
+  assert.equal(fake.prompts.length, 0)
+})
+
+test('send uses codex queue once the codex seat has a thread', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.sessionId, 'thread-xyz')
+  const sent = await commands.send(deps, identity, { seat: 'w-cx', kind: 'answer', body: 'use sqlite' })
+  assert.equal(sent.ok, true)
+  assert.equal(fake.queued[0]?.thread, 'thread-xyz')
+  assert.equal(fake.prompts.length, 0)
+})
+
+test('prompt types raw text but refuses a blocked pane', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  fake.setStatus('w-api', 'idle')
+  assert.equal((await commands.prompt(deps, identity, 'w-api', 'carry on')).ok, true)
+  assert.equal(fake.prompts[0]?.text, 'carry on')
+  fake.setStatus('w-api', 'blocked')
+  const refused = await commands.prompt(deps, identity, 'w-api', 'again')
+  assert.equal(!refused.ok && refused.code, 'blocked')
+  assert.equal(fake.prompts.length, 1)
+})
+
+test('close quits the agent, closes the pane and the empty tab, and keeps the worktree by default', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const closed = await commands.close(deps, identity, 'w-api', false)
+  assert.equal(closed.ok, true, closed.text)
+  assert.equal(fake.prompts[0]?.text, '/exit')
+  assert.ok(fake.herdrCalls().includes('pane close'))
+  assert.ok(fake.herdrCalls().includes('tab close'))
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'closed')
+  assert.ok(existsSync(join(repo, '.claude', 'worktrees', 'w-api')))
+  assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
+})
+
+test('close --remove-worktree keeps an unmerged worktree and removes a merged one', async () => {
+  const { deps, identity, repo } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const worktree = join(repo, '.claude', 'worktrees', 'w-api')
+  await writeFile(join(worktree, 'a.txt'), 'x\n')
+  await git(worktree, 'add', 'a.txt')
+  await git(worktree, 'commit', '-q', '-m', 'work')
+  const kept = await commands.close(deps, identity, 'w-api', true)
+  assert.match(kept.text, /not merged into main, so the worktree .* was kept/)
+  assert.ok(existsSync(worktree))
+
+  await git(repo, 'merge', '--no-ff', '-q', '-m', 'merge', 'drove/w-api')
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const removed = await commands.close(deps, identity, 'w-api', true)
+  assert.match(removed.text, /Removed worktree/)
+  assert.equal(existsSync(worktree), false)
+})
+
+test('promote on a settled Claude worker restarts it with --resume and the new model', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const { updateRoster } = await import('../src/roster.ts')
+  await updateRoster(deps.home, RUN, roster => ({
+    ...roster,
+    seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, owes: 'answer' as const, lastReport: { id: 'r-1', kind: 'promote' as const, expects: 'answer' as const, summary: 'stuck', at: '2026-10-09T10:30:00.000Z' } })),
+  }))
+  fake.setStatus('w-api', 'idle')
+  const sessionId = (await loadRoster(deps.home, RUN)).seats[0]?.sessionId
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high', reason: 'subtle bug' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.equal(fake.prompts[0]?.text, '/exit')
+  const starts = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')
+  assert.equal(starts.length, 2)
+  const restart = starts[1] ?? []
+  assert.equal(restart[restart.indexOf('--resume') + 1], sessionId)
+  assert.equal(restart[restart.indexOf('--model') + 1], 'claude-opus-5-5')
+  assert.equal(restart[restart.indexOf('--effort') + 1], 'high')
+  assert.ok(!restart.includes('--session-id'))
+  assert.match(restart.at(-1) ?? '', /kind=promote model=claude-opus-5-5 effort=high/)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.deepEqual([seat?.model, seat?.effort, seat?.state, seat?.owes], ['claude-opus-5-5', 'high', 'working', 'none'])
+})
+
+test('promote on a codex worker quits with /quit and resumes the thread', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  const { updateRoster } = await import('../src/roster.ts')
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, lastReport: { id: 'r-1', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })) }))
+  const promoted = await commands.promote(deps, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.equal(fake.prompts[0]?.text, '/quit')
+  const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')[1] ?? []
+  const argv = restart.slice(restart.indexOf('--') + 1)
+  assert.deepEqual(argv.slice(0, 2), ['resume', 'thread-xyz'])
+  assert.equal(argv[argv.indexOf('-m') + 1], 'gpt-big')
+  assert.ok(argv.includes('model_reasoning_effort="xhigh"'))
+})
+
+test('promote mid-turn is queued until the seat is idle, not restarted', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(promoted.ok, true)
+  assert.match(promoted.text, /Queued until w-api is idle/)
+  assert.equal(fake.prompts.length, 0)
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats[0]?.pendingPromote, { model: 'claude-opus-5-5', effort: 'high' })
+})
+
+test('applyPendingPromotes completes a queued promote once the seat has settled', async () => {
+  const { fake, deps, identity, run } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.deepEqual(await commands.applyPendingPromotes(deps, run), [])
+  const { updateRoster } = await import('../src/roster.ts')
+  await updateRoster(deps.home, RUN, roster => ({
+    ...roster,
+    seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, lastReport: { id: 'r-1', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })),
+  }))
+  fake.setStatus('w-api', 'idle')
+  const results = await commands.applyPendingPromotes(deps, run)
+  assert.deepEqual(results.map(item => item.ok), [true])
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.deepEqual([seat?.model, seat?.pendingPromote], ['claude-opus-5-5', undefined])
+  assert.equal(fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').length, 2)
+})
+
+test('promote on a Claude worker with the mod only updates the roster and sends a control', async () => {
+  const { fake, deps, identity } = await setup(new FakeHerdr(), { planner: { kind: 'claude', paneId: 'w1:p0', model: 'claude-opus-5-5', effort: 'high', viaMod: true } })
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  fake.setStatus('w-api', 'idle')
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.ok(!fake.prompts.some(item => item.text === '/exit'))
+  assert.match(fake.prompts[0]?.text ?? '', /kind=promote model=claude-opus-5-5 effort=high/)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.model, 'claude-opus-5-5')
+})
+
+test('roster refreshes states from herdr and prints one line per seat plus the attention list', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  fake.setStatus('w-api', 'blocked')
+  const listed = await commands.roster(deps, { run: RUN, repo: '/nowhere' }, false)
+  assert.equal(listed.ok, true)
+  assert.match(listed.text, /^run drove-20261009-1042-a3f1 · /)
+  assert.match(listed.text, /- w-api \[blocked\] claude Sonnet 5\.5 medium/)
+  assert.match(listed.text, /needs attention:\n- w-api: dialog/)
+  const json = await commands.roster(deps, { run: RUN, repo: '/nowhere' }, true)
+  assert.equal(JSON.parse(json.ok ? json.text : '{}').seats[0].state, 'blocked')
+})
+
+test('roster marks a vanished pane gone', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  fake.agents.clear()
+  const listed = await commands.roster(deps, { run: RUN, repo: '/nowhere' }, false)
+  assert.match(listed.text, /\[gone\]/)
+  assert.match(listed.text, /drove up --seat w-api/)
+})
+
+test('capture reads the seat through herdr', async () => {
+  const fake = new FakeHerdr({ screen: 'last lines' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const captured = await commands.capture(deps, { run: RUN, repo: '/nowhere' }, 'w-api', 20)
+  assert.deepEqual([captured.ok, captured.text], [true, 'last lines'])
+  assert.ok(fake.calls.some(call => call[2] === 'read' && call[3] === 'w1:p1'))
+})
+
+test('budget is for the human only and validates the number', async () => {
+  const { deps } = await setup()
+  const raised = await commands.budget(deps, { run: RUN, repo: '/x' }, 6)
+  assert.equal(raised.ok, true)
+  assert.equal((await loadRun(deps.home, RUN))?.budget, 6)
+  assert.equal((await commands.budget(deps, { run: RUN, repo: '/x' }, 0)).ok, false)
+  process.env.DROVE_ROLE = 'planner'
+  const denied = await commands.budget(deps, { run: RUN, repo: '/x' }, 9)
+  assert.equal(!denied.ok && denied.code, 'forbidden')
+  assert.equal((await loadRun(deps.home, RUN))?.budget, 6)
+})
+
+test('down saves session ids and closes everything; up relaunches each seat with resume and the planner resume plan', async () => {
+  const fake = new FakeHerdr({ startSession: 'codex-thread' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await commands.spawn(deps, identity, { seat: 'w-b', kind: 'codex', brief })
+  fake.setStatus('w-a', 'idle')
+  fake.setStatus('w-b', 'idle')
+  const downed = await commands.down(deps, { run: RUN, repo: '/x' })
+  assert.equal(downed.ok, true, downed.text)
+  assert.match(downed.text, /2 seat\(s\) saved/)
+  assert.equal(fake.agents.size, 0)
+  assert.equal((await loadRun(deps.home, RUN))?.status, 'down')
+  const seats = (await loadRoster(deps.home, RUN)).seats
+  assert.deepEqual(seats.map(seat => seat.state), ['down', 'down'])
+  assert.ok(seats.every(seat => seat.sessionId))
+
+  process.env.HERDR_PANE_ID = 'w1:p77'
+  const upped = await commands.up(deps, { run: RUN, repo: '/x' })
+  assert.equal(upped.ok, true, upped.text)
+  const starts = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').slice(2)
+  assert.equal(starts.length, 2)
+  assert.ok(starts[0]?.includes('--resume'))
+  assert.ok(starts[1]?.includes('resume'))
+  const plan = upped.ok ? (upped.data as commands.ProcessPlan) : undefined
+  assert.equal(plan?.argv[0], 'claude')
+  assert.ok(plan?.argv.includes('--resume'))
+  assert.equal(plan?.argv[plan.argv.indexOf('--resume') + 1], 'planner-session')
+  assert.equal(plan?.env.DROVE_ROLE, 'planner')
+  const run = await loadRun(deps.home, RUN)
+  assert.equal(run?.status, 'up')
+  assert.equal(run?.planner.paneId, 'w1:p77')
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats.map(seat => seat.state), ['working', 'working'])
+})
+
+test('up --seat relaunches only a dead seat, and refuses a live one or one with no session', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  const live = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(!live.ok && live.code, 'not-dead')
+  fake.agents.clear()
+  await commands.roster(deps, { run: RUN, repo: '/x' }, false)
+  const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').at(-1) ?? []
+  assert.ok(restart.includes('--resume'))
+  assert.match(restart.at(-1) ?? '', /Resumed by Drove/)
+
+  const { updateRoster } = await import('../src/roster.ts')
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: [{ ...makeSeat('w-x', { kind: 'codex', state: 'gone' }) }] }))
+  const none = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-x')
+  assert.equal(!none.ok && none.code, 'relaunch')
+  assert.match(none.text, /no saved session id/)
+})
+
+test('plan creates a run, writes the planner files and returns the exec plan', async () => {
+  const repo = await makeRepo()
+  const fake = new FakeHerdr()
+  const deps = await makeDeps(fake)
+  process.env.HERDR_PANE_ID = 'w1:p5'
+  const planned = await commands.plan(deps, { repo, kind: 'claude', goal: 'Ship the thing' })
+  assert.equal(planned.ok, true, planned.text)
+  const plan = (planned.ok ? planned.data : undefined) as commands.ProcessPlan
+  assert.equal(plan.argv[0], 'claude')
+  assert.ok(!plan.argv.includes('--dangerously-skip-permissions'))
+  assert.equal(plan.argv.at(-1), 'Ship the thing')
+  assert.equal(plan.env.DROVE_ROLE, 'planner')
+  assert.equal(plan.cwd, await realpath(repo))
+  const id = plan.env.DROVE_RUN as string
+  const run = await loadRun(deps.home, id)
+  assert.deepEqual([run?.status, run?.base, run?.hasRemote, run?.planner.paneId, run?.goal], ['up', 'main', false, 'w1:p5', 'Ship the thing'])
+  assert.ok(run?.planner.sessionId)
+  assert.ok(existsSync(join(deps.home, 'runs', id, 'planner', 'settings.json')))
+})
+
+test('plan for codex has an initial prompt and no session id yet; it needs a herdr pane and a repo', async () => {
+  const repo = await makeRepo()
+  const deps = await makeDeps(new FakeHerdr())
+  const outside = await commands.plan(deps, { repo, kind: 'codex' })
+  assert.equal(!outside.ok && outside.code, 'not-in-herdr')
+  process.env.HERDR_PANE_ID = 'w1:p5'
+  const planned = await commands.plan(deps, { repo, kind: 'codex' })
+  const plan = (planned.ok ? planned.data : undefined) as commands.ProcessPlan
+  assert.equal(plan.argv[0], 'codex')
+  assert.equal(plan.argv.at(-1), 'Read the roster and wait for the human.')
+  assert.equal((await loadRun(deps.home, plan.env.DROVE_RUN as string))?.planner.sessionId, undefined)
+  const notRepo = await commands.plan(deps, { repo: deps.home, kind: 'claude' })
+  assert.equal(!notRepo.ok && notRepo.code, 'not-a-repo')
+})
+
+test('loadConfig merges ~/.drove/config.json over the defaults', async () => {
+  const deps = await makeDeps(new FakeHerdr())
+  assert.deepEqual(await commands.loadConfig(deps.home), commands.DEFAULT_CONFIG)
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ humanName: 'Cal', workerModel: { codex: 'gpt-x' }, claudeChannel: true }))
+  const config = await commands.loadConfig(deps.home)
+  assert.equal(config.humanName, 'Cal')
+  assert.deepEqual(config.workerModel, { claude: 'claude-sonnet-5-5', codex: 'gpt-x' })
+  assert.equal(config.claudeChannel, true)
+  assert.equal(config.budget, 5)
+})
+
+test('identityOrPlanner falls back to a planner identity without a run', () => {
+  assert.deepEqual(commands.identityOrPlanner({ DROVE_HOME: '/h' }), { home: '/h', run: '', role: 'planner', seat: 'planner' })
+  const env = { DROVE_HOME: '/h', DROVE_RUN: 'r', DROVE_ROLE: 'worker', DROVE_SEAT: 'w-a', DROVE_TOKEN: 't' }
+  assert.equal(commands.identityOrPlanner(env).role, 'worker')
+})
+
+test('nodeExec captures output, passes input and reports a missing binary', async () => {
+  const echoed = await commands.nodeExec(['cat'], { input: 'hi' })
+  assert.deepEqual([echoed.code, echoed.stdout], [0, 'hi'])
+  const missing = await commands.nodeExec(['definitely-not-a-binary-xyz'])
+  assert.equal(missing.code, 127)
+  const slow = await commands.nodeExec(['sleep', '5'], { timeoutMs: 50 })
+  assert.equal(slow.code, 124)
 })
