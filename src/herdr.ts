@@ -31,7 +31,11 @@ export const agentReadArgv = (target: string, lines: number, source: 'recent-unw
   'herdr', 'agent', 'read', target, '--source', source, '--lines', String(lines),
 ]
 
-export const agentListArgv = (): string[] => ['herdr', 'agent', 'list']
+export const paneReadArgv = (paneId: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): string[] => [
+  'herdr', 'pane', 'read', paneId, '--source', source, '--lines', String(lines),
+]
+
+export const agentListArgv =(): string[] => ['herdr', 'agent', 'list']
 export const agentGetArgv = (target: string): string[] => ['herdr', 'agent', 'get', target]
 export const agentExplainArgv = (target: string): string[] => ['herdr', 'agent', 'explain', target, '--json']
 export const paneCloseArgv = (paneId: string): string[] => ['herdr', 'pane', 'close', paneId]
@@ -114,14 +118,20 @@ export const getAgent = async (exec: Exec, target: string): Promise<HerdrResult<
   return agent ? { ok: true, value: agent } : { ok: false, code: 'unparseable', output: ran.value.slice(0, 300) }
 }
 
-export const readScreen = async (exec: Exec, target: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): Promise<HerdrResult<string>> => {
-  const ran = await run(exec, agentReadArgv(target, lines, source), 10_000)
+const readOutput = async (exec: Exec, argv: readonly string[]): Promise<HerdrResult<string>> => {
+  const ran = await run(exec, argv, 10_000)
   if (!ran.ok) return ran
   const result = asRecord(asRecord(parseJson(ran.value))?.result)
   const read = asRecord(result?.read)
   const text = [result?.text, read?.text, result?.output].find((candidate): candidate is string => typeof candidate === 'string')
   return { ok: true, value: text ?? ran.value }
 }
+
+export const readScreen = (exec: Exec, target: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): Promise<HerdrResult<string>> =>
+  readOutput(exec, agentReadArgv(target, lines, source))
+
+export const readPane = (exec: Exec, paneId: string, lines: number, source: 'recent-unwrapped' | 'detection' = 'recent-unwrapped'): Promise<HerdrResult<string>> =>
+  readOutput(exec, paneReadArgv(paneId, lines, source))
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 

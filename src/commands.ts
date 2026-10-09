@@ -1,9 +1,10 @@
 import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { basename, join } from 'node:path'
+import { chmod, mkdir, writeFile } from 'node:fs/promises'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { applyDerived, deriveState, matchDialog } from './detect.ts'
+import { applyDerived, deriveState, findDialog, matchDialog } from './detect.ts'
 import { BUSY_RETRY_MS, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
@@ -157,6 +158,23 @@ const writeLaunchJson = async (deps: Deps, run: string, seat: string, spec: Para
   await writeJsonAtomic(join(seatDir(deps.home, run, seat), 'launch.json'), redactSpec(spec))
 }
 
+const START_FAILURE_LINES = 60
+
+const captureStartFailure = async (deps: Deps, run: RunMeta, seat: string, paneId: string | undefined, failure: { code: string; output: string }): Promise<{ hint?: string; file: string }> => {
+  const byAgent = await herdr.readScreen(deps.exec, seat, START_FAILURE_LINES)
+  const screen = byAgent.ok || !paneId ? byAgent : await herdr.readPane(deps.exec, paneId, START_FAILURE_LINES)
+  const text = screen.ok ? screen.value : `(could not read the pane: ${screen.code})\n${screen.output}`
+  const file = join(seatDir(deps.home, run.id, seat), 'start-failure.txt')
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  await writeFile(file, text.endsWith('\n') ? text : `${text}\n`, { mode: 0o600 })
+  await chmod(file, 0o600)
+  const dialog = screen.ok ? findDialog(text) : undefined
+  await recordEvent(deps, run.id, { type: 'seat.start_failed', seat, data: { code: failure.code, ...(dialog ? { reason: dialog.reason } : {}), ...(paneId ? { pane: paneId } : {}), file } })
+  return { ...(dialog ? { hint: dialog.hint } : {}), file }
+}
+
+const hintText = (captured: { hint?: string; file: string }): string => `${captured.hint ? ` Hint: ${captured.hint}.` : ''} Pane output saved to ${captured.file}.`
+
 export const refreshRoster = async (deps: Deps, run: RunMeta): Promise<void> => {
   const listed = await herdr.listAgents(deps.exec)
   if (!listed.ok) return
@@ -294,8 +312,10 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const kind = request.kind
   const model = resolveModel(kind, request.model, config)
   const effort = request.effort ?? config.workerEffort
+  const isClaude = kind === 'claude'
   const worktree = worktreePath(run.repo, request.seat)
-  const branch = branchName(request.seat)
+  const branch = isClaude ? git.claudeBranchName(request.seat) : branchName(request.seat)
+  const launchCwd = isClaude ? run.repo : worktree
   const sessionId = kind === 'claude' ? randomUUID() : undefined
   const seat: Seat = {
     name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), model, effort, worktree, branch,
@@ -323,13 +343,19 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     } else if (paneId) await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
     await updateRoster(deps.home, run.id, roster => ({ ...roster, seats: roster.seats.filter(entry => entry.name !== seat.name) }))
     if (isWorktreeNew) {
-      await git.removeWorktree(deps.exec, run.repo, worktree).catch(() => undefined)
+      await git.removeWorktree(deps.exec, run.repo, worktree, isClaude).catch(() => undefined)
       await git.deleteBranch(deps.exec, run.repo, branch)
     }
   }
 
+  const baseNotes: string[] = []
   try {
-    if (!existsSync(worktree)) {
+    if (isClaude) {
+      isWorktreeNew = !existsSync(worktree)
+      const base = await git.baseRef(deps.exec, run.repo, run.base)
+      if (request.base) baseNotes.push(`--base ${request.base} was ignored: Claude creates its own worktree.`)
+      if (!(await git.isHeadAt(deps.exec, run.repo, base))) baseNotes.push(`Claude branches ${branch} from the main checkout's current HEAD (${(await git.headBranch(deps.exec, run.repo)) ?? 'detached'}), which is not ${base}; rebase it if the base matters.`)
+    } else if (!existsSync(worktree)) {
       await git.addWorktree(deps.exec, run.repo, worktree, branch, await git.baseRef(deps.exec, run.repo, request.base ?? run.base))
       isWorktreeNew = true
     }
@@ -349,14 +375,14 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const isViaPrompt = process.env.DROVE_BRIEF_VIA === 'herdr-prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
   const spec = specFor(
-    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: worktree, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}) }, config),
+    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}) }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
 
   const roster = await loadRoster(deps.home, run.id)
   const placed = openSeats(roster).filter(entry => entry.name !== seat.name && entry.paneId)
-  const placement = await placePane(deps, run, placed, worktree, spec.env)
+  const placement = await placePane(deps, run, placed, launchCwd, spec.env)
   if (!isPlacement(placement)) {
     await rollback(undefined, undefined)
     return placement
@@ -366,6 +392,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(seat.name, kind, paneId, spec.argv), BUSY_RETRY_MS)
   const live = started.ok ? await herdr.getAgent(deps.exec, seat.name) : undefined
   const isRecovered = !started.ok && started.code !== 'agent_not_ready' && (await herdr.getAgent(deps.exec, seat.name)).ok
+  const captured = started.ok ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
 
   if (!started.ok && started.code === 'agent_not_ready') {
     const screen = await herdr.readScreen(deps.exec, seat.name, 40, 'detection')
@@ -378,7 +405,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   }
   if (!started.ok && !isRecovered) {
     await rollback(paneId, createdTab)
-    return failed('herdr', `herdr could not start ${kind} in pane ${paneId}, so the pane was closed again and no worker exists: ${clip(started.output)}`)
+    return failed('herdr', `herdr could not start ${kind} in pane ${paneId}, so the pane was closed again and no worker exists: ${clip(started.output)}.${captured ? hintText(captured) : ''}`)
   }
 
   const isWorking = !isViaPrompt
@@ -391,10 +418,10 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
       ...(live?.ok && live.value.sessionId && !seat.sessionId ? { sessionId: live.value.sessionId } : {}),
     }),
   )
-  await recordEvent(deps, run.id, { type: 'seat.spawn', seat: seat.name, data: { kind, model, effort, pane: paneId, worktree, branch, cairn: request.cairn } })
+  await recordEvent(deps, run.id, { type: 'seat.spawn', seat: seat.name, data: { kind, model, effort, pane: paneId, worktree, branch, cairn: request.cairn, ...(baseNotes.length > 0 ? { notes: baseNotes } : {}) } })
   const via = isViaPrompt ? await queueBrief(deps, run, seat.name, briefText) : 'launch-arg'
   if (!isViaPrompt) await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, data: { kind: 'brief', via: 'launch-arg' } })
-  return ok(`Worker ${seat.name} (${kind}${model ? ` ${model}` : ''} ${effort}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.`, { paneId, worktree, branch })
+  return ok(`Worker ${seat.name} (${kind}${model ? ` ${model}` : ''} ${effort}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch })
 }
 
 const queueBrief = async (deps: Deps, run: RunMeta, seat: string, text: string): Promise<string> => {
@@ -512,12 +539,25 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
-  const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(seat.name, seat.kind, seat.paneId, spec.argv), BUSY_RETRY_MS)
-  if (!started.ok) {
-    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
-    return failed('restart', `${seat.name} exited but did not come back: ${clip(started.output)}. Relaunch it with \`drove up --seat ${seat.name}\`.`)
+  let paneId = seat.paneId
+  if (seat.kind === 'claude') {
+    await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
+    const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
+    const placement = await placePane(deps, run, others, seat.worktree, spec.env)
+    if (!isPlacement(placement)) {
+      await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, paneId: undefined, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `no pane for the promote restart (${clip(placement.text, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
+      return failed('restart', `${seat.name} exited but no new pane could be placed in its worktree: ${clip(placement.text)}. Relaunch it with \`drove up --seat ${seat.name}\`.`)
+    }
+    paneId = placement.paneId
+    updated.paneId = paneId
   }
-  const typed = isInline ? undefined : await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(seat.paneId, controlText), BUSY_RETRY_MS)
+  const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(seat.name, seat.kind, paneId, spec.argv), BUSY_RETRY_MS)
+  if (!started.ok) {
+    const captured = await captureStartFailure(deps, run, seat.name, paneId, started)
+    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
+    return failed('restart', `${seat.name} exited but did not come back: ${clip(started.output)}.${hintText(captured)} Relaunch it with \`drove up --seat ${seat.name}\`.`)
+  }
+  const typed = isInline ? undefined : await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, controlText), BUSY_RETRY_MS)
   const via: Transport = isInline ? 'launch-arg' : 'herdr-prompt'
   if (typed && !typed.ok && typed.code !== 'timeout') {
     await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'idle', owes: 'none', hasNudged: false }))
@@ -659,9 +699,10 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   if (!isPlacement(placement)) return { error: placement.text }
   if (placement.createdTab) run.tabId = placement.createdTab
   const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(seat.name, seat.kind, placement.paneId, spec.argv), BUSY_RETRY_MS)
+  const captured = started.ok ? undefined : await captureStartFailure(deps, run, seat.name, placement.paneId, started)
   if (!started.ok && started.code !== 'agent_not_ready') {
     await herdr.run(deps.exec, herdr.paneCloseArgv(placement.paneId))
-    return { error: `herdr could not start ${seat.name}: ${clip(started.output)}` }
+    return { error: `herdr could not start ${seat.name}: ${clip(started.output)}.${captured ? hintText(captured) : ''}` }
   }
   const iso = deps.clock.now().toISOString()
   const next: Seat = {

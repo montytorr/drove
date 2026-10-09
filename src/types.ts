@@ -142,6 +142,7 @@ export type DroveEventType =
   | 'run.up'
   | 'run.down'
   | 'seat.spawn'
+  | 'seat.start_failed'
   | 'seat.state'
   | 'seat.close'
   | 'report'

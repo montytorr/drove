@@ -84,6 +84,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     '--model', request.model,
     '--effort', request.effort,
     ...(isWorker ? ['-n', identity.seat] : []),
+    ...(isWorker && !request.resumeId ? ['--worktree', identity.seat] : []),
     ...(request.resumeId ? ['--resume', request.resumeId] : request.sessionId ? ['--session-id', request.sessionId] : []),
     '--mcp-config', mcpPath,
     '--settings', settingsPath,

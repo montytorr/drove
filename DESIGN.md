@@ -25,7 +25,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | Command | Who runs it | Why it exists |
 |---|---|---|
 | `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT] [--run ID]` | human, in a herdr pane | Creates a run (or attaches to `--run`), records this pane as the planner pane, then `exec`s `claude` or `codex` with the planner MCP server, the planner guard and the planner role attached. This is the only way a planner starts outside the mod. |
-| `drove spawn <seat> --kind claude\|codex --cairn REF --brief TEXT\|-  [--model M] [--effort E] [--base BRANCH]` | planner | Creates the worktree and branch, opens a pane in the run's worker tab (grid), launches the agent with its launch spec, and delivers the first brief. Enforces the 5-pane budget. |
+| `drove spawn <seat> --kind claude\|codex --cairn REF --brief TEXT\|-  [--model M] [--effort E] [--base BRANCH]` | planner | Opens a pane in the run's worker tab (grid), launches the agent with its launch spec, and delivers the first brief. A Codex worker gets a worktree and branch made by Drove (`git worktree add`); a Claude worker creates its own through `claude --worktree <seat>` (§5). `--base` applies to Codex only. Enforces the 5-pane budget. |
 | `drove send <seat> --kind message\|answer\|verdict [--verdict approve\|changes] [--expects E] TEXT` | planner | Sends one enveloped control message through the best transport for that seat (see §4), with a guarded send and a retry queue. Verdicts and answers are kinds of `send`. |
 | `drove prompt <seat> TEXT` | planner, human | Raw `herdr agent prompt` into a seat the run owns, with no envelope. This is the escape hatch for a re-brief after a restart, or when `codex queue` is unavailable. It still refuses a `blocked` pane. |
 | `drove promote <seat> --model M --effort E [--reason TEXT]` | planner | Changes a worker's model or effort (§8). It is a separate command because it can restart the agent; demote is the same command with a lower setting. |
@@ -64,11 +64,11 @@ $DROVE_HOME (default ~/.drove), mode 700
       settings.json     # Claude worker --settings
       mcp.json          # Claude worker --mcp-config
       launch.json       # the LaunchSpec used (token redacted), for relaunch and debugging
-  worktrees: <repo>/.claude/worktrees/<seat>   (see Open question 1)
+  worktrees: <repo>/.claude/worktrees/<seat>   (Codex: made by Drove on drove/<seat>; Claude: made by Claude on worktree-<seat>; see Open question 1)
 ```
 
 - **Run id**: `<repo-basename>-<yyyymmdd>-<hhmm>-<4 hex>`, e.g. `drove-20261009-1042-a3f1`.
-- **Seat names**: `[a-z][a-z0-9_-]{0,31}`, which is herdr's agent-name rule. The seat name is also the herdr agent name, the branch suffix (`drove/<seat>`) and the worktree directory. The planner's seat name is `planner`.
+- **Seat names**: `[a-z][a-z0-9_-]{0,31}`, which is herdr's agent-name rule. The seat name is also the herdr agent name, the branch suffix (`drove/<seat>` for Codex, `worktree-<seat>` for Claude) and the worktree directory. The roster's `worktree` and `branch` fields hold the real values, and `close`, `up`, `launch.json` and the board read them from there. The planner's seat name is `planner`.
 - **Writers**: `roster.json` and `run.json` are written only by planner-side code (the planner MCP server and `drove` commands run by the planner or the human), always under the lock. Workers never write the roster; they only append to their own `outbox.jsonl`. Hooks append only to `hooks.jsonl`.
 - **Identity env** (set on the pane with `herdr pane split --env` and inherited by the agent, its hooks and its MCP servers):
 
@@ -165,16 +165,23 @@ Launch argv must be free of control characters (newline, C0, DEL): herdr types i
 
 ```
 env:  _CC_ACCT_PINNED=1 DROVE_HOME=… DROVE_RUN=… DROVE_ROLE=worker DROVE_SEAT=<seat> DROVE_TOKEN=…
-cwd:  <worktree>
+cwd:  <repo>              (fresh launch; the main checkout, which Claude already trusts)
 argv: --dangerously-skip-permissions                      [proven]
       --model <model> --effort <effort>                   [proven]
       -n <seat>                                           [proven]
+      --worktree <seat>                                   [proven in the mod; fresh launch only]
       --session-id <uuid minted by drove>                 [docs] (so resume needs no discovery)
       --mcp-config <run>/seats/<seat>/mcp.json            [docs]
       --settings <run>/seats/<seat>/settings.json         [docs: launch-only, merged, writes no file]
       --append-system-prompt-file <run>/seats/<seat>/role.md  [docs: works interactively; no role text in argv]
       "<brief + footer>"                                  [docs; verify with herdr agent start]
 ```
+
+**Why `--worktree` and not `git worktree add`.** Claude Code asks "Do you trust the files in this folder?" in a folder made by `git worktree add`, even under a trusted repo, because trust is per folder in `~/.claude.json`. `claude --worktree <seat>` creates `<repo>/.claude/worktrees/<seat>` itself, on branch `worktree-<seat>` with no upstream, and does not ask (proven by the orchestrator mod). So a Claude seat is launched from the repo root with `--worktree <seat>`; Drove runs no `git worktree add` for it and records worktree `<repo>/.claude/worktrees/<seat>` and branch `worktree-<seat>` in the roster. Pre-trusting by writing `~/.claude.json` is rejected: it is global config that live sessions rewrite.
+
+**Base branch.** Claude decides the base for `--worktree`: it branches from the main checkout's current HEAD (the mod's experience), not from the run base, and Drove never sets an upstream. Drove does not switch the main checkout, because the planner works in it. Instead `spawn` adds a note to its result (and to the `seat.spawn` event) when HEAD is not at the run base, and when `--base` was given, which is ignored for Claude. Codex workers still start from the run base.
+
+**Resume.** A resumed Claude worker runs `claude --resume <id>` with cwd = the seat's worktree and **without** `--worktree`: the session was recorded while Claude's working directory was the worktree, Claude finds sessions by working directory, and `--worktree` on a resume would try to create or re-enter a worktree instead of continuing the session [docs/inference; verify with a real resume, DROVE-8]. `up` and `up --seat` open the new pane with cwd = the worktree. `promote` for a Claude seat does the same instead of reusing the pane, whose shell sits in the repo root after `/exit` (Claude's move into the worktree is inside its own process); see §8.
 
 `mcp.json`: `{"mcpServers":{"drove":{"command":"node","args":["<drove>/src/cli.ts","mcp"]}}}`. The env is inherited [docs]. `settings.json` holds `hooks.PreToolUse` with matcher `Bash|Edit|Write|MultiEdit|NotebookEdit` running `drove guard pre-tool-use`, plus `SessionStart`, `Stop` and `Notification` hooks running `drove guard <event>`. No `--strict-mcp-config`: the user's own MCP servers stay available.
 
@@ -287,8 +294,10 @@ Signals, by freshness:
 | Pattern | Attention reason |
 |---|---|
 | `/Background server has incompatible feature settings/` | `codex-version-mismatch` |
-| `/trust (this|the files in this) folder/i` | `trust` |
+| `/trust (this\|the files in this) folder\|project you created or one you trust/i` | `trust` (Claude: "Do you trust the files in this folder?") |
 | `/hook.*trust/i` | `hook-trust` |
+
+**Start failures.** Whenever `herdr agent start` fails or times out (in `spawn`, `promote` and `up`), before any rollback closes the pane, Drove runs `herdr agent read <seat> --source recent-unwrapped --lines 60` (falling back to `herdr pane read <pane>`), saves it to `seats/<seat>/start-failure.txt` (mode 600), appends a `seat.start_failed` event with the herdr error code and the first matching dialog reason from this table, and puts a one-line hint in the error ("Claude is asking to trust the folder") with the file path.
 
 `codex-version-mismatch` carries the detail "Codex CLI and app-server daemon versions differ (`codex --version` vs the daemon); align them. Drove will not answer the dialog". Drove never answers a dialog itself.
 
@@ -299,7 +308,7 @@ Signals, by freshness:
 | Kind | Recommended | How |
 |---|---|---|
 | Claude worker, mod present | **Per-request switch** [proven in the mod] | Drove updates the seat's model and effort in the roster and sends a `promote` control. The mod, running inside the worker, reads its seat from the roster and applies it in `turn.step` from the next request. |
-| Claude worker, no mod | **Restart with resume** | Wait until the seat is idle. Send `/exit` with `herdr agent prompt`, then wait for the pane to return to the shell. Then `herdr agent start` with the same spec, plus `--resume <session id> --model M --effort E`, and the promote control as the initial prompt [docs]. The pane and layout are kept. |
+| Claude worker, no mod | **Restart with resume** | Wait until the seat is idle. Send `/exit` with `herdr agent prompt`, then wait for the pane to return to the shell. Then `herdr agent start` with the same spec, plus `--resume <session id> --model M --effort E`, and the promote control as the initial prompt [docs]. Because Claude's pane shell is in the repo root after `/exit` and the resume must run in the seat's worktree, Drove closes the old pane and places a new one with cwd = the worktree (the `up --seat` path); the grid slot may move. |
 | Codex worker | **Restart with resume** | Wait until idle. Send `/quit`, then `codex resume <thread> -m M -c model_reasoning_effort=E … "<promote control>"` in the same pane [`resume -m` docs; verify]. Cheaper candidates to verify later: `codex queue -m M` (the help lists `-m`, but it may be a shared global flag), and app-server `turn/settings/update` (needs a control-socket client; skipped in v1 because of the version coupling seen in the daemon handshake warnings). |
 
 A restart is refused while the seat owes a report or is mid-turn. `promote` returns "queued until idle" in that case, and the watcher completes it.
@@ -349,7 +358,7 @@ The mod is loaded by Claude's runtime, not by Node. How it resolves the import (
 
 ### (b) Codex planner + Claude worker
 
-1. **Spawn.** The Codex planner calls the MCP tool `spawn{seat:w-ui, kind:claude, …}`. Drove creates the worktree and pane, then runs `herdr agent start w-ui --kind claude -- --session-id <uuid> … "<brief>"`. The session id is known from the start.
+1. **Spawn.** The Codex planner calls the MCP tool `spawn{seat:w-ui, kind:claude, …}`. Drove opens a pane at the repo root, then runs `herdr agent start w-ui --kind claude -- … --worktree w-ui --session-id <uuid> … "<brief>"`. The session id is known from the start.
 2. **Report done.** `w-ui` calls `report` (server `drove`, from `--mcp-config`), and the line lands in its outbox.
 3. **Wake.** The planner MCP server reads the line and runs `codex queue --thread <planner thread> --message "[w-ui · done · expects review] … → Review the diff, then call verdict."`. If the planner is mid-turn, it runs as the next turn.
 4. **Review.** The planner reads the diff through its shell, which the guard allows as read-only git.
@@ -432,7 +441,7 @@ Five pieces with disjoint files. `src/types.ts` is frozen by this design: a piec
 
 Recommendations accepted by the planner on 2026-10-09; the human-run [verify] items are gathered per piece in §12.
 
-1. **Where do worktrees live?** `<repo>/.claude/worktrees/<seat>` is where the mod and Claude's `--worktree` put them, and Claude's folder trust works there because the repo is trusted. The cost is an untracked `.claude/` in repos that do not ignore it. `~/.drove/worktrees/<repo>/<seat>` keeps repos clean, but risks a Claude folder-trust dialog per worktree. **Recommend `.claude/worktrees/<seat>` for v1** (proven), and test the outside-repo path once.
+1. **Where do worktrees live?** `<repo>/.claude/worktrees/<seat>`. **Answered by the first real launch:** Claude's folder trust does *not* carry over to a folder made by `git worktree add` there (trust is per folder in `~/.claude.json`), so the seat stalled at "Do you trust the files in this folder?". Claude workers therefore use `claude --worktree <seat>` (Claude makes the folder and does not ask; branch `worktree-<seat>`), and only Codex workers keep a Drove-made worktree (`drove/<seat>`; their trust comes from the per-launch `projects."<path>".trust_level` override). The cost is an untracked `.claude/` in repos that do not ignore it. `~/.drove/worktrees/<repo>/<seat>` keeps repos clean, but risks a Claude folder-trust dialog per worktree. **Recommend `.claude/worktrees/<seat>` for v1** (proven), and test the outside-repo path once.
 2. **Claude planner wake without the mod.** A dev channel (research preview, one confirmation per launch, claude.ai auth only) or keystrokes into the human's pane. **Recommend: try the channel first, fall back to keystroke wake after 5 s idle, and always piggyback.** If the channel does not start turns when idle, drop it and document that the mod is the comfortable Claude planner.
 3. **Codex hook trust.** Constant command strings plus one approval by the human, or `--dangerously-bypass-hook-trust` per launch (which also runs any untrusted repo-local hooks). **Recommend constant strings and a one-time approval.** Bypass stays an explicit opt-in in `~/.drove/config.json`. Never prewrite trust hashes.
 4. **Codex worker network.** `network_access=true` lets workers run `cairn` and package installs, but also makes `git push` possible, so only the guard prevents it. **Recommend network on, with the guard denying push** (workers need Cairn). Revisit if the Codex hook is unreliable.

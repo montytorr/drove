@@ -36,8 +36,28 @@ export const toplevel = async (exec: Exec, dir: string): Promise<string | undefi
   return result.code === 0 ? result.stdout.trim() || undefined : undefined
 }
 
-export const removeWorktree = async (exec: Exec, repo: string, path: string): Promise<void> => {
+export const removeWorktree = async (exec: Exec, repo: string, path: string, force = false): Promise<void> => {
+  if (force) {
+    await must(exec, repo, ['worktree', 'remove', '--force', '--force', path])
+    return
+  }
+  const removed = await git(exec, repo, ['worktree', 'remove', path])
+  if (removed.code === 0) return
+  if (!/locked/i.test(removed.stderr)) throw new Error(`git worktree remove ${path} failed: ${(removed.stderr || removed.stdout).trim().slice(0, 300)}`)
+  await must(exec, repo, ['worktree', 'unlock', path])
   await must(exec, repo, ['worktree', 'remove', path])
+}
+
+export const claudeBranchName = (seat: string): string => `worktree-${seat}`
+
+export const headBranch = async (exec: Exec, repo: string): Promise<string | undefined> => {
+  const result = await git(exec, repo, ['rev-parse', '--abbrev-ref', 'HEAD'])
+  return result.code === 0 ? result.stdout.trim() || undefined : undefined
+}
+
+export const isHeadAt = async (exec: Exec, repo: string, ref: string): Promise<boolean> => {
+  const [head, target] = await Promise.all([git(exec, repo, ['rev-parse', 'HEAD']), git(exec, repo, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`])])
+  return head.code === 0 && target.code === 0 && head.stdout.trim() === target.stdout.trim()
 }
 
 export const isMerged = async (exec: Exec, repo: string, branch: string, into: string): Promise<boolean> =>
