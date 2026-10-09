@@ -12,7 +12,8 @@ import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun } from './p3
 
 beforeEach(() => {
   Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20 })
-  for (const key of ['DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_BRIEF_VIA', 'DROVE_ROLE_IN_BRIEF', 'HERDR_PANE_ID']) delete process.env[key]
+  for (const key of ['DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_ROLE_IN_BRIEF', 'HERDR_PANE_ID']) delete process.env[key]
+  process.env.DROVE_BRIEF_VIA = 'launch-arg'
 })
 
 const planner = (deps: Deps): Identity => ({ home: deps.home, run: RUN, role: 'planner', seat: 'planner' })
@@ -250,6 +251,125 @@ test('DROVE_BRIEF_VIA=herdr-prompt starts without the prompt and sends the brief
   assert.equal(fake.prompts.length, 1)
   assert.match(fake.prompts[0]?.text ?? '', /kind=brief/)
   assert.match(fake.prompts[0]?.text ?? '', /Build the widget/)
+})
+
+test('by default the agent starts without the brief and the brief arrives as the first herdr prompt', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  for (const kind of ['claude', 'codex'] as const) {
+    const { fake, deps, identity } = await setup()
+    const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind, cairn: 'DROVE-5', brief })
+    assert.equal(spawned.ok, true, `${kind}: ${spawned.text}`)
+    const start = fake.find('herdr', 'agent', 'start') ?? []
+    assert.ok(!start.some(arg => arg.includes('Build the widget')), kind)
+    const order = fake.herdrCalls()
+    assert.ok(order.indexOf('agent start') < order.indexOf('agent prompt'), kind)
+    assert.equal(fake.prompts.length, 1, kind)
+    assert.match(fake.prompts[0]?.text ?? '', /kind=brief[\s\S]*Build the widget\.[\s\S]*Your Cairn task is DROVE-5/)
+    assert.match(spawned.text, /Brief: herdr-prompt\./)
+    const seat = (await loadRoster(deps.home, RUN)).seats[0]
+    assert.equal(seat?.state, 'working')
+    assert.ok(seat?.lastWorkingAt)
+  }
+})
+
+test('briefVia "launch-arg" in the config restores the launch argument, and DROVE_BRIEF_VIA overrides the config', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const configured = await setup()
+  await writeFile(join(configured.deps.home, 'config.json'), JSON.stringify({ briefVia: 'launch-arg' }))
+  assert.equal((await commands.spawn(configured.deps, configured.identity, { seat: 'w-api', kind: 'claude', brief })).ok, true)
+  assert.match((configured.fake.find('herdr', 'agent', 'start') ?? []).at(-1) ?? '', /^Build the widget\./)
+  assert.equal(configured.fake.prompts.length, 0)
+
+  process.env.DROVE_BRIEF_VIA = 'prompt'
+  const overridden = await setup()
+  await writeFile(join(overridden.deps.home, 'config.json'), JSON.stringify({ briefVia: 'launch-arg' }))
+  assert.equal((await commands.spawn(overridden.deps, overridden.identity, { seat: 'w-api', kind: 'claude', brief })).ok, true)
+  assert.equal(overridden.fake.prompts.length, 1)
+})
+
+test('a first turn that outlasts the prompt wait still yields a successful spawn', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const { fake, deps, identity } = await setup(new FakeHerdr({ promptTimesOut: true }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /Brief: herdr-prompt \(typed; herdr did not confirm/)
+  assert.equal(fake.prompts.length, 1)
+  assert.ok(!fake.herdrCalls().includes('pane close') && !fake.herdrCalls().includes('tab close'))
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.state, 'working')
+  assert.equal(seat?.paneId, 'w1:p1')
+  const sent = (await readEvents(deps)).find(item => item.type === 'control.sent')
+  assert.equal(sent?.data?.unconfirmed, true)
+})
+
+test('a start timeout with a live agent in the pane keeps the seat instead of rolling back', async () => {
+  for (const kind of ['claude', 'codex'] as const) {
+    for (const status of ['working', 'idle'] as const) {
+      const fake = new FakeHerdr({ startFails: 'timeout', startLeavesAgent: true, startStatus: status })
+      const { deps, identity } = await setup(fake)
+      process.env.DROVE_BRIEF_VIA = 'launch-arg'
+      const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind, brief })
+      assert.equal(spawned.ok, true, `${kind} ${status}: ${spawned.text}`)
+      assert.match(spawned.text, /timed out but the \w+ agent is up in the pane/)
+      assert.ok(!fake.herdrCalls().includes('pane close') && !fake.herdrCalls().includes('tab close'))
+      const seat = (await loadRoster(deps.home, RUN)).seats[0]
+      assert.equal(seat?.paneId, 'w1:p1')
+      assert.equal(seat?.state, status)
+      const events = await readEvents(deps)
+      assert.equal(events.find(item => item.type === 'seat.spawn')?.data?.startTimeout, true)
+      assert.equal(events.some(item => item.type === 'seat.start_failed'), false)
+    }
+  }
+})
+
+test('after a start timeout the brief still goes by herdr prompt in the default mode', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const fake = new FakeHerdr({ startFails: 'timeout', startLeavesAgent: true, startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal(fake.prompts.length, 1)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'working')
+})
+
+test('a start timeout with the agent screen up and no dialog registers the seat for the watcher to judge', async () => {
+  const fake = new FakeHerdr({ startFails: 'timeout', screen: ' ▐▛███▛█   Claude Code v2.1.295\n❯ Build the widget.\n' })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'starting')
+  assert.ok(!fake.herdrCalls().includes('tab close'))
+})
+
+test('a start timeout rolls back when the agent is absent, blocked, or the screen shows a dialog', async () => {
+  const cases: { name: string; fake: FakeHerdr }[] = [
+    { name: 'absent', fake: new FakeHerdr({ startFails: 'timeout', screen: 'zsh: command not found: claude' }) },
+    { name: 'blocked', fake: new FakeHerdr({ startFails: 'timeout', startLeavesAgent: true, startStatus: 'blocked', screen: FOLDER_TRUST_SCREEN }) },
+    { name: 'dialog on screen', fake: new FakeHerdr({ startFails: 'timeout', startLeavesAgent: true, startStatus: 'idle', screen: `Claude Code v2.1.295\n${FOLDER_TRUST_SCREEN}` }) },
+    { name: 'dialog, no agent', fake: new FakeHerdr({ startFails: 'timeout', screen: `Claude Code v2.1.295\n${FOLDER_TRUST_SCREEN}` }) },
+  ]
+  for (const { name, fake } of cases) {
+    const { deps, identity } = await setup(fake)
+    const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+    assert.equal(spawned.ok, false, name)
+    assert.match(spawned.text, /no worker exists/, name)
+    assert.ok(fake.herdrCalls().includes('tab close'), name)
+    assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [], name)
+    assert.equal((await readEvents(deps)).filter(item => item.type === 'seat.start_failed').length, 1, name)
+  }
+})
+
+test('the worker role names the branch each kind is already on', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const claude = await setup()
+  await commands.spawn(claude.deps, claude.identity, { seat: 'w-api', kind: 'claude', brief })
+  const role = await readFile(join(seatDir(claude.deps.home, RUN, 'w-api'), 'role.md'), 'utf8')
+  assert.match(role, /already on your own branch \(`worktree-w-api`\) in your own worktree\. Commit there\. Do not create, switch or rebase branches unless the planner asks\./)
+  assert.doesNotMatch(role, /switch -c/)
+  const codex = await setup()
+  await commands.spawn(codex.deps, codex.identity, { seat: 'w-cx', kind: 'codex', brief })
+  const instructions = (codex.fake.find('herdr', 'agent', 'start') ?? []).find(arg => arg.startsWith('developer_instructions=')) ?? ''
+  assert.match(instructions, /already on your own branch \(`drove\/w-cx`\)/)
 })
 
 test('DROVE_ROLE_IN_BRIEF=1 moves a codex worker role from developer_instructions to the brief', async () => {
@@ -642,6 +762,127 @@ test('up --seat relaunches only a dead seat, and refuses a live one or one with 
   const none = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-x')
   assert.equal(!none.ok && none.code, 'relaunch')
   assert.match(none.text, /no saved session id/)
+})
+
+const settleSeat = async (deps: Deps, fake: FakeHerdr, name: string) => {
+  await updateRoster(deps.home, RUN, roster => ({
+    ...roster,
+    seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, owes: 'none' as const, lastReport: { id: 'r-1', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2099-01-01T00:00:00.000Z' } })),
+  }))
+  fake.setStatus(name, 'idle')
+}
+
+const killedMidTurn = async (fake: FakeHerdr, deps: Deps) => {
+  fake.agents.clear()
+  await commands.roster(deps, { run: RUN, repo: '/x' }, false)
+}
+
+test('by default up --seat resumes with no prompt argument and sends the resume notice by herdr prompt', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await killedMidTurn(fake, deps)
+  const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').at(-1) ?? []
+  assert.ok(restart.includes('--resume'))
+  assert.ok(!restart.some(arg => arg.includes('Resumed by Drove')))
+  assert.equal(fake.prompts.at(-1)?.text, 'Resumed by Drove after a restart: carry on, and report when done.')
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'working')
+})
+
+test('a slow resumed turn does not fail up --seat: the notice is typed and the seat stays', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const fake = new FakeHerdr({ promptTimesOut: true })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await killedMidTurn(fake, deps)
+  const closesBefore = fake.herdrCalls().filter(call => call === 'pane close').length
+  const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  assert.equal(fake.herdrCalls().filter(call => call === 'pane close').length, closesBefore)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.state, 'working')
+  assert.deepEqual(seat?.attention, [])
+})
+
+test('up --seat keeps a seat whose agent start timed out but is up in the pane, and rolls back when it is absent', async () => {
+  for (const mode of ['prompt', 'launch-arg'] as const) {
+    process.env.DROVE_BRIEF_VIA = mode
+    const fake = new FakeHerdr()
+    const { deps, identity } = await setup(fake)
+    await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+    await killedMidTurn(fake, deps)
+    Object.assign(fake, { startFails: 'timeout', startLeavesAgent: true, startStatus: 'working' })
+    const closesBefore = fake.herdrCalls().filter(call => call === 'pane close').length
+    const kept = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+    assert.equal(kept.ok, true, `${mode}: ${kept.text}`)
+    assert.equal(fake.herdrCalls().filter(call => call === 'pane close').length, closesBefore, mode)
+    const seat = (await loadRoster(deps.home, RUN)).seats[0]
+    assert.equal(seat?.state, 'working', mode)
+    assert.equal(seat?.paneId, fake.agents.get('w-a')?.paneId, mode)
+    assert.equal(fake.prompts.some(item => item.text.includes('Resumed by Drove')), mode === 'prompt', mode)
+  }
+
+  const absent = new FakeHerdr()
+  const { deps, identity } = await setup(absent)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await killedMidTurn(absent, deps)
+  absent.startFails = 'timeout'
+  const rolledBack = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(!rolledBack.ok && rolledBack.code, 'relaunch')
+  assert.ok(absent.herdrCalls().includes('pane close'))
+})
+
+test('up --seat rolls back when the agent in the pane is blocked at a dialog', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await killedMidTurn(fake, deps)
+  Object.assign(fake, { startFails: 'timeout', startLeavesAgent: true, startStatus: 'blocked', screen: FOLDER_TRUST_SCREEN })
+  const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(!relaunched.ok && relaunched.code, 'relaunch')
+  assert.match(relaunched.text, /Hint: Claude is asking to trust the folder/)
+})
+
+test('promote with a slow resumed turn still succeeds: the notice is typed and unconfirmed', async () => {
+  const fake = new FakeHerdr({ promptTimesOut: true })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  await settleSeat(deps, fake, 'w-api')
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.match(promoted.text, /herdr did not confirm/)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.deepEqual([seat?.model, seat?.state], ['claude-opus-5-5', 'working'])
+  const sent = (await readEvents(deps)).filter(item => item.type === 'control.sent').at(-1)
+  assert.equal(sent?.data?.unconfirmed, true)
+})
+
+test('promote keeps the restarted seat when agent start timed out but the agent is up, and marks it gone when it is not', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  await settleSeat(deps, fake, 'w-api')
+  Object.assign(fake, { startFails: 'timeout', startLeavesAgent: true, startStatus: 'working' })
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.match(promoted.text, /timed out but the agent is up in the pane/)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.deepEqual([seat?.model, seat?.state, seat?.paneId], ['claude-opus-5-5', 'working', fake.agents.get('w-api')?.paneId])
+  assert.match(fake.prompts.at(-1)?.text ?? '', /kind=promote/)
+  const sent = (await readEvents(deps)).filter(item => item.type === 'control.sent').at(-1)
+  assert.equal(sent?.data?.startTimeout, true)
+
+  const absent = new FakeHerdr()
+  const second = await setup(absent)
+  await commands.spawn(second.deps, second.identity, { seat: 'w-api', kind: 'claude', brief })
+  await settleSeat(second.deps, absent, 'w-api')
+  absent.startFails = 'timeout'
+  const failed = await commands.promote(second.deps, second.identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(!failed.ok && failed.code, 'restart')
+  assert.equal((await loadRoster(second.deps.home, RUN)).seats[0]?.state, 'gone')
 })
 
 test('plan creates a run, writes the planner files and returns the exec plan', async () => {

@@ -14,6 +14,7 @@ const config: DroveConfig = {
   codexBypassHookTrust: false,
   codexWorkerSandbox: 'bypass',
   claudeChannel: false,
+  briefVia: 'prompt',
 }
 
 const run: RunMeta = {
@@ -72,6 +73,13 @@ test('worker role covers rules, cairn, questions and reporting', () => {
   assert.match(text, /`done`/)
   assert.match(text, /`progress`/)
   assert.doesNotMatch(text, /mcp__orchestrator__|\bcal\b/)
+})
+
+test('worker role says the worker is already on its own branch and must not switch', () => {
+  const text = prompts.workerRole({ ...seat, branch: 'worktree-w-api' }, run, config)
+  assert.match(text, /already on your own branch \(`worktree-w-api`\) in your own worktree\. Commit there\. Do not create, switch or rebase branches unless the planner asks\./)
+  assert.doesNotMatch(text, /switch -c/)
+  assert.doesNotMatch(prompts.plannerRole(run, config, 'claude'), /branch with --no-track from main/)
 })
 
 test('planner files one task per worker with --no-start and never hands over a task it holds', () => {

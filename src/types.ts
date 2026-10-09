@@ -29,6 +29,7 @@ export type DroveConfig = {
   codexBypassHookTrust: boolean
   codexWorkerSandbox: 'bypass' | 'workspace-write'
   claudeChannel: boolean
+  briefVia: 'prompt' | 'launch-arg'
 }
 
 export type PlannerMeta = {

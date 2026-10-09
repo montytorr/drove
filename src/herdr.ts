@@ -67,7 +67,9 @@ export const isPromptUnconfirmed = (output: string): boolean => herdrError(outpu
 
 const STATUSES: ReadonlySet<string> = new Set<HerdrStatus>(['idle', 'working', 'blocked', 'done', 'unknown'])
 
-const toAgent = (raw: unknown): HerdrAgent | undefined => {
+export type ListedAgent = HerdrAgent & { kind?: string }
+
+const toAgent = (raw: unknown): ListedAgent | undefined => {
   const agent = asRecord(raw)
   if (!agent || typeof agent.pane_id !== 'string') return undefined
   const status = typeof agent.agent_status === 'string' && STATUSES.has(agent.agent_status) ? (agent.agent_status as HerdrStatus) : 'unknown'
@@ -75,6 +77,7 @@ const toAgent = (raw: unknown): HerdrAgent | undefined => {
   const title = typeof agent.terminal_title_stripped === 'string' ? agent.terminal_title_stripped.trim() : ''
   return {
     ...(typeof agent.name === 'string' ? { name: agent.name } : {}),
+    ...(typeof agent.agent === 'string' ? { kind: agent.agent } : {}),
     paneId: agent.pane_id,
     status,
     ...(typeof session?.value === 'string' ? { sessionId: session.value } : {}),
@@ -82,13 +85,13 @@ const toAgent = (raw: unknown): HerdrAgent | undefined => {
   }
 }
 
-export const parseAgents = (stdout: string): HerdrAgent[] | undefined => {
+export const parseAgents = (stdout: string): ListedAgent[] | undefined => {
   const list = asRecord(asRecord(parseJson(stdout))?.result)?.agents
   if (!Array.isArray(list)) return undefined
-  return list.map(toAgent).filter((agent): agent is HerdrAgent => agent !== undefined)
+  return list.map(toAgent).filter((agent): agent is ListedAgent => agent !== undefined)
 }
 
-export const parseAgent = (stdout: string): HerdrAgent | undefined => toAgent(asRecord(asRecord(parseJson(stdout))?.result)?.agent)
+export const parseAgent = (stdout: string): ListedAgent | undefined => toAgent(asRecord(asRecord(parseJson(stdout))?.result)?.agent)
 
 export const parseNewPane = (stdout: string): { paneId: string; tabId?: string } | undefined => {
   const result = asRecord(asRecord(parseJson(stdout))?.result)
@@ -108,14 +111,14 @@ export const run = async (exec: Exec, argv: readonly string[], timeoutMs = 20_00
   return { ok: false, code: code ?? `exit_${result.code}`, output }
 }
 
-export const listAgents = async (exec: Exec): Promise<HerdrResult<HerdrAgent[]>> => {
+export const listAgents = async (exec: Exec): Promise<HerdrResult<ListedAgent[]>> => {
   const ran = await run(exec, agentListArgv(), 10_000)
   if (!ran.ok) return ran
   const agents = parseAgents(ran.value)
   return agents ? { ok: true, value: agents } : { ok: false, code: 'unparseable', output: ran.value.slice(0, 300) }
 }
 
-export const getAgent = async (exec: Exec, target: string): Promise<HerdrResult<HerdrAgent>> => {
+export const getAgent = async (exec: Exec, target: string): Promise<HerdrResult<ListedAgent>> => {
   const ran = await run(exec, agentGetArgv(target), 10_000)
   if (!ran.ok) return ran
   const agent = parseAgent(ran.value)
