@@ -97,15 +97,31 @@ test('planner session: tools/list, a call, and a pending report riding on the to
   session.send({ id: 1, method: 'initialize', params: INIT })
   session.send({ id: 2, method: 'tools/list' })
   session.send({ id: 3, method: 'tools/call', params: { name: 'roster', arguments: {} } })
+  const first = (await session.reply(3)).result?.content[0].text as string
   session.send({ id: 4, method: 'tools/call', params: { name: 'roster', arguments: {} } })
   assert.equal(await session.end(), 0)
 
   const names = (await session.reply(2)).result?.tools.map((tool: { name: string }) => tool.name)
   assert.ok(['spawn', 'send', 'verdict', 'roster', 'close'].every((name) => names.includes(name)))
   assert.ok(!names.includes('report'))
-  const first = (await session.reply(3)).result?.content[0].text as string
   assert.match(first, /^roster ok/)
   assert.match(first, /which database\?/)
+  assert.equal((await session.reply(4)).result?.content[0].text, 'roster ok')
+})
+
+test('planner session: a report that landed in an outbox between ticks rides on the next tool result, exactly once', async () => {
+  const ctx = await setup({ seats: ['w-api'] })
+  const session = launch(ctx, 'planner', 'planner')
+  session.send({ id: 1, method: 'initialize', params: INIT })
+  session.send({ id: 2, method: 'tools/call', params: { name: 'roster', arguments: {} } })
+  assert.equal((await session.reply(2)).result?.content[0].text, 'roster ok')
+  const report = stampReport({ kind: 'done', summary: 'built the parser' }, { id: 'r-w-api-2-abcd', run: ctx.run.id, seat: 'w-api', token: 'token-w-api', at: '2026-10-09T10:00:00.000Z' })
+  await appendJsonl(join(seatDir(ctx.home, ctx.run.id, 'w-api'), 'outbox.jsonl'), report)
+  session.send({ id: 3, method: 'tools/call', params: { name: 'roster', arguments: {} } })
+  const riding = (await session.reply(3)).result?.content[0].text as string
+  session.send({ id: 4, method: 'tools/call', params: { name: 'roster', arguments: {} } })
+  assert.equal(await session.end(), 0)
+  assert.match(riding, /built the parser/)
   assert.equal((await session.reply(4)).result?.content[0].text, 'roster ok')
 })
 

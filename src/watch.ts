@@ -448,6 +448,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const takePending = () =>
     serial(async () => {
       const run = await currentRun()
+      await guarded('ingest', () => ingest(run))
       const reports = await unackedReports(deps, run, ports)
       await ackReports(deps, run, ports, reports)
       for (const report of reports) await emit('report.delivered', report.seat, report.id, { via: 'piggyback' })
