@@ -1,15 +1,152 @@
-import type { AgentKind, GuardDecision, HookEventName, HookInput, HookRecord, Identity } from './types.ts'
-
-const todo = (name: string): never => {
-  throw new Error(`not implemented: hooks.${name}`)
-}
+import { homedir } from 'node:os'
+import { join } from 'node:path'
+import { commandOf, decide, denyText } from './guard.ts'
+import { identityFromEnv, plannerDir, runDir, seatDir } from './paths.ts'
+import type { AgentKind, GuardDecision, GuardInput, HookEventName, HookInput, HookRecord, Identity } from './types.ts'
 
 export const HOOK_EVENTS: readonly HookEventName[] = ['session-start', 'user-prompt-submit', 'pre-tool-use', 'stop', 'notification', 'permission-request']
 export const DENY_EXIT_CODE = 2
 
-export const detectAgent = (raw: Record<string, unknown>, env: NodeJS.ProcessEnv): AgentKind => todo('detectAgent')
-export const parseHookInput = (event: HookEventName, raw: Record<string, unknown>, agent: AgentKind): HookInput => todo('parseHookInput')
-export const renderHookOutput = (agent: AgentKind, decision: GuardDecision): { stdout: string; stderr: string; code: number } => todo('renderHookOutput')
-export const toRecord = (input: HookInput, at: Date): HookRecord => todo('toRecord')
-export const recordHook = async (identity: Identity, record: HookRecord): Promise<void> => todo('recordHook')
-export const runHook = async (event: HookEventName, stdin: string, env: NodeJS.ProcessEnv): Promise<{ stdout: string; stderr: string; code: number }> => todo('runHook')
+const DETAIL_MAX = 200
+const CODEX_ONLY_TOOLS = new Set(['shell', 'exec_command', 'apply_patch'])
+
+export type HookResult = { stdout: string; stderr: string; code: number }
+
+export type HookDeps = {
+  now: () => Date
+  identity: (env: NodeJS.ProcessEnv) => Identity | undefined
+  hooksPath: (identity: Identity) => string
+  eventsPath: (identity: Identity) => string
+  scratchRoot: (identity: Identity) => string
+  append: (path: string, value: unknown) => Promise<void>
+  openIds: (identity: Identity) => Promise<string[]>
+}
+
+export const defaultHookDeps: HookDeps = {
+  now: () => new Date(),
+  identity: env => identityFromEnv(env),
+  hooksPath: identity => join(identity.role === 'planner' ? plannerDir(identity.home, identity.run) : seatDir(identity.home, identity.run, identity.seat), 'hooks.jsonl'),
+  eventsPath: identity => join(runDir(identity.home, identity.run), 'events.jsonl'),
+  scratchRoot: identity => join(runDir(identity.home, identity.run), 'scratch'),
+  append: async (path, value) => (await import('./store.ts')).appendJsonl(path, value),
+  openIds: async identity => {
+    const roster = await import('./roster.ts')
+    return roster.openSeats(await roster.loadRoster(identity.home, identity.run)).flatMap(seat => [seat.name, ...(seat.sessionId ? [seat.sessionId] : [])])
+  },
+}
+
+const text = (value: unknown): string | undefined => (typeof value === 'string' && value.length > 0 ? value : undefined)
+const clip = (value: string): string => (value.length > DETAIL_MAX ? `${value.slice(0, DETAIL_MAX - 1)}…` : value)
+
+export const detectAgent = (raw: Record<string, unknown>, env: NodeJS.ProcessEnv): AgentKind => {
+  const declared = env.DROVE_AGENT
+  if (declared === 'claude' || declared === 'codex') return declared
+  if (typeof raw.tool_name === 'string' && CODEX_ONLY_TOOLS.has(raw.tool_name)) return 'codex'
+  return 'turn_id' in raw ? 'codex' : 'claude'
+}
+
+const detailOf = (event: HookEventName, raw: Record<string, unknown>, tool: string | undefined, toolInput: Record<string, unknown> | undefined): string | undefined => {
+  if (event === 'notification') return text(raw.notification_type) ?? text(raw.message)
+  if (event === 'session-start') return text(raw.source)
+  if (event === 'permission-request') {
+    const what = text(raw.reason) ?? (toolInput ? commandOf(toolInput) : undefined) ?? text(toolInput?.file_path)
+    return [tool, what].filter(Boolean).join(': ') || undefined
+  }
+  return undefined
+}
+
+export const parseHookInput = (event: HookEventName, raw: Record<string, unknown>, agent: AgentKind): HookInput => {
+  const tool = text(raw.tool_name)
+  const toolInput = raw.tool_input && typeof raw.tool_input === 'object' && !Array.isArray(raw.tool_input) ? (raw.tool_input as Record<string, unknown>) : undefined
+  const detail = detailOf(event, raw, tool, toolInput)
+  return {
+    agent,
+    event,
+    ...(text(raw.session_id ?? raw.thread_id) ? { sessionId: text(raw.session_id ?? raw.thread_id) } : {}),
+    ...(text(raw.cwd) ? { cwd: text(raw.cwd) } : {}),
+    ...(tool ? { tool } : {}),
+    ...(toolInput ? { toolInput } : {}),
+    ...(detail ? { detail: clip(detail) } : {}),
+  }
+}
+
+export const renderHookOutput = (agent: AgentKind, decision: GuardDecision): HookResult => {
+  if (decision.allow) return { stdout: '', stderr: '', code: 0 }
+  const stdout =
+    agent === 'claude'
+      ? JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.reason } })
+      : ''
+  return { stdout, stderr: decision.reason, code: DENY_EXIT_CODE }
+}
+
+export const toRecord = (input: HookInput, at: Date): HookRecord => ({
+  at: at.toISOString(),
+  agent: input.agent,
+  event: input.event,
+  ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+  ...(input.detail ? { detail: input.detail } : {}),
+})
+
+export const recordHook = async (identity: Identity, record: HookRecord, deps: HookDeps = defaultHookDeps): Promise<void> => {
+  await deps.append(deps.hooksPath(identity), record)
+}
+
+const parseStdin = (stdin: string): Record<string, unknown> => {
+  const parsed: unknown = stdin.trim() ? JSON.parse(stdin) : {}
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('hook input is not a JSON object')
+  return parsed as Record<string, unknown>
+}
+
+const mentionsSessions = (input: HookInput): boolean => /herdr|codex/.test(JSON.stringify(input.toolInput ?? {}))
+
+const guardInput = async (identity: Identity, input: HookInput, deps: HookDeps): Promise<GuardInput> => {
+  const isPlanner = identity.role === 'planner'
+  const home = process.env.HOME ?? homedir()
+  return {
+    agent: input.agent,
+    role: identity.role,
+    tool: input.tool ?? '',
+    input: input.toolInput ?? {},
+    cwd: input.cwd ?? process.cwd(),
+    writableRoots: isPlanner ? ['/tmp', '/private/tmp', join(home, '.claude', 'plans'), deps.scratchRoot(identity)] : [],
+    openSeats: isPlanner && mentionsSessions(input) ? await deps.openIds(identity) : [],
+  }
+}
+
+const logDeny = async (identity: Identity, input: HookInput, reason: string, deps: HookDeps): Promise<void> => {
+  const command = input.toolInput ? commandOf(input.toolInput) : undefined
+  try {
+    await deps.append(deps.eventsPath(identity), {
+      at: deps.now().toISOString(),
+      type: 'guard.deny',
+      seat: identity.seat,
+      data: { tool: input.tool, ...(command ? { command: clip(command) } : {}), reason: clip(reason) },
+    })
+  } catch {
+    // the deny stands even when the event log is unwritable
+  }
+}
+
+const preToolUse = async (identity: Identity, raw: Record<string, unknown>, agent: AgentKind, deps: HookDeps): Promise<HookResult> => {
+  const input = parseHookInput('pre-tool-use', raw, agent)
+  const decision = decide(await guardInput(identity, input, deps))
+  if (!decision.allow) await logDeny(identity, input, decision.reason, deps)
+  return renderHookOutput(agent, decision)
+}
+
+export const runHook = async (event: HookEventName, stdin: string, env: NodeJS.ProcessEnv, deps: HookDeps = defaultHookDeps): Promise<HookResult> => {
+  const identity = deps.identity(env)
+  if (!identity) return { stdout: '', stderr: '', code: 0 }
+  let agent: AgentKind = env.DROVE_AGENT === 'codex' ? 'codex' : 'claude'
+  try {
+    const raw = parseStdin(stdin)
+    agent = detectAgent(raw, env)
+    if (event === 'pre-tool-use') return await preToolUse(identity, raw, agent, deps)
+    await recordHook(identity, toRecord(parseHookInput(event, raw, agent), deps.now()), deps)
+    return { stdout: '', stderr: '', code: 0 }
+  } catch (error) {
+    if (event !== 'pre-tool-use' || identity.role !== 'planner') return { stdout: '', stderr: '', code: 0 }
+    const reason = denyText('planner', `the guard could not check this call (${error instanceof Error ? error.message : String(error)}), so it is refused`)
+    return renderHookOutput(agent, { allow: false, reason })
+  }
+}
