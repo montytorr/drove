@@ -48,6 +48,7 @@ export class FakeHerdr {
   startStatus: HerdrStatus = 'working'
   busyStarts = 0
   queueFails = false
+  onStart: ((name: string) => Promise<void>) | undefined
   agentReadFails = false
   paneCwds = new Map<string, string>()
   claudeWorktrees: { path: string; branch: string }[] = []
@@ -163,6 +164,7 @@ export class FakeHerdr {
       return herdrFail(this.startFails)
     }
     const tabId = [...this.tabs].at(-1) ?? 'w1:t1'
+    await this.onStart?.(name)
     const failure = await this.claudeCreatesWorktree(paneId, argv)
     if (failure) return failure
     this.agents.set(name, { name, paneId, tabId, status: this.startStatus, ...(this.startSession ? { sessionId: this.startSession } : {}) })

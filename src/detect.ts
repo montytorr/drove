@@ -64,7 +64,7 @@ const idleWithoutReport = (seat: Seat, state: SeatState, reported: LastReport | 
 }
 
 export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derived => {
-  if (seat.state === 'closed' || seat.state === 'down') return { state: seat.state, attention: [] }
+  if (seat.state === 'closed' || seat.state === 'down' || seat.state === 'closing') return { state: seat.state, attention: [] }
   const at = now.toISOString()
   const nowMs = now.getTime()
   const attention: Attention[] = []

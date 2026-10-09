@@ -4,6 +4,8 @@ import { createWatcher, piggyback, readNewReports, shouldWake, BATCH_MS } from '
 import type { HerdrAgent } from '../src/types.ts'
 import { join } from 'node:path'
 import { appendJsonl } from '../src/store.ts'
+import { deriveState, needsNudge } from '../src/detect.ts'
+import { updateRoster } from '../src/roster.ts'
 import { eventsOf, fakePorts, fileReport, rosterOf, setup } from './p4-helpers.ts'
 
 const queued = (calls: string[][]) => calls.filter((argv) => argv[0] === 'codex')
@@ -344,4 +346,80 @@ test('a Codex planner thread falls back to the herdr agent session', async () =>
   ctx.clock.advance(BATCH_MS)
   await watcher.tick()
   assert.deepEqual(queued(ctx.calls)[0]?.slice(0, 4), ['codex', 'queue', '--thread', 'thread-from-herdr'])
+})
+
+const markWorking = (ctx: Awaited<ReturnType<typeof setup>>) =>
+  updateRoster(ctx.home, ctx.run.id, (current) => ({ ...current, seats: current.seats.map((seat) => ({ ...seat, lastWorkingAt: seat.stateAt })) }))
+
+test('a report that lands inside the working episode stops idle-without-report and the nudge', async () => {
+  const ctx = await setup()
+  await markWorking(ctx)
+  let status: HerdrAgent['status'] = 'working'
+  const { ports, controls } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status }], deriveState, needsNudge })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await fileReport(ctx, 'w-api', 'done', 'finished', { expects: 'none' })
+  ctx.clock.advance(1000)
+  await watcher.tick()
+  ctx.clock.advance(5000)
+  status = 'idle'
+  await watcher.tick()
+  ctx.clock.advance(60_000)
+  await watcher.tick()
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.state, 'idle')
+  assert.deepEqual(seat?.attention, [])
+  assert.equal(controls.length, 0)
+})
+
+test('a seat that stops without any report is still nudged', async () => {
+  const ctx = await setup()
+  await markWorking(ctx)
+  let status: HerdrAgent['status'] = 'working'
+  const { ports, controls } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status }], deriveState, needsNudge })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  ctx.clock.advance(5000)
+  status = 'idle'
+  await watcher.tick()
+  ctx.clock.advance(60_000)
+  await watcher.tick()
+  assert.equal(controls.length, 1)
+})
+
+test('after a question is answered, a new silent stop is nudged', async () => {
+  const ctx = await setup()
+  await markWorking(ctx)
+  let status: HerdrAgent['status'] = 'working'
+  const { ports, controls } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status }], deriveState, needsNudge })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await fileReport(ctx, 'w-api', 'question', 'which table?', { expects: 'answer' })
+  ctx.clock.advance(1000)
+  status = 'idle'
+  await watcher.tick()
+  ctx.clock.advance(60_000)
+  await watcher.tick()
+  assert.equal(controls.length, 0)
+
+  await updateRoster(ctx.home, ctx.run.id, (current) => ({ ...current, seats: current.seats.map((seat) => ({ ...seat, owes: 'none' })) }))
+  status = 'working'
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  status = 'idle'
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  ctx.clock.advance(60_000)
+  await watcher.tick()
+  assert.equal(controls.length, 1)
+})
+
+test('the watcher leaves a closing seat alone', async () => {
+  const ctx = await setup()
+  await updateRoster(ctx.home, ctx.run.id, (current) => ({ ...current, seats: current.seats.map((seat) => ({ ...seat, state: 'closing' })) }))
+  const { ports } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'blocked' }], deriveState, needsNudge })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.state, 'closing')
+  assert.deepEqual(seat?.attention, [])
+  assert.equal((await eventsOf(ctx)).filter((event) => event.type === 'attention').length, 0)
 })

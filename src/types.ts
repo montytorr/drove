@@ -8,7 +8,7 @@ export type ControlKind = 'brief' | 'message' | 'answer' | 'verdict' | 'promote'
 export type Verdict = 'approve' | 'changes'
 
 export type HerdrStatus = 'idle' | 'working' | 'blocked' | 'done' | 'unknown'
-export type SeatState = 'starting' | 'working' | 'idle' | 'done' | 'blocked' | 'needs-input' | 'unknown' | 'gone' | 'closed' | 'down'
+export type SeatState = 'starting' | 'working' | 'idle' | 'done' | 'blocked' | 'needs-input' | 'unknown' | 'gone' | 'closing' | 'closed' | 'down'
 
 export type Identity = {
   home: string

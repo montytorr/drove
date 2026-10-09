@@ -6,7 +6,7 @@ import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
 import { seatDir } from '../src/paths.ts'
 import { approvedText } from '../src/prompts.ts'
-import { loadRoster, loadRun } from '../src/roster.ts'
+import { loadRoster, loadRun, updateRoster } from '../src/roster.ts'
 import type { Deps, Identity, RunMeta } from '../src/types.ts'
 import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun } from './p3-helpers.ts'
 
@@ -372,6 +372,46 @@ test('close quits the agent, closes the pane and the empty tab, and keeps the wo
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'closed')
   assert.ok(existsSync(join(repo, '.claude', 'worktrees', 'w-api')))
   assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
+})
+
+test('close marks the seat closing before /exit, so the worktree exit question raises nothing', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const seen: string[] = []
+  const exec = deps.exec
+  const watching: Deps = {
+    ...deps,
+    exec: async argv => {
+      if (argv.includes('/exit')) seen.push((await loadRoster(deps.home, RUN)).seats[0]?.state ?? 'missing')
+      return exec(argv)
+    },
+  }
+  const closed = await commands.close(watching, identity, 'w-api', false)
+  assert.equal(closed.ok, true, closed.text)
+  assert.deepEqual(seen, ['closing'])
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.state, 'closed')
+  assert.deepEqual(seat?.attention, [])
+  assert.ok(fake.herdrCalls().includes('pane close'))
+})
+
+test('a report filed while herdr starts the agent survives the spawn bookkeeping', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  fake.onStart = async name => {
+    await updateRoster(deps.home, RUN, roster => ({
+      ...roster,
+      seats: roster.seats.map(seat =>
+        seat.name === name ? { ...seat, owes: 'review', lastReport: { id: 'r1', kind: 'done', expects: 'review', summary: 'early', at: deps.clock.now().toISOString() } } : seat,
+      ),
+    }))
+  }
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.lastReport?.id, 'r1')
+  assert.equal(seat?.owes, 'review')
+  assert.equal(seat?.state, 'working')
 })
 
 test('close --remove-worktree keeps an unmerged worktree and removes a merged one', async () => {
