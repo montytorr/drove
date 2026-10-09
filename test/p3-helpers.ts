@@ -34,7 +34,7 @@ const UNSAFE_AGENT_ARG = /[\u0000-\u001f\u007f]/
 
 export type FakeAgent = { name: string; paneId: string; tabId: string; status: HerdrStatus; sessionId?: string }
 
-export type FakeHerdrOptions = { git?: boolean; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number }
+export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number }
 
 export class FakeHerdr {
   calls: string[][] = []
@@ -48,6 +48,9 @@ export class FakeHerdr {
   startStatus: HerdrStatus = 'working'
   busyStarts = 0
   queueFails = false
+  agentReadFails = false
+  paneCwds = new Map<string, string>()
+  claudeWorktrees: { path: string; branch: string }[] = []
   private counter = 0
 
   constructor(options: FakeHerdrOptions = {}) {
@@ -56,6 +59,7 @@ export class FakeHerdr {
     this.startSession = options.startSession
     this.startStatus = options.startStatus ?? 'working'
     this.busyStarts = options.busyStarts ?? 0
+    this.agentReadFails = options.agentReadFails ?? false
   }
 
   exec: Exec = async argv => {
@@ -84,6 +88,7 @@ export class FakeHerdr {
       const id = ++this.counter
       const tabId = `w1:t${id}`
       this.tabs.add(tabId)
+      this.paneCwds.set(`w1:p${id}`, argv[argv.indexOf('--cwd') + 1] ?? '')
       return this.json({ result: { tab: { tab_id: tabId }, root_pane: { pane_id: `w1:p${id}` } } })
     }
     const tabId = argv[3] ?? ''
@@ -99,6 +104,7 @@ export class FakeHerdr {
   private pane(action: string | undefined, argv: readonly string[]): ExecResult {
     if (action === 'split') {
       const id = ++this.counter
+      this.paneCwds.set(`w1:p${id}`, argv[argv.indexOf('--cwd') + 1] ?? '')
       return this.json({ result: { pane: { pane_id: `w1:p${id}` } } })
     }
     if (action === 'close') {
@@ -106,6 +112,7 @@ export class FakeHerdr {
       for (const [name, agent] of this.agents) if (agent.paneId === paneId) this.agents.delete(name)
       return this.json({ result: {} })
     }
+    if (action === 'read') return this.json({ result: { text: this.screen } })
     return herdrFail('unknown_command')
   }
 
@@ -121,14 +128,14 @@ export class FakeHerdr {
     terminal_title_stripped: agent.name,
   })
 
-  private agent(action: string | undefined, argv: readonly string[]): ExecResult {
+  private async agent(action: string | undefined, argv: readonly string[]): Promise<ExecResult> {
     const target = argv[3] ?? ''
     if (action === 'list') return this.json({ result: { agents: [...this.agents.values()].map(this.wire) } })
     if (action === 'get') {
       const agent = this.lookup(target)
       return agent ? this.json({ result: { agent: this.wire(agent) } }) : herdrFail('agent_not_found')
     }
-    if (action === 'read') return this.json({ result: { text: this.screen } })
+    if (action === 'read') return this.agentReadFails ? herdrFail('agent_not_found') : this.json({ result: { text: this.screen } })
     if (action === 'start') return this.start(argv)
     if (action === 'prompt') {
       const agent = this.lookup(target)
@@ -143,7 +150,7 @@ export class FakeHerdr {
     return herdrFail('unknown_command')
   }
 
-  private start(argv: readonly string[]): ExecResult {
+  private async start(argv: readonly string[]): Promise<ExecResult> {
     if (this.busyStarts > 0) {
       this.busyStarts -= 1
       return herdrFail('agent_pane_busy')
@@ -156,8 +163,25 @@ export class FakeHerdr {
       return herdrFail(this.startFails)
     }
     const tabId = [...this.tabs].at(-1) ?? 'w1:t1'
+    const failure = await this.claudeCreatesWorktree(paneId, argv)
+    if (failure) return failure
     this.agents.set(name, { name, paneId, tabId, status: this.startStatus, ...(this.startSession ? { sessionId: this.startSession } : {}) })
     return this.json({ result: { agent: this.wire(this.agents.get(name) as FakeAgent) } })
+  }
+
+  private async claudeCreatesWorktree(paneId: string, argv: readonly string[]): Promise<ExecResult | undefined> {
+    const flag = argv.indexOf('--worktree')
+    if (flag < 0) return undefined
+    const name = argv[flag + 1] ?? ''
+    const cwd = this.paneCwds.get(paneId) ?? ''
+    const path = join(cwd, '.claude', 'worktrees', name)
+    const branch = `worktree-${name}`
+    if (!existsSync(path)) {
+      const added = await nodeExec(['git', '-C', cwd, 'worktree', 'add', '--no-track', '-b', branch, path, 'HEAD'])
+      if (added.code !== 0) return herdrFail('agent_start_failed', added.stderr)
+    }
+    this.claudeWorktrees.push({ path, branch })
+    return undefined
   }
 
   private codexQueue(argv: readonly string[]): ExecResult {

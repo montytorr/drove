@@ -30,8 +30,10 @@ const request = (overrides: Partial<LaunchRequest>): LaunchRequest => ({
 })
 
 test('claude worker spec matches the golden file', () => {
-  const spec = launch.claudeWorkerSpec(request({ sessionId: '11111111-2222-3333-4444-555555555555' }))
+  const spec = launch.claudeWorkerSpec(request({ cwd: '/work/repo', sessionId: '11111111-2222-3333-4444-555555555555' }))
   assertGolden('claude-worker', spec)
+  assert.equal(spec.cwd, '/work/repo')
+  assert.deepEqual(spec.argv.slice(spec.argv.indexOf('--worktree'), spec.argv.indexOf('--worktree') + 2), ['--worktree', 'w-api'])
   assert.equal(spec.env._CC_ACCT_PINNED, '1')
   assert.equal(spec.env.DROVE_AGENT, 'claude')
   assert.ok(spec.argv.includes('--dangerously-skip-permissions'))
@@ -41,6 +43,13 @@ test('claude worker resume replaces --session-id with --resume', () => {
   const spec = launch.claudeWorkerSpec(request({ resumeId: 'abc', sessionId: 'ignored', initialPrompt: undefined }))
   assertGolden('claude-worker-resume', spec)
   assert.ok(!spec.argv.includes('--session-id'))
+  assert.ok(!spec.argv.includes('--worktree'))
+  assert.equal(spec.cwd, '/work/repo/.claude/worktrees/w-api')
+})
+
+test('claude planner and codex worker never get --worktree', () => {
+  assert.ok(!launch.claudePlannerSpec(request({ identity: planner })).argv.includes('--worktree'))
+  assert.ok(!launch.codexWorkerSpec(request({ kind: 'codex' })).argv.includes('--worktree'))
 })
 
 test('a prompt that starts with a dash is passed after --', () => {

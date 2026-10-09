@@ -1,7 +1,7 @@
 {
   "kind": "claude",
   "role": "worker",
-  "cwd": "/work/repo/.claude/worktrees/w-api",
+  "cwd": "/work/repo",
   "env": {
     "_CC_ACCT_PINNED": "1",
     "DROVE_HOME": "/home/cal/.drove",
@@ -18,6 +18,8 @@
     "--effort",
     "medium",
     "-n",
+    "w-api",
+    "--worktree",
     "w-api",
     "--session-id",
     "11111111-2222-3333-4444-555555555555",

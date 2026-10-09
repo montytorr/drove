@@ -121,7 +121,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
   return [
     defineTool(
       'spawn',
-      'Start a worker: creates its git worktree and branch, opens a pane in the run tab and launches the agent with your brief. Give each worker one Cairn ref and a self-contained brief (files it owns, acceptance, what to verify). Returns at once with the seat running. Do NOT wait, poll or sleep afterwards: the worker\'s report is delivered to you as a message (or at the end of your next tool result). Spawn the next independent worker, or end your turn.',
+      'Start a worker: a Claude worker gets Claude\'s own worktree (branch worktree-SEAT) and a Codex worker a Drove worktree (branch drove/SEAT); opens a pane in the run tab and launches the agent with your brief. Give each worker one Cairn ref and a self-contained brief (files it owns, acceptance, what to verify). Returns at once with the seat running. Do NOT wait, poll or sleep afterwards: the worker\'s report is delivered to you as a message (or at the end of your next tool result). Spawn the next independent worker, or end your turn.',
       {
         seat: { type: 'string', description: 'New seat name: lowercase letters, digits, - and _, starting with a letter, up to 32 characters (e.g. w-api).' },
         kind: { type: 'string', enum: KINDS, description: 'Which agent runs the seat: claude or codex.' },
@@ -129,7 +129,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         brief: { type: 'string', description: 'The full brief. The worker sees nothing else.' },
         model: { type: 'string', description: 'Optional model override.' },
         effort: { type: 'string', enum: EFFORTS, description: 'Optional reasoning effort override.' },
-        base: { type: 'string', description: 'Optional base branch for the worktree (default: origin/main, or main without a remote).' },
+        base: { type: 'string', description: 'Optional base branch for a Codex worktree (default: origin/main, or main without a remote). Ignored for Claude, which branches from the main checkout\'s current HEAD.' },
       },
       ['seat', 'kind', 'brief'],
       async (args) => {

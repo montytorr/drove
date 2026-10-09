@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { readFile, realpath, writeFile } from 'node:fs/promises'
+import { readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
@@ -26,7 +26,7 @@ const setup = async (fake = new FakeHerdr(), overrides: Partial<RunMeta> = {}) =
 
 const brief = 'Build the widget.'
 
-test('spawn creates the worktree, opens the tab, then starts the agent, in that order', async () => {
+test('spawn opens the tab at the repo root, then starts the agent, which creates its own worktree', async () => {
   const { fake, deps, identity, repo } = await setup()
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
   assert.equal(spawned.ok, true, spawned.text)
@@ -35,16 +35,20 @@ test('spawn creates the worktree, opens the tab, then starts the agent, in that 
   assert.ok(order.indexOf('tab create') < order.indexOf('agent start'))
   const worktree = join(repo, '.claude', 'worktrees', 'w-api')
   assert.ok(existsSync(worktree))
-  assert.equal(await git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD'), 'drove/w-api')
-  assert.equal(await git(repo, 'for-each-ref', '--format=%(upstream:short)', 'refs/heads/drove/w-api'), '')
+  assert.equal(await git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD'), 'worktree-w-api')
+  assert.equal(await git(repo, 'for-each-ref', '--format=%(upstream:short)', 'refs/heads/worktree-w-api'), '')
+  assert.equal(await git(repo, 'branch', '--list', 'drove/w-api'), '')
+  assert.deepEqual(fake.calls.filter(call => call[0] === 'git' && call.includes('worktree')), [])
 
   const start = fake.find('herdr', 'agent', 'start') ?? []
   assert.equal(start[3], 'w-api')
   assert.equal(start[start.indexOf('--kind') + 1], 'claude')
+  assert.equal(start[start.indexOf('--worktree') + 1], 'w-api')
   assert.ok(start.includes('--session-id'))
   assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-api`\. Your Cairn task is DROVE-5/)
   assert.equal(fake.prompts.length, 0)
   const tab = fake.find('herdr', 'tab', 'create') ?? []
+  assert.equal(tab[tab.indexOf('--cwd') + 1], repo)
   assert.ok(tab.includes('_CC_ACCT_PINNED=1'))
   assert.ok(tab.some(arg => arg.startsWith('DROVE_TOKEN=')))
   assert.equal(tab[tab.indexOf('--workspace') + 1], 'w1')
@@ -52,11 +56,47 @@ test('spawn creates the worktree, opens the tab, then starts the agent, in that 
   const roster = await loadRoster(deps.home, RUN)
   assert.equal(roster.seats[0]?.state, 'working')
   assert.equal(roster.seats[0]?.paneId, 'w1:p1')
+  assert.equal(roster.seats[0]?.worktree, worktree)
+  assert.equal(roster.seats[0]?.branch, 'worktree-w-api')
   assert.equal((await loadRun(deps.home, RUN))?.tabId, 'w1:t1')
   const token = await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'token'), 'utf8')
   const launch = await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'launch.json'), 'utf8')
   assert.ok(!launch.includes(token.trim()))
+  assert.equal(JSON.parse(launch).cwd, repo)
   assert.ok(existsSync(join(seatDir(deps.home, RUN, 'w-api'), 'mcp.json')))
+})
+
+test('a codex worker still gets a Drove git worktree on drove/<seat> and launches inside it', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const worktree = join(repo, '.claude', 'worktrees', 'w-cx')
+  assert.equal(await git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD'), 'drove/w-cx')
+  assert.ok(fake.calls.some(call => call[0] === 'git' && call.includes('worktree') && call.includes('add')))
+  const tab = fake.find('herdr', 'tab', 'create') ?? []
+  assert.equal(tab[tab.indexOf('--cwd') + 1], worktree)
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.ok(!start.includes('--worktree'))
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.branch, 'drove/w-cx')
+})
+
+test('a claude spawn warns when the main checkout is not at the base, and says --base is ignored', async () => {
+  const { deps, identity, repo } = await setup()
+  await git(repo, 'switch', '-q', '-c', 'side', '--no-track')
+  await writeFile(join(repo, 'b.txt'), 'x\n')
+  await git(repo, 'add', 'b.txt')
+  await git(repo, 'commit', '-q', '-m', 'side work')
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief, base: 'main' })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /Note: Claude branches worktree-w-api from the main checkout's current HEAD \(side\), which is not main/)
+  assert.match(spawned.text, /Note: --base main was ignored/)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-api'), 'rev-parse', 'HEAD'), await git(repo, 'rev-parse', 'side'))
+})
+
+test('a claude spawn at the base carries no base note', async () => {
+  const { deps, identity } = await setup()
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.doesNotMatch(spawned.text, /Note:/)
 })
 
 test('the second worker splits into the grid instead of opening another tab', async () => {
@@ -93,8 +133,62 @@ test('a failed agent start closes the new tab, removes the seat and the fresh wo
   assert.equal(fake.tabs.size, 0)
   assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
   assert.equal(existsSync(join(repo, '.claude', 'worktrees', 'w-api')), false)
-  assert.equal(await git(repo, 'branch', '--list', 'drove/w-api'), '')
+  assert.equal(await git(repo, 'branch', '--list', 'worktree-w-api'), '')
   assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
+})
+
+test('a failed codex start removes the Drove worktree and its branch', async () => {
+  const { deps, identity, repo } = await setup(new FakeHerdr({ startFails: 'agent_start_failed' }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(spawned.ok, false)
+  assert.equal(existsSync(join(repo, '.claude', 'worktrees', 'w-cx')), false)
+  assert.equal(await git(repo, 'branch', '--list', 'drove/w-cx'), '')
+})
+
+const FOLDER_TRUST_SCREEN = ' Do you trust the files in this folder?\n\n /repo/.claude/worktrees/w-api\n\n 1. Yes, proceed\n 2. No, exit\n'
+
+const readEvents = async (deps: Deps) =>
+  (await readFile(join(deps.home, 'runs', RUN, 'events.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { type: string; seat?: string; data?: Record<string, unknown> })
+
+test('a failed start saves the pane output, logs seat.start_failed and hints at the folder-trust dialog', async () => {
+  const fake = new FakeHerdr({ startFails: 'timeout', screen: FOLDER_TRUST_SCREEN })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, false)
+  assert.match(spawned.text, /Hint: Claude is asking to trust the folder\./)
+  const file = join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt')
+  assert.match(spawned.text, new RegExp(file.replaceAll('.', '\\.')))
+  assert.equal(await readFile(file, 'utf8'), FOLDER_TRUST_SCREEN)
+  assert.equal((await stat(file)).mode & 0o777, 0o600)
+  const read = fake.find('herdr', 'agent', 'read') ?? []
+  assert.deepEqual(read.slice(3), ['w-api', '--source', 'recent-unwrapped', '--lines', '60'])
+  assert.ok(fake.calls.findIndex(call => call[2] === 'read') < fake.calls.findIndex(call => call[1] === 'tab' && call[2] === 'close'))
+  const event = (await readEvents(deps)).find(item => item.type === 'seat.start_failed')
+  assert.equal(event?.seat, 'w-api')
+  assert.equal(event?.data?.code, 'timeout')
+  assert.equal(event?.data?.reason, 'trust')
+})
+
+test('the failure capture falls back to a pane read and omits the hint when no dialog matches', async () => {
+  const fake = new FakeHerdr({ startFails: 'agent_start_failed', screen: 'command not found: claude', agentReadFails: true })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, false)
+  assert.doesNotMatch(spawned.text, /Hint:/)
+  assert.ok(fake.find('herdr', 'pane', 'read', 'w1:p1'))
+  assert.equal(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt'), 'utf8'), 'command not found: claude\n')
+  const event = (await readEvents(deps)).find(item => item.type === 'seat.start_failed')
+  assert.equal(event?.data?.reason, undefined)
+})
+
+test('a startup dialog on a claude worker also saves the capture', async () => {
+  const fake = new FakeHerdr({ startFails: 'agent_not_ready', screen: FOLDER_TRUST_SCREEN })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true)
+  assert.match(spawned.text, /\(trust\)/)
+  assert.equal(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt'), 'utf8'), FOLDER_TRUST_SCREEN)
+  assert.equal((await readEvents(deps)).filter(item => item.type === 'seat.start_failed').length, 1)
 })
 
 test('a failed start into an existing grid closes only that pane', async () => {
@@ -288,18 +382,18 @@ test('close --remove-worktree keeps an unmerged worktree and removes a merged on
   await git(worktree, 'add', 'a.txt')
   await git(worktree, 'commit', '-q', '-m', 'work')
   const kept = await commands.close(deps, identity, 'w-api', true)
-  assert.match(kept.text, /not merged into main, so the worktree .* was kept/)
+  assert.match(kept.text, /Branch worktree-w-api is not merged into main, so the worktree .* was kept/)
   assert.ok(existsSync(worktree))
 
-  await git(repo, 'merge', '--no-ff', '-q', '-m', 'merge', 'drove/w-api')
+  await git(repo, 'merge', '--no-ff', '-q', '-m', 'merge', 'worktree-w-api')
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
   const removed = await commands.close(deps, identity, 'w-api', true)
   assert.match(removed.text, /Removed worktree/)
   assert.equal(existsSync(worktree), false)
 })
 
-test('promote on a settled Claude worker restarts it with --resume and the new model', async () => {
-  const { fake, deps, identity } = await setup()
+test('promote on a settled Claude worker restarts it with --resume and the new model, in a new pane in its worktree', async () => {
+  const { fake, deps, identity, repo } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
   const { updateRoster } = await import('../src/roster.ts')
   await updateRoster(deps.home, RUN, roster => ({
@@ -318,11 +412,20 @@ test('promote on a settled Claude worker restarts it with --resume and the new m
   assert.equal(restart[restart.indexOf('--model') + 1], 'claude-opus-5-5')
   assert.equal(restart[restart.indexOf('--effort') + 1], 'high')
   assert.ok(!restart.includes('--session-id'))
+  assert.ok(!restart.includes('--worktree'))
   assert.ok(!restart.some(arg => arg.includes('kind=promote')))
+  const worktree = join(repo, '.claude', 'worktrees', 'w-api')
+  const order = fake.herdrCalls()
+  assert.ok(order.lastIndexOf('pane close') < order.lastIndexOf('tab create'))
+  const created = fake.calls.filter(call => call[1] === 'tab' && call[2] === 'create').at(-1) ?? []
+  assert.equal(created[created.indexOf('--cwd') + 1], worktree)
+  assert.equal(restart[restart.indexOf('--pane') + 1], 'w1:p2')
   assert.equal(fake.prompts.length, 2)
   assert.match(fake.prompts[1]?.text ?? '', /kind=promote model=claude-opus-5-5 effort=high/)
   const seat = (await loadRoster(deps.home, RUN)).seats[0]
   assert.deepEqual([seat?.model, seat?.effort, seat?.state, seat?.owes], ['claude-opus-5-5', 'high', 'working', 'none'])
+  assert.equal(seat?.paneId, 'w1:p2')
+  assert.equal(seat?.worktree, worktree)
 })
 
 test('promote on a codex worker quits with /quit and resumes the thread', async () => {
@@ -427,7 +530,7 @@ test('budget is for the human only and validates the number', async () => {
 
 test('down saves session ids and closes everything; up relaunches each seat with resume and the planner resume plan', async () => {
   const fake = new FakeHerdr({ startSession: 'codex-thread' })
-  const { deps, identity } = await setup(fake)
+  const { deps, identity, repo } = await setup(fake)
   await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
   await commands.spawn(deps, identity, { seat: 'w-b', kind: 'codex', brief })
   fake.setStatus('w-a', 'idle')
@@ -447,7 +550,10 @@ test('down saves session ids and closes everything; up relaunches each seat with
   const starts = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').slice(2)
   assert.equal(starts.length, 2)
   assert.ok(starts[0]?.includes('--resume'))
+  assert.ok(!starts[0]?.includes('--worktree'))
   assert.ok(starts[1]?.includes('resume'))
+  const placedAt = fake.calls.filter(call => call[1] === 'tab' || (call[1] === 'pane' && call[2] === 'split')).filter(call => call[2] === 'create' || call[2] === 'split').slice(-2).map(call => call[call.indexOf('--cwd') + 1])
+  assert.deepEqual(placedAt, [join(repo, '.claude', 'worktrees', 'w-a'), join(repo, '.claude', 'worktrees', 'w-b')])
   const plan = upped.ok ? (upped.data as commands.ProcessPlan) : undefined
   assert.equal(plan?.argv[0], 'claude')
   assert.ok(plan?.argv.includes('--resume'))
@@ -461,7 +567,7 @@ test('down saves session ids and closes everything; up relaunches each seat with
 
 test('up --seat relaunches only a dead seat, and refuses a live one or one with no session', async () => {
   const fake = new FakeHerdr()
-  const { deps, identity } = await setup(fake)
+  const { deps, identity, repo } = await setup(fake)
   await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
   const live = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
   assert.equal(!live.ok && live.code, 'not-dead')
@@ -471,7 +577,10 @@ test('up --seat relaunches only a dead seat, and refuses a live one or one with 
   assert.equal(relaunched.ok, true, relaunched.text)
   const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').at(-1) ?? []
   assert.ok(restart.includes('--resume'))
+  assert.ok(!restart.includes('--worktree'))
   assert.match(restart.at(-1) ?? '', /Resumed by Drove/)
+  const placed = fake.calls.filter(call => call[1] === 'pane' && call[2] === 'split' || call[1] === 'tab' && call[2] === 'create').at(-1) ?? []
+  assert.equal(placed[placed.indexOf('--cwd') + 1], join(repo, '.claude', 'worktrees', 'w-a'))
 
   const { updateRoster } = await import('../src/roster.ts')
   await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: [{ ...makeSeat('w-x', { kind: 'codex', state: 'gone' }) }] }))

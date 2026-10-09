@@ -1,14 +1,20 @@
 import type { Attention, Derived, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
 
-export const DIALOGS: readonly { pattern: RegExp; reason: Attention['reason']; detail: string }[] = [
+export const DIALOGS: readonly { pattern: RegExp; reason: Attention['reason']; detail: string; hint: string }[] = [
   {
     pattern: /Background server has incompatible feature settings/,
     reason: 'codex-version-mismatch',
     detail: 'Codex CLI and app-server daemon versions differ; align them (codex --version vs the daemon). Drove will not answer the dialog.',
+    hint: 'Codex CLI and its app-server daemon versions differ',
   },
-  { pattern: /trust (this|the files in this) folder/i, reason: 'trust', detail: 'A folder-trust prompt is waiting in the pane.' },
-  { pattern: /hook.*trust/i, reason: 'hook-trust', detail: 'A hook-trust prompt is waiting in the pane.' },
-  { pattern: /development channels?/i, reason: 'channel-confirm', detail: 'A development-channel confirmation is waiting in the pane.' },
+  {
+    pattern: /trust (this|the files in this) folder|project you created or one you trust/i,
+    reason: 'trust',
+    detail: 'A folder-trust prompt is waiting in the pane.',
+    hint: 'Claude is asking to trust the folder',
+  },
+  { pattern: /hook.*trust/i, reason: 'hook-trust', detail: 'A hook-trust prompt is waiting in the pane.', hint: 'the agent is asking to trust the Drove hooks' },
+  { pattern: /development channels?/i, reason: 'channel-confirm', detail: 'A development-channel confirmation is waiting in the pane.', hint: 'Claude is asking to confirm the development channel' },
 ]
 
 export const HOOK_FRESH_MS = 10_000
@@ -20,8 +26,10 @@ const PERMISSION_NOTICE = /permission|approv|elicitation|dialog|trust/i
 
 const ms = (at: string | undefined): number => (at ? Date.parse(at) : Number.NaN)
 
+export const findDialog = (screen: string): (typeof DIALOGS)[number] | undefined => DIALOGS.find(({ pattern }) => pattern.test(screen))
+
 export const matchDialog = (seat: string, screen: string, at: Date): Attention | undefined => {
-  const hit = DIALOGS.find(({ pattern }) => pattern.test(screen))
+  const hit = findDialog(screen)
   return hit ? { seat, reason: hit.reason, detail: hit.detail, at: at.toISOString() } : undefined
 }
 

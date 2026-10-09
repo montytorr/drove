@@ -23,6 +23,8 @@ test('the Codex version-mismatch dialog becomes a codex-version-mismatch attenti
 test('dialog table: folder trust, hook trust, channel confirm, and no match', () => {
   assert.equal(detect.matchDialog('s', 'Do you trust this folder?', NOW)?.reason, 'trust')
   assert.equal(detect.matchDialog('s', 'Do you trust the files in this folder?', NOW)?.reason, 'trust')
+  assert.equal(detect.matchDialog('s', 'Quick safety check: Is this a project you created or one you trust?', NOW)?.reason, 'trust')
+  assert.equal(detect.findDialog('Do you trust the files in this folder?')?.hint, 'Claude is asking to trust the folder')
   assert.equal(detect.matchDialog('s', '2 hooks need trust before they run', NOW)?.reason, 'hook-trust')
   assert.equal(detect.matchDialog('s', 'Loading development channels', NOW)?.reason, 'channel-confirm')
   assert.equal(detect.matchDialog('s', 'just a normal prompt', NOW), undefined)
