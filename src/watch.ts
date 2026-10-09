@@ -177,6 +177,13 @@ export const piggyback = async (deps: Deps, run: RunMeta, text: string, ports: W
   return withReports(text, ports.renderReports(reports, config?.humanName ?? 'the human'), reports.length)
 }
 
+const reportedThisEpisode = (seat: Seat): boolean => {
+  const report = seat.lastReport
+  if (!report || report.kind === 'progress') return false
+  const episodeStart = seat.state === 'working' ? seat.stateAt : seat.state === 'starting' ? seat.spawnedAt : undefined
+  return episodeStart !== undefined && Date.parse(report.at) >= Date.parse(episodeStart)
+}
+
 const attentionLine = (item: Attention) => `⚠ ${item.seat}: ${item.reason}: ${item.detail}`
 
 const clip = (text: string, max = 300) => (text.length > max ? `${text.slice(0, max)}…` : text)
@@ -364,7 +371,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     plannerAgentSession = planner?.sessionId ?? plannerAgentSession
     const current = await ports.loadRoster(deps.home, run.id)
     const derived = new Map<string, { state: Seat['state']; attention: Attention[] }>()
-    for (const seat of ports.openSeats(current)) {
+    for (const seat of ports.openSeats(current).filter((open) => open.state !== 'closing')) {
       const agent = listed.value.find((candidate) => candidate.name === seat.name) ?? listed.value.find((candidate) => seat.paneId !== undefined && candidate.paneId === seat.paneId)
       let screen: string | undefined
       if (agent?.status === 'blocked') {
@@ -381,7 +388,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       ...latest,
       seats: latest.seats.map((seat) => {
         const result = derived.get(seat.name)
-        if (!result || roster.CLOSED_STATES.has(seat.state)) return seat
+        if (!result || seat.state === 'closing' || roster.CLOSED_STATES.has(seat.state)) return seat
         const changed = result.state !== seat.state
         if (changed) transitions.push({ seat: seat.name, from: seat.state, to: result.state })
         return {
@@ -389,7 +396,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
           state: result.state,
           stateAt: changed ? at : seat.stateAt,
           attention: [...seat.attention.filter((item) => KEPT_ATTENTION.includes(item.reason)), ...result.attention],
-          ...(result.state === 'working' ? { lastWorkingAt: at } : {}),
+          ...(result.state === 'working' && !reportedThisEpisode(seat) ? { lastWorkingAt: at } : {}),
           ...(result.state === 'working' && seat.state !== 'working' ? { hasNudged: false } : {}),
         }
       }),

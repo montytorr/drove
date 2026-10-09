@@ -292,6 +292,11 @@ const closeEmptyTab = async (deps: Deps, run: RunMeta, roster: { seats: readonly
 class OverBudget extends Error {}
 class SeatTaken extends Error {}
 
+const keptWatcherFields = (recorded: Seat | undefined): Partial<Seat> => ({
+  ...(recorded?.lastReport ? { lastReport: recorded.lastReport, owes: recorded.owes } : {}),
+  ...(recorded?.hasNudged !== undefined ? { hasNudged: recorded.hasNudged } : {}),
+})
+
 export const spawn = async (deps: Deps, identity: Identity, request: SpawnRequest): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
   if (denied) return denied
@@ -412,6 +417,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   await updateRoster(deps.home, run.id, current =>
     upsertSeat(current, {
       ...seat,
+      ...keptWatcherFields(findSeat(current, seat.name)),
       paneId,
       state: isWorking ? 'working' : 'idle',
       ...(isWorking ? { lastWorkingAt: iso } : {}),
@@ -615,6 +621,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
   const seat = findSeat(await loadRoster(deps.home, run.id), seatName)
   if (!seat || seat.state === 'closed') return failed('no-seat', `no open seat named ${seatName}`)
   if (seat.paneId && seat.state !== 'gone' && seat.state !== 'down') {
+    await updateRoster(deps.home, run.id, current => ({ ...current, seats: current.seats.map(entry => (entry.name === seat.name ? { ...entry, state: 'closing', attention: [] } : entry)) }))
     await quitAgent(deps, seat, timing.closeWaitMs)
     const closed = await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
     if (!closed.ok && !/not.?found|no such|unknown/i.test(`${closed.code} ${closed.output}`)) return failed('herdr', `herdr could not close pane ${seat.paneId}: ${clip(closed.output)}`)

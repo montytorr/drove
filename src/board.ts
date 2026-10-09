@@ -26,6 +26,7 @@ const GLYPH: Record<SeatState, string> = {
   'needs-input': '?',
   unknown: '~',
   gone: '✕',
+  closing: '·',
   closed: '·',
   down: '↓',
 }
@@ -39,6 +40,7 @@ const TONE: Record<SeatState, string> = {
   'needs-input': '31',
   unknown: '2',
   gone: '2',
+  closing: '2',
   closed: '2',
   down: '2',
 }
