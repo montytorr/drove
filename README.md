@@ -2,6 +2,8 @@
 
 Drove runs one planner and several worker agents side by side in [herdr](https://herdr.dev) panes. You choose the planner: Claude Code or Codex. It splits work into Cairn tasks, starts a worker for each, reviews their diffs and merges. The workers write the code, each in its own pane and its own git worktree, and they are Claude Code or Codex under either planner.
 
+**Why the name.** A drove is a herd driven together, and the drover drives it: Drove runs on herdr and keeps one planner's workers moving. Drove roads were the old Scottish cattle routes the drovers walked to market, which fits the names in this family (Bothy, Cairn, Croft, Trig, Holloway).
+
 Three ways to start a planner:
 
 | Planner | Start it with | What you get |
