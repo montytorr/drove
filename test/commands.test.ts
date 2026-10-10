@@ -782,6 +782,15 @@ test('up --seat relaunches only a dead seat, and refuses a live one or one with 
   const none = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-x')
   assert.equal(!none.ok && none.code, 'relaunch')
   assert.match(none.text, /no saved session id/)
+  const events = (await readEvents(deps)).filter(item => item.type === 'seat.relaunch')
+  assert.equal(events.length, 2)
+  assert.equal(events[0]?.seat, 'w-a')
+  assert.equal(events[0]?.data?.ok, true)
+  assert.equal(events[0]?.data?.resumed, true)
+  assert.ok(events[0]?.data?.pane)
+  assert.equal(events[1]?.seat, 'w-x')
+  assert.equal(events[1]?.data?.ok, false)
+  assert.match(String(events[1]?.data?.error), /no saved session id/)
 })
 
 const settleSeat = async (deps: Deps, fake: FakeHerdr, name: string) => {
