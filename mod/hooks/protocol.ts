@@ -4,6 +4,9 @@ export const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 export const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
 export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 export const EXPECTS: readonly Expects[] = ['review', 'answer', 'none']
+// The human's name in feed entries; seat names are lowercase, so it never clashes with one.
+export const HUMAN = 'Human'
+export const DEFAULT_HUMAN_NAME = 'the human'
 
 export const isEffort = (value: unknown): value is Effort => typeof value === 'string' && (EFFORTS as readonly string[]).includes(value)
 export const isExpects = (value: unknown): value is Expects => typeof value === 'string' && (EXPECTS as readonly string[]).includes(value)

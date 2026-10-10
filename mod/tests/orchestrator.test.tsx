@@ -128,7 +128,7 @@ describe('bridge stream', () => {
   })
 
   test('a wake splits into one block per report', () => {
-    const blocks = splitWake('[worker w-a · done · expects review]\nAll green\n→ Review it\n\n[worker w-b · question for Cal · expects answer]\nWhich table?')
+    const blocks = splitWake('[worker w-a · done · expects review]\nAll green\n→ Review it\n\n[worker w-b · question for the human · expects answer]\nWhich table?')
     expect(blocks.map(({ seat, kind }) => [seat, kind])).toEqual([['w-a', 'done'], ['w-b', 'question']])
   })
 })
@@ -426,6 +426,19 @@ describe('orchestrator session', () => {
     expect(sections[1]?.text).toContain('Ship it')
     expect(sections[1]?.text).toContain(RUN)
     expect(sections[1]?.text).toContain('kind: codex')
+    expect(sections[1]?.text).toContain('the human switched this session into orchestrator mode')
+  })
+
+  test("the orchestrator section names the human from Drove's config.json", async ($, on) => {
+    const { world } = engine(on)
+    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ humanName: 'Sam' })
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    const sections = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections
+    expect(sections[1]?.text).toContain('Sam switched this session into orchestrator mode')
+    expect(sections[1]?.text).toContain('summarise for Sam:')
+    expect(sections[1]?.text).not.toContain('the human switched')
   })
 
   test('spawn_worker runs drove spawn with the brief on stdin, Claude or Codex', async ($, on) => {
@@ -446,7 +459,7 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'spawn')).toHaveLength(2)
   })
 
-  test('a full pane budget asks Cal; yes raises the budget by one and spawns, no refuses', async ($, on) => {
+  test('a full pane budget asks the human; yes raises the budget by one and spawns, no refuses', async ($, on) => {
     const { world } = engine(on)
     await $.session.start(START)
     await runCommand($, '')
@@ -689,7 +702,7 @@ describe('worker session', () => {
       ['another wrapper id', wrapped(pasted(BRIEF, '\n'), 'f00d')],
       ['two nested wrappers', wrapped(wrapped(pasted(BRIEF, '\n'), 'a1b2'), 'c3d4')],
       ['text after the wrapper', `${wrapped(pasted(BRIEF, '\n'))}\n\nthanks, go ahead`, 'thanks, go ahead'],
-      ['text before the wrapper', `Cal: please read this.${wrapped(pasted(BRIEF, '\n'))}`, 'Cal: please read this.'],
+      ['text before the wrapper', `Note: please read this.${wrapped(pasted(BRIEF, '\n'))}`, 'Note: please read this.'],
     ]
     for (const [name, text, extra] of cases) {
       await $.prompt.submit({ text, origin: { kind: 'composer' } } as never)
@@ -797,6 +810,8 @@ describe('worker session', () => {
     const [call] = droveCalls(world, 'mod')
     expect(call?.args).toEqual(['mod', 'report'])
     expect(JSON.parse(call?.stdin ?? '{}')).toEqual({ kind: 'question', summary: 'Drop the table?', for: 'human' })
+    await $.tool.call({ tool: 'mcp__orchestrator__report', kind: 'question', summary: 'Drop the column?', for: 'human' } as never)
+    expect(JSON.parse(droveCalls(world, 'mod')[1]?.stdin ?? '{}')).toEqual({ kind: 'question', summary: 'Drop the column?', for: 'human' })
   })
 
   test('the worker follows its seat model from the roster, and a verified promote moves it at once; a forged one does not', async ($, on) => {

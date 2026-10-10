@@ -284,7 +284,7 @@ const plannerRun = async (fake: FakeHerdr, overrides: Partial<RunMeta['planner']
 test('wakePlanner uses codex queue with the planner thread, even mid-turn', async () => {
   const fake = new FakeHerdr()
   const { deps, run } = await plannerRun(fake)
-  assert.deepEqual(await deliver.wakePlanner(deps, run, [report('w-api')], 'Cal'), { ok: true, via: 'codex-queue' })
+  assert.deepEqual(await deliver.wakePlanner(deps, run, [report('w-api')], 'Sam'), { ok: true, via: 'codex-queue' })
   assert.equal(fake.queued[0]?.thread, 'planner-thread')
   assert.match(fake.queued[0]?.text ?? '', /\[worker w-api · done · expects review\]/)
 })

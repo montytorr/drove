@@ -4,7 +4,7 @@ import * as prompts from '../src/prompts.ts'
 import type { DroveConfig, RunMeta, Seat } from '../src/types.ts'
 
 const config: DroveConfig = {
-  humanName: 'Cal',
+  humanName: 'Sam',
   plannerModel: { claude: 'claude-opus-5-5', codex: 'gpt-5' },
   plannerEffort: 'high',
   workerModel: { claude: 'claude-sonnet-5-5', codex: 'gpt-5' },
@@ -15,6 +15,7 @@ const config: DroveConfig = {
   codexWorkerSandbox: 'bypass',
   claudeChannel: false,
   briefVia: 'prompt',
+  workerEnv: {},
 }
 
 const run: RunMeta = {
@@ -47,7 +48,7 @@ const seat: Seat = {
 test('planner role uses the configured human and Drove tool names', () => {
   for (const kind of ['claude', 'codex'] as const) {
     const text = prompts.plannerRole(run, config, kind)
-    assert.match(text, /Cal started this session as the planner of Drove run drove-20261009-1042-a3f1 for this goal: ship P1/)
+    assert.match(text, /Sam started this session as the planner of Drove run drove-20261009-1042-a3f1 for this goal: ship P1/)
     assert.match(text, /up to 5 worker panes/)
     assert.match(text, /drove spawn tool/)
     assert.match(text, /Sonnet 5\.5/)
@@ -69,7 +70,7 @@ test('worker role covers rules, cairn, questions and reporting', () => {
   assert.match(text, /worker `w-api` of Drove run drove-20261009-1042-a3f1/)
   assert.match(text, /Never push\./)
   assert.match(text, /cairn claim <ref>/)
-  assert.match(text, /`for: human` when only Cal can decide/)
+  assert.match(text, /`for: human` when only Sam can decide/)
   assert.match(text, /`done`/)
   assert.match(text, /`progress`/)
   assert.doesNotMatch(text, /mcp__orchestrator__|\bcal\b/)
