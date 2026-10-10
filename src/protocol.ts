@@ -80,10 +80,20 @@ export const canonicalText = (text: string): string =>
 
 export const canonicalBody = (text: string): string => canonicalText(text).trim()
 
-export const macOf = (token: string, id: string, body: string): string =>
-  createHmac('sha256', token).update(`${id}\n${canonicalBody(body)}`).digest('hex').slice(0, MAC_LENGTH)
-
 const fieldValue = (value: string): string => value.replace(/[\s⟧]+/g, '_')
+
+// The mac covers every header field that changes what the worker does, not just the id and the body: an edit to model, effort,
+// kind, verdict, to, run or expects on a genuine envelope must fail it. The fields go in this fixed order, as `key=value` lines
+// (a missing field is an empty value), then the canonical body. mod/hooks/protocol.ts MAC_FIELDS and macOf mirror this; keep them identical.
+export const MAC_FIELDS = ['id', 'run', 'from', 'to', 'kind', 'verdict', 'model', 'effort', 'expects'] as const
+
+export type MacFields = Readonly<Record<string, string | undefined>>
+
+export const macInput = (fields: MacFields, body: string): string =>
+  ['drove v1', ...MAC_FIELDS.map(key => `${key}=${fieldValue(fields[key] ?? '')}`), '', canonicalBody(body)].join('\n')
+
+export const macOf = (token: string, fields: MacFields, body: string): string =>
+  createHmac('sha256', token).update(macInput(fields, body)).digest('hex').slice(0, MAC_LENGTH)
 
 export const replyLine = (kind: ControlKind, expects: Expects): string => {
   const via = 'Reply with the drove report tool (server drove)'
@@ -101,6 +111,7 @@ export const replyLine = (kind: ControlKind, expects: Expects): string => {
 
 export const formatControl = (control: Control, token: string): string => {
   const body = canonicalBody(control.body)
+  const signed = { id: control.id, run: control.run, from: control.from, to: control.to, kind: control.kind, verdict: control.verdict, model: control.model, effort: control.effort, expects: control.expects }
   const fields: [string, string | undefined][] = [
     ['run', control.run],
     ['from', control.from],
@@ -111,7 +122,7 @@ export const formatControl = (control: Control, token: string): string => {
     ['model', control.model],
     ['effort', control.effort],
     ['expects', control.expects],
-    ['mac', macOf(token, control.id, body)],
+    ['mac', macOf(token, signed, body)],
   ]
   const header = fields
     .filter((entry): entry is [string, string] => Boolean(entry[1]))
@@ -135,7 +146,7 @@ export const parseEnvelope = (text: string): Envelope | undefined => {
 export const verifyControl = (envelope: Envelope, token: string): boolean => {
   const { id, mac } = envelope.fields
   if (!id || !mac || !token) return false
-  const expected = Buffer.from(macOf(token, id, envelope.body))
+  const expected = Buffer.from(macOf(token, envelope.fields, envelope.body))
   const given = Buffer.from(mac)
   return expected.length === given.length && timingSafeEqual(expected, given)
 }

@@ -106,12 +106,23 @@ export const hmacSha256 = async (key: string, message: string): Promise<string> 
   return hex((await sha256(concat(outer, innerHash))).buffer as ArrayBuffer)
 }
 
-export const macOf = async (token: string, id: string, body: string): Promise<string> => (await hmacSha256(token, `${id}\n${canonicalBody(body)}`)).slice(0, MAC_LENGTH)
+const fieldValue = (value: string): string => value.replace(/[\s⟧]+/g, '_')
+
+// The mac covers every header field that changes what the worker does, not just the id and the body, in this fixed order as
+// `key=value` lines (a missing field is an empty value), then the canonical body. src/protocol.ts MAC_FIELDS and macInput
+// mirror this; keep them identical.
+export const MAC_FIELDS = ['id', 'run', 'from', 'to', 'kind', 'verdict', 'model', 'effort', 'expects'] as const
+
+export const macInput = (fields: Readonly<Record<string, string | undefined>>, body: string): string =>
+  ['drove v1', ...MAC_FIELDS.map(key => `${key}=${fieldValue(fields[key] ?? '')}`), '', canonicalBody(body)].join('\n')
+
+export const macOf = async (token: string, fields: Readonly<Record<string, string | undefined>>, body: string): Promise<string> =>
+  (await hmacSha256(token, macInput(fields, body))).slice(0, MAC_LENGTH)
 
 export const verifyEnvelope = async (envelope: Envelope, token: string | undefined): Promise<boolean> => {
   const { id, mac } = envelope.fields
   if (!id || !mac || !token) return false
-  return (await macOf(token, id, envelope.body)) === mac
+  return (await macOf(token, envelope.fields, envelope.body)) === mac
 }
 
 export const UNVERIFIED =

@@ -46,7 +46,7 @@ drove board                 # in a spare pane: live seats, states and what needs
 4. **Verdict.** The planner reads the diff and sends `approve` or `changes`. After an approve the worker commits its own paths and reports `done` again.
 5. **Close.** The planner merges, then closes the seat. A Claude seat is closed by closing its pane, never with `/exit`; Drove releases the worktree lock Claude leaves behind. Codex gets `/quit` first. A worktree is removed only on request and only when its branch is merged.
 
-Planner messages are signed with a per-seat token. A Claude worker with the mod marks any message that fails the check as unverified, and acts on a `promote` only when it verifies.
+Planner messages are signed with a per-seat token. The signature covers the header fields that change what a worker does (`kind`, `to`, `run`, `model`, `effort`, `verdict`, `expects`) as well as the body, so editing any of them on a genuine message fails the check. A Claude worker with the mod marks a message that fails the check as unverified, and acts on a `promote` only when it verifies. A Codex worker's `UserPromptSubmit` hook (`drove guard user-prompt-submit`) runs the same check and, on a failure, hands Codex the same "not signed by your planner" notice as additional context and a warning, without blocking the turn.
 
 `promote` changes a worker's model or effort, `demote` moves it back. `--model` is optional, so a Codex worker on Codex's default model can be promoted by effort alone. A Claude worker with the mod switches on its next request; otherwise, and for Codex, Drove restarts the agent with resume once it is idle.
 

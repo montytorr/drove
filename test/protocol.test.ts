@@ -54,13 +54,34 @@ test('a report round-trips through JSON after stamping', () => {
   assert.equal(protocol.validateReport(report).ok, true)
 })
 
-test('macOf is the first 16 hex of HMAC-SHA256', () => {
-  const mac = protocol.macOf(TOKEN, 'c-1', 'body')
+const FIELDS = { id: 'c-1', run: 'r-1', from: 'planner', to: 'w-api', kind: 'promote', model: 'claude-opus-5-5', effort: 'high', expects: 'none' }
+
+test('macOf is the first 16 hex of HMAC-SHA256 over the signed header fields and the body', () => {
+  const mac = protocol.macOf(TOKEN, FIELDS, 'body')
   assert.match(mac, /^[0-9a-f]{16}$/)
-  assert.equal(mac, protocol.macOf(TOKEN, 'c-1', 'body'))
-  assert.notEqual(mac, protocol.macOf(TOKEN, 'c-2', 'body'))
-  assert.notEqual(mac, protocol.macOf(TOKEN, 'c-1', 'bodY'))
-  assert.notEqual(mac, protocol.macOf('b'.repeat(64), 'c-1', 'body'))
+  assert.equal(mac, protocol.macOf(TOKEN, FIELDS, 'body'))
+  assert.notEqual(mac, protocol.macOf(TOKEN, { ...FIELDS, id: 'c-2' }, 'body'))
+  assert.notEqual(mac, protocol.macOf(TOKEN, FIELDS, 'bodY'))
+  assert.notEqual(mac, protocol.macOf('b'.repeat(64), FIELDS, 'body'))
+  assert.deepEqual(protocol.MAC_FIELDS, ['id', 'run', 'from', 'to', 'kind', 'verdict', 'model', 'effort', 'expects'])
+  assert.equal(
+    protocol.macInput(FIELDS, ' body \r\n'),
+    'drove v1\nid=c-1\nrun=r-1\nfrom=planner\nto=w-api\nkind=promote\nverdict=\nmodel=claude-opus-5-5\neffort=high\nexpects=none\n\nbody',
+  )
+  // pinned: mod/hooks/protocol.ts and mod/tests/orchestrator.test.tsx pin the same value for the same input
+  assert.equal(protocol.macOf('tok', FIELDS, 'Approved.\n\nShip it'), '82816e5fcc24eb4a')
+})
+
+test('every header field that changes behaviour is covered by the mac, and a missing field differs from a set one', () => {
+  const edits: Record<string, string> = { id: 'c-9', run: 'r-9', from: 'planner2', to: 'w-other', kind: 'brief', verdict: 'approve', model: 'claude-fable-5-1', effort: 'max', expects: 'review' }
+  const all = { ...FIELDS, verdict: 'changes' }
+  const base = protocol.macOf(TOKEN, all, 'body')
+  assert.notEqual(base, protocol.macOf(TOKEN, FIELDS, 'body'), 'a verdict that was not there before')
+  for (const key of protocol.MAC_FIELDS) {
+    assert.notEqual(protocol.macOf(TOKEN, { ...all, [key]: edits[key] }, 'body'), base, `editing ${key}`)
+    assert.notEqual(protocol.macOf(TOKEN, { ...all, [key]: undefined }, 'body'), base, `dropping ${key}`)
+  }
+  assert.equal(protocol.macOf(TOKEN, { ...all, extra: 'ignored' }, 'body'), base)
 })
 
 test('a control envelope round-trips and verifies', () => {
@@ -101,6 +122,23 @@ test('a MAC mismatch is detected', () => {
   assert.equal(protocol.verifyControl({ ...envelope, fields: noMac }, TOKEN), false)
 })
 
+test('editing a header field of a genuine envelope fails the mac', () => {
+  const genuine = protocol.formatControl({ ...control, kind: 'promote', verdict: undefined, model: 'claude-sonnet-5-5', effort: 'high', expects: 'none' }, TOKEN)
+  const envelope = protocol.parseEnvelope(genuine)
+  assert.ok(envelope)
+  assert.equal(protocol.verifyControl(envelope, TOKEN), true)
+  const edits: Record<string, string> = { model: 'claude-fable-5-1', effort: 'max', kind: 'demote', expects: 'review', to: 'w-other', run: 'drove-20991231-2359-ffff', from: 'human', verdict: 'approve' }
+  for (const [key, value] of Object.entries(edits)) {
+    assert.equal(protocol.verifyControl({ ...envelope, fields: { ...envelope.fields, [key]: value } }, TOKEN), false, `edited ${key}`)
+  }
+  const { effort: _effort, ...withoutEffort } = envelope.fields
+  assert.equal(protocol.verifyControl({ ...envelope, fields: withoutEffort }, TOKEN), false, 'dropped effort')
+  assert.equal(protocol.verifyControl({ ...envelope, fields: { ...envelope.fields, note: 'extra' } }, TOKEN), true, 'a key outside the signed set is ignored')
+  const verdict = protocol.parseEnvelope(protocol.formatControl(control, TOKEN))
+  assert.ok(verdict)
+  assert.equal(protocol.verifyControl({ ...verdict, fields: { ...verdict.fields, verdict: 'changes' } }, TOKEN), false, 'verdict approve edited to changes')
+})
+
 test('promote controls carry model and effort', () => {
   const text = protocol.formatControl({ ...control, kind: 'promote', verdict: undefined, model: 'claude-opus-5-5', effort: 'high', expects: 'none' }, TOKEN)
   const envelope = protocol.parseEnvelope(text)
@@ -112,7 +150,7 @@ test('a multi-paragraph envelope typed as a paste (CR or CRLF line ends, trailin
   const body = 'Plan — step one → verify · done   \n\nSecond paragraph, with a line that ends in blanks \t \n\nThird: ok'
   const text = protocol.formatControl({ ...control, kind: 'brief', verdict: undefined, expects: 'review', body }, TOKEN)
   assert.doesNotMatch(text, /[ \t]$/m)
-  assert.equal(protocol.macOf(TOKEN, 'c-17', body), protocol.macOf(TOKEN, 'c-17', body.replace(/\n/g, '\r\n')))
+  assert.equal(protocol.macOf(TOKEN, FIELDS, body), protocol.macOf(TOKEN, FIELDS, body.replace(/\n/g, '\r\n')))
   for (const eol of ['\n', '\r', '\r\n']) {
     const envelope = protocol.parseEnvelope(text.replace(/\n/g, eol))
     assert.ok(envelope)
