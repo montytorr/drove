@@ -754,7 +754,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
       await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'idle', owes: 'none', hasNudged: false }))
       return failed('delivery', `${seat.name} restarted on ${model || 'the default model'} at ${request.effort} effort, but herdr could not type the ${control.kind} notice into it: ${clip(typed.output)}`)
     }
-    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'working', lastWorkingAt: deps.clock.now().toISOString(), owes: 'none', hasNudged: false }))
+    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'working', lastWorkingAt: deps.clock.now().toISOString(), lastSentAt: deps.clock.now().toISOString(), owes: 'none', hasNudged: false }))
     const isUnconfirmed = typed !== undefined && !typed.ok
     await appendJsonl(join(seatDir(deps.home, run.id, seat.name), 'sent.jsonl'), { id: control.id, via, at: deps.clock.now().toISOString() })
     await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via, model, effort: request.effort, ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(adopted && !started.ok ? { startTimeout: started.code === 'timeout' } : {}) } })
@@ -928,7 +928,7 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
     const isResumed = Boolean(resumeText) && isUp && !isUndelivered
     const next: Seat = {
       ...seat, paneId, state: !isUp ? 'blocked' : isResumed ? 'working' : adopted?.state === 'working' ? 'working' : adopted?.state === 'starting' ? 'starting' : 'idle', stateAt: iso,
-      ...(isResumed ? { lastWorkingAt: iso } : {}),
+      ...(isResumed ? { lastWorkingAt: iso, lastSentAt: iso } : {}),
       attention: !isUp
         ? [{ seat: seat.name, reason: 'dialog', detail: 'The resumed agent stopped on a startup dialog; answer it in the pane.', at: iso }]
         : isUndelivered

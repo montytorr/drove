@@ -90,8 +90,10 @@ const hookWorkingAfter = (hooks: readonly HookRecord[], since: number, now: numb
 
 const idleWithoutReport = (seat: Seat, state: SeatState, reported: LastReport | undefined, now: Date): boolean => {
   if (!SETTLED.has(state) || !seat.lastWorkingAt) return false
-  const reportedAt = ms((reported ?? seat.lastReport)?.at)
+  const last = reported ?? seat.lastReport
+  const reportedAt = ms(last?.at)
   if (reportedAt >= ms(seat.lastWorkingAt)) return false
+  if (last && last.kind !== 'progress' && !(ms(seat.lastSentAt) > reportedAt)) return false
   return now.getTime() - ms(seat.stateAt) >= NUDGE_GRACE_MS
 }
 

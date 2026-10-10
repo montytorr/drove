@@ -176,6 +176,27 @@ test('idle without a report raises an attention item after the grace', () => {
   assert.deepEqual(early.attention, [])
 })
 
+test('a done worker that takes a hook turn after its report raises nothing and is not nudged', () => {
+  const seat = seatOf({ state: 'idle', lastWorkingAt: ago(60), stateAt: ago(30), lastReport: report('done', 'review', 100), owes: 'review' })
+  const derived = detect.deriveState(seat, { herdr: live('idle'), hooks: [], lastReport: seat.lastReport }, NOW)
+  assert.deepEqual(derived.attention, [])
+  assert.equal(detect.needsNudge({ ...seat, owes: 'none' }, NOW), false)
+})
+
+test('a worker messaged after its done report and then silent is still flagged', () => {
+  const seat = seatOf({ state: 'idle', lastWorkingAt: ago(60), stateAt: ago(30), lastReport: report('done', 'review', 100), lastSentAt: ago(80) })
+  const derived = detect.deriveState(seat, { herdr: live('idle'), hooks: [], lastReport: seat.lastReport }, NOW)
+  assert.deepEqual(derived.attention.map(item => item.reason), ['idle-without-report'])
+})
+
+test('an answered question followed by a silent stop is flagged, an unanswered one is not', () => {
+  const base = { state: 'idle' as const, lastWorkingAt: ago(60), stateAt: ago(30), lastReport: report('question', 'answer', 100) }
+  const unanswered = detect.deriveState(seatOf(base), { herdr: live('idle'), hooks: [], lastReport: base.lastReport }, NOW)
+  assert.deepEqual(unanswered.attention, [])
+  const answered = detect.deriveState(seatOf({ ...base, lastSentAt: ago(80) }), { herdr: live('idle'), hooks: [], lastReport: base.lastReport }, NOW)
+  assert.deepEqual(answered.attention.map(item => item.reason), ['idle-without-report'])
+})
+
 test('needsNudge: once per working episode, after the 20 s grace, never when a report followed', () => {
   const base = seatOf({ state: 'idle', stateAt: ago(25), lastWorkingAt: ago(60) })
   assert.equal(detect.needsNudge(base, NOW), true)
