@@ -2,3 +2,5 @@ node_modules/
 .claude/worktrees/
 *.log
 .DS_Store
+.env*
+.claude/settings.local.json
