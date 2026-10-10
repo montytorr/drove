@@ -167,11 +167,34 @@ export const COMMANDS: Record<string, Spec> = {
         io,
       ),
   },
+  migrate: {
+    usage: 'drove migrate <seat> --kind claude|codex [--model M] [--effort E] [--reason TEXT]',
+    why: 'move a worker to the other agent kind in the same worktree, with a handoff brief',
+    options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, reason: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(
+        await commands.migrate(commands.defaultDeps(), commands.identityOrPlanner(), {
+          seat: need(positionals[0], '<seat>'),
+          kind: need(str(values, 'kind'), '--kind') as AgentKind,
+          model: str(values, 'model'),
+          effort: str(values, 'effort') as Effort | undefined,
+          reason: str(values, 'reason'),
+        }),
+        io,
+      ),
+  },
   roster: {
     usage: 'drove roster [--json] [--run ID]',
     why: 'one line per seat',
     options: { json: { type: 'boolean' }, run: { type: 'string' } },
     run: async (values, _positionals, io) => print(await commands.roster(commands.defaultDeps(), runRef(values), values.json === true), io),
+  },
+  reports: {
+    usage: 'drove reports [<seat>] [--all] [--json] [--run ID]',
+    why: "the workers' reports in full, those not yet read (a seat's latest when it has none unread); --all for every report",
+    options: { all: { type: 'boolean' }, json: { type: 'boolean' }, run: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(await commands.reports(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { seat: positionals[0], all: values.all === true, asJson: values.json === true }), io),
   },
   capture: {
     usage: 'drove capture <seat> [--lines N] [--run ID]',

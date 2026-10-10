@@ -11,11 +11,11 @@ import * as herdr from './herdr.ts'
 import { type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readCodexHome, redactSpec, specFor, userClaudeConfig, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
-import { formatControl } from './protocol.ts'
+import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
-  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, PromoteRequest, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
+  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, MigrateRequest, PromoteRequest, Report, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
 export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string }
@@ -991,6 +991,170 @@ export const applyPendingPromotes = async (deps: Deps, run: RunMeta): Promise<Co
   return results
 }
 
+// ---------- migrate ----------
+
+const HANDOFF_LINES = 40
+const HANDOFF_REPORTS = 3
+
+export type Handoff = { from: AgentKind; reason?: string; brief?: string; base: string; log: string; diffStat: string; status: string; reports: readonly string[] }
+
+export const handoffText = (handoff: Handoff): string => `You replace a ${handoff.from} worker that hit its usage limit (or was migrated); its turn in flight is lost.${handoff.reason ? ` Reason: ${handoff.reason}.` : ''} You keep its worktree, its branch and its Cairn task. Read what it left below, check the worktree, then carry on with the brief.
+
+## The brief it was given
+${handoff.brief ?? '(none saved: this seat was spawned before Drove saved briefs; ask the planner for it with a question report)'}
+
+## Its commits (git log --oneline ${handoff.base}..HEAD)
+${handoff.log || '(none)'}
+
+## Uncommitted changes (git diff --stat HEAD)
+${handoff.diffStat || '(none)'}
+
+## git status --short
+${handoff.status || '(clean)'}
+
+## Its last reports
+${handoff.reports.length > 0 ? handoff.reports.join('\n') : '(none)'}`
+
+const firstLines = (text: string): string => {
+  const lines = text.split('\n')
+  return lines.length > HANDOFF_LINES ? [...lines.slice(0, HANDOFF_LINES), `… ${lines.length - HANDOFF_LINES} more lines`].join('\n') : text
+}
+
+const gitOutput = async (deps: Deps, worktree: string, args: readonly string[]): Promise<string> => {
+  const ran = await deps.exec(['git', '-C', worktree, ...args], { timeoutMs: 30_000 })
+  return ran.code === 0 ? firstLines(ran.stdout.trimEnd()) : `(git ${args.join(' ')} failed: ${clip(ran.stderr || ran.stdout, 200)})`
+}
+
+const reportLine = (report: Report): string => `- ${report.at} ${report.kind} (expects ${report.expects}): ${report.summary}${report.details ? `\n  ${clip(report.details, 600)}` : ''}`
+
+const ROLE_START = '# Worker mode'
+const ROLE_END = 'says how to reply.'
+
+// A Codex brief saved before DROVE-72 carries the worker role in front. The new agent gets the role its own way, so it is cut.
+const briefOf = (saved: string): string => {
+  const end = saved.indexOf(ROLE_END)
+  return saved.startsWith(ROLE_START) && end >= 0 ? saved.slice(end + ROLE_END.length).trim() : saved
+}
+
+const gatherHandoff = async (deps: Deps, run: RunMeta, seat: Seat, reason: string | undefined): Promise<Handoff> => {
+  const dir = seatDir(deps.home, run.id, seat.name)
+  const brief = briefOf((await readFile(join(dir, 'brief.md'), 'utf8').catch(() => '')).trim())
+  const log = await gitOutput(deps, seat.worktree, ['log', '--oneline', `${run.base}..HEAD`])
+  const diffStat = await gitOutput(deps, seat.worktree, ['diff', '--stat', 'HEAD'])
+  const status = await gitOutput(deps, seat.worktree, ['status', '--short'])
+  const reports = (await readJsonlFrom<Report>(join(dir, 'outbox.jsonl'), { offset: 0 })).items.slice(-HANDOFF_REPORTS).map(reportLine)
+  return { from: seat.kind, ...(reason ? { reason } : {}), ...(brief ? { brief } : {}), base: run.base, log, diffStat, status, reports }
+}
+
+// A conversation cannot move between Claude Code and Codex, but the work can (DROVE-69): the seat keeps its name, worktree,
+// branch, token and Cairn task, and the other kind starts fresh in that worktree with a handoff brief. A Claude seat runs
+// from the worktree without --worktree: Claude keys folder trust by the canonical git root, which for a linked worktree
+// is the main repo (Claude Code 2.1.296), so a Drove-made worktree of a trusted repo is trusted.
+export const migrate = async (deps: Deps, identity: Identity, request: MigrateRequest): Promise<CommandResult> => {
+  const denied = requirePlanner(identity)
+  if (denied) return denied
+  if (request.kind !== 'claude' && request.kind !== 'codex') return failed('usage', '--kind must be claude or codex')
+  if (request.effort && !EFFORTS.includes(request.effort)) return failed('usage', `--effort must be one of ${EFFORTS.join(', ')}`)
+  const located = await locateFor(deps, identity, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
+  const config = await loadConfig(deps.home)
+  const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
+  if (!seat || ['closed', 'closing', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
+  if (seat.kind === request.kind) return failed('usage', `${seat.name} is already a ${seat.kind} worker; use promote to change its model or effort`)
+  if (!existsSync(seat.worktree)) return failed('no-worktree', `${seat.name}'s worktree ${seat.worktree} is missing, so there is nothing to hand over; close the seat and spawn a new worker`)
+  const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
+  if (!token) return failed('no-token', `no token for ${seat.name}`)
+
+  const kind = request.kind
+  const model = resolveModel(kind, request.model, config)
+  const effort = request.effort ?? seat.effort
+  const iso = deps.clock.now().toISOString()
+  const oldSession = seat.sessionId ?? (await hookSessionId(deps, run.id, seat.name))
+  const briefText = handoffText(await gatherHandoff(deps, run, seat, request.reason))
+  const before = await markRestarting(deps, run.id, seat.name)
+  try {
+    const stop = await stopAgent(deps, seat, timing.exitWaitMs)
+    if (!stop.stopped) {
+      await restoreState(deps, run.id, seat.name, before)
+      return failed('restart', `${seat.name} did not stop after ${seat.kind === 'claude' ? 'its pane was closed' : '/quit'}${stop.detail ? ` (${stop.detail})` : ''}. Check the pane.`)
+    }
+    if (seat.paneId && !stop.paneClosed) {
+      const closed = await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
+      if (!closed.ok && !isPaneMissing(closed)) {
+        await restoreState(deps, run.id, seat.name, before)
+        return failed('herdr', `${seat.name} stopped but herdr could not close pane ${seat.paneId}: ${clip(closed.output)}`)
+      }
+    }
+    const notes = [
+      seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined,
+      seat.cairn ? await releaseCairnClaim(deps, seat.cairn) : undefined,
+    ].filter((note): note is string => Boolean(note))
+
+    const { sessionId: _session, codexHome: _home, pendingPromote: _pending, restartingSince: _since, ...kept } = seat
+    const sessionId = kind === 'claude' ? randomUUID() : undefined
+    const migrated: Seat = {
+      ...kept, kind, model, effort, state: 'starting', stateAt: iso, owes: 'none', hasNudged: false, attention: [],
+      ...(sessionId ? { sessionId } : {}),
+      ...(kind === 'codex' ? { codexHome: codexHomeDir(deps.home, run.id) } : {}),
+      migratedFrom: { kind: seat.kind, ...(oldSession ? { sessionId: oldSession } : {}), model: seat.model, at: iso, ...(request.reason ? { reason: request.reason } : {}) },
+    }
+    const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+    const extras = await launchExtrasOf(deps, run, config, migrated)
+    notes.push(...missingMcpNote(migrated, extras.missing))
+    const spec = specFor(
+      launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: seat.worktree, model, effort, roleText: workerRole(run, config), inWorktree: true, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
+    )
+    await writeLaunchFiles(spec)
+    await writeLaunchJson(deps, run.id, seat.name, spec)
+
+    const lost = async (why: string): Promise<void> => {
+      const at = deps.clock.now().toISOString()
+      const detail = `migrate to ${kind} failed (${clip(why, 160)}); \`drove up --seat ${seat.name}\` resumes the ${seat.kind} session, or run \`drove migrate\` again`
+      await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...kept, ...(oldSession ? { sessionId: oldSession } : {}), ...(seat.codexHome ? { codexHome: seat.codexHome } : {}), paneId: undefined, state: 'gone', stateAt: at, attention: [{ seat: seat.name, reason: 'gone', detail, at }] }))
+    }
+    const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
+    const placement = await placePane(deps, run, others, seat.worktree, spec.env)
+    if (!isPlacement(placement)) {
+      await lost(placement.text)
+      return failed('migrate', `${seat.name} stopped but no pane could be placed for ${kind}: ${clip(placement.text)}. \`drove up --seat ${seat.name}\` resumes the ${seat.kind} session.`)
+    }
+    const { started, adopted, paneId } = await startWithRetry(deps, run, {
+      seat: seat.name, kind, argv: spec.argv, paneId: placement.paneId, ...(placement.createdTab ? { createdTab: placement.createdTab } : {}),
+      place: () => placePane(deps, run, others, seat.worktree, spec.env),
+    })
+    const event = { from: seat.kind, to: kind, model, effort, pane: paneId, worktree: seat.worktree, branch: seat.branch, ...(request.reason ? { reason: request.reason } : {}) }
+
+    if (!started.ok && started.code === 'agent_not_ready') {
+      const screen = await herdr.readScreen(deps.exec, paneId, 40, 'visible')
+      const at = deps.clock.now().toISOString()
+      const attention = (screen.ok ? matchDialog(seat.name, screen.value, deps.clock.now()) : undefined) ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at }
+      await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...migrated, paneId, state: 'blocked', stateAt: at, attention: [attention] }))
+      await recordEvent(deps, run.id, { type: 'seat.migrate', seat: seat.name, data: { ...event, blocked: attention.reason } })
+      await queueBrief(deps, run, seat.name, briefText)
+      return ok(`${seat.name} moved from ${seat.kind} to ${kind} in pane ${paneId}, but the new agent stopped on a dialog (${attention.reason}): ${attention.detail} The handoff brief is queued.${notes.map(note => ` ${note}`).join('')}`, { state: 'blocked', paneId })
+    }
+    if (!started.ok && !adopted) {
+      const captured = await captureStartFailure(deps, run, seat.name, paneId, started)
+      await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
+      await lost(started.output)
+      return failed('migrate', `${seat.name} stopped but ${kind} did not start: ${clip(started.output)}.${hintText(captured)} \`drove up --seat ${seat.name}\` resumes the ${seat.kind} session.`)
+    }
+
+    const live = started.ok ? await herdr.getAgent(deps.exec, paneId) : undefined
+    const liveSession = (live?.ok ? live.value.sessionId : undefined) ?? adopted?.sessionId
+    await updateRoster(deps.home, run.id, roster =>
+      upsertSeat(roster, { ...migrated, paneId, state: adopted ? adopted.state : 'idle', stateAt: deps.clock.now().toISOString(), ...(liveSession && !sessionId ? { sessionId: liveSession } : {}) }),
+    )
+    await recordEvent(deps, run.id, { type: 'seat.migrate', seat: seat.name, data: event })
+    const via = await queueBrief(deps, run, seat.name, briefText)
+    return ok(`${seat.name} moved from ${seat.kind} to ${kind}${model ? ` ${model}` : ''} ${effort} in pane ${paneId}, worktree ${seat.worktree} on branch ${seat.branch}. Handoff brief: ${via}.${notes.map(note => ` ${note}`).join('')}`, { paneId, kind, branch: seat.branch })
+  } finally {
+    await clearRestarting(deps, run.id, seat.name)
+  }
+}
+
 // ---------- roster / capture ----------
 
 export const roster = async (deps: Deps, ref: RunRef, asJson: boolean): Promise<CommandResult> => {
@@ -1013,6 +1177,43 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
   if (!seat) return failed('no-seat', `no seat named ${seatName}`)
   const screen = await herdr.readScreen(deps.exec, herdr.agentTarget(located.run.id, seat), Number.isFinite(lines) && lines > 0 ? lines : 80)
   return screen.ok ? ok(screen.value) : failed('herdr', `could not read ${seat.name}: ${screen.code}`)
+}
+
+// ---------- reports ----------
+
+// The planner reads its workers' reports in full here: a wake shows it one line per report. Read ids are kept in the planner's folder.
+export type ReportsRequest = { seat?: string; all?: boolean; asJson?: boolean }
+
+const readReportsPath = (home: string, run: string): string => join(plannerDir(home, run), 'reports-read.json')
+
+const seatReports = async (deps: Deps, run: RunMeta, seat: string): Promise<Report[]> => {
+  const dir = seatDir(deps.home, run.id, seat)
+  const token = await readToken(join(dir, 'token'))
+  if (!token) return []
+  const { items } = await readJsonlFrom<Partial<Report> | null>(join(dir, 'outbox.jsonl'), { offset: 0 })
+  return items.filter((item): item is Report =>
+    item?.v === 1 && item.run === run.id && item.seat === seat && item.token === token && typeof item.id === 'string' && typeof item.summary === 'string' && item.kind !== 'progress' && REPORT_KINDS.includes(item.kind as Report['kind']),
+  )
+}
+
+export const reports = async (deps: Deps, identity: Identity, ref: RunRef, request: ReportsRequest): Promise<CommandResult> => {
+  const denied = requirePlanner(identity)
+  if (denied) return denied
+  const located = await locateRun(deps, ref, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  const roster = await loadRoster(deps.home, run.id)
+  if (request.seat && !findSeat(roster, request.seat)) return failed('no-seat', `no seat named ${request.seat}`)
+  const seats = request.seat ? [request.seat] : roster.seats.map(seat => seat.name)
+  const all = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().sort((a, b) => a.at.localeCompare(b.at))
+  const read = new Set((await readJson<string[]>(readReportsPath(deps.home, run.id))) ?? [])
+  const unread = all.filter(report => !read.has(report.id))
+  const picked = request.all ? all : unread.length > 0 || !request.seat ? unread : all.slice(-1)
+  if (picked.some(report => !read.has(report.id))) await writeJsonAtomic(readReportsPath(deps.home, run.id), [...read, ...picked.filter(report => !read.has(report.id)).map(report => report.id)])
+  const shown = picked.map(({ v: _v, token: _token, run: _run, ...rest }) => rest)
+  if (request.asJson) return ok(JSON.stringify({ run: run.id, reports: shown }, null, 2), { run: run.id, reports: shown })
+  if (picked.length === 0) return ok(request.seat ? `${request.seat} has not reported yet` : 'no unread reports', { run: run.id, reports: shown })
+  return ok(renderReports(picked, (await loadConfig(deps.home)).humanName), { run: run.id, reports: shown })
 }
 
 // ---------- close ----------

@@ -23,6 +23,7 @@ const fakeCommands = () => {
     send: record('send', 2),
     prompt: record('prompt', 2),
     promote: record('promote', 2),
+    migrate: record('migrate', 2),
     roster: record('roster'),
     capture: record('capture'),
     close: record('close', 2),
@@ -115,6 +116,7 @@ test('planner tools map their arguments onto the commands', async () => {
   await tool('verdict').call({ seat: 'w-ui', verdict: 'changes', notes: 'rename x' })
   await tool('prompt').call({ seat: 'w-ui', text: 'hello' })
   await tool('promote').call({ seat: 'w-ui', model: 'opus', effort: 'max', reason: 'hard' })
+  await tool('migrate').call({ seat: 'w-ui', kind: 'codex', reason: 'usage limit' })
   await tool('close').call({ seat: 'w-ui', removeWorktree: true })
   await tool('roster').call({ json: true })
   await tool('capture').call({ seat: 'w-ui', lines: 20 })
@@ -128,6 +130,7 @@ test('planner tools map their arguments onto the commands', async () => {
     { name: 'send', args: [{ seat: 'w-ui', kind: 'verdict', verdict: 'changes', body: 'rename x', expects: 'review' }] },
     { name: 'prompt', args: ['w-ui', 'hello'] },
     { name: 'promote', args: [{ seat: 'w-ui', model: 'opus', effort: 'max', reason: 'hard' }] },
+    { name: 'migrate', args: [{ seat: 'w-ui', kind: 'codex', model: undefined, effort: undefined, reason: 'usage limit' }] },
     { name: 'close', args: ['w-ui', true] },
     { name: 'roster', args: [ref, true] },
     { name: 'capture', args: [ref, 'w-ui', 20] },
@@ -160,6 +163,8 @@ test('planner tools reject bad arguments before calling a command', async () => 
     ['verdict', { seat: 'w-ui', verdict: 'changes' }],
     ['verdict', { seat: 'w-ui', verdict: 'maybe' }],
     ['promote', { seat: 'w-ui', model: 'm', effort: 'huge' }],
+    ['migrate', { seat: 'w-ui', kind: 'gemini' }],
+    ['migrate', { seat: 'w-ui' }],
     ['capture', { seat: 'w-ui', lines: -3 }],
     ['close', { seat: 'w-ui', removeWorktree: 'yes' }],
   ]

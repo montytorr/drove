@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'close', 'roster', 'capture', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'roster', 'capture', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -218,6 +218,20 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       ['seat', 'model', 'effort'],
       async (args) =>
         asResult(await cmd.promote(deps, identity, { seat: seatName(args), model: text(args, 'model') as string, effort: oneOf(args, 'effort', EFFORTS) as Effort, reason: text(args, 'reason', false) })),
+    ),
+    defineTool(
+      'migrate',
+      'Move a worker to the other agent kind (Claude to Codex or Codex to Claude), usually because it hit its usage limit. The seat keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost.',
+      {
+        seat: seatProp,
+        kind: { type: 'string', enum: KINDS, description: 'The kind to move to.' },
+        model: { type: 'string', description: 'Model for the new kind (default: that kind\'s worker model).' },
+        effort: { type: 'string', enum: EFFORTS, description: 'Effort (default: the seat\'s current effort).' },
+        reason: { type: 'string', description: 'Why, shown to the new worker.' },
+      },
+      ['seat', 'kind'],
+      async (args) =>
+        asResult(await cmd.migrate(deps, identity, { seat: seatName(args), kind: oneOf(args, 'kind', KINDS) as AgentKind, model: text(args, 'model', false), effort: oneOf(args, 'effort', EFFORTS, false), reason: text(args, 'reason', false) })),
     ),
     defineTool(
       'close',

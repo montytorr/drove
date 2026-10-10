@@ -75,6 +75,7 @@ export type Seat = {
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
   restartingSince?: string
+  migratedFrom?: { kind: AgentKind; sessionId?: string; model: string; at: string; reason?: string }
   attention: Attention[]
 }
 
@@ -92,6 +93,7 @@ export type DroveEventType =
   | 'seat.spawn'
   | 'seat.start_failed'
   | 'seat.relaunch'
+  | 'seat.migrate'
   | 'seat.state'
   | 'seat.close'
   | 'report'

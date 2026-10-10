@@ -4,7 +4,7 @@ import type { Engine } from 'claude-code/testing'
 
 import type { RunMeta, Seat } from '../types'
 import { buildBoard, fixedRows, gauge, needsAnimation, progressOf } from '../hooks/board'
-import { backoffMs, feedOf, parseLine, splitLines, splitWake, wakeHeadlines } from '../hooks/bridge'
+import { HEADLINE_SUMMARY_MAX, backoffMs, feedOf, parseLine, splitLines, splitWake, wakeHeadlines } from '../hooks/bridge'
 import { attachArgs, failureOf, guardStdin, guardVerdictOf, jsonResultOf, spawnArgs } from '../hooks/drove'
 import { UNVERIFIED, hmacSha256, locateEnvelope, macOf, parseEnvelope, raiseEffort, renderControl, shortModel, verifyEnvelope } from '../hooks/protocol'
 
@@ -131,10 +131,14 @@ describe('bridge stream', () => {
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: false, error: 'no pane' } }, bodies)).toMatchObject({ kind: 'failed', summary: 'relaunch failed: no pane' })
   })
 
-  test('a wake splits into one block per report', () => {
-    const blocks = splitWake('[worker w-a · done · expects review]\nAll green\n→ Review it\n\n[worker w-b · question for the human · expects answer]\nWhich table?')
-    expect(blocks.map(({ seat, kind }) => [seat, kind])).toEqual([['w-a', 'done'], ['w-b', 'question']])
-    expect(wakeHeadlines(blocks)).toBe('w-a · done · expects review\nw-b · question for the human · expects answer')
+  test('a wake splits into one block per report, each shown as its head and its summary', () => {
+    const blocks = splitWake('[worker w-a · done · expects review]\nAll green\n→ Review it\n\n[worker w-b · question for the human · expects answer]\nWhich table?\n\n[worker w-c · blocked · expects answer]\n→ Unblock it')
+    expect(blocks.map(({ seat, kind }) => [seat, kind])).toEqual([['w-a', 'done'], ['w-b', 'question'], ['w-c', 'blocked']])
+    expect(wakeHeadlines(blocks)).toBe('w-a · done · expects review — All green\nw-b · question for the human · expects answer — Which table?\nw-c · blocked · expects answer')
+    const long = wakeHeadlines(splitWake(`[worker w-a · done · expects review]\n${'word '.repeat(60)}\n→ Review it`))
+    expect(long.startsWith('w-a · done · expects review — word word')).toBe(true)
+    expect(long.endsWith('…')).toBe(true)
+    expect(long.length).toBe('w-a · done · expects review — '.length + HEADLINE_SUMMARY_MAX)
   })
 })
 
@@ -277,6 +281,7 @@ const fakeDrove = (world: World, call: Call) => {
     return ok(`Pane budget for run ${RUN} is now ${action}.`)
   }
   if (command === 'roster') return ok(`run ${RUN} · repo · up · budget 5\nw-auth working`)
+  if (command === 'reports') return ok('[worker w-auth · done · expects review]\nRate limiter added\nBranch worktree-w-auth, 12 tests pass\n→ Review the work')
   return ok(`${command} ok`)
 }
 
@@ -432,6 +437,26 @@ describe('orchestrator session', () => {
     expect(sections[1]?.text).toContain(RUN)
     expect(sections[1]?.text).toContain('kind: codex')
     expect(sections[1]?.text).toContain('the human switched this session into orchestrator mode')
+    expect(sections[1]?.text).toContain('A wake shows one line per worker report')
+    expect(sections[1]?.text).toContain('call mcp__orchestrator__read_reports for the full text')
+  })
+
+  test("read_reports returns the workers' full reports through drove reports, for one worker or all of them", async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    expect(denial(await callTool($, 'read_reports', {}))).toContain('Orchestrator mode is off')
+    await runCommand($, 'Ship it')
+    expect(world.registeredTools).toContain('read_reports')
+    const read = String((await callTool($, 'read_reports', {})).result)
+    expect(read).toContain('Branch worktree-w-auth, 12 tests pass')
+    await callTool($, 'read_reports', { name: 'w-auth' })
+    await callTool($, 'read_reports', { name: ' ', all: true })
+    expect(droveCalls(world, 'reports').map(({ args }) => args)).toEqual([
+      ['reports', '--run', RUN],
+      ['reports', 'w-auth', '--run', RUN],
+      ['reports', '--all', '--run', RUN],
+    ])
+    expect(droveCalls(world, 'reports')[0]?.env).toMatchObject({ DROVE_RUN: RUN, DROVE_ROLE: 'planner' })
   })
 
   test("the orchestrator section names the human from Drove's config.json", async ($, on) => {
@@ -508,7 +533,24 @@ describe('orchestrator session', () => {
     expect(String((await callTool($, 'roster', {})).result)).toContain('w-auth working')
   })
 
-  test('a wake from the bridge becomes a prompt of its own: the person sees one line per report, the model also reads the reports in a hidden row; the roster feeds the pills', async ($, on) => {
+  test('migrate_worker is drove migrate to the other kind, and refuses the same kind', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat(), seat({ name: 'w-cx', kind: 'codex', model: 'gpt-5' })], updatedAt: ISO }, status: {} })
+    expect(world.registeredTools).toContain('migrate_worker')
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-auth', kind: 'codex', reason: 'usage limit' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'migrate')[0]?.args).toEqual(['migrate', 'w-auth', '--kind', 'codex', '--reason', 'usage limit'])
+    await callTool($, 'migrate_worker', { name: 'w-cx', kind: 'claude', model: 'opus', effort: 'high' })
+    expect(droveCalls(world, 'migrate')[1]?.args).toEqual(['migrate', 'w-cx', '--kind', 'claude', '--model', 'claude-opus-5-5', '--effort', 'high'])
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-auth', kind: 'claude' })) as never)).toContain('already a claude worker')
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-auth', kind: 'gemini' })) as never)).toContain('kind must be')
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-none', kind: 'codex' })) as never)).toContain('No open worker')
+    expect(droveCalls(world, 'migrate')).toHaveLength(2)
+  })
+
+  test('a wake from the bridge becomes a prompt of its own: one line per report with its summary, no hidden row; the roster feeds the pills', async ($, on) => {
     const { world, clock } = engine(on)
     const session = mock.session(on)
     await $.session.start(START)
@@ -518,23 +560,12 @@ describe('orchestrator session', () => {
     world.submitted.length = 0
     const wake = "[worker w-auth · done · expects review]\nRate limiter added\n→ Review the work\n\n[worker w-api · question for Cal · expects answer]\nWhich port?\n→ This decision is Cal's"
     await emit(world, clock, { t: 'wake', text: wake })
-    const headlines = 'w-auth · done · expects review\nw-api · question for Cal · expects answer'
+    const headlines = 'w-auth · done · expects review — Rate limiter added\nw-api · question for Cal · expects answer — Which port?'
     expect(world.submitted).toEqual([headlines])
-    expect(session.appended()).toHaveLength(0)
     await $.turn.start({ text: `The orchestrator plugin sent a message: ${headlines}`, turnId: 't-wake' })
-    const rows = session.appended()
-    expect(rows).toHaveLength(1)
-    expect(rows[0]?.message.type).toBe('user')
-    expect(rows[0]?.door).toBe('note')
-    const hidden = JSON.stringify(rows[0]?.message.content)
-    expect(hidden).toContain(JSON.stringify(wake).slice(1, -1))
-    expect(hidden).toContain('The person sees only the headlines')
-    await $.turn.start({ text: headlines, turnId: 't-again' })
-    expect(session.appended()).toHaveLength(1)
+    expect(session.appended()).toHaveLength(0)
     await emit(world, clock, { t: 'wake', text: 'not a report block' })
     expect(world.submitted.at(-1)).toBe('not a report block')
-    await $.turn.start({ text: 'not a report block', turnId: 't-plain' })
-    expect(session.appended()).toHaveLength(1)
     expect(world.toasts).toContain('w-auth: done, w-api: question')
     const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
     expect((await ui.find({ type: 'Text', text: /orchestrator · 1\/5/ }))?.text).toContain('⌘')

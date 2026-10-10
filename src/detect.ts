@@ -108,6 +108,20 @@ export const matchDialog = (seat: string, screen: string, at: Date): Attention |
 const latest = (hooks: readonly HookRecord[], events: readonly HookRecord['event'][]): HookRecord | undefined =>
   hooks.reduce<HookRecord | undefined>((best, hook) => (events.includes(hook.event) && !(ms(hook.at) < ms(best?.at)) ? hook : best), undefined)
 
+const LIMIT_ERRORS = /^(?:rate_limit|billing_error)\b/
+
+// Claude's StopFailure hook (DROVE-69) is a durable usage-limit signal: it holds after the limit text has scrolled
+// off the screen, until the seat starts or takes a prompt again.
+const hookLimit = (seat: string, hooks: readonly HookRecord[], at: string): Attention | undefined => {
+  const failure = latest(hooks, ['stop-failure'])
+  const detail = failure?.detail ?? ''
+  if (!failure || !LIMIT_ERRORS.test(detail)) return undefined
+  const after = latest(hooks, ['session-start', 'user-prompt-submit', 'pre-tool-use', 'stop'])
+  if (after && ms(after.at) > ms(failure.at)) return undefined
+  const reset = CLAUDE_RESET.exec(detail)?.[1]?.trim()
+  return { seat, reason: 'usage-limit', detail: reset ? limitDetail(reset) : `hit its usage limit (${detail.split(':')[0]})`, at }
+}
+
 const isPermissionAsk = (hook: HookRecord): boolean => hook.event === 'permission-request' || (hook.event === 'notification' && PERMISSION_NOTICE.test(hook.detail ?? ''))
 
 const pendingAsk = (hooks: readonly HookRecord[]): HookRecord | undefined => {
@@ -146,7 +160,7 @@ export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derive
     return { state: 'gone', attention }
   }
 
-  const dialog = signals.screen ? matchDialog(seat.name, signals.screen, now) : undefined
+  const dialog = (signals.screen ? matchDialog(seat.name, signals.screen, now) : undefined) ?? hookLimit(seat.name, hooks, at)
   const ask = pendingAsk(hooks)
   const isAskLive = ask !== undefined && (herdr?.status !== 'working' || nowMs - ms(ask.at) <= HOOK_FRESH_MS)
 

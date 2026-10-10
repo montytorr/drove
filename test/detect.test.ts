@@ -291,6 +291,20 @@ test('usage limit: needsNudge never fires for a seat carrying the item', () => {
   assert.equal(detect.needsNudge(limited, NOW), false)
 })
 
+test('usage limit: a StopFailure rate_limit or billing_error hook gives the item with no limit text on screen, until the seat works again', () => {
+  const seat = seatOf({ state: 'idle', lastWorkingAt: ago(100), stateAt: ago(40) })
+  const limited = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('session-start', 300), hook('user-prompt-submit', 200), hook('stop-failure', 90, 'rate_limit')] }, NOW)
+  assert.equal(limited.state, 'blocked')
+  assert.deepEqual(limited.attention.map(item => [item.reason, item.detail]), [['usage-limit', 'hit its usage limit (rate_limit)']])
+  assert.equal(detect.needsNudge({ ...seat, state: limited.state, attention: limited.attention }, NOW), false)
+  const billing = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('stop-failure', 90, "billing_error: You're out of extra usage · resets 11:30pm")] }, NOW)
+  assert.deepEqual(billing.attention.map(item => [item.reason, item.detail]), [['usage-limit', 'hit its usage limit (resets 11:30pm)']])
+  const resumed = detect.deriveState(seat, { herdr: live('working'), hooks: [hook('stop-failure', 90, 'rate_limit'), hook('user-prompt-submit', 5)] }, NOW)
+  assert.equal(resumed.attention.some(item => item.reason === 'usage-limit'), false)
+  const overloaded = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('stop-failure', 90, 'overloaded')] }, NOW)
+  assert.equal(overloaded.attention.some(item => item.reason === 'usage-limit'), false)
+})
+
 test('shouldReadScreen: a seat that went idle with no report since it worked is read even after its hooks fired', () => {
   const started = [hook('session-start', 500), hook('user-prompt-submit', 400)]
   const silent = seatOf({ state: 'idle', lastWorkingAt: ago(100), stateAt: ago(40) })
