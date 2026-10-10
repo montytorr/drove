@@ -138,6 +138,9 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         effort: { type: 'string', enum: EFFORTS, description: 'Optional reasoning effort override.' },
         base: { type: 'string', description: 'Optional base branch for a Codex worktree (default: origin/main, or main without a remote). Ignored for Claude, which branches from the main checkout\'s current HEAD.' },
         mcp: { type: 'array', items: { type: 'string' }, description: 'Optional: the user MCP servers this worker needs, by name (e.g. ["mongodb"]). Given, the worker loads Drove\'s server, these and the configured workerMcp only; [] for Drove\'s alone. Left out, it loads what workerMcp allows, or everything when that is unset.' },
+        owns: { type: 'array', items: { type: 'string' }, description: 'Optional: globs, relative to the worker\'s worktree, of the files it may change (e.g. ["src/guard.ts", "test/**"]). Given, Drove\'s guard refuses the worker\'s edits to any other file and tells it to ask you. Left out, the worker may edit anywhere.' },
+        maxTurns: { type: 'integer', minimum: 1, description: 'Optional: how many turns (stops) the worker may take. At the limit you get a budget attention and the worker is told once to report progress or promote and stop; it is not killed. Left out, the configured maxTurns applies, or none.' },
+        maxTokens: { type: 'integer', minimum: 1, description: 'Optional: how many tokens (input, cached input and output, read from the agent\'s own transcript) the worker may use. Same effect at the limit as maxTurns.' },
       },
       ['seat', 'kind', 'brief'],
       async (args) => {
@@ -154,6 +157,9 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
             effort: oneOf(args, 'effort', EFFORTS, false),
             base: text(args, 'base', false),
             ...(args.mcp != null ? { mcp: names(args, 'mcp') } : {}),
+            ...(args.owns != null ? { owns: names(args, 'owns') } : {}),
+            ...(args.maxTurns != null ? { maxTurns: count(args, 'maxTurns', 1) } : {}),
+            ...(args.maxTokens != null ? { maxTokens: count(args, 'maxTokens', 1) } : {}),
           }),
         )
       },

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { realpath } from 'node:fs/promises'
 import { beforeEach, test } from 'node:test'
-import { COMMANDS, main } from '../src/cli.ts'
+import { COMMANDS, main, splitGlobs } from '../src/cli.ts'
 import type { ProcessPlan } from '../src/commands.ts'
 import { saveRun } from '../src/roster.ts'
 import { makeRepo, makeRun, RUN, tmp } from './p3-helpers.ts'
@@ -23,6 +23,22 @@ beforeEach(async () => {
 
 test('cli knows the commands from the design', () => {
   assert.deepEqual(Object.keys(COMMANDS), ['plan', 'spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'board', 'down', 'up', 'budget', 'guard', 'mcp', 'mod'])
+})
+
+test('--owns splits on commas outside braces, and spawn reads --owns, --max-turns and --max-tokens', async () => {
+  assert.deepEqual(splitGlobs('src/a.ts, test/**/*.{ts,tsx} ,{README,DESIGN}.md,'), ['src/a.ts', 'test/**/*.{ts,tsx}', '{README,DESIGN}.md'])
+  assert.deepEqual(splitGlobs('a}, b'), ['a}', 'b'])
+  assert.match(COMMANDS.spawn?.usage ?? '', /--owns GLOB,GLOB.*--max-turns N.*--max-tokens N/)
+  const base = ['spawn', 'w-api', '--kind', 'claude', '--brief', 'x']
+  for (const [extra, message] of [
+    [['--owns', 'src/**,../other'], /--owns takes globs relative to the worktree/],
+    [['--max-turns', 'abc'], /--max-turns must be a whole number of at least 1/],
+    [['--max-tokens', '0'], /--max-tokens must be a whole number of at least 1/],
+  ] as const) {
+    const { err, io } = capture()
+    assert.equal(await main([...base, ...extra], io), 1)
+    assert.match(err.join('\n'), message)
+  }
 })
 
 test('cli --help prints usage and exits 0', async () => {

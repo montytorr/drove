@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import * as paths from '../src/paths.ts'
 
 test('env names are fixed', () => {
-  assert.deepEqual(Object.values(paths.ENV), ['DROVE_HOME', 'DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN'])
+  assert.deepEqual(Object.values(paths.ENV), ['DROVE_HOME', 'DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_OWNS'])
 })
 
 test('seat names follow the herdr agent-name rule', () => {
@@ -37,6 +37,17 @@ test('identity round-trips through the env', () => {
   const env = paths.identityEnv(identity)
   assert.deepEqual(env, { DROVE_HOME: '/h', DROVE_RUN: 'r1', DROVE_ROLE: 'worker', DROVE_SEAT: 'w-api', DROVE_TOKEN: 'abc' })
   assert.deepEqual(paths.identityFromEnv(env), identity)
+})
+
+test('a worker owned globs travel as one JSON env value, commas in braces intact', () => {
+  const owns = ['src/guard.ts', 'test/**/*.{ts,tsx}']
+  const identity = { home: '/h', run: 'r1', role: 'worker' as const, seat: 'w-api', token: 'abc', owns }
+  const env = paths.identityEnv(identity)
+  assert.equal(env.DROVE_OWNS, JSON.stringify(owns))
+  assert.deepEqual(paths.identityFromEnv(env), identity)
+  assert.equal('DROVE_OWNS' in paths.identityEnv({ ...identity, owns: [] }), false)
+  assert.equal(paths.identityFromEnv({ ...env, DROVE_OWNS: 'src/a' })?.owns, undefined)
+  assert.equal(paths.identityFromEnv({ ...env, DROVE_OWNS: '[1]' })?.owns, undefined)
 })
 
 test('planner identity has no token', () => {

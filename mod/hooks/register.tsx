@@ -231,6 +231,9 @@ const ORCHESTRATOR_TOOLS = [
         model: { type: 'string', description: 'Claude: sonnet (default) or opus, or a full model id. Codex: a model id, or leave out for Drove’s default' },
         cairn: { type: 'string', description: 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
         mcp: { type: 'array', items: { type: 'string' }, description: 'optional: the user MCP servers this worker needs, by name; [] for Drove’s alone. Left out, Drove’s workerMcp setting decides' },
+        owns: { type: 'array', items: { type: 'string' }, description: 'optional: globs, relative to the worktree, of the files this worker may change; Drove’s guard refuses its edits elsewhere. Left out, it may edit anywhere' },
+        maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
+        maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
       },
       required: ['name', 'brief'],
     },
@@ -371,7 +374,10 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const model = kind === 'claude' ? resolveModel(input.model, config.workerModel) : typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
   if (!(await herdrPane($))) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
   const mcp = Array.isArray(input.mcp) ? input.mcp.filter((entry): entry is string => typeof entry === 'string') : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}) })
+  const owns = Array.isArray(input.owns) ? input.owns.filter((entry): entry is string => typeof entry === 'string') : undefined
+  const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
+  const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })

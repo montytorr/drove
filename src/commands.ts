@@ -90,8 +90,10 @@ const envOf = (value: unknown): Record<string, string> =>
 const namesOf = (value: unknown): string[] | undefined =>
   Array.isArray(value) ? [...new Set(value.filter((name): name is string => typeof name === 'string').map(name => name.trim()).filter(Boolean))] : undefined
 
+const isWhole = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 1
+
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const { workerMcp, workerSkills, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, maxTurns, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const mcp = namesOf(workerMcp)
   const skills = namesOf(workerSkills)
   return {
@@ -99,11 +101,18 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
     ...file,
     ...(mcp ? { workerMcp: mcp } : {}),
     ...(skills ? { workerSkills: skills } : {}),
+    ...(isWhole(maxTurns) ? { maxTurns } : {}),
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
     workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel },
     promotedModel: { ...DEFAULT_CONFIG.promotedModel, ...file.promotedModel },
     workerEnv: envOf(file.workerEnv),
   }
+}
+
+// Owned globs are relative to the worktree; a leading ./ and duplicates mean nothing, and none at all means no limit.
+const ownsOf = (value: readonly string[] | undefined): string[] | undefined => {
+  const globs = [...new Set((value ?? []).map(glob => glob.trim().replace(/^(\.\/)+/, '')).filter(Boolean))]
+  return globs.length > 0 ? globs : undefined
 }
 
 const resolveModel = (kind: AgentKind, value: string | undefined, config: DroveConfig): string => {
@@ -603,6 +612,11 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (request.effort && !EFFORTS.includes(request.effort)) return failed('usage', `--effort must be one of ${EFFORTS.join(', ')}`)
   const badMcp = request.mcp?.find(name => !MCP_NAME_RE.test(name))
   if (badMcp !== undefined) return failed('usage', `--mcp takes server names separated by commas; got "${badMcp}"`)
+  const owns = ownsOf(request.owns)
+  const badOwns = owns?.find(glob => glob.startsWith('/') || glob.startsWith('~') || glob.split('/').includes('..'))
+  if (badOwns !== undefined) return failed('usage', `--owns takes globs relative to the worktree, without .. or a leading / or ~; got "${badOwns}"`)
+  const badBudget = [['--max-turns', request.maxTurns], ['--max-tokens', request.maxTokens]].find(([, value]) => value !== undefined && !isWhole(value))
+  if (badBudget) return failed('usage', `${badBudget[0]} must be a whole number of at least 1`)
   const brief = request.brief.trim()
   if (!brief) return failed('usage', 'a worker needs a brief')
   const located = await locateFor(deps, identity, 'up')
@@ -624,7 +638,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const launchCwd = isClaude ? run.repo : worktree
   const sessionId = kind === 'claude' ? randomUUID() : undefined
   const seat: Seat = {
-    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}), model, effort, worktree, branch,
+    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}), ...(owns ? { owns } : {}), model, effort, worktree, branch,
+    ...(request.maxTurns ?? config.maxTurns ? { maxTurns: request.maxTurns ?? config.maxTurns } : {}), ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
     ...(isClaude ? {} : { codexHome: codexHomeDir(deps.home, run.id) }),
   }
@@ -684,7 +699,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
 
   const token = mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
-  const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+  const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
   const isBriefInline = isShellSafeArg(brief.trim())
   const footerText = briefFooter(seat.name, request.cairn, { branch, verify: await repoVerifyCommands(run.repo) })
   const briefText = isBriefInline ? `${brief.trim()} ${footerText.trimStart()}` : `${brief}${footerText}`
@@ -916,7 +931,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
 
     const updated: Seat = { ...seat, ...change, sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
-    const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+    const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
     const controlText = formatControl(control, token)
     const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
     const spec = specFor(
@@ -1113,7 +1128,7 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
   if (!seat.sessionId) return { error: `${seat.name} has no saved session id, so it cannot be resumed; close it and spawn a new one` }
   const token = (await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))) ?? mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
-  const identity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+  const identity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
   const resumeText = resumePrompt(seat)
   const isInline = resolveBriefVia(config) === 'launch-arg'
   const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seatRoleText(run, config, seat), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config))

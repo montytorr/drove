@@ -9,6 +9,7 @@ export const ENV = {
   role: 'DROVE_ROLE',
   seat: 'DROVE_SEAT',
   token: 'DROVE_TOKEN',
+  owns: 'DROVE_OWNS',
 } as const
 
 export const SEAT_RE = /^[a-z][a-z0-9_-]{0,31}$/
@@ -41,13 +42,25 @@ export const userCodexHome = (home: string, env: NodeJS.ProcessEnv = process.env
 export const worktreePath =(repo: string, seat: string): string => join(repo, '.claude', 'worktrees', seat)
 export const branchName = (seat: string): string => `drove/${seat}`
 
+// DROVE_OWNS is a JSON array of globs: a glob may hold commas, so no separator is safe. Unreadable means unset.
+const ownsFromEnv = (value: string | undefined): string[] | undefined => {
+  if (!value) return undefined
+  try {
+    const parsed: unknown = JSON.parse(value)
+    return Array.isArray(parsed) && parsed.every(item => typeof item === 'string') && parsed.length > 0 ? (parsed as string[]) : undefined
+  } catch {
+    return undefined
+  }
+}
+
 export const identityFromEnv = (env: NodeJS.ProcessEnv = process.env): Identity | undefined => {
   const run = env[ENV.run]
   const role = env[ENV.role]
   const seat = env[ENV.seat]
   if (!run || (role !== 'planner' && role !== 'worker') || !seat || !SEAT_RE.test(seat)) return undefined
   const token = env[ENV.token]
-  return { home: defaultHome(env), run, role: role as Role, seat, ...(token ? { token } : {}) }
+  const owns = ownsFromEnv(env[ENV.owns])
+  return { home: defaultHome(env), run, role: role as Role, seat, ...(token ? { token } : {}), ...(owns ? { owns } : {}) }
 }
 
 export const identityEnv = (identity: Identity): Record<string, string> => ({
@@ -56,4 +69,5 @@ export const identityEnv = (identity: Identity): Record<string, string> => ({
   [ENV.role]: identity.role,
   [ENV.seat]: identity.seat,
   ...(identity.token ? { [ENV.token]: identity.token } : {}),
+  ...(identity.owns && identity.owns.length > 0 ? { [ENV.owns]: JSON.stringify(identity.owns) } : {}),
 })

@@ -71,6 +71,7 @@ export const parseHookInput = (event: HookEventName, raw: Record<string, unknown
     ...(tool ? { tool } : {}),
     ...(toolInput ? { toolInput } : {}),
     ...(detail ? { detail: clip(detail) } : {}),
+    ...(text(raw.transcript_path) ? { transcript: text(raw.transcript_path) } : {}),
   }
 }
 
@@ -89,6 +90,7 @@ export const toRecord = (input: HookInput, at: Date): HookRecord => ({
   event: input.event,
   ...(input.sessionId ? { sessionId: input.sessionId } : {}),
   ...(input.detail ? { detail: input.detail } : {}),
+  ...(input.transcript ? { transcript: input.transcript } : {}),
 })
 
 export const recordHook = async (identity: Identity, record: HookRecord, deps: HookDeps = defaultHookDeps): Promise<void> => {
@@ -114,6 +116,7 @@ const guardInput = async (identity: Identity, input: HookInput, deps: HookDeps):
     cwd: input.cwd ?? process.cwd(),
     writableRoots: isPlanner ? ['/tmp', '/private/tmp', join(home, '.claude', 'plans'), deps.scratchRoot(identity)] : [],
     openSeats: isPlanner && mentionsSessions(input) ? await deps.openIds(identity) : [],
+    ...(!isPlanner && identity.owns ? { owns: identity.owns } : {}),
   }
 }
 

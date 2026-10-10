@@ -8,6 +8,7 @@ import * as prompts from './prompts.ts'
 import * as protocol from './protocol.ts'
 import * as roster from './roster.ts'
 import * as store from './store.ts'
+import * as usage from './usage.ts'
 import type { Attention, Control, Delivery, Deps, DroveConfig, DroveEvent, DroveEventType, HerdrAgent, HookRecord, Report, RunMeta, Seat } from './types.ts'
 
 export const TICK_MS = 3_000
@@ -18,7 +19,7 @@ export const WAKE_RETRY_MS = 15_000
 export const LOOP_MS = 1_000
 const HOOK_WINDOW = 50
 const WAIT = 'wait: '
-const KEPT_ATTENTION: readonly Attention['reason'][] = ['budget', 'pending-delivery']
+const KEPT_ATTENTION: readonly Attention['reason'][] = ['pending-delivery']
 
 export type WatchPorts = {
   runDir: typeof paths.runDir
@@ -44,6 +45,8 @@ export type WatchPorts = {
   flushPending: typeof deliver.flushPending
   applyPendingPromotes: typeof commands.applyPendingPromotes
   nudgeText: typeof prompts.nudgeText
+  advanceTokens: typeof usage.advanceTokens
+  findRollout: typeof usage.findRollout
 }
 
 export const defaultWatchPorts: WatchPorts = {
@@ -70,6 +73,8 @@ export const defaultWatchPorts: WatchPorts = {
   flushPending: deliver.flushPending,
   applyPendingPromotes: commands.applyPendingPromotes,
   nudgeText: prompts.nudgeText,
+  advanceTokens: usage.advanceTokens,
+  findRollout: usage.findRollout,
 }
 
 export type WatchOptions = {
@@ -214,7 +219,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const notedPending = new Set<string>()
   let knownAttention = new Set<string>()
   let freshAttention: Attention[] = []
-  const hookWindows = new Map<string, { cursor: store.Cursor; records: HookRecord[] }>()
+  const hookWindows = new Map<string, { cursor: store.Cursor; records: HookRecord[]; turns: number; transcript?: string }>()
+  const tokenCounters = new Map<string, usage.TokenCounter>()
   let humanName: string | undefined
   const plannerHooks: { cursor: store.Cursor; sessionId?: string } = { cursor: { offset: 0 } }
   let plannerAgentSession: string | undefined
@@ -376,12 +382,24 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   }
 
   const hooksFor = async (run: RunMeta, seat: string): Promise<HookRecord[]> => {
-    const window = hookWindows.get(seat) ?? { cursor: { offset: 0 }, records: [] }
+    const window = hookWindows.get(seat) ?? { cursor: { offset: 0 }, records: [], turns: 0 }
     const read = await readFrom<HookRecord>(ports, join(ports.seatDir(deps.home, run.id, seat), 'hooks.jsonl'), window.cursor)
     window.cursor = read.cursor
     window.records = [...window.records, ...read.items].slice(-HOOK_WINDOW)
+    // A turn ends at a Stop hook. The window forgets old records, so the count is kept apart (it rebuilds from the file's start).
+    window.turns += read.items.filter((record) => record.event === 'stop').length
+    window.transcript = read.items.findLast((record) => record.transcript)?.transcript ?? window.transcript
     hookWindows.set(seat, window)
     return window.records
+  }
+
+  const tokensOf = async (seat: Seat): Promise<number | undefined> => {
+    if (seat.maxTokens === undefined) return undefined
+    const path = hookWindows.get(seat.name)?.transcript ?? (seat.kind === 'codex' && seat.codexHome && seat.sessionId ? await ports.findRollout(seat.codexHome, seat.sessionId) : undefined)
+    if (!path) return undefined
+    const counter = await ports.advanceTokens(seat.kind, path, tokenCounters.get(seat.name))
+    tokenCounters.set(seat.name, counter)
+    return counter.total
   }
 
   const poll = async (run: RunMeta) => {
@@ -404,6 +422,11 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         screen = read.code === 0 ? read.stdout : undefined
       }
       const result = ports.deriveState(seat, { herdr: agent, hooks, lastReport: seat.lastReport, screen }, now)
+      if (result.state !== 'gone' && (seat.maxTurns !== undefined || seat.maxTokens !== undefined)) {
+        const tokens = await tokensOf(seat).catch(() => undefined)
+        const detail = detect.budgetDetail(seat, { turns: hookWindows.get(seat.name)?.turns ?? 0, ...(tokens !== undefined ? { tokens } : {}) })
+        if (detail) result.attention = [...result.attention, { seat: seat.name, reason: 'budget', detail, at: now.toISOString() }]
+      }
       const sessionId = seat.sessionId ? undefined : (hooks.findLast((record) => record.event === 'session-start' && record.sessionId) ?? hooks.findLast((record) => record.sessionId))?.sessionId
       derived.set(seat.name, { ...result, ...(sessionId ? { sessionId } : {}) })
     }
@@ -447,6 +470,15 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       }
     }
     knownAttention = live
+    for (const seat of updated.seats) {
+      const budget = seat.attention.find((item) => item.reason === 'budget')
+      if (!derived.has(seat.name) || restarting.has(seat.name) || !budget || !detect.needsBudgetNotice(seat)) continue
+      const control: Control = { v: 1, id: `c-budget-${seat.name}-${now.getTime()}`, run: run.id, from: 'planner', to: seat.name, kind: 'message', expects: 'none', body: detect.budgetNoticeText(budget.detail), at }
+      await guarded('budget-notice', async () => {
+        await ports.deliverControl(deps, run, control)
+      })
+      await ports.updateRoster(deps.home, run.id, (latest) => ({ ...latest, seats: latest.seats.map((item) => (item.name === seat.name ? { ...item, budgetNoticed: true } : item)) }))
+    }
     for (const seat of updated.seats) {
       if (!derived.has(seat.name) || !ports.needsNudge(seat, now)) continue
       const control: Control = { v: 1, id: `c-nudge-${seat.name}-${now.getTime()}`, run: run.id, from: 'planner', to: seat.name, kind: 'nudge', expects: 'answer', body: ports.nudgeText(), at }

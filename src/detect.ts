@@ -71,7 +71,7 @@ export const EXIT_WAIT_MS = 20_000
 export const RESTART_BOUND_MS = 2 * EXIT_WAIT_MS + DEFAULT_START_TIMEOUT_MS
 export const NUDGE_GRACE_MS = 20_000
 
-const DERIVED_REASONS: ReadonlySet<Attention['reason']> = new Set(['dialog', 'permission', 'trust', 'hook-trust', 'channel-confirm', 'codex-version-mismatch', 'usage-limit', 'idle-without-report', 'gone'])
+const DERIVED_REASONS: ReadonlySet<Attention['reason']> = new Set(['dialog', 'permission', 'trust', 'hook-trust', 'channel-confirm', 'codex-version-mismatch', 'usage-limit', 'idle-without-report', 'gone', 'budget'])
 const SETTLED: ReadonlySet<SeatState> = new Set(['idle', 'done'])
 const PERMISSION_NOTICE = /permission|approv|elicitation|dialog|trust/i
 
@@ -177,9 +177,27 @@ export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derive
   return { state, attention }
 }
 
+export type SeatUsage = { turns: number; tokens?: number }
+
+const COUNT = new Intl.NumberFormat('en-US')
+
+// A seat reaches its budget at maxTurns Stop records or maxTokens tokens, whichever comes first (DROVE-71).
+export const budgetDetail = (seat: Pick<Seat, 'maxTurns' | 'maxTokens'>, usage: SeatUsage): string | undefined => {
+  if (seat.maxTurns !== undefined && usage.turns >= seat.maxTurns) return `used ${usage.turns} of its ${seat.maxTurns} turns`
+  if (seat.maxTokens !== undefined && usage.tokens !== undefined && usage.tokens >= seat.maxTokens) return `used ${COUNT.format(usage.tokens)} of its ${COUNT.format(seat.maxTokens)} tokens`
+  return undefined
+}
+
+export const budgetNoticeText = (detail: string): string =>
+  `Budget reached: you have ${detail}. Do not start new work. Send a progress report with the drove report tool (what is done, what is left), or a promote report if you need more room, and stop.`
+
+// The worker is told once, and not while it is waiting on the planner after a done, question or blocked report.
+export const needsBudgetNotice = (seat: Seat): boolean =>
+  !seat.budgetNoticed && seat.owes === 'none' && seat.attention.some(item => item.reason === 'budget')
+
 export const needsNudge = (seat: Seat, now: Date): boolean => {
   if (!SETTLED.has(seat.state) || seat.hasNudged || seat.owes !== 'none') return false
-  if (seat.attention.some(item => item.reason === 'usage-limit')) return false
+  if (seat.attention.some(item => item.reason === 'usage-limit' || item.reason === 'budget')) return false
   return idleWithoutReport(seat, seat.state, undefined, now)
 }
 

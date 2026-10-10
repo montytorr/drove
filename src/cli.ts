@@ -26,6 +26,22 @@ const need = (value: string | undefined, what: string): string => {
 
 class UsageError extends Error {}
 
+// Globs may hold commas inside braces ({a,b}), so only a comma outside braces separates two of them.
+export const splitGlobs = (text: string): string[] => {
+  const globs: string[] = ['']
+  let depth = 0
+  for (const char of text) {
+    if (char === ',' && depth === 0) globs.push('')
+    else {
+      depth = Math.max(0, depth + (char === '{' ? 1 : char === '}' ? -1 : 0))
+      globs[globs.length - 1] += char
+    }
+  }
+  return globs.map(glob => glob.trim()).filter(Boolean)
+}
+
+const count = (values: Values, key: string): number | undefined => (str(values, key) === undefined ? undefined : Number(str(values, key)))
+
 const readStdin = async (): Promise<string> => {
   const chunks: Buffer[] = []
   for await (const chunk of process.stdin) chunks.push(chunk as Buffer)
@@ -88,9 +104,9 @@ export const COMMANDS: Record<string, Spec> = {
       ),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME]',
+    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]',
     why: 'open a worker in its own worktree and pane, and brief it',
-    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' } },
+    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, owns: { type: 'string' }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
     run: async (values, positionals, io) => {
       const brief = need(str(values, 'brief'), '--brief')
       return print(
@@ -103,6 +119,9 @@ export const COMMANDS: Record<string, Spec> = {
           effort: str(values, 'effort') as Effort | undefined,
           base: str(values, 'base'),
           mcp: str(values, 'mcp')?.split(',').map(name => name.trim()).filter(Boolean),
+          owns: str(values, 'owns') === undefined ? undefined : splitGlobs(str(values, 'owns') as string),
+          maxTurns: count(values, 'max-turns'),
+          maxTokens: count(values, 'max-tokens'),
         }),
         io,
       )
