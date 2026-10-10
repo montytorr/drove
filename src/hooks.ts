@@ -1,6 +1,7 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { commandOf, decide, denyText } from './guard.ts'
+import { agentName } from './herdr.ts'
 import { identityFromEnv, plannerDir, runDir, seatDir } from './paths.ts'
 import type { AgentKind, GuardDecision, GuardInput, HookEventName, HookInput, HookRecord, Identity } from './types.ts'
 
@@ -31,7 +32,7 @@ export const defaultHookDeps: HookDeps = {
   append: async (path, value) => (await import('./store.ts')).appendJsonl(path, value),
   openIds: async identity => {
     const roster = await import('./roster.ts')
-    return roster.openSeats(await roster.loadRoster(identity.home, identity.run)).flatMap(seat => [seat.name, ...(seat.sessionId ? [seat.sessionId] : [])])
+    return roster.openSeats(await roster.loadRoster(identity.home, identity.run)).flatMap(seat => [seat.name, agentName(identity.run, seat.name), ...(seat.paneId ? [seat.paneId] : []), ...(seat.sessionId ? [seat.sessionId] : [])])
   },
 }
 
