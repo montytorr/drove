@@ -2,7 +2,7 @@
 
 Cairn DROVE-2 (parent DROVE-1). Date: 2026-10-09. Inputs: `spikes/codex-proof/RESULT.md` (CCS-48), `spikes/openrig/RESULT.md` (CCS-49), CCS-47 findings, CCS-50, and the Claude orchestrator mod (`~/.claude/mods/orchestrator`, read only). Brought up to date with `main` on 2026-10-10 (DROVE-36): where this file and the code disagree, the code is right.
 
-Drove is a small cross-agent orchestrator on herdr. One **planner** plans, delegates, reviews diffs and merges. **Workers** write the code. Either side can be Claude Code or Codex. Every agent runs in its own herdr pane, and each worker has its own git worktree.
+Drove is a small cross-agent orchestrator on herdr. One **planner** plans, delegates, reviews diffs and merges. **Workers** write the code. Either side can be Claude Code or Codex: you choose the planner, and the workers are Claude Code or Codex under either one. A planner starts three ways: `/orchestrate` in Claude Code with the mod (§10), `drove plan --kind claude` without it, or `drove plan --kind codex` (§1). Both planners were seen working live (DROVE-49). Every agent runs in its own herdr pane, and each worker has its own git worktree.
 
 Markers used below: **[proven]** was seen working in a spike or in the mod. **[docs]** is stated in official docs but not yet run by us. **[verify]** is a guess that a human-run launch must confirm before we rely on it.
 
