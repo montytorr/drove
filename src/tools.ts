@@ -10,7 +10,7 @@ export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promot
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'roster' | 'capture' | 'close' | 'down' | 'budget'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -114,7 +114,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
     const approved = await ports.elicit(`Spawning ${seat} needs pane ${open + 1}, over the budget of ${run.budget}. Allow it?`)
     if (approved === undefined) return undefined
     if (!approved) return `The human declined pane ${open + 1}. ${seat} was not spawned. Do not retry; finish or close a seat first.`
-    const raised = await cmd.budget(deps, { run: run.id, repo: run.repo }, open + 1)
+    const raised = await cmd.raiseBudget(deps, { run: run.id, repo: run.repo }, open + 1)
     return raised.ok ? undefined : `Could not raise the budget: ${raised.text}`
   }
 

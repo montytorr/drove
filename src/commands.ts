@@ -1016,11 +1016,15 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
 
 // ---------- budget ----------
 
-export const budget = async (deps: Deps, ref: RunRef, size: number): Promise<CommandResult> => {
-  if (process.env[ENV.role]) return failed('forbidden', 'only the human can raise the pane budget; ask them to run `drove budget <n>`')
+export const raiseBudget = async (deps: Deps, ref: RunRef, size: number): Promise<CommandResult> => {
   if (!Number.isInteger(size) || size < 1) return failed('usage', 'the budget must be a whole number of at least 1')
   const located = await locateRun(deps, ref, 'up')
   if ('error' in located) return located.error
   await saveRun(deps.home, { ...located.run, budget: size })
   return ok(`Pane budget for run ${located.run.id} is now ${size}.`, { budget: size })
+}
+
+export const budget = async (deps: Deps, ref: RunRef, size: number): Promise<CommandResult> => {
+  if (process.env[ENV.role]) return failed('forbidden', 'only the human can raise the pane budget; ask them to run `drove budget <n>`')
+  return raiseBudget(deps, ref, size)
 }
