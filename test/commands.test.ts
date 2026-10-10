@@ -35,8 +35,8 @@ test('spawn opens the tab at the repo root, then starts the agent, which creates
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
   assert.equal(spawned.ok, true, spawned.text)
   const order = fake.calls.map(call => (call[0] === 'git' ? 'git' : call.slice(1, 3).join(' ')))
-  assert.ok(order.indexOf('git') < order.indexOf('tab create'))
   assert.ok(order.indexOf('tab create') < order.indexOf('agent start'))
+  assert.ok(order.indexOf('agent start') < order.indexOf('git'))
   const worktree = join(repo, '.claude', 'worktrees', 'w-api')
   assert.ok(existsSync(worktree))
   assert.equal(await git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD'), 'worktree-w-api')
@@ -84,17 +84,57 @@ test('a codex worker still gets a Drove git worktree on drove/<seat> and launche
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.branch, 'drove/w-cx')
 })
 
-test('a claude spawn warns when the main checkout is not at the base, and says --base is ignored', async () => {
-  const { deps, identity, repo } = await setup()
-  await git(repo, 'switch', '-q', '-c', 'side', '--no-track')
-  await writeFile(join(repo, 'b.txt'), 'x\n')
-  await git(repo, 'add', 'b.txt')
-  await git(repo, 'commit', '-q', '-m', 'side work')
+const commitOn = async (repo: string, file: string): Promise<string> => {
+  await writeFile(join(repo, file), 'x\n')
+  await git(repo, 'add', file)
+  await git(repo, 'commit', '-q', '-m', `add ${file}`)
+  return git(repo, 'rev-parse', 'HEAD')
+}
+
+test('a claude spawn says --base is ignored', async () => {
+  const { deps, identity } = await setup()
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief, base: 'main' })
   assert.equal(spawned.ok, true, spawned.text)
-  assert.match(spawned.text, /Note: Claude branches worktree-w-api from the main checkout's current HEAD \(side\), which is not main/)
-  assert.match(spawned.text, /Note: --base main was ignored/)
-  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-api'), 'rev-parse', 'HEAD'), await git(repo, 'rev-parse', 'side'))
+  assert.match(spawned.text, /Note: --base main was ignored: Claude creates its own worktree, which Drove then fast-forwards to the run base main/)
+})
+
+test('a claude worktree that starts behind local main is fast-forwarded to main before the brief, with a note', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  const behind = await git(repo, 'rev-parse', 'HEAD')
+  const tip = await commitOn(repo, 'b.txt')
+  fake.claudeWorktreeFrom = behind
+  process.env.DROVE_BRIEF_VIA = 'prompt'
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const worktree = join(repo, '.claude', 'worktrees', 'w-api')
+  assert.equal(await git(worktree, 'rev-parse', 'HEAD'), tip)
+  assert.equal(await git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD'), 'worktree-w-api')
+  assert.match(spawned.text, /Note: Claude created worktree-w-api at [0-9a-f]+, behind main; it was fast-forwarded to [0-9a-f]+\./)
+  assert.equal(fake.prompts.length, 1)
+})
+
+test('a claude worktree already at main is left unchanged and carries no note', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  const tip = await commitOn(repo, 'b.txt')
+  fake.claudeWorktreeFrom = tip
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-api'), 'rev-parse', 'HEAD'), tip)
+  assert.doesNotMatch(spawned.text, /Note:/)
+})
+
+test('a claude worktree that diverged from main is left alone and the spawn result says so', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  const base = await git(repo, 'rev-parse', 'HEAD')
+  await git(repo, 'switch', '-q', '-c', 'other', '--no-track')
+  const other = await commitOn(repo, 'o.txt')
+  await git(repo, 'switch', '-q', 'main')
+  await commitOn(repo, 'b.txt')
+  assert.notEqual(other, base)
+  fake.claudeWorktreeFrom = 'other'
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-api'), 'rev-parse', 'HEAD'), other)
+  assert.match(spawned.text, /Note: Claude created worktree-w-api at [0-9a-f]+, which is not an ancestor of main, so it was left as is/)
 })
 
 test('a claude spawn at the base carries no base note', async () => {
