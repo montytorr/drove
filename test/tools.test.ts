@@ -8,7 +8,8 @@ import type { ToolPorts } from '../src/tools.ts'
 import type { CommandResult, Report } from '../src/types.ts'
 import { setup } from './p4-helpers.ts'
 import { seatOf } from './p4-helpers.ts'
-import { updateRoster } from '../src/roster.ts'
+import * as realCommands from '../src/commands.ts'
+import { loadRun, updateRoster } from '../src/roster.ts'
 
 const fakeCommands = () => {
   const calls: { name: string; args: unknown[] }[] = []
@@ -26,7 +27,7 @@ const fakeCommands = () => {
     capture: record('capture'),
     close: record('close', 2),
     down: record('down'),
-    budget: record('budget'),
+    raiseBudget: record('raiseBudget'),
   } as unknown as ToolPorts['commands']
   return { commands, calls }
 }
@@ -179,8 +180,30 @@ test('spawn over budget asks the human through elicitation and raises the budget
   const result = await tool('spawn').call({ seat: 'w-six', kind: 'claude', brief: 'x' })
   assert.equal(result.isError, undefined)
   assert.equal(asked.length, 1)
-  assert.deepEqual(fake.calls.map((call) => call.name), ['budget', 'spawn'])
+  assert.deepEqual(fake.calls.map((call) => call.name), ['raiseBudget', 'spawn'])
   assert.equal((fake.calls[0]?.args[1]), 6)
+})
+
+test('an approved elicitation raises the budget and spawns even with DROVE_ROLE set; a declined one refuses', async () => {
+  const saved = process.env.DROVE_ROLE
+  process.env.DROVE_ROLE = 'planner'
+  try {
+    for (const approve of [true, false]) {
+      const ctx = await setup()
+      await fullRoster(ctx)
+      const fake = fakeCommands()
+      const commands = { ...fake.commands, raiseBudget: realCommands.raiseBudget }
+      const identity = { home: ctx.home, run: ctx.run.id, role: 'planner' as const, seat: 'planner' }
+      const tools = plannerTools(ctx.deps, identity, { ...defaultToolPorts, commands, elicit: async () => approve })
+      const result = await tools.find((tool) => tool.name === 'spawn')?.call({ seat: 'w-six', kind: 'claude', brief: 'x' })
+      assert.equal((await loadRun(ctx.home, ctx.run.id))?.budget, approve ? 6 : 5)
+      assert.equal(result?.isError, approve ? undefined : true)
+      assert.deepEqual(fake.calls.map((call) => call.name), approve ? ['spawn'] : [])
+    }
+  } finally {
+    if (saved === undefined) delete process.env.DROVE_ROLE
+    else process.env.DROVE_ROLE = saved
+  }
 })
 
 test('spawn over budget stops when the human declines, and falls through without elicitation', async () => {

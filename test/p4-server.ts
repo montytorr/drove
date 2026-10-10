@@ -9,7 +9,7 @@ const identity = identityFromEnv()
 if (!identity) throw new Error('identity env missing')
 
 const commands = Object.fromEntries(
-  ['spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'down', 'budget'].map((name) => [name, async () => ({ ok: true as const, text: `${name} ok` })]),
+  ['spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'down', 'raiseBudget'].map((name) => [name, async () => ({ ok: true as const, text: `${name} ok` })]),
 ) as unknown as ToolPorts['commands']
 
 const { exec } = makeExec()
