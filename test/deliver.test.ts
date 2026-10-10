@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import * as deliver from '../src/deliver.ts'
+import { deriveState } from '../src/detect.ts'
 import { seatDir } from '../src/paths.ts'
 import { loadRoster } from '../src/roster.ts'
 import type { Control, DeliveryAdapter, Report, RunMeta, Seat } from '../src/types.ts'
@@ -318,4 +319,15 @@ test('only a control that owes a report back stamps lastSentAt; a promote notice
   assert.equal(await stamp(), undefined)
   assert.equal((await deliver.deliverControl(deps, run, control('w-api', { id: 'c-3', kind: 'message', expects: 'answer' }))).ok, true)
   assert.equal(await stamp(), deps.clock.now().toISOString())
+})
+
+test('a question answered with expects none is a reply that owes a report: a silent stop after it is flagged', async () => {
+  const asked = { id: 'r-1', kind: 'question' as const, expects: 'answer' as const, summary: 'which table?', at: '2000-01-01T00:00:00.000Z' }
+  const { deps, run } = await setup(makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1', state: 'idle', stateAt: '2000-01-01T00:01:00.000Z', lastWorkingAt: '2000-01-01T00:01:00.000Z', lastReport: asked, owes: 'answer' }))
+  assert.equal((await deliver.deliverControl(deps, run, control('w-api', { kind: 'answer', expects: 'none' }))).ok, true)
+  const seat = (await loadRoster(deps.home, run.id)).seats[0]!
+  assert.equal(seat.lastSentAt, deps.clock.now().toISOString())
+  const later = new Date(deps.clock.now().getTime() + 60_000)
+  const derived = deriveState({ ...seat, lastWorkingAt: deps.clock.now().toISOString(), stateAt: deps.clock.now().toISOString() }, { herdr: { paneId: 'w1:p1', status: 'idle' }, hooks: [], lastReport: asked }, later)
+  assert.deepEqual(derived.attention.map(item => item.reason), ['idle-without-report'])
 })
