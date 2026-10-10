@@ -17,12 +17,12 @@ The transport works end to end with no Claude-only APIs. The one gap: the **firs
 
 ## Timeline (all from this run)
 
-Launch by Cal at 10:18; agent `codex-proof`, pane `w23:p2`, thread `01a11fbe-0a6c-7973-bdeb-db61e3773d83`.
+Launch by the human at 10:18; agent `codex-proof`, pane `w23:p2`, thread `01a11fbe-0a6c-7973-bdeb-db61e3773d83`.
 
 | Time (CEST) | Event |
 |---|---|
 | 10:18:30 | Codex up, herdr `idle`, `agent_session: null` |
-| ~10:20 | Cal sends brief with `herdr agent prompt` (workers/orchestrator guards block it) |
+| ~10:20 | The human sends brief with `herdr agent prompt` (workers/orchestrator guards block it) |
 | 10:20:53 | outbox line 1: `done / review / "wrote hello.txt"`, `sandbox/hello.txt` = `hello from codex` |
 | 10:21:08 | `codex queue` follow-up 1 accepted (0.06s) |
 | 10:21:20 | outbox line 2: `progress / none / "queue-ok"` (about 12s after queue) |
@@ -57,7 +57,7 @@ Naming the tool, the server and all three field values was enough; the "only way
 **Which unverified points held?**
 - Quoted `-c` passthrough: yes. `agent-start.json` argv shows all seven `-c` args intact, including the TOML table for `env`.
 - `default_tools_approval_mode="approve"`: accepted by 0.160.1, no approval prompt on `report`.
-- Trust override `projects."<sandbox>".trust_level="trusted"`: no trust prompt shown (Cal accepted nothing extra).
+- Trust override `projects."<sandbox>".trust_level="trusted"`: no trust prompt shown (the human accepted nothing extra).
 
 ## Findings
 
@@ -68,19 +68,19 @@ Naming the tool, the server and all three field values was enough; the "only way
 
 ## Stretch: PreToolUse hook denying apply_patch
 
-Prepared, **not run** (it needs a second Codex launched by Cal): `launch-planner.sh` starts `codex-planner` with an inline `-c hooks.PreToolUse=[{matcher="apply_patch|Edit|Write", hooks=[{type="command", command="sh .../deny-apply-patch.sh"}]}]`, without `--dangerously-bypass-hook-trust`, so the hook-trust prompt behaviour is recorded. `deny-apply-patch.sh` prints a `permissionDecision: deny` JSON (shape unverified for Codex 0.160; tested only that it emits valid JSON). The inline `-c` syntax for hooks is a best guess; there is no existing PreToolUse example in `~/.codex/hooks.json`. To finish: Cal runs `sh launch-planner.sh`, then the brief "use apply_patch to create planner.txt, then report what happened" goes in with `herdr agent prompt`, and we check whether `sandbox/planner.txt` exists and what the trust prompt said.
+Prepared, **not run** (it needs a second Codex launched by the human): `launch-planner.sh` starts `codex-planner` with an inline `-c hooks.PreToolUse=[{matcher="apply_patch|Edit|Write", hooks=[{type="command", command="sh .../deny-apply-patch.sh"}]}]`, without `--dangerously-bypass-hook-trust`, so the hook-trust prompt behaviour is recorded. `deny-apply-patch.sh` prints a `permissionDecision: deny` JSON (shape unverified for Codex 0.160; tested only that it emits valid JSON). The inline `-c` syntax for hooks is a best guess; there is no existing PreToolUse example in `~/.codex/hooks.json`. To finish: Cal runs `sh launch-planner.sh`, then the brief "use apply_patch to create planner.txt, then report what happened" goes in with `herdr agent prompt`, and we check whether `sandbox/planner.txt` exists and what the trust prompt said.
 
 ## Files
 
 - `orch-mcp.mjs`: the MCP server. `test-orch-mcp.mjs`: stdio test (passes).
-- `launch.sh`: the one script Cal ran. `drive.sh`: `thread | status | queue MSG | outbox | wait N`. `poll.sh`: 1s state poller.
+- `launch.sh`: the one script the human ran. `drive.sh`: `thread | status | queue MSG | outbox | wait N`. `poll.sh`: 1s state poller.
 - `launch-planner.sh`, `deny-apply-patch.sh`: stretch, untested.
 - Not committed (gitignored): `outbox.jsonl`, `*.log`, `sandbox/*`; `agent-start.json` is a run artifact.
 
 ## Commands used
 
 ```sh
-sh launch.sh                                   # Cal, from his herdr pane
+sh launch.sh                                   # the human, from their herdr pane
 sh drive.sh status                             # herdr agent get codex-proof
 sh drive.sh thread                             # agent_session.value, null until the first turn ends
 herdr agent prompt codex-proof "<brief>" --wait --timeout 120000   # first brief only
