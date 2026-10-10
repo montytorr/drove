@@ -56,6 +56,7 @@ export type Seat = {
   effort: Effort
   paneId?: string
   sessionId?: string
+  codexHome?: string
   worktree: string
   branch: string
   state: SeatState

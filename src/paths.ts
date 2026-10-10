@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, join, resolve } from 'node:path'
 import type { Identity, Role } from './types.ts'
 
 export const ENV = {
@@ -28,7 +28,17 @@ export const newRunId = (repo: string, now: Date): string => {
 export const runDir = (home: string, run: string): string => join(home, 'runs', run)
 export const seatDir = (home: string, run: string, seat: string): string => join(runDir(home, run), 'seats', seat)
 export const plannerDir = (home: string, run: string): string => join(runDir(home, run), 'planner')
-export const worktreePath = (repo: string, seat: string): string => join(repo, '.claude', 'worktrees', seat)
+// One Drove-owned CODEX_HOME per run (DROVE-34): its sessions stay with the run, and runs never rewrite each other's.
+export const codexHomeDir = (home: string, run: string): string => join(runDir(home, run), 'codex-home')
+
+// The user's own Codex home, read and linked from but never written. A CODEX_HOME that points into Drove's state is
+// a Drove home inherited from a worker pane, not the user's.
+export const userCodexHome = (home: string, env: NodeJS.ProcessEnv = process.env): string => {
+  const set = env.CODEX_HOME
+  return set && !resolve(set).startsWith(`${resolve(home)}/`) ? set : join(homedir(), '.codex')
+}
+
+export const worktreePath =(repo: string, seat: string): string => join(repo, '.claude', 'worktrees', seat)
 export const branchName = (seat: string): string => `drove/${seat}`
 
 export const identityFromEnv = (env: NodeJS.ProcessEnv = process.env): Identity | undefined => {

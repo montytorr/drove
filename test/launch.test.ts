@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { statSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
+import { readFile, realpath } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import * as launch from '../src/launch.ts'
@@ -288,4 +288,169 @@ test('the typed Claude launch line stays well under the 1024-byte tty limit with
 
 test('execArgv puts the agent binary first', () => {
   assert.deepEqual(launch.execArgv({ kind: 'codex', role: 'planner', cwd: '/x', env: {}, argv: ['-s', 'x'], files: [] }), ['codex', '-s', 'x'])
+})
+
+// ---------- Drove-owned CODEX_HOME (DROVE-34) ----------
+
+const CODEX_DIR = '/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home'
+const USER_CODEX = '/home/cal/.codex'
+const USER_CONFIG = [
+  'model = "gpt-6.1-sol"',
+  "personality = 'pragmatic'",
+  'model_reasoning_effort = "high"',
+  '',
+  '[projects."/home/cal/elsewhere"]',
+  'trust_level = "trusted"',
+  '',
+  '[mcp_servers.docs]',
+  'command = "npx"',
+  'args = [',
+  '  "docs-mcp",',
+  ']',
+  '',
+  '[mcp_servers.docs.env]',
+  'TOKEN_FILE = "/home/cal/.docs"',
+  '',
+  '[mcp_servers.drove]',
+  'command = "stale"',
+  '',
+  '[tui]',
+  'screen_reader_detection_done = true',
+  '',
+  '[hooks.state."/home/cal/.codex/hooks.json:session_start:0:0"]',
+  'trusted_hash = "sha256:user-approved"',
+  '',
+  '[hooks.state."/home/cal/.codex/hooks.json:stop:0:0"]',
+  'trusted_hash = "sha256:user-stop"',
+  'enabled = false',
+  '',
+  '[hooks.state."/<session-flags>/config.toml:stop:0:0"]',
+  'trusted_hash = "sha256:old-inline"',
+].join('\n')
+const USER_HOOKS = {
+  SessionStart: [{ hooks: [{ type: 'command', command: "bash '/home/cal/.codex/herdr-agent-state.sh' session", timeout: 10 }] }],
+  Stop: [{ hooks: [{ type: 'command', command: 'cairn-end', timeout: 120, async: true }] }],
+}
+const codexHome = (overrides: Partial<launch.CodexHome> = {}): launch.CodexHome => ({
+  dir: CODEX_DIR, user: USER_CODEX, userConfig: USER_CONFIG, userHooks: USER_HOOKS, links: ['auth.json', 'AGENTS.md'], skills: ['cairn', 'croft'], ...overrides,
+})
+const homeRequest = (overrides: Partial<launch.CodexLaunchRequest> = {}) =>
+  request({ kind: 'codex', model: 'gpt-x', effort: 'high', roleText: '', initialPrompt: undefined, codexHome: codexHome(), ...overrides })
+const fileOf = (spec: { files: readonly { path: string; content: string }[] }, name: string): string => spec.files.find(file => file.path.endsWith(`/${name}`))?.content ?? ''
+
+test('codexHookHash reproduces the trusted_hash values Codex itself wrote (codex-cli 0.162.0)', () => {
+  const shim = '/Users/cal/.drove/g-ff7841bf'
+  const command = (event: string) => ({ type: 'command', command: `${shim} ${event}`, timeout: 10 })
+  assert.equal(launch.codexHookHash('PreToolUse', { matcher: launch.CODEX_GUARDED_TOOLS }, command('pre-tool-use')), 'sha256:164080a958b75aedbbaf804fddc99ac5a7dfac9779587c0bab11e1f72abe34c5')
+  assert.equal(launch.codexHookHash('PermissionRequest', {}, command('permission-request')), 'sha256:12473e07e15a5d300591c818a3e98e32656cea5ad30d810b2912e6831d1aa383')
+  assert.equal(launch.codexHookHash('SessionStart', {}, command('session-start')), 'sha256:b1f47b3c43ad06c6726a135cf0ca33355c01a434ac05b0e7dbf1c152f2f77643')
+  assert.equal(launch.codexHookHash('UserPromptSubmit', {}, command('user-prompt-submit')), 'sha256:2879930912548ff1529c26e88918af63a70979b68430a967f9aaa492887f61bf')
+  assert.equal(launch.codexHookHash('Stop', {}, command('stop')), 'sha256:6a7dff9277070641a6b1a1d35637089498f5c614c577472eac9d576486b8a07c')
+  assert.equal(launch.codexHookHash('SessionStart', {}, { type: 'command', command: "bash '/Users/cal/.codex/herdr-agent-state.sh' session", timeout: 10 }), 'sha256:caebd0a1922d55ac29a2de20f125aa461e0a11777d499c99f22c11597ed42a4c')
+  assert.equal(
+    launch.codexHookHash('Stop', {}, { type: 'command', command: 'CAIRN_AGENT=codex CAIRN_PLATFORM=codex node /Users/cal/.cairn/hooks/cairn-session-end.mjs --ongoing', timeout: 120, async: true }),
+    'sha256:9e08c97c86da93f549b778314a7f9917369cde4da6b4559520c5b2eb3b100315',
+  )
+})
+
+test('codex worker with a Drove-owned CODEX_HOME matches the golden file', () => {
+  const spec = launch.codexWorkerSpec(homeRequest({ initialPrompt: 'Build the thing. (You are worker `w-api`.)' }))
+  assertGolden('codex-worker-home', spec)
+  assert.equal(spec.env.CODEX_HOME, CODEX_DIR)
+  assert.deepEqual(spec.argv.slice(0, 7), ['--dangerously-bypass-approvals-and-sandbox', '-C', '/work/repo/.claude/worktrees/w-api', '-m', 'gpt-x', '-c', 'model_reasoning_effort="high"'])
+  assert.ok(!spec.argv.some(arg => /^(hooks\.|mcp_servers|projects\.|check_for_update)/.test(arg)))
+})
+
+test('the Drove config.toml holds the repo trust, the drove MCP server, the user model and MCP servers, and hook trust', () => {
+  const config = fileOf(launch.codexWorkerSpec(homeRequest()), 'config.toml')
+  assert.ok(config.includes('model = "gpt-6.1-sol"\npersonality = \'pragmatic\'\ncheck_for_update_on_startup = false\n'), config)
+  assert.ok(!config.includes('model_reasoning_effort'), 'effort stays per seat on the launch line')
+  assert.ok(config.includes('[projects."/work/repo"]\ntrust_level = "trusted"\n'))
+  assert.ok(!config.includes('/home/cal/elsewhere'))
+  assert.ok(config.includes('[mcp_servers.drove]\ncommand = "node"\nargs = ["/opt/drove/src/cli.ts", "mcp"]\nenv_vars = ["DROVE_HOME", "DROVE_RUN", "DROVE_ROLE", "DROVE_SEAT", "DROVE_TOKEN"]\ndefault_tools_approval_mode = "approve"\n'))
+  assert.ok(config.includes('[mcp_servers.docs]\ncommand = "npx"\nargs = [\n  "docs-mcp",\n]\n\n[mcp_servers.docs.env]\nTOKEN_FILE = "/home/cal/.docs"\n'))
+  assert.ok(!config.includes('stale'), 'a user mcp_servers.drove never shadows Drove\'s')
+  assert.ok(!config.includes('[tui]') && !config.includes('session-flags'))
+  assert.ok(config.includes(`[hooks.state."${CODEX_DIR}/hooks.json:session_start:0:0"]\ntrusted_hash = "sha256:user-approved"\n`))
+  assert.ok(config.includes(`[hooks.state."${CODEX_DIR}/hooks.json:stop:0:0"]\ntrusted_hash = "sha256:user-stop"\nenabled = false\n`))
+  const shim = `${HOME}/g-d43caf1d`
+  const droveHash = launch.codexHookHash('SessionStart', {}, { type: 'command', command: `${shim} session-start`, timeout: 10 })
+  assert.ok(config.includes(`[hooks.state."${CODEX_DIR}/hooks.json:session_start:1:0"]\ntrusted_hash = "${droveHash}"\n`))
+  for (const position of ['pre_tool_use:0:0', 'user_prompt_submit:0:0', 'stop:1:0', 'permission_request:0:0']) assert.ok(config.includes(`hooks.json:${position}"]\ntrusted_hash = "sha256:`), position)
+  assert.ok(!config.includes('\n\n\n'))
+})
+
+test('the Drove hooks.json keeps the user groups first, at the indices their trust is keyed by, then Drove groups', () => {
+  const hooks = (JSON.parse(fileOf(launch.codexWorkerSpec(homeRequest()), 'hooks.json')) as { hooks: Record<string, { matcher?: string; hooks: { command: string }[] }[]> }).hooks
+  assert.deepEqual(hooks.SessionStart?.map(group => group.hooks[0]?.command), ["bash '/home/cal/.codex/herdr-agent-state.sh' session", `${HOME}/g-d43caf1d session-start`])
+  assert.deepEqual(hooks.Stop?.map(group => group.hooks[0]?.command), ['cairn-end', `${HOME}/g-d43caf1d stop`])
+  assert.equal(hooks.PreToolUse?.[0]?.matcher, launch.CODEX_GUARDED_TOOLS)
+  assert.deepEqual(Object.keys(hooks).sort(), ['PermissionRequest', 'PreToolUse', 'SessionStart', 'Stop', 'UserPromptSubmit'])
+})
+
+test('with no user Codex setup the Drove home holds only Drove, and every Drove hook is trusted', () => {
+  const spec = launch.codexWorkerSpec(homeRequest({ codexHome: codexHome({ userConfig: '', userHooks: {}, links: [], skills: [] }) }))
+  const config = fileOf(spec, 'config.toml')
+  assert.ok(config.startsWith('# Written by Drove'))
+  assert.equal(config.match(/trusted_hash/g)?.length, 5)
+  assert.deepEqual(spec.links, [])
+})
+
+test('the Drove home links the user login, instructions and each skill, never .system', () => {
+  const spec = launch.codexWorkerSpec(homeRequest())
+  assert.deepEqual(spec.links, [
+    { path: `${CODEX_DIR}/auth.json`, target: `${USER_CODEX}/auth.json` },
+    { path: `${CODEX_DIR}/AGENTS.md`, target: `${USER_CODEX}/AGENTS.md` },
+    { path: `${CODEX_DIR}/skills/cairn`, target: `${USER_CODEX}/skills/cairn` },
+    { path: `${CODEX_DIR}/skills/croft`, target: `${USER_CODEX}/skills/croft` },
+  ])
+})
+
+test('the typed Codex line with a Drove-owned CODEX_HOME stays under 700 bytes for worker, resume and promote, with long paths', () => {
+  const user = '/Users/someone-with-a-long-account-name'
+  const repo = `${user}/${'projects/'.repeat(4)}a-rather-long-repository-name`
+  const long = {
+    identity: { ...worker, home: `${user}/.drove`, run: 'a-rather-long-repository-name-20261010-1934-87d7', seat: 'w-a-seat-name-of-32-characters-x' },
+    repo, cwd: `${repo}/.claude/worktrees/w-a-seat-name-of-32-characters-x`, droveEntry: `${user}/${'projects/'.repeat(4)}drove/src/cli.ts`,
+    codexHome: codexHome({ dir: `${user}/.drove/runs/a-rather-long-repository-name-20261010-1934-87d7/codex-home` }),
+  }
+  const fresh = launch.codexWorkerSpec(homeRequest({ ...long, model: 'gpt-6.1-sol', effort: 'medium' }))
+  const resume = launch.codexWorkerSpec(homeRequest({ ...long, model: 'gpt-6.1-sol', effort: 'medium', resumeId: '019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b' }))
+  const promote = launch.codexWorkerSpec(homeRequest({ ...long, model: 'gpt-6.1-sol-pro-max', effort: 'xhigh', resumeId: '019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b', bypassHookTrust: true }))
+  const sandboxed = launch.codexWorkerSpec(homeRequest({ ...long, model: 'gpt-6.1-sol', effort: 'xhigh', resumeId: '019a1b2c-3d4e-7f80-9a1b-2c3d4e5f6a7b', bypassSandbox: false }))
+  for (const [name, spec] of Object.entries({ fresh, resume, promote, sandboxed })) assert.ok(typedBytes(spec) < 700, `${name}: ${typedBytes(spec)} bytes`)
+  assert.ok(typedBytes(launch.codexWorkerSpec(homeRequest({ ...long, codexHome: undefined }))) > 1024, 'the inline line this replaces was over the tty limit')
+})
+
+test('readCodexHome reads the user home without writing to it, and writeLaunchFiles links without replacing a real file', async () => {
+  const { mkdir, writeFile: write, readlink, lstat, readdir, symlink, unlink } = await import('node:fs/promises')
+  const root = await tmp('codex-home')
+  const user = join(root, 'user-codex')
+  await mkdir(join(user, 'skills', '.system'), { recursive: true })
+  await mkdir(join(user, 'skills', 'cairn'))
+  await write(join(user, 'auth.json'), '{"user":true}')
+  await write(join(user, 'config.toml'), 'model = "gpt-y"\n')
+  await write(join(user, 'hooks.json'), JSON.stringify({ hooks: USER_HOOKS }))
+  const before = (await readdir(user)).sort()
+  const home = await launch.readCodexHome(join(root, 'drove', 'codex-home'), user)
+  assert.deepEqual([home.links, home.skills, home.userConfig, Object.keys(home.userHooks)], [['auth.json'], ['cairn'], 'model = "gpt-y"\n', ['SessionStart', 'Stop']])
+  assert.equal(home.dir, await realpath(join(root, 'drove', 'codex-home')))
+
+  const spec = launch.codexWorkerSpec(homeRequest({ identity: { ...worker, home: join(root, 'drove') }, codexHome: home }))
+  await write(join(home.dir, 'AGENTS.md'), 'a real file the user made here')
+  await launch.writeLaunchFiles({ ...spec, links: [...(spec.links ?? []), { path: join(home.dir, 'AGENTS.md'), target: join(user, 'AGENTS.md') }] })
+  assert.equal(await readlink(join(home.dir, 'auth.json')), join(home.user, 'auth.json'))
+  assert.equal(await readFile(join(home.dir, 'auth.json'), 'utf8'), '{"user":true}')
+  assert.equal(await readlink(join(home.dir, 'skills', 'cairn')), join(home.user, 'skills', 'cairn'))
+  assert.ok(!(await lstat(join(home.dir, 'skills'))).isSymbolicLink(), 'skills is Drove\'s own folder, so Codex writes .system there')
+  assert.equal(await readFile(join(home.dir, 'AGENTS.md'), 'utf8'), 'a real file the user made here')
+  assert.match(await readFile(join(home.dir, 'config.toml'), 'utf8'), /model = "gpt-y"/)
+  assert.equal(statSync(join(home.dir, 'config.toml')).mode & 0o777, 0o600)
+
+  await unlink(join(home.dir, 'auth.json'))
+  await symlink('/somewhere/else/auth.json', join(home.dir, 'auth.json'))
+  await launch.writeLaunchFiles(spec)
+  assert.equal(await readlink(join(home.dir, 'auth.json')), join(home.user, 'auth.json'), 'an older symlink is re-pointed')
+  assert.deepEqual((await readdir(user)).sort(), before, 'nothing was written into the user Codex home')
+  assert.ok(!(await readdir(home.dir)).some(name => name.endsWith('.tmp')))
 })

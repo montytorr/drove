@@ -8,8 +8,8 @@ import { applyDerived, deriveState, findDialog, matchDialog, shouldReadScreen } 
 import { BUSY_RETRY_MS, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
-import { type CodexLaunchRequest, execArgv, isShellSafeArg, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
-import { branchName, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, worktreePath } from './paths.ts'
+import { type CodexLaunchRequest, execArgv, isShellSafeArg, readCodexHome, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
+import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { approvedText, briefFooter, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
@@ -173,7 +173,7 @@ const releaseStaleLock = async (deps: Deps, run: RunMeta, seat: Seat): Promise<s
 
 const launchRequest = (
   deps: Deps,
-  parts: Pick<LaunchRequest, 'identity' | 'kind' | 'repo' | 'cwd' | 'model' | 'effort' | 'roleText'> & Partial<LaunchRequest>,
+  parts: Pick<LaunchRequest, 'identity' | 'kind' | 'repo' | 'cwd' | 'model' | 'effort' | 'roleText'> & Partial<CodexLaunchRequest>,
   config: DroveConfig,
 ): CodexLaunchRequest => ({
   droveEntry: DROVE_ENTRY,
@@ -181,6 +181,11 @@ const launchRequest = (
   bypassSandbox: config.codexWorkerSandbox !== 'workspace-write',
   ...parts,
 })
+
+// A Codex seat resumes with the CODEX_HOME it started with, because its session lives under that home's sessions/
+// (DROVE-34). A seat with none recorded started before Drove owned one and keeps the inline launch line and ~/.codex.
+const codexHomeOf = async (deps: Deps, seat: Seat): Promise<Pick<CodexLaunchRequest, 'codexHome'>> =>
+  seat.kind === 'codex' && seat.codexHome ? { codexHome: await readCodexHome(seat.codexHome, deps.codexUserHome ?? userCodexHome(deps.home)) } : {}
 
 const writeLaunchJson = async (deps: Deps, run: string, seat: string, spec: Parameters<typeof redactSpec>[0]): Promise<void> => {
   await writeJsonAtomic(join(seatDir(deps.home, run, seat), 'launch.json'), redactSpec(spec))
@@ -445,6 +450,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const seat: Seat = {
     name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), model, effort, worktree, branch,
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
+    ...(isClaude ? {} : { codexHome: codexHomeDir(deps.home, run.id) }),
   }
 
   const clash = await heldByAnotherRun(deps, run, seat)
@@ -503,7 +509,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
   const spec = specFor(
-    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}) }, config),
+    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}), ...(await codexHomeOf(deps, seat)) }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -702,7 +708,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   const controlText = formatControl(control, token)
   const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
   const spec = specFor(
-    launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seat.kind === 'codex' ? '' : workerRole(updated, run, config), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}) }, config),
+    launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seat.kind === 'codex' ? '' : workerRole(updated, run, config), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await codexHomeOf(deps, seat)) }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -876,7 +882,7 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
   const identity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const resumeText = resumePrompt(seat)
   const isInline = resolveBriefVia(config) === 'launch-arg'
-  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seat.kind === 'codex' ? '' : workerRole(seat, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}) }, config))
+  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seat.kind === 'codex' ? '' : workerRole(seat, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}), ...(await codexHomeOf(deps, seat)) }, config))
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
