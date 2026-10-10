@@ -1,4 +1,4 @@
-import type { Effort, Expects } from '../types'
+import type { Effort, Expects } from '../types/index.d.ts'
 
 export const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/
 export const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
@@ -96,7 +96,7 @@ const concat = (a: Uint8Array, b: Uint8Array): Uint8Array => {
 // HMAC-SHA256 (RFC 2104) on crypto.subtle.digest: the plugin runtime has digest but no HMAC key import.
 export const hmacSha256 = async (key: string, message: string): Promise<string> => {
   const encoder = new TextEncoder()
-  let keyBytes = encoder.encode(key)
+  let keyBytes: Uint8Array = encoder.encode(key)
   if (keyBytes.length > 64) keyBytes = await sha256(keyBytes)
   const block = new Uint8Array(64)
   block.set(keyBytes)

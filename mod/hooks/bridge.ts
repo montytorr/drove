@@ -1,5 +1,5 @@
-import type { DroveEvent, OrchFeedEntry, OrchModStatus, Roster, RunMeta } from '../types'
-import { oneLine } from './protocol'
+import type { DroveEvent, OrchFeedEntry, OrchModStatus, Roster, RunMeta } from '../types/index.d.ts'
+import { oneLine } from './protocol.ts'
 
 // What `drove mod bridge` writes, one JSON object per line (src/modhost.ts BridgeLine).
 export type BridgeLine =

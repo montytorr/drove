@@ -1,5 +1,5 @@
-import type { Effort, OrchFeedEntry, OrchModStatus, Seat, SeatState } from '../types'
-import { shortModel } from './protocol'
+import type { Effort, OrchFeedEntry, OrchModStatus, Seat, SeatState } from '../types/index.d.ts'
+import { shortModel } from './protocol.ts'
 
 export const CLOSED_STATES: ReadonlySet<SeatState> = new Set(['closed', 'gone', 'down'])
 

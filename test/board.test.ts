@@ -1,11 +1,21 @@
 import assert from 'node:assert/strict'
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs'
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { PULSE_MS, STATUS_TONE } from '../mod/hooks/board.ts'
+import { statusGlyph } from '../mod/hooks/roster.ts'
 import * as board from '../src/board.ts'
-import type { Attention, DroveEvent, Roster, RunMeta, Seat } from '../src/types.ts'
+import { runDir, seatDir } from '../src/paths.ts'
+import { saveRun } from '../src/roster.ts'
+import { appendJsonl, writeJsonAtomic } from '../src/store.ts'
+import type { Deps, DroveEvent, Roster, RunMeta, Seat, SeatState } from '../src/types.ts'
 import { assertExports } from './helpers.ts'
 
-const NOW = new Date('2026-10-09T10:42:00.000Z')
+const NOW = Date.parse('2026-10-09T10:42:00.000Z')
+const ESC = /\x1b/
+const stripAnsi = (text: string): string => text.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '')
 
 const RUN: RunMeta = {
   v: 1,
@@ -34,113 +44,228 @@ const seat = (overrides: Partial<Seat> & Pick<Seat, 'name'>): Seat => ({
   ...overrides,
 })
 
-const ATTENTION: Attention[] = [
-  { seat: 'w-guard', reason: 'codex-version-mismatch', detail: 'Codex CLI and app-server daemon versions differ (codex --version vs the daemon); align them. Drove will not answer the dialog', at: '2026-10-09T10:38:00.000Z' },
-  { seat: 'w-store', reason: 'idle-without-report', detail: 'went idle at 10:20 with no report', at: '2026-10-09T10:41:00.000Z' },
-]
-
 const ROSTER: Roster = {
   v: 1,
   run: RUN.id,
   updatedAt: '2026-10-09T10:41:00.000Z',
   seats: [
-    seat({ name: 'w-core', cairn: 'DROVE-3', state: 'done', stateAt: '2026-10-09T10:35:00.000Z', owes: 'review', lastReport: { id: 'r1', kind: 'done', expects: 'review', summary: 'P1 core state and protocol finished, 48 tests green', at: '2026-10-09T10:35:00.000Z' } }),
-    seat({ name: 'w-guard', kind: 'codex', model: 'gpt-5.5-codex', effort: 'xhigh', cairn: 'DROVE-4', state: 'blocked', stateAt: '2026-10-09T10:38:00.000Z', attention: [ATTENTION[0]!] }),
-    seat({ name: 'w-runtime', cairn: 'DROVE-5', state: 'working', stateAt: '2026-10-09T10:12:00.000Z', lastReport: { id: 'r2', kind: 'progress', expects: 'none', summary: 'herdr wrapper and launch specs written', at: '2026-10-09T10:30:00.000Z' } }),
-    seat({ name: 'w-store', kind: 'codex', model: 'gpt-5.5-codex', effort: 'high', cairn: 'DROVE-6', state: 'idle', stateAt: '2026-10-09T10:20:00.000Z', attention: [ATTENTION[1]!] }),
-    seat({ name: 'w-board', cairn: 'DROVE-7', state: 'needs-input', stateAt: '2026-10-09T10:41:30.000Z', owes: 'answer', lastReport: { id: 'r3', kind: 'question', expects: 'answer', summary: 'Need a types change for the color flag?', at: '2026-10-09T10:41:30.000Z' } }),
-    seat({ name: 'w-old', state: 'closed', stateAt: '2026-10-09T09:00:00.000Z' }),
+    seat({ name: 'w-core', cairn: 'DROVE-3', state: 'done', spawnedAt: '2026-10-09T10:01:00.000Z', owes: 'review', lastReport: { id: 'r1', kind: 'done', expects: 'review', summary: 'P1 core state and protocol finished, 48 tests green', at: '2026-10-09T10:35:00.000Z' } }),
+    seat({ name: 'w-guard', kind: 'codex', model: 'gpt-5.5-codex', effort: 'xhigh', cairn: 'DROVE-4', state: 'blocked', spawnedAt: '2026-10-09T10:02:00.000Z', attention: [{ seat: 'w-guard', reason: 'dialog', detail: 'a trust dialog waits in its pane', at: '2026-10-09T10:38:00.000Z' }] }),
+    seat({ name: 'w-runtime', cairn: 'DROVE-5', state: 'working', spawnedAt: '2026-10-09T10:03:00.000Z' }),
+    seat({ name: 'w-store', cairn: 'DROVE-6', state: 'idle', spawnedAt: '2026-10-09T10:04:00.000Z', lastReport: { id: 'r2', kind: 'progress', expects: 'none', summary: 'store written', at: '2026-10-09T10:20:00.000Z' } }),
+    seat({ name: 'w-board', cairn: 'DROVE-7', state: 'working', spawnedAt: '2026-10-09T10:05:00.000Z' }),
+    seat({ name: 'w-old', state: 'gone', stateAt: '2026-10-09T09:00:00.000Z' }),
   ],
 }
 
 const EVENTS: DroveEvent[] = [
-  { at: '2026-10-09T10:00:01.000Z', type: 'run.up' },
-  { at: '2026-10-09T10:01:00.000Z', type: 'seat.spawn', seat: 'w-core' },
-  { at: '2026-10-09T10:35:00.000Z', type: 'report', seat: 'w-core', data: { kind: 'done', summary: 'P1 finished' } },
-  { at: '2026-10-09T10:38:00.000Z', type: 'attention', seat: 'w-guard', data: { reason: 'codex-version-mismatch' } },
-  { at: '2026-10-09T10:41:30.000Z', type: 'report.pending', seat: 'w-board' },
+  { at: '2026-10-09T10:01:00.000Z', type: 'control.sent', seat: 'w-core', id: 'c1', data: { kind: 'brief' } },
+  { at: '2026-10-09T10:35:00.000Z', type: 'report', seat: 'w-core', id: 'r1', data: { kind: 'done', expects: 'review', summary: 'P1 core state and protocol finished, 48 tests green' } },
+  { at: '2026-10-09T10:36:00.000Z', type: 'seat.state', seat: 'w-old', data: { from: 'idle', to: 'gone' } },
+  { at: '2026-10-09T10:38:00.000Z', type: 'attention', seat: 'w-guard', data: { reason: 'dialog', detail: 'a trust dialog waits in its pane' } },
 ]
 
-const frame = (width: number, color = false) => board.renderBoard({ run: RUN, roster: ROSTER, events: EVENTS, attention: ATTENTION, now: NOW, width, color })
+const STATUS = {
+  'w-runtime': { activity: 'editing src/herdr.ts', ctx: 31, at: '2026-10-09T10:41:00.000Z' },
+  'w-board': { asking: 'Which width is the minimum?', at: '2026-10-09T10:41:58.000Z' },
+}
+
+const DATA: board.BoardData = { run: RUN, roster: ROSTER, status: STATUS, feed: board.feedFrom(EVENTS), bridgeHeld: false }
+
+const input = (columns: number, rows = 30, overrides: Partial<board.FrameInput> = {}): board.FrameInput => ({ ...DATA, now: NOW, frame: 0, columns, rows, offsetMinutes: 0, ...overrides })
+
+const lineOf = (lines: readonly string[], name: string): string => lines.find(line => line.includes(name)) ?? assert.fail(`no line for ${name}`)
 
 const golden = (name: string, actual: string) => {
-  const path = new URL(`./fixtures/p5/${name}`, import.meta.url)
+  const path = new URL(`./fixtures/board/${name}`, import.meta.url)
   if (process.env.UPDATE_GOLDEN === '1') {
-    mkdirSync(new URL('./fixtures/p5/', import.meta.url), { recursive: true })
+    mkdirSync(new URL('./fixtures/board/', import.meta.url), { recursive: true })
     writeFileSync(path, `${actual}\n`)
   }
   assert.equal(`${actual}\n`, readFileSync(path, 'utf8'))
 }
 
 test('board exports its interface', () => {
-  assertExports(board, ['renderBoard', 'runBoard'])
+  assertExports(board, ['runBoard', 'renderFrame', 'modelOf', 'colorDepthOf', 'feedFrom', 'boardSource', 'widthOf'])
 })
 
-test('golden frame at width 80', () => golden('board-80.txt', frame(80)))
-test('golden frame at width 140', () => golden('board-140.txt', frame(140)))
+test('golden plain frame at 60 columns', () => golden('board-60.txt', board.renderFrame(input(60), 0).join('\n')))
+test('golden plain frame at 120 columns', () => golden('board-120.txt', board.renderFrame(input(120), 0).join('\n')))
 
-test('no line exceeds the width', () => {
-  for (const width of [80, 100, 110, 140]) for (const line of frame(width).split('\n')) assert.ok([...line].length <= width, `${width}: ${line}`)
+test('every line fits the width, in colour or not, at 60 and 120 columns', () => {
+  for (const columns of [60, 120])
+    for (const depth of [0, 8, 24] as const)
+      for (const line of board.renderFrame(input(columns), depth)) assert.ok(board.widthOf(stripAnsi(line)) <= columns, `${columns}/${depth}: ${stripAnsi(line)}`)
 })
 
-test('a relaunch event renders as a readable timeline row', () => {
-  const events: DroveEvent[] = [
-    { at: '2026-10-09T10:40:00.000Z', type: 'seat.relaunch', seat: 'w-core', data: { ok: true, resumed: true, pane: 'w1:p2' } },
-    { at: '2026-10-09T10:41:00.000Z', type: 'seat.relaunch', seat: 'w-guard', data: { ok: false, resumed: false, error: 'no saved session id' } },
-  ]
-  const text = board.renderBoard({ run: RUN, roster: ROSTER, events, attention: ATTENTION, now: NOW, width: 100 })
-  assert.match(text, /seat\.relaunch w-core relaunched \(resumed\)/)
-  assert.match(text, /seat\.relaunch w-guard relaunch failed: no saved session id/)
+test('the frame never outgrows the pane height', () => {
+  for (const rows of [4, 9, 12]) assert.ok(board.renderFrame(input(120, rows), 0).length <= rows)
+  assert.equal(board.renderFrame(input(120, 40), 0).length, 5 + 5 + DATA.feed.length)
 })
 
-test('the attention list comes before the seats', () => {
-  const text = frame(80)
-  const attentionAt = text.indexOf('ATTENTION 2')
-  assert.ok(attentionAt >= 0)
-  assert.ok(text.indexOf('codex-version-mismatch') > attentionAt)
-  assert.ok(attentionAt < text.indexOf('w-core'))
+test('the narrow frame drops the wide columns and the gauge but keeps the goal', () => {
+  const lines = board.renderFrame(input(60), 0)
+  assert.match(lines[0] ?? '', /^◆ drove Build Drove/)
+  assert.doesNotMatch(lines[0] ?? '', /▰/)
+  assert.doesNotMatch(lineOf(lines, 'w-core'), /DROVE-3/)
+  assert.match(lineOf(board.renderFrame(input(120), 0), 'w-core'), /DROVE-3/)
 })
 
-test('colour is optional and frames read the same without it', () => {
-  const coloured = frame(80, true)
-  assert.match(coloured, /\x1b\[/)
-  assert.equal(coloured.replace(/\x1b\[[0-9;]*m/g, ''), frame(80))
+test('NO_COLOR turns colour off even when FORCE_COLOR is set; FORCE_COLOR paints a pipe', () => {
+  assert.equal(board.colorDepthOf({ NO_COLOR: '1', FORCE_COLOR: '3' }, true), 0)
+  assert.equal(board.colorDepthOf({ NO_COLOR: '1' }, true), 0)
+  assert.equal(board.colorDepthOf({}, false), 0)
+  assert.equal(board.colorDepthOf({ TERM: 'dumb' }, true), 0)
+  assert.equal(board.colorDepthOf({ FORCE_COLOR: '1' }, false), 8)
+  assert.equal(board.colorDepthOf({ FORCE_COLOR: '1', COLORTERM: 'truecolor' }, false), 24)
+  assert.equal(board.colorDepthOf({ FORCE_COLOR: '0' }, true), 0)
+  assert.equal(board.colorDepthOf({ COLORTERM: '24bit' }, true), 24)
+  assert.equal(board.colorDepthOf({ TERM: 'xterm-256color' }, true), 8)
+  for (const line of board.renderFrame(input(120), board.colorDepthOf({ NO_COLOR: '1' }, true))) assert.doesNotMatch(line, ESC)
 })
 
-test('an empty roster still renders', () => {
-  const text = board.renderBoard({ run: RUN, roster: { ...ROSTER, seats: [] }, events: [], attention: [], now: NOW, width: 80 })
-  assert.match(text, /ATTENTION none/)
-  assert.match(text, /no seats yet/)
-  assert.match(text, /no events yet/)
+test('colour is foreground only: no background escape anywhere', () => {
+  const text = board.renderFrame(input(120), 24).join('\n')
+  assert.match(text, /\x1b\[38;2;/)
+  assert.doesNotMatch(text, /\x1b\[(?:[0-9;]*;)?(?:4[0-9]|48;)/)
+  assert.doesNotMatch(board.renderFrame(input(120), 8).join('\n'), /\x1b\[(?:[0-9;]*;)?(?:4[0-9]|48;)/)
 })
 
-test('model and effort are never cut at width 80, and the report keeps 20 columns', () => {
-  const lines = frame(80).split('\n')
-  for (const seatRow of ROSTER.seats) {
-    const line = lines.find((text) => !text.startsWith('!') && text.includes(` ${seatRow.name} `))
-    assert.ok(line?.includes(board.modelEffort(seatRow.model, seatRow.effort)), `${seatRow.name}: ${line}`)
+test('each seat state maps to its glyph and its colour', () => {
+  const cases: [SeatState, string][] = [['working', 'working'], ['idle', 'good'], ['done', 'good'], ['blocked', 'alert'], ['needs-input', 'alert'], ['gone', 'dim'], ['starting', 'muted']]
+  for (const [state, tone] of cases) assert.equal(STATUS_TONE[state], tone, state)
+  const seats = (['working', 'idle', 'done', 'blocked', 'starting'] as const).map((state, at) => seat({ name: `w-${state}`, state, spawnedAt: `2026-10-09T10:0${at}:00.000Z` }))
+  const lines = board.renderFrame({ ...input(120), roster: { ...ROSTER, seats }, status: {} }, 24)
+  for (const { name, state } of seats) {
+    const line = lineOf(lines, name)
+    assert.ok(line.includes(`${board.sgrOf(STATUS_TONE[state], false, 24)}${statusGlyph(state)}`), `${state} glyph`)
+    assert.ok(line.includes(`${board.sgrOf(STATUS_TONE[state], true, 24)}${name}`), `${state} name`)
   }
-  const core = lines.find((text) => text.includes(' w-core '))!
-  assert.ok(core.includes('done: P1 core state and'), core)
+  assert.equal(board.TONE_COLOR.working, '#89b4fa')
+  assert.equal(board.TONE_COLOR.alert, '#f38ba8')
+  assert.equal(board.TONE_COLOR.dim, '#585b70')
 })
 
-test('short model forms', () => {
-  assert.equal(board.shortModel('claude-sonnet-5-5'), 'sonnet 5.5')
-  assert.equal(board.shortModel('claude-opus-5-5'), 'opus 5.5')
-  assert.equal(board.shortModel('gpt-5.5-codex'), 'gpt-5.5')
-  assert.equal(board.modelEffort('claude-sonnet-5-5', 'medium'), 'sonnet 5.5·m')
-  assert.equal(board.modelEffort('gpt-5.5-codex', 'xhigh'), 'gpt-5.5·x')
-  assert.deepEqual(['low', 'medium', 'high', 'xhigh', 'max'].map(board.effortShort), ['l', 'm', 'h', 'x', 'M'])
+test('an asking seat shows ?, its question in red, and a stripe that pulses then stays red', () => {
+  const alert = board.sgrOf('alert', false, 24)
+  const dim = board.sgrOf('dim', false, 24)
+  const stripe = (frame: number, now = NOW) => lineOf(board.renderFrame(input(120, 30, { frame, now }), 24), 'w-board')
+  assert.ok(stripe(0).includes(`${alert}▌`))
+  assert.ok(stripe(1).includes(`${dim}▌`))
+  assert.ok(stripe(0).includes(`${alert}?`))
+  assert.ok(stripe(0).includes(`${alert}Which width is the minimum?`))
+  const later = NOW + PULSE_MS + 1_000
+  assert.ok(stripe(1, later).includes(`${alert}▌`))
 })
 
-test('kind is a letter under 110 columns and a word from 110', () => {
-  assert.match(frame(80), /w-guard\s+X /)
-  assert.match(frame(110), /w-guard\s+codex /)
+test('a gone seat leaves the rows and shows in the timeline', () => {
+  const lines = board.renderFrame(input(120), 24)
+  assert.ok(!lines.slice(0, 9).some(line => line.includes('w-old')))
+  const gone = lineOf(lines, 'its pane closed')
+  assert.ok(gone.includes(`${board.sgrOf('alert', false, 24)}✕`))
 })
 
-test('since formats ages', () => {
-  assert.equal(board.since('2026-10-09T10:41:40.000Z', NOW), 'now')
-  assert.equal(board.since('2026-10-09T10:12:00.000Z', NOW), '30m')
-  assert.equal(board.since('2026-10-09T08:37:00.000Z', NOW), '2h05')
-  assert.equal(board.since(undefined, NOW), '-')
+test('the spinner turns only while something moves', () => {
+  assert.equal(board.isAnimated(input(120)), true)
+  const still = ROSTER.seats.map(each => ({ ...each, state: each.state === 'working' ? ('idle' as const) : each.state }))
+  assert.equal(board.isAnimated({ ...input(120), roster: { ...ROSTER, seats: still }, status: {} }), false)
+  assert.notEqual(lineOf(board.renderFrame(input(120, 30, { frame: 0 }), 0), 'w-runtime'), lineOf(board.renderFrame(input(120, 30, { frame: 1 }), 0), 'w-runtime'))
+})
+
+test('the lead row says what the lead owes, and a planner bridge nobody holds', () => {
+  assert.match(lineOf(board.renderFrame(input(120), 0), 'lead'), /waiting · owes 1 review/)
+  const viaMod = { ...input(120), run: { ...RUN, planner: { ...RUN.planner, viaMod: true } } }
+  assert.match(lineOf(board.renderFrame(viaMod, 0), 'lead'), /Drove bridge stopped: no planner session holds it/)
+  assert.doesNotMatch(lineOf(board.renderFrame({ ...viaMod, bridgeHeld: true }, 0), 'lead'), /bridge/)
+})
+
+test('all done becomes the heading', () => {
+  const seats = [seat({ name: 'w-a', state: 'done', lastReport: { id: 'r', kind: 'done', expects: 'none', summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })]
+  assert.match(board.renderFrame({ ...input(120), roster: { ...ROSTER, seats }, status: {} }, 0)[0] ?? '', /✓ all done · 42m$/)
+})
+
+test('text from a worker cannot carry an escape sequence into the frame', () => {
+  const status = { 'w-runtime': { activity: 'evil \x1b[2J\x1b[41mred\nline', at: '2026-10-09T10:41:00.000Z' } }
+  for (const line of board.renderFrame({ ...input(120), status }, 0)) assert.doesNotMatch(line, ESC)
+})
+
+test('256-colour terminals get the nearest palette index', () => {
+  assert.equal(board.ansi256('#000000'), 16)
+  assert.equal(board.ansi256('#ffffff'), 231)
+  assert.match(board.sgrOf('working', true, 8), /^\x1b\[1;38;5;\d+m$/)
+})
+
+test('a live frame redraws in place: home, clear to line end, clear below, never a full clear', () => {
+  const text = board.paintFrame(['a', 'b'])
+  assert.match(text, /\x1b\[H/)
+  assert.match(text, /a\x1b\[K\r\nb\x1b\[K\x1b\[J/)
+  assert.doesNotMatch(text, /\x1b\[2J/)
+})
+
+const makeHome = async (): Promise<{ deps: Deps }> => {
+  const home = await mkdtemp(join(tmpdir(), 'drove-board-'))
+  await saveRun(home, RUN)
+  await writeJsonAtomic(join(runDir(home, RUN.id), 'roster.json'), ROSTER)
+  for (const event of EVENTS) await appendJsonl(join(runDir(home, RUN.id), 'events.jsonl'), event)
+  for (const [name, status] of Object.entries(STATUS)) {
+    mkdirSync(seatDir(home, RUN.id, name), { recursive: true })
+    await writeFile(join(seatDir(home, RUN.id, name), 'mod.json'), JSON.stringify(status))
+  }
+  return { deps: { home, clock: { now: () => new Date(NOW) } } as unknown as Deps }
+}
+
+test('stdout not a TTY: one plain frame, even without --once', async () => {
+  const { deps } = await makeHome()
+  const written: string[] = []
+  await board.runBoard(deps, RUN.id, false, { write: text => void written.push(text), columns: () => undefined, rows: () => undefined, isTTY: false, depth: board.colorDepthOf({}, false), offsetMinutes: 0 })
+  assert.equal(written.length, 1)
+  assert.doesNotMatch(written[0] ?? '', ESC)
+  assert.match(written[0] ?? '', /^◆ drove Build Drove/)
+  assert.match(written[0] ?? '', /w-runtime .*editing src\/herdr\.ts/)
+  assert.match(written[0] ?? '', /drove-20261009-1000-a3f1/)
+  assert.ok((written[0] ?? '').split('\n').every(line => board.widthOf(line) <= board.ONCE_COLUMNS))
+})
+
+test('--once on a TTY with NO_COLOR is one plain frame and never enters the alternate screen', async () => {
+  const { deps } = await makeHome()
+  const written: string[] = []
+  await board.runBoard(deps, RUN.id, true, { write: text => void written.push(text), columns: () => 80, rows: () => 24, isTTY: true, depth: board.colorDepthOf({ NO_COLOR: '1' }, true), offsetMinutes: 0 })
+  assert.equal(written.length, 1)
+  assert.doesNotMatch(written.join(''), ESC)
+})
+
+test('live mode enters the alternate screen, hides the cursor, redraws on resize, and restores both when stopped', async () => {
+  const { deps } = await makeHome()
+  const written: string[] = []
+  const controller = new AbortController()
+  let resize: (() => void) | undefined
+  let columns = 120
+  const done = board.runBoard(deps, RUN.id, false, {
+    write: text => {
+      written.push(text)
+      if (written.length === 2) {
+        columns = 60
+        resize?.()
+      }
+      if (written.length === 3) controller.abort()
+    },
+    columns: () => columns,
+    rows: () => 24,
+    isTTY: true,
+    depth: 24,
+    offsetMinutes: 0,
+    signal: controller.signal,
+    frameMs: 5,
+    pollMs: 5,
+    onResize: listener => {
+      resize = listener
+      return () => (resize = undefined)
+    },
+  })
+  await done
+  assert.equal(written[0], board.ENTER)
+  assert.equal(written.at(-1), board.LEAVE)
+  assert.match(written[1] ?? '', /\x1b\[H/)
+  assert.ok(stripAnsi(written[2] ?? '').split('\r\n').every(line => board.widthOf(line) <= 60))
+  assert.equal(resize, undefined)
 })

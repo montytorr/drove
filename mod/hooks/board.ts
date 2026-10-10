@@ -1,6 +1,6 @@
-import type { Effort, OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus, OrchOrchestrator, Seat, SeatState } from '../types'
-import { shortModel } from './protocol'
-import { isAsking, openSeats, spawnedMs, statusGlyph } from './roster'
+import type { Effort, OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus, OrchOrchestrator, Seat, SeatState } from '../types/index.d.ts'
+import { shortModel } from './protocol.ts'
+import { isAsking, openSeats, spawnedMs, statusGlyph } from './roster.ts'
 
 export const BOARD_ID = 'orchestra'
 
@@ -24,7 +24,7 @@ export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 export const PULSE_MS = 6_000
 const GAUGE = { full: '▰', empty: '▱' }
 
-const STATUS_TONE: Record<SeatState, Tone> = {
+export const STATUS_TONE: Record<SeatState, Tone> = {
   starting: 'muted',
   working: 'working',
   idle: 'good',
