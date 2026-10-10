@@ -1,0 +1,14 @@
+◆ drove Build Drove v1 pieces P1…  1/5 done · 5/5 open · 42m
+
+⌘  lead          waiting · owes 1 review               41m
+├─ ▌ ✓  w-core     owes you a review · P1 core state … 7m
+├─ ▌ ⛔ w-guard    a trust dialog waits in its pane    40m
+├─ ▌ ⚙  w-runtime  ⠋ editing src/herdr.ts              39m
+├─ ▌ ·  w-store    store written                       22m
+└─ ▌ ?  w-board    Which width is the minimum?         37m
+
+── timeline ──────────────────── drove-20261009-1000-a3f1 ──
+10:01 ➤  ⌘          → w-core     brief
+10:35 ✓  w-core     → ⌘          expects review · P1 core s…
+10:36 ✕  w-old      → ⌘          its pane closed
+10:38 ⚠  w-guard    → you        dialog: a trust dialog wai…

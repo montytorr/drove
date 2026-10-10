@@ -81,7 +81,7 @@ Planner messages are signed with a per-seat token. The signature covers the head
 | `drove roster [--json] [--run ID]` | one line per seat |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
-| `drove board [--once] [--run ID]` | live plain-text board (this repo's latest run unless `--run` or `DROVE_RUN`) |
+| `drove board [--once] [--run ID]` | live coloured board, the orchestrator mod's layout on your terminal's own background; one frame with `--once` or when piped; no colour when piped or with `NO_COLOR` (this repo's latest run unless `--run` or `DROVE_RUN`) |
 | `drove down [--run ID]` / `drove up [--run ID] [--seat SEAT]` | stop and resume a run |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only; agents are denied) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |

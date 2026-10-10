@@ -1,210 +1,401 @@
-import { runDir } from './paths.ts'
-import { attentionOf, loadRoster, loadRun } from './roster.ts'
-import { readJsonlFrom } from './store.ts'
-import type { Attention, Deps, DroveEvent, Roster, RunMeta, Seat, SeatState } from './types.ts'
+import { join } from 'node:path'
+import { buildBoard, needsAnimation } from '../mod/hooks/board.ts'
+import type { BoardModel, Cell, Tone } from '../mod/hooks/board.ts'
+import { feedOf } from '../mod/hooks/bridge.ts'
+import { FEED_MAX, openSeats } from '../mod/hooks/roster.ts'
+import type { OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus } from '../mod/types/index.d.ts'
+import { plannerDir, runDir, seatDir } from './paths.ts'
+import { loadRoster, loadRun } from './roster.ts'
+import { readJson, readJsonlFrom } from './store.ts'
+import type { Deps, DroveEvent, Roster, RunMeta, Seat } from './types.ts'
 
-export const REFRESH_MS = 2_000
+// The mod's board model (mod/hooks/board.ts) drawn in a terminal, in the terminal's own background.
+
 export const POLL_MS = 500
-export const EVENT_LINES = 8
+export const FRAME_MS = 200
+export const ONCE_COLUMNS = 100
+export const ONCE_ROWS = 40
+const NARROW = 80
 
-export type BoardFrame = {
+// The mod's palette (mod/hooks/register.tsx COLOR and TONE), as foreground colours only.
+export const TONE_COLOR: Record<Tone, string> = {
+  lead: '#cba6f7',
+  working: '#89b4fa',
+  good: '#a6e3a1',
+  warn: '#f9e2af',
+  alert: '#f38ba8',
+  muted: '#7f849c',
+  dim: '#585b70',
+  text: '#cdd6f4',
+  you: '#fab387',
+}
+
+export type ColorDepth = 0 | 8 | 24
+
+export type BoardData = {
   run: RunMeta
   roster: Roster
-  events: readonly DroveEvent[]
-  attention: readonly Attention[]
-  now: Date
-  width: number
-  color?: boolean
+  status: Record<string, OrchModStatus>
+  feed: OrchFeedEntry[]
+  bridgeHeld: boolean
 }
 
-const GLYPH: Record<SeatState, string> = {
-  starting: '◌',
-  working: '●',
-  idle: '○',
-  done: '✓',
-  blocked: '■',
-  'needs-input': '?',
-  unknown: '~',
-  gone: '✕',
-  closing: '·',
-  closed: '·',
-  down: '↓',
+export type FrameInput = BoardData & { now: number; frame: number; columns: number; rows: number; offsetMinutes: number }
+
+export const colorDepthOf = (env: NodeJS.ProcessEnv, isTTY: boolean): ColorDepth => {
+  if (env.NO_COLOR) return 0
+  const force = env.FORCE_COLOR
+  const rich: ColorDepth = env.COLORTERM === 'truecolor' || env.COLORTERM === '24bit' ? 24 : 8
+  if (force !== undefined && force !== '') return force === '0' || force === 'false' ? 0 : force === '3' ? 24 : force === '2' ? 8 : rich
+  if (!isTTY || env.TERM === 'dumb') return 0
+  return rich
 }
 
-const TONE: Record<SeatState, string> = {
-  starting: '2',
-  working: '36',
-  idle: '32',
-  done: '32',
-  blocked: '31',
-  'needs-input': '31',
-  unknown: '2',
-  gone: '2',
-  closing: '2',
-  closed: '2',
-  down: '2',
+// ---------- text width ----------
+
+const WIDE_BMP = new Set([...'⌚⌛⏩⏪⏫⏬⏰⏳◽◾☔☕♈♉♊♋♌♍♎♏♐♑♒♓♿⚓⚡⚪⚫⚽⚾⛄⛅⛎⛔⛪⛲⛳⛵⛺⛽✅✊✋✨❌❎❓❔❕❗➕➖➗➰➿⬛⬜⭐⭕'].map(char => char.codePointAt(0)))
+
+const charWidth = (code: number): number => {
+  if (code < 0x20 || (code >= 0x7f && code < 0xa0)) return 0
+  if ((code >= 0x300 && code <= 0x36f) || (code >= 0x200b && code <= 0x200f) || (code >= 0xfe00 && code <= 0xfe0f)) return 0
+  if (WIDE_BMP.has(code)) return 2
+  if (
+    (code >= 0x1100 && code <= 0x115f) ||
+    (code >= 0x2e80 && code <= 0xa4cf) ||
+    (code >= 0xac00 && code <= 0xd7a3) ||
+    (code >= 0xf900 && code <= 0xfaff) ||
+    (code >= 0xfe30 && code <= 0xfe4f) ||
+    (code >= 0xff00 && code <= 0xff60) ||
+    (code >= 0xffe0 && code <= 0xffe6) ||
+    (code >= 0x1f300 && code <= 0x1f64f) ||
+    (code >= 0x1f900 && code <= 0x1f9ff) ||
+    (code >= 0x20000 && code <= 0x3fffd)
+  )
+    return 2
+  return 1
 }
 
-const OWES: Record<Seat['owes'], string> = { review: 'review', answer: 'answer', none: '-' }
+export const widthOf = (text: string): number => [...text].reduce((sum, char) => sum + charWidth(char.codePointAt(0) ?? 0), 0)
 
-const paint = (text: string, code: string, color: boolean | undefined): string => (color ? `\x1b[${code}m${text}\x1b[0m` : text)
+// Untrusted text (summaries, activities) loses control characters, so it can never carry an escape sequence.
+const clean = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
 
-export const fit = (text: string, width: number): string => {
-  const flat = text.replace(/\s+/g, ' ').trim()
+export const fitWidth = (text: string, width: number): string => {
   if (width <= 0) return ''
-  return flat.length <= width ? flat : `${flat.slice(0, Math.max(0, width - 1))}…`
+  if (widthOf(text) <= width) return text
+  let out = ''
+  let used = 0
+  for (const char of text) {
+    const size = charWidth(char.codePointAt(0) ?? 0)
+    if (used + size > width - 1) break
+    out += char
+    used += size
+  }
+  return `${out}…`
 }
 
-const cell = (text: string, width: number): string => fit(text, width).padEnd(width)
+const padTo = (text: string, width: number): string => `${text}${' '.repeat(Math.max(0, width - widthOf(text)))}`
 
-export const since = (from: string | undefined, now: Date): string => {
-  const at = from === undefined ? Number.NaN : Date.parse(from)
-  if (Number.isNaN(at)) return '-'
-  const minutes = Math.floor(Math.max(0, now.getTime() - at) / 60_000)
-  if (minutes < 1) return 'now'
-  if (minutes < 60) return `${minutes}m`
-  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}`
-}
+// ---------- lines ----------
 
-export const clockOf = (at: string): string => {
-  const date = new Date(at)
-  return Number.isNaN(date.getTime()) ? '--:--' : date.toISOString().slice(11, 16)
-}
+type Seg = { text: string; tone?: Tone; isBold?: boolean }
 
-const EFFORT_LETTER: Record<string, string> = { low: 'l', medium: 'm', high: 'h', xhigh: 'x', max: 'M' }
+const segWidth = (segs: readonly Seg[]): number => segs.reduce((sum, { text }) => sum + widthOf(text), 0)
 
-export const effortShort = (effort: string): string => EFFORT_LETTER[effort] ?? effort.charAt(0)
-
-export const shortModel = (model: string): string => {
-  const bare = model.replace(/^claude-/, '')
-  const family = /^(opus|sonnet|haiku|fable)-(\d+)-(\d+)$/.exec(bare)
-  return family === null ? bare.replace(/-codex$/, '') : `${family[1]} ${family[2]}.${family[3]}`
-}
-
-export const modelEffort = (model: string, effort: string): string => `${shortModel(model)}·${effortShort(effort)}`
-
-const reportOf = (seat: Seat): string => (seat.lastReport === undefined ? '-' : `${seat.lastReport.kind}: ${seat.lastReport.summary}`)
-
-const eventDetail = (event: DroveEvent): string => {
-  const data = event.data ?? {}
-  if (event.type === 'seat.relaunch') return data.ok === false ? `relaunch failed: ${String(data.error ?? '')}` : `relaunched${data.resumed ? ' (resumed)' : ''}`
-  const pick = ['summary', 'reason', 'state', 'kind', 'to'].map((key) => data[key]).find((value) => typeof value === 'string')
-  return typeof pick === 'string' ? pick : ''
-}
-
-const eventLine = (event: DroveEvent, width: number): string => {
-  const head = `${clockOf(event.at)} ${event.type}${event.seat === undefined ? '' : ` ${event.seat}`}`
-  const detail = eventDetail(event)
-  return fit(detail === '' ? head : `${head} ${detail}`, width)
-}
-
-const seatLine = (seat: Seat, now: Date, width: number, modelW: number, color: boolean | undefined): string => {
-  const wide = width >= 110
-  const seatW = wide ? 14 : 10
-  const kindW = wide ? 6 : 1
-  const cairnW = wide ? 10 : 8
-  const ageW = 5
-  const owesW = 6
-  const fixed = 2 + seatW + 1 + kindW + 1 + modelW + 1 + cairnW + 1 + ageW + 1 + 1 + owesW
-  const reportW = Math.max(20, width - fixed)
-  const kind = wide ? seat.kind : seat.kind === 'claude' ? 'C' : 'X'
-  const glyph = paint(GLYPH[seat.state], TONE[seat.state], color)
-  const body = [cell(seat.name, seatW), cell(kind, kindW), cell(modelEffort(seat.model, seat.effort), modelW), cell(seat.cairn ?? '-', cairnW), cell(since(seat.stateAt, now), ageW), cell(reportOf(seat), reportW), cell(OWES[seat.owes], owesW)]
-  return `${glyph} ${body.join(' ')}`.trimEnd()
-}
-
-export const renderBoard = (frame: BoardFrame): string => {
-  const { run, roster, events, attention, now, width, color } = frame
-  const rule = '─'.repeat(width)
-  const open = roster.seats.filter((seat) => seat.state !== 'closed').length
-  const title = `drove ${run.id} · ${run.status} · ${open}/${run.budget} seats · planner ${run.planner.kind} ${modelEffort(run.planner.model, run.planner.effort)}`
-  const lines: string[] = [paint(fit(title, width), '1', color)]
-  if (run.goal !== undefined) lines.push(fit(`goal: ${run.goal}`, width))
-  lines.push(rule)
-  lines.push(paint(fit(attention.length === 0 ? 'ATTENTION none' : `ATTENTION ${attention.length}`, width), attention.length === 0 ? '2' : '1;31', color))
-  for (const item of attention) lines.push(`${paint('!', '31', color)} ${fit(`${item.seat} ${item.reason}: ${item.detail}`, width - 2)}`)
-  lines.push(rule)
-  if (roster.seats.length === 0) lines.push('no seats yet')
-  const modelW = Math.max(...roster.seats.map((seat) => [...modelEffort(seat.model, seat.effort)].length), 0)
-  for (const seat of roster.seats) lines.push(seatLine(seat, now, width, modelW, color))
-  lines.push(rule)
-  lines.push(paint('RECENT', '2', color))
-  const recent = events.slice(-EVENT_LINES)
-  if (recent.length === 0) lines.push('no events yet')
-  for (const event of recent) lines.push(eventLine(event, width))
-  return lines.join('\n')
-}
-
-export type BoardIo = {
-  write: (text: string) => void
-  width: () => number
-  color: boolean
-  signal?: AbortSignal
-  pollMs?: number
-  refreshMs?: number
-}
-
-const stdoutIo = (): BoardIo => ({
-  write: (text) => void process.stdout.write(text),
-  width: () => process.stdout.columns ?? 100,
-  color: process.stdout.isTTY === true && process.env.NO_COLOR === undefined,
-})
-
-const CLEAR = '\x1b[H\x1b[2J'
-
-const sleep = (ms: number, signal: AbortSignal): Promise<void> =>
-  new Promise((resolve) => {
-    if (signal.aborted) return resolve()
-    const done = () => {
-      clearTimeout(timer)
-      signal.removeEventListener('abort', done)
-      resolve()
+const clipSegs = (segs: readonly Seg[], columns: number): Seg[] => {
+  if (segWidth(segs) <= columns) return [...segs]
+  const out: Seg[] = []
+  let room = columns
+  for (const seg of segs) {
+    const size = widthOf(seg.text)
+    if (size < room) {
+      out.push(seg)
+      room -= size
+      continue
     }
-    const timer = setTimeout(done, ms)
-    signal.addEventListener('abort', done, { once: true })
+    out.push({ ...seg, text: fitWidth(seg.text, room) })
+    break
+  }
+  return out
+}
+
+const cellText = (cell: Cell): string => clean(cell.text)
+
+const rowSegs = (cells: readonly Cell[], columns: number): Seg[] => {
+  const flexible = cells.findIndex(cell => cell.width === undefined)
+  const fixed = cells.reduce((sum, cell, at) => sum + (at === flexible ? 0 : (cell.width ?? 0)), 0) + Math.max(0, cells.length - 1)
+  const flexWidth = Math.max(0, columns - fixed)
+  const segs: Seg[] = []
+  cells.forEach((cell, at) => {
+    if (at > 0) segs.push({ text: ' ' })
+    const width = at === flexible ? flexWidth : (cell.width ?? 0)
+    const text = fitWidth(cellText(cell), width)
+    segs.push({ text, tone: cell.tone, isBold: cell.isBold })
+    if (at < cells.length - 1) segs.push({ text: ' '.repeat(Math.max(0, width - widthOf(text))) })
+  })
+  return clipSegs(segs, columns)
+}
+
+const headSegs = (model: BoardModel, columns: number): Seg[] => {
+  const [brand, goal] = model.title
+  let progress = model.progress
+  const progressWidth = (cells: readonly Cell[]) => widthOf(cells.map(cellText).join(' '))
+  const brandWidth = brand ? widthOf(brand.text) : 0
+  if (progress.length > 1 && (columns < NARROW || columns - progressWidth(progress) - 2 < brandWidth + 20)) progress = progress.slice(1)
+  const right: Seg[] = progress.flatMap((cell, at) => [...(at > 0 ? [{ text: ' ' }] : []), { text: cellText(cell), tone: cell.tone, isBold: cell.isBold }])
+  const leftRoom = Math.max(0, columns - segWidth(right) - 2)
+  const left = clipSegs(
+    [
+      ...(brand ? [{ text: cellText(brand), tone: brand.tone, isBold: brand.isBold }] : []),
+      ...(goal ? [{ text: ' ' }, { text: fitWidth(cellText(goal), Math.max(0, leftRoom - brandWidth - 1)), tone: goal.tone, isBold: goal.isBold }] : []),
+    ],
+    leftRoom,
+  )
+  return clipSegs([...left, { text: ' '.repeat(Math.max(2, columns - segWidth(left) - segWidth(right))) }, ...right], columns)
+}
+
+const ruleSegs = (title: string, run: string, columns: number): Seg[] => {
+  const head = `── ${title} `
+  const tail = ` ${run} ──`
+  const fill = columns - widthOf(head) - widthOf(tail)
+  return clipSegs(fill >= 3 ? [{ text: `${head}${'─'.repeat(fill)}`, tone: 'dim' }, { text: ` ${run}`, tone: 'muted' }, { text: ' ──', tone: 'dim' }] : [{ text: `${head}${'─'.repeat(Math.max(0, columns - widthOf(head)))}`, tone: 'dim' }], columns)
+}
+
+export const boardLines = (model: BoardModel, run: string, columns: number, rows: number): Seg[][] => {
+  const lines: Seg[][] = [headSegs(model, columns), [], rowSegs(model.lead.cells, columns), ...model.workers.map(row => rowSegs(row.cells, columns))]
+  if (model.empty) lines.push([{ text: fitWidth(model.empty, columns), tone: 'muted' }])
+  lines.push([], ruleSegs(model.feedTitle, run, columns))
+  if (model.feed.length === 0) lines.push([{ text: fitWidth('Briefs, reports and verdicts appear here.', columns), tone: 'muted' }])
+  for (const row of model.feed) lines.push(rowSegs(row.cells, columns))
+  return lines.slice(0, Math.max(1, rows))
+}
+
+// ---------- colour ----------
+
+const rgbOf = (hex: string): [number, number, number] => [1, 3, 5].map(at => Number.parseInt(hex.slice(at, at + 2), 16)) as [number, number, number]
+
+const CUBE = [0, 95, 135, 175, 215, 255]
+
+export const ansi256 = (hex: string): number => {
+  const rgb = rgbOf(hex)
+  const level = (value: number) => (value < 48 ? 0 : value < 115 ? 1 : Math.floor((value - 35) / 40))
+  const [r, g, b] = rgb.map(level) as [number, number, number]
+  const cube = 16 + 36 * r + 6 * g + b
+  const gray = Math.max(0, Math.min(23, Math.round((rgb.reduce((sum, value) => sum + value, 0) / 3 - 8) / 10)))
+  const distance = (other: readonly number[]) => other.reduce((sum, value, at) => sum + (value - (rgb[at] ?? 0)) ** 2, 0)
+  return distance([CUBE[r] ?? 0, CUBE[g] ?? 0, CUBE[b] ?? 0]) <= distance([8 + gray * 10, 8 + gray * 10, 8 + gray * 10]) ? cube : 232 + gray
+}
+
+export const sgrOf = (tone: Tone, isBold: boolean | undefined, depth: ColorDepth): string => {
+  const hex = TONE_COLOR[tone]
+  const color = depth === 24 ? `38;2;${rgbOf(hex).join(';')}` : `38;5;${ansi256(hex)}`
+  return `\x1b[${isBold ? '1;' : ''}${color}m`
+}
+
+const paintLine = (segs: readonly Seg[], depth: ColorDepth): string => {
+  const kept = [...segs]
+  while (kept.length > 0 && (kept.at(-1)?.text.trim() ?? '') === '') kept.pop()
+  const last = kept.at(-1)
+  if (last) kept[kept.length - 1] = { ...last, text: last.text.trimEnd() }
+  return kept.map(({ text, tone, isBold }) => (depth === 0 || tone === undefined || text.trim() === '' ? text : `${sgrOf(tone, isBold, depth)}${text}\x1b[0m`)).join('')
+}
+
+// ---------- model ----------
+
+const ownedOf = (seats: readonly Seat[]): string => {
+  const reviews = seats.filter(({ owes }) => owes === 'review').length
+  const answers = seats.filter(({ owes }) => owes === 'answer').length
+  return [reviews ? `${reviews} review${reviews === 1 ? '' : 's'}` : '', answers ? `${answers} answer${answers === 1 ? '' : 's'}` : ''].filter(Boolean).join(' and ')
+}
+
+// What the lead is doing, as far as Drove can see from outside its pane: what it owes the workers, and since when it last sent.
+export const leadOf = (data: BoardData): OrchLead => {
+  const owed = ownedOf(openSeats(data.roster.seats))
+  const sent = data.feed.filter(({ from }) => from === '⌘').at(-1)?.at
+  const activity = data.run.status === 'down' ? 'idle · the run is down; drove up resumes it' : owed ? `waiting · owes ${owed}` : 'waiting on the workers'
+  return { activity, since: sent ?? (Date.parse(data.run.createdAt) || 0) }
+}
+
+const bridgeOf = (data: BoardData, now: number): OrchBridge | null =>
+  data.run.status === 'up' && data.run.planner.viaMod && !data.bridgeHeld ? { state: 'stopped', detail: 'no planner session holds it', since: now } : null
+
+export const asksAtOf = (seats: readonly Seat[], status: Readonly<Record<string, OrchModStatus>>): Record<string, number> =>
+  Object.fromEntries(
+    openSeats(seats).flatMap(seat => {
+      const mine = status[seat.name]
+      const at = mine?.asking ? Date.parse(mine.at ?? '') : seat.state === 'needs-input' ? Date.parse(seat.stateAt) : Number.NaN
+      return Number.isNaN(at) ? [] : [[seat.name, at] as const]
+    }),
+  )
+
+export const modelOf = (input: FrameInput): BoardModel => {
+  const model = buildBoard({
+    orchestrator: { run: input.run.id, repo: input.run.repo, goal: input.run.goal, startedAt: Date.parse(input.run.createdAt) || input.now, budget: input.run.budget },
+    seats: input.roster.seats,
+    status: input.status,
+    asksAt: asksAtOf(input.roster.seats, input.status),
+    bridge: bridgeOf(input, input.now),
+    feed: input.feed,
+    lead: leadOf(input),
+    leadModel: input.run.planner.model,
+    leadEffort: input.run.planner.effort,
+    now: input.now,
+    frame: input.frame,
+    offsetMinutes: input.offsetMinutes,
+    columns: input.columns,
+    rows: input.rows,
+  })
+  const [brand, ...rest] = model.title
+  return { ...model, title: [{ ...(brand ?? { tone: 'lead', isBold: true }), text: '◆ drove' }, ...rest], feedTitle: model.feedTitle.replace(' · scroll for more', '') }
+}
+
+export const isAnimated = (input: FrameInput): boolean => needsAnimation(leadOf(input), input.roster.seats, asksAtOf(input.roster.seats, input.status), input.now)
+
+export const renderFrame = (input: FrameInput, depth: ColorDepth): string[] =>
+  boardLines(modelOf(input), input.run.id, input.columns, input.rows).map(line => paintLine(line, depth))
+
+// ---------- reading the run ----------
+
+// Control bodies are not kept on disk, so a brief or a verdict shows its kind, not its text.
+export const feedFrom = (events: readonly DroveEvent[], first = 0): OrchFeedEntry[] =>
+  events.flatMap((event, at) => {
+    const draft = feedOf(event, new Map())
+    return draft ? [{ ...draft, id: event.id ?? `e${first + at}` }] : []
   })
 
-export const runBoard = async (deps: Deps, run: string, once: boolean, io: BoardIo = stdoutIo()): Promise<void> => {
-  const eventsPath = `${runDir(deps.home, run)}/events.jsonl`
-  let events: DroveEvent[] = []
-  let cursor = { offset: 0 }
-  let lastText = ''
-  let lastDrawAt = 0
+const isAlive = (pid: number | undefined): boolean => {
+  if (!pid) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
 
-  const frameText = async (): Promise<string> => {
+export const boardSource = (deps: Deps, run: string): (() => Promise<BoardData>) => {
+  const eventsPath = join(runDir(deps.home, run), 'events.jsonl')
+  let cursor = { offset: 0 }
+  let feed: OrchFeedEntry[] = []
+  let seen = 0
+  return async () => {
     const meta = await loadRun(deps.home, run)
     if (meta === undefined) throw new Error(`unknown run: ${run}`)
     const roster = await loadRoster(deps.home, run)
     const read = await readJsonlFrom<DroveEvent>(eventsPath, cursor)
     cursor = read.cursor
-    events = [...events, ...read.items].slice(-EVENT_LINES * 4)
-    return renderBoard({ run: meta, roster, events, attention: attentionOf(roster), now: deps.clock.now(), width: io.width(), color: io.color })
+    feed = [...feed, ...feedFrom(read.items, seen)].slice(-FEED_MAX)
+    seen += read.items.length
+    const status = Object.fromEntries(
+      (
+        await Promise.all(
+          openSeats(roster.seats).map(async seat => [seat.name, await readJson<OrchModStatus>(join(seatDir(deps.home, run, seat.name), 'mod.json')).catch(() => undefined)] as const),
+        )
+      ).filter((entry): entry is readonly [string, OrchModStatus] => entry[1] !== undefined),
+    )
+    const lock = await readJson<{ pid?: number }>(join(plannerDir(deps.home, run), 'bridge.json')).catch(() => undefined)
+    return { run: meta, roster, status, feed, bridgeHeld: isAlive(lock?.pid) }
+  }
+}
+
+// ---------- drawing ----------
+
+export type BoardIo = {
+  write: (text: string) => void
+  columns: () => number | undefined
+  rows: () => number | undefined
+  isTTY: boolean
+  depth: ColorDepth
+  offsetMinutes?: number
+  signal?: AbortSignal
+  onResize?: (listener: () => void) => () => void
+  pollMs?: number
+  frameMs?: number
+}
+
+const stdoutIo = (): BoardIo => ({
+  write: text => void process.stdout.write(text),
+  columns: () => process.stdout.columns,
+  rows: () => process.stdout.rows,
+  isTTY: process.stdout.isTTY === true,
+  depth: colorDepthOf(process.env, process.stdout.isTTY === true),
+  onResize: listener => {
+    process.stdout.on('resize', listener)
+    return () => void process.stdout.off('resize', listener)
+  },
+})
+
+export const ENTER = '\x1b[?1049h\x1b[?25l'
+export const LEAVE = '\x1b[?25h\x1b[?1049l'
+const SYNC_ON = '\x1b[?2026h'
+const SYNC_OFF = '\x1b[?2026l'
+
+// Home, each line then clear to its end, clear below: the old frame is overwritten in place, never blanked first.
+export const paintFrame = (lines: readonly string[]): string => `${SYNC_ON}\x1b[H${lines.map(line => `${line}\x1b[K`).join('\r\n')}\x1b[J${SYNC_OFF}`
+
+export const runBoard = async (deps: Deps, run: string, once: boolean, io: BoardIo = stdoutIo()): Promise<void> => {
+  const load = boardSource(deps, run)
+  const offsetOf = (now: number) => io.offsetMinutes ?? new Date(now).getTimezoneOffset()
+  const frameOf = (data: BoardData, frame: number, live: boolean): FrameInput => {
+    const now = deps.clock.now().getTime()
+    return { ...data, now, frame, offsetMinutes: offsetOf(now), columns: io.columns() || ONCE_COLUMNS, rows: io.rows() || (live ? 24 : ONCE_ROWS) }
   }
 
-  if (once) {
-    io.write(`${await frameText()}\n`)
+  if (once || !io.isTTY) {
+    io.write(`${renderFrame(frameOf(await load(), 0, false), io.depth).join('\n')}\n`)
     return
   }
 
   const controller = new AbortController()
   const stop = () => controller.abort()
+  const signal = io.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, io.signal])
+  let wake: (() => void) | undefined
+  let last = ''
+  const resized = () => {
+    last = ''
+    wake?.()
+  }
+  const restore = () => io.write(LEAVE)
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
-  const signal = io.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, io.signal])
+  process.once('exit', restore)
+  const offResize = io.onResize?.(resized)
+  io.write(ENTER)
   try {
+    let data = await load()
+    let loadedAt = deps.clock.now().getTime()
+    let frame = 0
     while (!signal.aborted) {
-      const text = await frameText()
-      const nowMs = deps.clock.now().getTime()
-      if (text !== lastText || nowMs - lastDrawAt >= (io.refreshMs ?? REFRESH_MS)) {
-        io.write(`${CLEAR}${text}\n`)
-        lastText = text
-        lastDrawAt = nowMs
+      const now = deps.clock.now().getTime()
+      if (now - loadedAt >= (io.pollMs ?? POLL_MS)) {
+        data = await load().catch(() => data)
+        loadedAt = now
       }
-      await sleep(io.pollMs ?? POLL_MS, signal)
+      const input = frameOf(data, frame, true)
+      const moving = isAnimated(input)
+      const text = paintFrame(renderFrame(input, io.depth))
+      if (text !== last) {
+        io.write(text)
+        last = text
+      }
+      if (moving) frame = (frame + 1) % 1000
+      await new Promise<void>(resolve => {
+        const done = () => {
+          clearTimeout(timer)
+          signal.removeEventListener('abort', done)
+          wake = undefined
+          resolve()
+        }
+        const timer = setTimeout(done, moving ? (io.frameMs ?? FRAME_MS) : (io.pollMs ?? POLL_MS))
+        wake = done
+        signal.addEventListener('abort', done, { once: true })
+      })
     }
   } finally {
+    offResize?.()
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
-    io.write('\n')
+    process.off('exit', restore)
+    restore()
   }
 }
