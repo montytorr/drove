@@ -470,3 +470,67 @@ test('the watcher leaves a closing seat alone', async () => {
   assert.deepEqual(seat?.attention, [])
   assert.equal((await eventsOf(ctx)).filter((event) => event.type === 'attention').length, 0)
 })
+
+test('a report of a seat closed after it filed is dropped, not woken', async () => {
+  const ctx = await setup()
+  const { ports } = fakePorts()
+  await fileReport(ctx, 'w-api', 'done', 'api finished')
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  await updateRoster(ctx.home, ctx.run.id, (roster) => ({ ...roster, seats: roster.seats.map((seat) => ({ ...seat, state: 'closed' as const })) }))
+  ctx.clock.advance(BATCH_MS)
+  await watcher.tick()
+  assert.equal(queued(ctx.calls).length, 0)
+  const events = await eventsOf(ctx)
+  assert.ok(events.some((event) => event.type === 'report.delivered' && event.data?.via === 'dropped-seat-closed'))
+  assert.equal(await watcher.piggyback('r'), 'r')
+})
+
+test('a report of a seat that vanished or went down is still woken', async () => {
+  for (const state of ['gone', 'down'] as const) {
+    const ctx = await setup()
+    const { ports } = fakePorts()
+    await fileReport(ctx, 'w-api', 'blocked', `died as ${state}`)
+    const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+    await watcher.tick()
+    await updateRoster(ctx.home, ctx.run.id, (roster) => ({ ...roster, seats: roster.seats.map((seat) => ({ ...seat, state })) }))
+    ctx.clock.advance(BATCH_MS)
+    await watcher.tick()
+    assert.equal(queued(ctx.calls).length, 1, state)
+    assert.match(queued(ctx.calls)[0]?.at(-1) ?? '', new RegExp(`died as ${state}`))
+  }
+})
+
+test('a wake handed to the mod is recorded as a handoff, not a delivery', async () => {
+  const ctx = await setup({ planner: { kind: 'claude', viaMod: true } })
+  const { ports } = fakePorts()
+  await fileReport(ctx, 'w-api', 'done', 'via the mod')
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false, modWake: async () => true })
+  await watcher.tick()
+  ctx.clock.advance(BATCH_MS)
+  await watcher.tick()
+  const delivered = (await eventsOf(ctx)).filter((event) => event.type === 'report.delivered')
+  assert.deepEqual(delivered.map((event) => event.data?.via), ['mod-handoff'])
+})
+
+test('the poll copies a hook session id into the live seat record once', async () => {
+  const ctx = await setup()
+  const hooks = join(ctx.home, 'runs', ctx.run.id, 'seats', 'w-api', 'hooks.jsonl')
+  await appendJsonl(hooks, { at: ctx.clock.now().toISOString(), agent: 'codex', event: 'session-start', sessionId: 'sess-1' })
+  const { ports } = fakePorts({
+    listAgents: async () => {
+      await updateRoster(ctx.home, ctx.run.id, (roster) => ({ ...roster, seats: roster.seats.map((seat) => ({ ...seat, branch: 'drove/late' })) }))
+      return { ok: true, value: [{ name: 'w-api', paneId: 'p-w-api', status: 'working' }] }
+    },
+  })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  let seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.sessionId, 'sess-1')
+  assert.equal(seat?.branch, 'drove/late')
+  await appendJsonl(hooks, { at: ctx.clock.now().toISOString(), agent: 'codex', event: 'stop', sessionId: 'sess-2' })
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.sessionId, 'sess-1', 'an id already saved is kept')
+})
