@@ -54,6 +54,30 @@ test("the mod's HMAC on crypto.subtle.digest matches Drove's mac for every contr
   assert.equal(await mod.verifyEnvelope(parsed!, 'other-token'), false)
 })
 
+test('a multi-paragraph control pasted into a terminal (LF turned into CR or CRLF, trailing blanks dropped) still verifies in the mod', async () => {
+  const mod = await load<ModProtocol>('protocol.ts')
+  const body = 'Plan — step one → verify · done   \n\nSecond paragraph, with a line that ends in blanks \t \n\nThird: ok'
+  const control: Control = { v: 1, id: 'c-11', run: 'r-1', from: 'planner', to: 'w-api', kind: 'brief', expects: 'review', body, at: 'x' }
+  const sent = formatControl(control, 'seat-token')
+  assert.doesNotMatch(sent, /[ \t]$/m, 'Drove sends the canonical body, with no trailing blanks')
+  const canonical = 'Plan — step one → verify · done\n\nSecond paragraph, with a line that ends in blanks\n\nThird: ok'
+  const transforms: [string, (text: string) => string][] = [
+    ['LF', text => text],
+    ['CR', text => text.replace(/\n/g, '\r')],
+    ['CRLF', text => text.replace(/\n/g, '\r\n')],
+    ['CR with a line padded by the terminal', text => text.replace(/\n/g, '\r').replace('verify · done', 'verify · done  ')],
+  ]
+  for (const [name, transform] of transforms) {
+    const parsed = mod.parseEnvelope(transform(sent))
+    assert.equal(parsed?.body, canonical, `body after ${name}`)
+    assert.equal(await mod.verifyEnvelope(parsed!, 'seat-token'), true, `verifies after ${name}`)
+    assert.equal(await mod.verifyEnvelope(parsed!, 'other-token'), false, `wrong token after ${name}`)
+    const tampered = mod.parseEnvelope(transform(sent).replace('Third: ok', 'Third: not ok'))
+    assert.equal(await mod.verifyEnvelope(tampered!, 'seat-token'), false, `tampered body after ${name}`)
+  }
+  assert.equal(await mod.macOf('seat-token', 'c-11', body.replace(/\n/g, '\r')), macOf('seat-token', 'c-11', body))
+})
+
 test("the mod's guard input is read by Drove's real hook, and its verdicts parsed back", async () => {
   const mod = await load<ModDrove>('drove.ts')
   const ctx = await setup({ planner: { kind: 'claude', viaMod: true, sessionId: 's-1' } })

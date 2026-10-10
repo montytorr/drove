@@ -38,8 +38,19 @@ const MAC_LENGTH = 16
 export type Envelope = { fields: Record<string, string>; body: string; reply?: string }
 export type Located = { envelope: Envelope; before: string }
 
+// A terminal turns a pasted LF into CR (or CRLF) and drops trailing blanks, so the mac is taken over this canonical
+// form on both ends. src/protocol.ts canonicalText and canonicalBody mirror these two; keep them identical.
+export const canonicalText = (text: string): string =>
+  text
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/[ \t]+$/, ''))
+    .join('\n')
+
+export const canonicalBody = (text: string): string => canonicalText(text).trim()
+
 export const parseEnvelope = (text: string): Envelope | undefined => {
-  const match = HEADER_RE.exec(text.trimStart())
+  const match = HEADER_RE.exec(canonicalText(text).trimStart())
   if (!match) return undefined
   const fields: Record<string, string> = {}
   for (const pair of (match[1] ?? '').trim().split(' ').filter(Boolean)) {
@@ -82,7 +93,7 @@ export const hmacSha256 = async (key: string, message: string): Promise<string> 
   return hex((await sha256(concat(outer, innerHash))).buffer as ArrayBuffer)
 }
 
-export const macOf = async (token: string, id: string, body: string): Promise<string> => (await hmacSha256(token, `${id}\n${body}`)).slice(0, MAC_LENGTH)
+export const macOf = async (token: string, id: string, body: string): Promise<string> => (await hmacSha256(token, `${id}\n${canonicalBody(body)}`)).slice(0, MAC_LENGTH)
 
 export const verifyEnvelope = async (envelope: Envelope, token: string | undefined): Promise<boolean> => {
   const { id, mac } = envelope.fields

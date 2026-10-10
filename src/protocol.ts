@@ -63,8 +63,19 @@ export const stampReport = (input: ReportInput, meta: { id: string; run: string;
   at: meta.at,
 })
 
+// A terminal turns a pasted LF into CR (or CRLF) and drops trailing blanks, so the mac is taken over this canonical
+// form on both ends. mod/hooks/protocol.ts canonicalText and canonicalBody mirror these two; keep them identical.
+export const canonicalText = (text: string): string =>
+  text
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map(line => line.replace(/[ \t]+$/, ''))
+    .join('\n')
+
+export const canonicalBody = (text: string): string => canonicalText(text).trim()
+
 export const macOf = (token: string, id: string, body: string): string =>
-  createHmac('sha256', token).update(`${id}\n${body}`).digest('hex').slice(0, MAC_LENGTH)
+  createHmac('sha256', token).update(`${id}\n${canonicalBody(body)}`).digest('hex').slice(0, MAC_LENGTH)
 
 const fieldValue = (value: string): string => value.replace(/[\s⟧]+/g, '_')
 
@@ -83,7 +94,7 @@ export const replyLine = (kind: ControlKind, expects: Expects): string => {
 }
 
 export const formatControl = (control: Control, token: string): string => {
-  const body = control.body.trim()
+  const body = canonicalBody(control.body)
   const fields: [string, string | undefined][] = [
     ['run', control.run],
     ['from', control.from],
@@ -105,7 +116,7 @@ export const formatControl = (control: Control, token: string): string => {
 }
 
 export const parseEnvelope = (text: string): Envelope | undefined => {
-  const match = HEADER_RE.exec(text.trimStart())
+  const match = HEADER_RE.exec(canonicalText(text).trimStart())
   if (!match) return undefined
   const fields: Record<string, string> = {}
   for (const pair of (match[1] ?? '').trim().split(' ').filter(Boolean)) {

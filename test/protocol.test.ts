@@ -108,6 +108,20 @@ test('promote controls carry model and effort', () => {
   assert.equal(envelope?.fields.effort, 'high')
 })
 
+test('a multi-paragraph envelope typed as a paste (CR or CRLF line ends, trailing blanks dropped) still verifies', () => {
+  const body = 'Plan — step one → verify · done   \n\nSecond paragraph, with a line that ends in blanks \t \n\nThird: ok'
+  const text = protocol.formatControl({ ...control, kind: 'brief', verdict: undefined, expects: 'review', body }, TOKEN)
+  assert.doesNotMatch(text, /[ \t]$/m)
+  assert.equal(protocol.macOf(TOKEN, 'c-17', body), protocol.macOf(TOKEN, 'c-17', body.replace(/\n/g, '\r\n')))
+  for (const eol of ['\n', '\r', '\r\n']) {
+    const envelope = protocol.parseEnvelope(text.replace(/\n/g, eol))
+    assert.ok(envelope)
+    assert.equal(envelope.body, 'Plan — step one → verify · done\n\nSecond paragraph, with a line that ends in blanks\n\nThird: ok')
+    assert.equal(protocol.verifyControl(envelope, TOKEN), true)
+    assert.equal(protocol.verifyControl({ ...envelope, body: `${envelope.body}!` }, TOKEN), false)
+  }
+})
+
 test('parseEnvelope rejects text that is not an envelope', () => {
   assert.equal(protocol.parseEnvelope('hello'), undefined)
   assert.equal(protocol.parseEnvelope('⟦orch v1 id=x⟧\nbody'), undefined)
