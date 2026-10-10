@@ -70,6 +70,10 @@ export const feedOf = (event: DroveEvent, bodies: Map<string, string[]>): FeedDr
       return { at, from: '⌘', to: seat, kind: 'close', summary: 'pane closed' }
     case 'seat.start_failed':
       return { at, from: seat, to: '⌘', kind: 'failed', summary: `did not start (${text(data.code)})${data.reason ? `: ${text(data.reason)}` : ''}` }
+    case 'seat.relaunch':
+      return data.ok === false
+        ? { at, from: '⌘', to: seat, kind: 'failed', summary: `relaunch failed: ${text(data.error)}` }
+        : { at, from: '⌘', to: seat, kind: 'relaunch', summary: `relaunched${data.resumed ? ' (resumed)' : ''}${data.pane ? ` in pane ${text(data.pane)}` : ''}` }
     case 'attention':
       return text(data.reason) === 'report-rejected' ? { at, from: seat, to: '⌘', kind: 'attention', summary: `report rejected: ${text(data.why)}` } : { at, from: seat, to: 'Cal', kind: 'attention', summary: `${text(data.reason)}${data.detail ? `: ${text(data.detail)}` : ''}` }
     default:

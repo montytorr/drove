@@ -83,6 +83,16 @@ test('no line exceeds the width', () => {
   for (const width of [80, 100, 110, 140]) for (const line of frame(width).split('\n')) assert.ok([...line].length <= width, `${width}: ${line}`)
 })
 
+test('a relaunch event renders as a readable timeline row', () => {
+  const events: DroveEvent[] = [
+    { at: '2026-10-09T10:40:00.000Z', type: 'seat.relaunch', seat: 'w-core', data: { ok: true, resumed: true, pane: 'w1:p2' } },
+    { at: '2026-10-09T10:41:00.000Z', type: 'seat.relaunch', seat: 'w-guard', data: { ok: false, resumed: false, error: 'no saved session id' } },
+  ]
+  const text = board.renderBoard({ run: RUN, roster: ROSTER, events, attention: ATTENTION, now: NOW, width: 100 })
+  assert.match(text, /seat\.relaunch w-core relaunched \(resumed\)/)
+  assert.match(text, /seat\.relaunch w-guard relaunch failed: no saved session id/)
+})
+
 test('the attention list comes before the seats', () => {
   const text = frame(80)
   const attentionAt = text.indexOf('ATTENTION 2')

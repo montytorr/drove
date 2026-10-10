@@ -121,6 +121,8 @@ describe('bridge stream', () => {
     expect(feedOf({ at: ISO, type: 'control.sent', seat: 'w-auth', data: { kind: 'nudge' } }, bodies)?.summary).toBe('stopped without a report')
     expect(feedOf({ at: ISO, type: 'seat.state', seat: 'w-auth', data: { from: 'working', to: 'gone' } }, bodies)?.kind).toBe('gone')
     expect(feedOf({ at: ISO, type: 'report.delivered', seat: 'w-auth' }, bodies)).toBeUndefined()
+    expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: true, resumed: true, pane: 'w1:p2' } }, bodies)).toMatchObject({ kind: 'relaunch', to: 'w-auth', summary: 'relaunched (resumed) in pane w1:p2' })
+    expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: false, error: 'no pane' } }, bodies)).toMatchObject({ kind: 'failed', summary: 'relaunch failed: no pane' })
   })
 
   test('a wake splits into one block per report', () => {

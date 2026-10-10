@@ -850,7 +850,9 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
 const resumePrompt = (seat: Seat): string | undefined =>
   seat.lastWorkingAt && (!seat.lastReport || Date.parse(seat.lastReport.at) < Date.parse(seat.lastWorkingAt)) ? resumedText() : undefined
 
-const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, placed: readonly Seat[]): Promise<{ seat: Seat; note?: string } | { error: string }> => {
+type Relaunched = { seat: Seat; note?: string } | { error: string }
+
+const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, placed: readonly Seat[]): Promise<Relaunched> => {
   if (!seat.sessionId) return { error: `${seat.name} has no saved session id, so it cannot be resumed; close it and spawn a new one` }
   const token = (await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))) ?? mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
@@ -896,6 +898,15 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   }
   await updateRoster(deps.home, run.id, roster => upsertSeat(roster, next))
   return { seat: next, ...(lockNote ? { note: lockNote } : {}) }
+}
+
+const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, placed: readonly Seat[]): Promise<Relaunched> => {
+  const relaunched = await launchRelaunch(deps, run, config, seat, placed)
+  const data = 'error' in relaunched
+    ? { ok: false, resumed: false, error: clip(relaunched.error, 200), ...(seat.paneId ? { pane: seat.paneId } : {}) }
+    : { ok: true, resumed: true, ...(relaunched.seat.paneId ? { pane: relaunched.seat.paneId } : {}) }
+  await recordEvent(deps, run.id, { type: 'seat.relaunch', seat: seat.name, data })
+  return relaunched
 }
 
 export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<CommandResult> => {
