@@ -109,6 +109,7 @@ const plannerWith = async (extra: Partial<ToolPorts> = {}) => {
 test('planner tools map their arguments onto the commands', async () => {
   const { ctx, fake, tool } = await plannerWith()
   await tool('spawn').call({ seat: 'w-ui', kind: 'claude', cairn: 'DROVE-9', brief: 'build it', effort: 'high' })
+  await tool('spawn').call({ seat: 'w-db', kind: 'codex', brief: 'migrate', mcp: ['mongodb', ' '] })
   await tool('send').call({ seat: 'w-ui', kind: 'answer', body: 'use postgres', expects: 'none' })
   await tool('verdict').call({ seat: 'w-ui', verdict: 'approve' })
   await tool('verdict').call({ seat: 'w-ui', verdict: 'changes', notes: 'rename x' })
@@ -121,6 +122,7 @@ test('planner tools map their arguments onto the commands', async () => {
   const ref = { run: ctx.run.id, repo: ctx.run.repo }
   assert.deepEqual(fake.calls, [
     { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'build it', cairn: 'DROVE-9', model: undefined, effort: 'high', base: undefined }] },
+    { name: 'spawn', args: [{ seat: 'w-db', kind: 'codex', brief: 'migrate', cairn: undefined, model: undefined, effort: undefined, base: undefined, mcp: ['mongodb'] }] },
     { name: 'send', args: [{ seat: 'w-ui', kind: 'answer', body: 'use postgres', expects: 'none' }] },
     { name: 'send', args: [{ seat: 'w-ui', kind: 'verdict', verdict: 'approve', body: '', expects: 'none' }] },
     { name: 'send', args: [{ seat: 'w-ui', kind: 'verdict', verdict: 'changes', body: 'rename x', expects: 'review' }] },
@@ -139,6 +141,7 @@ test('planner tools reject bad arguments before calling a command', async () => 
     ['spawn', { seat: 'W Bad', kind: 'claude', brief: 'x' }],
     ['spawn', { seat: 'w-ui', kind: 'gemini', brief: 'x' }],
     ['spawn', { seat: 'w-ui', kind: 'claude' }],
+    ['spawn', { seat: 'w-ui', kind: 'claude', brief: 'x', mcp: 'mongodb' }],
     ['send', { seat: 'w-ui', kind: 'verdict', body: 'x' }],
     ['verdict', { seat: 'w-ui', verdict: 'changes' }],
     ['verdict', { seat: 'w-ui', verdict: 'maybe' }],

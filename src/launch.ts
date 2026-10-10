@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, readdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { ENV, plannerDir, seatDir } from './paths.ts'
 import type { Identity, LaunchFile, LaunchLink, LaunchRequest, LaunchSpec, Role } from './types.ts'
@@ -65,9 +66,36 @@ export const claudeSettings = (droveEntry: string, _role: Role): Record<string, 
   },
 })
 
-export const claudeMcpConfig = (droveEntry: string, env: Record<string, string> = {}): Record<string, unknown> => ({
-  mcpServers: { drove: { command: 'node', args: [droveEntry, 'mcp'], ...(Object.keys(env).length > 0 ? { env } : {}) } },
+export const claudeMcpConfig = (droveEntry: string, env: Record<string, string> = {}, user: Record<string, unknown> = {}): Record<string, unknown> => ({
+  mcpServers: { ...user, drove: { command: 'node', args: [droveEntry, 'mcp'], ...(Object.keys(env).length > 0 ? { env } : {}) } },
 })
+
+// An allowlist (DROVE-72) turns on --strict-mcp-config: the seat loads Drove's server and the named user servers only.
+// Without one the seat loads the user's whole MCP setup, as before.
+const allowedMcp = (request: LaunchRequest): Record<string, unknown> =>
+  Object.fromEntries((request.mcpAllow ?? []).filter(name => name !== 'drove' && request.userMcp?.[name] !== undefined).map(name => [name, request.userMcp?.[name]]))
+
+export const userClaudeConfig = (env: NodeJS.ProcessEnv = process.env): string => join(env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json')
+
+const serversOf = (value: unknown): Record<string, unknown> => {
+  const servers = (value as { mcpServers?: unknown } | null)?.mcpServers
+  return servers && typeof servers === 'object' && !Array.isArray(servers) ? (servers as Record<string, unknown>) : {}
+}
+
+const readJsonFile = async (path: string): Promise<unknown> => {
+  try {
+    return JSON.parse(await readFile(path, 'utf8')) as unknown
+  } catch {
+    return undefined
+  }
+}
+
+// Reads only: the user's MCP servers as Claude would merge them for this repo, local over project over user scope.
+export const readClaudeMcp = async (configPath: string, repo: string): Promise<Record<string, unknown>> => {
+  const config = await readJsonFile(configPath)
+  const projects = (config as { projects?: Record<string, unknown> } | undefined)?.projects
+  return { ...serversOf(config), ...serversOf(await readJsonFile(join(repo, '.mcp.json'))), ...serversOf(projects?.[repo]) }
+}
 
 const jsonFile = (path: string, value: unknown): LaunchFile => ({ path, content: `${JSON.stringify(value, null, 2)}\n`, mode: 0o600 })
 
@@ -89,6 +117,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     ...(isWorker && !request.resumeId ? ['--worktree', identity.seat] : []),
     ...(request.resumeId ? ['--resume', request.resumeId] : request.sessionId ? ['--session-id', request.sessionId] : []),
     ...(!isWorker && request.channel ? [CHANNEL_FLAG, 'server:drove'] : []),
+    ...(isWorker && request.mcpAllow ? ['--strict-mcp-config'] : []),
     '--mcp-config', mcpPath,
     '--settings', settingsPath,
     ...(request.roleText ? ['--append-system-prompt-file', rolePath] : []),
@@ -102,7 +131,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     env: { ...(isWorker ? request.workerEnv : {}), ...identityEnv(identity), DROVE_AGENT: 'claude', ...(!isWorker && request.channel ? { DROVE_CHANNEL: '1' } : {}) },
     argv,
     files: [
-      jsonFile(mcpPath, claudeMcpConfig(request.droveEntry, identityEnv(identity))),
+      jsonFile(mcpPath, claudeMcpConfig(request.droveEntry, identityEnv(identity), isWorker ? allowedMcp(request) : {})),
       jsonFile(settingsPath, claudeSettings(request.droveEntry, identity.role)),
       ...(request.roleText ? [{ path: rolePath, content: `${request.roleText}\n`, mode: 0o600 }] : []),
     ],
@@ -117,9 +146,12 @@ export type CodexHome = {
   userHooks: Record<string, unknown[]>
   links: string[]
   skills: string[]
+  linkedSkills?: string[]
 }
 
-export type CodexLaunchRequest = LaunchRequest & { bypassSandbox?: boolean; codexHome?: CodexHome }
+// homeMcpAllow and skillAllow are the run's lists (workerMcp, workerSkills) and shape the shared home; a seat's own
+// mcpAllow differs from the home's only through -c mcp_servers.<name>.enabled overrides on its launch line.
+export type CodexLaunchRequest = LaunchRequest & { bypassSandbox?: boolean; codexHome?: CodexHome; homeMcpAllow?: string[]; skillAllow?: string[] }
 
 // The Codex launch line is typed into a shell, so every byte counts (DROVE-23). One shim per drove entry, named by a
 // hash of it so two checkouts sharing a home never overwrite each other, replaces `node <entry> guard` in all hooks.
@@ -199,6 +231,8 @@ const unquoteKey = (raw: string): string => {
 
 const USER_ROOT_KEY = /^\s*(model|personality)\s*=\s*("(?:[^"\\]|\\.)*"|'[^']*')\s*(?:#.*)?$/
 const MCP_HEADER = new RegExp(String.raw`^\[\s*mcp_servers\s*\.\s*(${TOML_KEY})`)
+const MCP_TABLE = new RegExp(String.raw`^\[\s*mcp_servers\s*\.\s*(${TOML_KEY})\s*\]`)
+const ENABLED_KEY = /^\s*enabled\s*=\s*(true|false)\b/
 const HOOK_STATE_HEADER = new RegExp(String.raw`^\[\s*hooks\s*\.\s*state\s*\.\s*(${TOML_KEY})\s*\]`)
 
 type HookTrust = { hash?: string; enabled?: boolean }
@@ -213,6 +247,34 @@ const userHookTrust = (sections: readonly TomlSection[]): Map<string, HookTrust>
     trust.set(unquoteKey(key), { ...(hash ? { hash } : {}), ...(enabled ? { enabled: enabled === 'true' } : {}) })
   }
   return trust
+}
+
+type UserMcp = { name: string; isUserDisabled: boolean }
+
+const userMcpServers = (sections: readonly TomlSection[]): UserMcp[] =>
+  sections.flatMap(section => {
+    const key = MCP_TABLE.exec(section.header)?.[1]
+    const name = key === undefined ? undefined : unquoteKey(key)
+    if (name === undefined || name === 'drove') return []
+    return [{ name, isUserDisabled: section.body.some(line => ENABLED_KEY.exec(line)?.[1] === 'false') }]
+  })
+
+export const codexMcpNames = (userConfig: string): string[] => userMcpServers(tomlSections(userConfig)).map(server => server.name)
+
+const isAllowed = (allow: readonly string[] | undefined, server: UserMcp): boolean => !server.isUserDisabled && (allow?.includes(server.name) ?? true)
+
+const tomlKey = (name: string): string => (/^[A-Za-z0-9_-]+$/.test(name) ? name : tomlString(name))
+
+// The overrides that turn the shared home's servers into this seat's allowlist: only where the two disagree.
+const seatMcpOverrides = (request: CodexLaunchRequest, home: CodexHome): string[] =>
+  userMcpServers(tomlSections(home.userConfig))
+    .filter(server => isAllowed(request.homeMcpAllow, server) !== isAllowed(request.mcpAllow, server))
+    .map(server => `mcp_servers.${tomlKey(server.name)}.enabled=${isAllowed(request.mcpAllow, server)}`)
+
+const withEnabled = (section: TomlSection, isEnabled: boolean): string[] => {
+  const body = trimBlank(section.body)
+  if (isEnabled || !MCP_TABLE.test(section.header)) return [section.header, ...body]
+  return [section.header, ...body.filter(line => !ENABLED_KEY.test(line)), 'enabled = false']
 }
 
 const trimBlank = (lines: readonly string[]): string[] => {
@@ -240,7 +302,7 @@ const handlersOf = (group: unknown): HookHandler[] => {
 // The Drove-owned CODEX_HOME holds what the typed line used to carry. hooks.json keeps the user's groups first, at the
 // indices their trust is keyed by, so the user's own trust decisions carry over re-keyed to this file; Drove's groups
 // follow, pre-trusted with Codex's fingerprint. Both files are rewritten on every launch.
-const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: string, envNames: readonly string[]): { files: LaunchFile[]; links: LaunchLink[] } => {
+const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: string, envNames: readonly string[]): { files: LaunchFile[]; links: LaunchLink[]; unlinks: string[] } => {
   const sections = tomlSections(home.userConfig)
   const userTrust = userHookTrust(sections)
   const hooks: Record<string, unknown[]> = Object.fromEntries(Object.entries(home.userHooks).map(([event, groups]) => [event, [...groups]]))
@@ -260,14 +322,18 @@ const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: s
     })
   }
   const rootKeys = (sections[0]?.body ?? []).filter(line => USER_ROOT_KEY.test(line)).map(line => line.trim())
-  const userMcp = sections.filter(section => {
-    const name = MCP_HEADER.exec(section.header)?.[1]
-    return name !== undefined && unquoteKey(name) !== 'drove'
+  const servers = userMcpServers(sections)
+  const userMcp = sections.flatMap(section => {
+    const key = MCP_HEADER.exec(section.header)?.[1]
+    const server = key === undefined ? undefined : servers.find(entry => entry.name === unquoteKey(key))
+    return server ? [{ section, isEnabled: isAllowed(request.homeMcpAllow, server) }] : []
   })
+  const skills = home.skills.filter(name => request.skillAllow?.includes(name) ?? true)
   const config = [
     "# Written by Drove on every Codex worker launch in this run (DROVE-34). Edits here, Codex's included, are overwritten.",
     ...rootKeys,
     'check_for_update_on_startup = false',
+    ...(request.roleText ? [`developer_instructions = ${tomlString(request.roleText)}`] : []),
     '',
     `[projects.${tomlString(request.repo)}]`,
     'trust_level = "trusted"',
@@ -278,7 +344,7 @@ const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: s
     `env_vars = ${tomlArray(envNames)}`,
     'default_tools_approval_mode = "approve"',
     '',
-    ...userMcp.flatMap(section => [section.header, ...trimBlank(section.body), '']),
+    ...userMcp.flatMap(({ section, isEnabled }) => [...withEnabled(section, isEnabled), '']),
     ...trust.flatMap(([key, state]) => [
       `[hooks.state.${tomlString(key)}]`,
       ...(state.hash ? [`trusted_hash = ${tomlString(state.hash)}`] : []),
@@ -293,8 +359,9 @@ const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: s
     ],
     links: [
       ...home.links.map(name => ({ path: join(home.dir, name), target: join(home.user, name) })),
-      ...home.skills.map(name => ({ path: join(home.dir, 'skills', name), target: join(home.user, 'skills', name) })),
+      ...skills.map(name => ({ path: join(home.dir, 'skills', name), target: join(home.user, 'skills', name) })),
     ],
+    unlinks: (home.linkedSkills ?? []).filter(name => !skills.includes(name)).map(name => join(home.dir, 'skills', name)),
   }
 }
 
@@ -324,7 +391,14 @@ export const readCodexHome = async (dir: string, user: string): Promise<CodexHom
     userHooks: parseUserHooks(await read('hooks.json')),
     links: present.filter((name): name is (typeof CODEX_HOME_LINKS)[number] => name !== undefined),
     skills: (await readdir(join(userDir, 'skills')).catch(() => [] as string[])).filter(name => !name.startsWith('.')).sort(),
+    linkedSkills: await linkedSkills(join(dir, 'skills')),
   }
+}
+
+const linkedSkills = async (dir: string): Promise<string[]> => {
+  const names = await readdir(dir).catch(() => [] as string[])
+  const linked = await Promise.all(names.map(async name => ((await lstat(join(dir, name)).catch(() => undefined))?.isSymbolicLink() ? name : undefined)))
+  return linked.filter((name): name is string => name !== undefined).sort()
 }
 
 const codexSpec = (request: CodexLaunchRequest): LaunchSpec => {
@@ -337,7 +411,7 @@ const codexSpec = (request: CodexLaunchRequest): LaunchSpec => {
   const homeOverrides = [
     `model_reasoning_effort=${tomlString(request.effort)}`,
     ...(isBypass ? [] : [CODEX_NETWORK_FLAG]),
-    ...(request.roleText ? [`developer_instructions=${tomlString(request.roleText)}`] : []),
+    ...(codexHome ? seatMcpOverrides(request, codexHome) : []),
   ]
   const inlineOverrides = [
     `model_reasoning_effort=${tomlString(request.effort)}`,
@@ -373,6 +447,7 @@ const codexSpec = (request: CodexLaunchRequest): LaunchSpec => {
     argv,
     files: [shim, ...(home?.files ?? [])],
     ...(home ? { links: home.links } : {}),
+    ...(home && home.unlinks.length > 0 ? { unlinks: home.unlinks } : {}),
   }
 }
 
@@ -426,6 +501,13 @@ export const writeLaunchFiles = async (spec: LaunchSpec): Promise<void> => {
     await rename(temporary, file.path)
   }
   for (const link of spec.links ?? []) await placeLink(link)
+  for (const path of spec.unlinks ?? []) await removeLink(path)
+}
+
+// Only a symlink is removed: a skill the user copied into the Drove home by hand stays.
+const removeLink = async (path: string): Promise<void> => {
+  const current = await lstat(path).catch(() => undefined)
+  if (current?.isSymbolicLink()) await unlink(path).catch(() => undefined)
 }
 
 export const execArgv = (spec: LaunchSpec): string[] => [spec.kind, ...spec.argv]

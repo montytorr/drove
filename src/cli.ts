@@ -88,9 +88,9 @@ export const COMMANDS: Record<string, Spec> = {
       ),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH]',
+    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME]',
     why: 'open a worker in its own worktree and pane, and brief it',
-    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' } },
+    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' } },
     run: async (values, positionals, io) => {
       const brief = need(str(values, 'brief'), '--brief')
       return print(
@@ -102,6 +102,7 @@ export const COMMANDS: Record<string, Spec> = {
           model: str(values, 'model'),
           effort: str(values, 'effort') as Effort | undefined,
           base: str(values, 'base'),
+          mcp: str(values, 'mcp')?.split(',').map(name => name.trim()).filter(Boolean),
         }),
         io,
       )

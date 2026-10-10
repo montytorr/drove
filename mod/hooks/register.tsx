@@ -230,6 +230,7 @@ const ORCHESTRATOR_TOOLS = [
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh'], description: 'low: mechanical; medium: standard (default); high: tricky logic or debugging' },
         model: { type: 'string', description: 'Claude: sonnet (default) or opus, or a full model id. Codex: a model id, or leave out for Drove’s default' },
         cairn: { type: 'string', description: 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
+        mcp: { type: 'array', items: { type: 'string' }, description: 'optional: the user MCP servers this worker needs, by name; [] for Drove’s alone. Left out, Drove’s workerMcp setting decides' },
       },
       required: ['name', 'brief'],
     },
@@ -381,7 +382,8 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const effort = isEffort(input.effort) ? input.effort : config.workerEffort
   const model = kind === 'claude' ? resolveModel(input.model, config.workerModel) : typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
   if (!(await herdrPane($))) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}) })
+  const mcp = Array.isArray(input.mcp) ? input.mcp.filter((entry): entry is string => typeof entry === 'string') : undefined
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
