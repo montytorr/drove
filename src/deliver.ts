@@ -126,7 +126,7 @@ const isReplyToOpenAsk = (seat: Seat, control: Control): boolean =>
 const hooksFileOf = (deps: Deps, run: string, seat: Seat): string =>
   join(seat.name === PLANNER_SEAT ? plannerDir(deps.home, run) : seatDir(deps.home, run, seat.name), 'hooks.jsonl')
 
-const confirmedByHook = async (deps: Deps, run: string, seat: Seat, since: number): Promise<boolean> => {
+export const confirmedByHook = async (deps: Deps, run: string, seat: Seat, since: number): Promise<boolean> => {
   for (let waited = 0; ; waited += confirmTiming.pollMs) {
     const { items } = await readJsonlFrom<HookRecord>(hooksFileOf(deps, run, seat), { offset: 0 })
     if (items.some(hook => hook.event === 'user-prompt-submit' && Date.parse(hook.at) >= since)) return true

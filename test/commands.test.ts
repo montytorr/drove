@@ -1150,6 +1150,23 @@ test('promote with a slow resumed turn still succeeds: the notice is typed and u
   assert.equal(sent?.data?.unconfirmed, true)
 })
 
+test('promote with a slow resumed turn is confirmed by the seat\'s hook record', async () => {
+  const fake = new FakeHerdr({ promptTimesOut: true })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  await settleSeat(deps, fake, 'w-api')
+  const base = deps.exec
+  deps.exec = async (argv, options) => {
+    if (argv[1] === 'agent' && argv[2] === 'prompt') await appendFile(join(seatDir(deps.home, RUN, 'w-api'), 'hooks.jsonl'), `${JSON.stringify({ at: new Date(Date.now() + 60_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`)
+    return base(argv, options)
+  }
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.doesNotMatch(promoted.text, /herdr did not confirm/)
+  const sent = (await readEvents(deps)).filter(item => item.type === 'control.sent').at(-1)
+  assert.equal(sent?.data?.unconfirmed, undefined)
+})
+
 test('promote keeps the restarted seat when agent start timed out but the agent is up, and marks it gone when it is not', async () => {
   const fake = new FakeHerdr()
   const { deps, identity } = await setup(fake)
