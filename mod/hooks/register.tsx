@@ -4,7 +4,7 @@ import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 import type { AgentKind, Effort, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat } from '../types'
 import { BOARD_ID, EXPAND_INDENT, buildBoard, needsAnimation, timelineRoom } from './board'
 import type { BoardRow, Cell, Tone } from './board'
-import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeContext, wakeHeadlines } from './bridge'
+import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeHeadlines } from './bridge'
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
 import { modelNotice, orchestratorSection, workerModelSection } from './prompts'
@@ -293,6 +293,18 @@ const ORCHESTRATOR_TOOLS = [
     description: 'Orchestrator mode: list the workers, their state, model, effort, last report and what you owe them.',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'read_reports',
+    description:
+      "Orchestrator mode: read workers' reports in full (summary, details, what Drove expects you to do next). A wake shows one line per report; call this before acting on a report that needs review or an answer. Default: every report you have not read yet, which it then marks read.",
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: "one worker only: its unread reports, or its latest report when none is unread" },
+        all: { type: 'boolean', description: 'every report, read or not' },
+      },
+    },
+  },
 ] as const
 
 const REPORT_TOOL = {
@@ -453,6 +465,13 @@ const rosterTool = async ($: EngineInterface): Promise<ToolAnswer> => {
   return orchestrator ? answerOf(await plannerRun($, drove.rosterArgs(orchestrator.run))) : { deny: OFF }
 }
 
+const readReportsTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const orchestrator = await read($, orchestratorAtom)
+  if (!orchestrator) return { deny: OFF }
+  const name = typeof input.name === 'string' && input.name.trim() ? input.name.trim() : undefined
+  return answerOf(await plannerRun($, drove.reportsArgs(orchestrator.run, name, input.all === true)))
+}
+
 // ---------- the bridge: Drove's watcher in a child process, streaming wakes, the roster and events ----------
 
 const onBridgeLine = async ($: EngineInterface, line: BridgeLine) => {
@@ -532,25 +551,12 @@ const onBridgeLine = async ($: EngineInterface, line: BridgeLine) => {
     if (config.effortRouting && blocks.some(({ kind }) => kind !== 'done')) pendingRouting = true
   }
   const wake = line.text
+  // A wake is submitted as one line per report, all the person sees and all the model gets: a row appended at turn.start lands after the
+  // turn's request is built, so the planner reads the full reports with read_reports.
   const text = blocks.length > 0 ? wakeHeadlines(blocks) : wake
-  if (text !== wake) hiddenWakes.set(text, [...(hiddenWakes.get(text) ?? []), wake])
   soon($, 0, async () => {
-    const submitted = await $.prompt.submit({ text })
-    if (submitted.drop !== undefined) takeHiddenWake(text)
+    await $.prompt.submit({ text })
   })
-}
-
-// A wake is submitted as its headlines, which is all the person sees. A plugin's own prompt skips its prompt.submit hooks, so the turn it starts
-// gets the full reports instead: turn.start appends them as a user row the person does not see (isMeta), keyed by the headlines.
-const hiddenWakes = new Map<string, string[]>()
-
-const takeHiddenWake = (text: string): string | undefined => {
-  const key = hiddenWakes.has(text) ? text : [...hiddenWakes.keys()].find(headlines => text.includes(headlines))
-  if (key === undefined) return undefined
-  const [wake, ...rest] = hiddenWakes.get(key) ?? []
-  if (rest.length > 0) hiddenWakes.set(key, rest)
-  else hiddenWakes.delete(key)
-  return wake
 }
 
 const superviseBridge = async ($: EngineInterface, run: string, epoch: number) => {
@@ -1071,6 +1077,9 @@ export const register: Register = (on, options) => {
     (await read($, orchestratorAtom)) ? closeWorker($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__read_reports' as never }, async ($, e): Promise<ToolAnswer> => readReportsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({
+    deny: toolFailure(next.error),
+  }))
   on('tool.call', { tool: 'mcp__orchestrator__report' as never }, async ($, e): Promise<ToolAnswer> => sendReport($, e as Record<string, unknown>)).catch(($, e, next) => ({
     deny: toolFailure(next.error),
   }))
@@ -1152,14 +1161,6 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('turn.start', async ($, e, next) => {
-    const wake = takeHiddenWake(e.text)
-    if (wake) {
-      try {
-        await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: wakeContext(wake) }] } })
-      } catch (error) {
-        $.ui.log(`orchestrator: the full reports did not reach the planner: ${messageOf(error)}`, { to: 'debug' })
-      }
-    }
     if (await read($, orchestratorAtom)) await setLead($, 'thinking')
     if (await read($, workerAtom)) await refreshSelf($)
     if (pendingRouting) {

@@ -153,6 +153,13 @@ export const COMMANDS: Record<string, Spec> = {
     options: { json: { type: 'boolean' }, run: { type: 'string' } },
     run: async (values, _positionals, io) => print(await commands.roster(commands.defaultDeps(), runRef(values), values.json === true), io),
   },
+  reports: {
+    usage: 'drove reports [<seat>] [--all] [--json] [--run ID]',
+    why: "the workers' reports in full, those not yet read (a seat's latest when it has none unread); --all for every report",
+    options: { all: { type: 'boolean' }, json: { type: 'boolean' }, run: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(await commands.reports(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { seat: positionals[0], all: values.all === true, asJson: values.json === true }), io),
+  },
   capture: {
     usage: 'drove capture <seat> [--lines N] [--run ID]',
     why: "read a seat's recent output",

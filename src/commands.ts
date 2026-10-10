@@ -11,11 +11,11 @@ import * as herdr from './herdr.ts'
 import { type CodexLaunchRequest, execArgv, isShellSafeArg, readCodexHome, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
-import { formatControl } from './protocol.ts'
+import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
-  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, PromoteRequest, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
+  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, PromoteRequest, Report, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
 export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string }
@@ -936,6 +936,43 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
   if (!seat) return failed('no-seat', `no seat named ${seatName}`)
   const screen = await herdr.readScreen(deps.exec, herdr.agentTarget(located.run.id, seat), Number.isFinite(lines) && lines > 0 ? lines : 80)
   return screen.ok ? ok(screen.value) : failed('herdr', `could not read ${seat.name}: ${screen.code}`)
+}
+
+// ---------- reports ----------
+
+// The planner reads its workers' reports in full here: a wake shows it one line per report. Read ids are kept in the planner's folder.
+export type ReportsRequest = { seat?: string; all?: boolean; asJson?: boolean }
+
+const readReportsPath = (home: string, run: string): string => join(plannerDir(home, run), 'reports-read.json')
+
+const seatReports = async (deps: Deps, run: RunMeta, seat: string): Promise<Report[]> => {
+  const dir = seatDir(deps.home, run.id, seat)
+  const token = await readToken(join(dir, 'token'))
+  if (!token) return []
+  const { items } = await readJsonlFrom<Partial<Report> | null>(join(dir, 'outbox.jsonl'), { offset: 0 })
+  return items.filter((item): item is Report =>
+    item?.v === 1 && item.run === run.id && item.seat === seat && item.token === token && typeof item.id === 'string' && typeof item.summary === 'string' && item.kind !== 'progress' && REPORT_KINDS.includes(item.kind as Report['kind']),
+  )
+}
+
+export const reports = async (deps: Deps, identity: Identity, ref: RunRef, request: ReportsRequest): Promise<CommandResult> => {
+  const denied = requirePlanner(identity)
+  if (denied) return denied
+  const located = await locateRun(deps, ref, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  const roster = await loadRoster(deps.home, run.id)
+  if (request.seat && !findSeat(roster, request.seat)) return failed('no-seat', `no seat named ${request.seat}`)
+  const seats = request.seat ? [request.seat] : roster.seats.map(seat => seat.name)
+  const all = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().sort((a, b) => a.at.localeCompare(b.at))
+  const read = new Set((await readJson<string[]>(readReportsPath(deps.home, run.id))) ?? [])
+  const unread = all.filter(report => !read.has(report.id))
+  const picked = request.all ? all : unread.length > 0 || !request.seat ? unread : all.slice(-1)
+  if (picked.some(report => !read.has(report.id))) await writeJsonAtomic(readReportsPath(deps.home, run.id), [...read, ...picked.filter(report => !read.has(report.id)).map(report => report.id)])
+  const shown = picked.map(({ v: _v, token: _token, run: _run, ...rest }) => rest)
+  if (request.asJson) return ok(JSON.stringify({ run: run.id, reports: shown }, null, 2), { run: run.id, reports: shown })
+  if (picked.length === 0) return ok(request.seat ? `${request.seat} has not reported yet` : 'no unread reports', { run: run.id, reports: shown })
+  return ok(renderReports(picked, (await loadConfig(deps.home)).humanName), { run: run.id, reports: shown })
 }
 
 // ---------- close ----------

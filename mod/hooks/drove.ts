@@ -41,6 +41,8 @@ export const closeArgs = (name: string, removeWorktree: boolean): string[] => ['
 
 export const rosterArgs = (run: string): string[] => ['roster', '--run', run]
 
+export const reportsArgs = (run: string, seat?: string, all?: boolean): string[] => ['reports', ...(seat ? [seat] : []), ...(all ? ['--all'] : []), '--run', run]
+
 export const budgetArgs = (run: string, size: number): string[] => ['budget', String(size), '--run', run]
 
 export const downArgs = (run: string): string[] => ['down', '--run', run]
