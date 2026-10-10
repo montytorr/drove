@@ -1,0 +1,26 @@
+import type { Effort, OrchFeedEntry, OrchModStatus, Seat, SeatState } from '../types'
+import { shortModel } from './protocol'
+
+export const CLOSED_STATES: ReadonlySet<SeatState> = new Set(['closed', 'gone', 'down'])
+
+export const openSeats = (seats: readonly Seat[]): Seat[] => seats.filter(({ state }) => !CLOSED_STATES.has(state))
+
+export const findSeat = (seats: readonly Seat[], name: string): Seat | undefined => seats.find(seat => seat.name === name && !CLOSED_STATES.has(seat.state))
+
+const STATUS_GLYPH: Record<SeatState, string> = {
+  starting: '…', working: '⚙', idle: '·', done: '✓', blocked: '⛔', 'needs-input': '?', unknown: '?', gone: '×', closing: '×', closed: '×', down: '⏸',
+}
+
+export const statusGlyph = (state: SeatState): string => STATUS_GLYPH[state]
+
+export const effortLetter = (effort: Effort): string => (effort === 'xhigh' ? 'xh' : effort.charAt(0))
+
+export const modelLetter = (seat: Pick<Seat, 'kind' | 'model'>): string => (seat.kind === 'codex' ? 'cx' : shortModel(seat.model).charAt(0))
+
+export const isAsking = (seat: Seat, status: OrchModStatus | undefined): boolean => Boolean(status?.asking) || seat.state === 'needs-input'
+
+export const FEED_MAX = 50
+
+export const pushFeed = (feed: readonly OrchFeedEntry[], entry: OrchFeedEntry): OrchFeedEntry[] => [...feed, entry].slice(-FEED_MAX)
+
+export const spawnedMs = (seat: Seat): number => Date.parse(seat.spawnedAt) || 0

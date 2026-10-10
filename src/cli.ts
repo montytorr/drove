@@ -6,8 +6,10 @@ import { parseArgs, type ParseArgsConfig } from 'node:util'
 import { runBoard } from './board.ts'
 import * as commands from './commands.ts'
 import { HOOK_EVENTS, runHook } from './hooks.ts'
+import { isPidAlive } from './git.ts'
 import { serveMcp } from './mcp.ts'
-import { ENV } from './paths.ts'
+import * as modhost from './modhost.ts'
+import { ENV, identityFromEnv } from './paths.ts'
 import { CONTROL_KINDS } from './protocol.ts'
 import type { AgentKind, CommandResult, Effort, HookEventName, Role, SendRequest } from './types.ts'
 
@@ -212,6 +214,66 @@ export const COMMANDS: Record<string, Spec> = {
       return 0
     },
   },
+  mod: {
+    usage: 'drove mod attach --session ID [--pane P] [--goal TEXT] [--model M] [--effort E] [--budget N] [--run ID] | drove mod bridge --run ID --session ID | drove mod report (JSON on stdin)',
+    why: "the Claude orchestrator mod's entry points: attach a session as planner, stream wakes and roster, the worker report alias",
+    options: { session: { type: 'string' }, pane: { type: 'string' }, goal: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, budget: { type: 'string' }, run: { type: 'string' } },
+    run: async (values, positionals, io) => {
+      const action = positionals[0]
+      const json = (result: CommandResult): number => {
+        io.out(JSON.stringify(result))
+        return result.ok ? 0 : 1
+      }
+      if (action === 'attach') {
+        const budget = str(values, 'budget')
+        return json(
+          await modhost.attach(commands.defaultDeps(), {
+            repo: process.cwd(),
+            sessionId: need(str(values, 'session'), '--session'),
+            paneId: str(values, 'pane'),
+            goal: str(values, 'goal'),
+            model: str(values, 'model'),
+            effort: str(values, 'effort') as Effort | undefined,
+            budget: budget === undefined ? undefined : Number(budget),
+            run: str(values, 'run'),
+          }),
+        )
+      }
+      if (action === 'report') return json(await modhost.report(commands.defaultDeps(), identityFromEnv(), JSON.parse((await io.stdin()) || '{}')))
+      if (action === 'bridge') {
+        const controller = new AbortController()
+        process.on('SIGTERM', () => controller.abort())
+        process.on('SIGINT', () => controller.abort())
+        return modhost.runBridge(commands.defaultDeps(), need(str(values, 'run'), '--run'), { sessionId: need(str(values, 'session'), '--session') }, nodeBridgeIo(), controller.signal)
+      }
+      throw new UsageError(`unknown mod action ${action ?? '<nothing>'}`)
+    },
+  },
+}
+
+const nodeBridgeIo = (): modhost.BridgeIo => {
+  let isBroken = false
+  process.stdout.on('error', () => {
+    isBroken = true
+  })
+  return {
+    write: line => {
+      if (isBroken) return false
+      process.stdout.write(`${JSON.stringify(line)}\n`)
+      return true
+    },
+    pid: process.pid,
+    ppid: () => process.ppid,
+    isAlive: isPidAlive,
+    kill: (pid, signal) => {
+      try {
+        process.kill(pid, signal)
+      } catch {
+        // already gone
+      }
+    },
+    sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+  }
 }
 
 export const usage = (): string =>
