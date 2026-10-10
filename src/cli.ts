@@ -169,8 +169,11 @@ export const COMMANDS: Record<string, Spec> = {
     usage: 'drove board [--once] [--run ID]',
     why: 'live plain-text board for a herdr pane',
     options: { once: { type: 'boolean' }, run: { type: 'string' } },
-    run: async values => {
-      await runBoard(commands.defaultDeps(), need(str(values, 'run') ?? process.env[ENV.run], '--run or DROVE_RUN'), values.once === true)
+    run: async (values, _positionals, io) => {
+      const deps = commands.defaultDeps()
+      const located = await commands.boardRun(deps, { run: str(values, 'run') ?? (process.env[ENV.run] || undefined), repo: process.cwd() })
+      if ('error' in located) return print(located.error, io)
+      await runBoard(deps, located.run, values.once === true)
       return 0
     },
   },
