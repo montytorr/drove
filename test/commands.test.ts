@@ -12,7 +12,7 @@ import type { Deps, Identity, RunMeta } from '../src/types.ts'
 import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun } from './p3-helpers.ts'
 
 beforeEach(() => {
-  Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20, lockWaitMs: 20 })
+  Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20, lockWaitMs: 20, promptWaitMs: 5 })
   for (const key of ['DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_ROLE_IN_BRIEF', 'HERDR_PANE_ID']) delete process.env[key]
   process.env.DROVE_BRIEF_VIA = 'launch-arg'
 })
@@ -123,7 +123,7 @@ test('a codex worker is launched with the codex spec and an initial prompt', asy
   assert.ok(!start.includes('--add-dir') && !start.includes('-s'))
   assert.ok(start.includes('model_reasoning_effort="high"'))
   assert.ok(!start.includes('-m'))
-  assert.match(start.at(-1) ?? '', /Build the widget/)
+  assert.match(fake.prompts[0]?.text ?? '', /Build the widget/)
 })
 
 test('codexWorkerSandbox "workspace-write" restores the sandboxed codex worker spec', async () => {
@@ -143,7 +143,7 @@ test('a failed agent start closes the new tab, removes the seat and the fresh wo
   assert.equal(spawned.ok, false)
   assert.match(spawned.text, /no worker exists/)
   const order = fake.herdrCalls()
-  assert.deepEqual(order.filter(item => ['tab create', 'agent start', 'tab close'].includes(item)), ['tab create', 'agent start', 'tab close'])
+  assert.deepEqual(order.filter(item => ['tab create', 'agent start', 'tab close'].includes(item)), ['tab create', 'agent start', 'tab close', 'tab create', 'agent start', 'tab close'])
   assert.equal(fake.tabs.size, 0)
   assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
   assert.equal(existsSync(join(repo, '.claude', 'worktrees', 'w-api')), false)
@@ -315,7 +315,7 @@ test('a start timeout with a live agent in the pane keeps the seat instead of ro
       assert.ok(!fake.herdrCalls().includes('pane close') && !fake.herdrCalls().includes('tab close'))
       const seat = (await loadRoster(deps.home, RUN)).seats[0]
       assert.equal(seat?.paneId, 'w1:p1')
-      assert.equal(seat?.state, status)
+      assert.equal(seat?.state, kind === 'codex' ? 'working' : status)
       const events = await readEvents(deps)
       assert.equal(events.find(item => item.type === 'seat.spawn')?.data?.startTimeout, true)
       assert.equal(events.some(item => item.type === 'seat.start_failed'), false)
@@ -369,12 +369,10 @@ test('the worker role names the branch each kind is already on', async () => {
   assert.doesNotMatch(role, /switch -c/)
   const codex = await setup()
   await commands.spawn(codex.deps, codex.identity, { seat: 'w-cx', kind: 'codex', brief })
-  const instructions = (codex.fake.find('herdr', 'agent', 'start') ?? []).find(arg => arg.startsWith('developer_instructions=')) ?? ''
-  assert.match(instructions, /already on your own branch \(`drove\/w-cx`\)/)
+  assert.match(codex.fake.prompts[0]?.text ?? '', /already on your own branch \(`drove\/w-cx`\)/)
 })
 
-test('DROVE_ROLE_IN_BRIEF=1 moves a codex worker role from developer_instructions to the brief', async () => {
-  process.env.DROVE_ROLE_IN_BRIEF = '1'
+test('a codex worker role rides in the brief, never in the typed launch line', async () => {
   const { fake, deps, identity } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
   const start = fake.find('herdr', 'agent', 'start') ?? []
@@ -1023,4 +1021,127 @@ test('nodeExec captures output, passes input and reports a missing binary', asyn
   assert.equal(missing.code, 127)
   const slow = await commands.nodeExec(['sleep', '5'], { timeoutMs: 50 })
   assert.equal(slow.code, 124)
+})
+
+const withPromptAfter = (fake: FakeHerdr, reads: number): { paneReads: () => number } => {
+  const inner = fake.exec
+  let paneReads = 0
+  fake.exec = async argv => {
+    if (argv[1] === 'pane' && argv[2] === 'read') {
+      paneReads += 1
+      fake.screen = paneReads >= reads ? 'cal@mac drove % ' : 'Last login: Sat Oct 10'
+    }
+    return inner(argv)
+  }
+  return { paneReads: () => paneReads }
+}
+
+const startIndexes = (fake: FakeHerdr): number[] => fake.calls.flatMap((call, index) => (call[1] === 'agent' && call[2] === 'start' ? [index] : []))
+
+test('the agent is started only once the pane shows a stable shell prompt', async () => {
+  Object.assign(commands.timing, { promptWaitMs: 200 })
+  const fake = new FakeHerdr()
+  const { paneReads } = withPromptAfter(fake, 4)
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const start = startIndexes(fake)[0] ?? -1
+  const readsBefore = fake.calls.slice(0, start).filter(call => call[1] === 'pane' && call[2] === 'read').length
+  assert.ok(readsBefore >= 5, `prompt first appears at read 4 and must hold for a second read, saw ${readsBefore}`)
+  assert.ok(paneReads() >= 5)
+})
+
+test('every pane Drove creates for an agent has the powerlevel10k instant prompt off', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'codex', brief })
+  await commands.spawn(deps, identity, { seat: 'w-b', kind: 'claude', brief })
+  const created = fake.calls.filter(call => call[0] === 'herdr' && ((call[1] === 'tab' && call[2] === 'create') || (call[1] === 'pane' && call[2] === 'split')))
+  assert.deepEqual(created.map(call => call.slice(1, 3).join(' ')), ['tab create', 'pane split'])
+  for (const call of created) assert.ok(call.some((arg, index) => arg === 'POWERLEVEL9K_INSTANT_PROMPT=off' && call[index - 1] === '--env'), call.join(' '))
+})
+
+test('a shell that never shows a prompt does not hang the start: the wait is bounded and the line is typed anyway', async () => {
+  const fake = new FakeHerdr({ screen: 'Last login: Sat Oct 10' })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal(startIndexes(fake).length, 1)
+})
+
+test('an agent that never appears is retried once in a fresh pane, and not a second time', async () => {
+  for (const succeedsOnRetry of [true, false]) {
+    const fake = new FakeHerdr({ startFails: 'timeout' })
+    if (succeedsOnRetry) {
+      const inner = fake.exec
+      fake.exec = async argv => {
+        const out = await inner(argv)
+        if (argv[1] === 'agent' && argv[2] === 'start') fake.startFails = undefined
+        return out
+      }
+    }
+    const { deps, identity } = await setup(fake)
+    const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+    assert.equal(spawned.ok, succeedsOnRetry, spawned.text)
+    assert.equal(startIndexes(fake).length, 2, `succeedsOnRetry=${succeedsOnRetry}`)
+    const retries = (await readEvents(deps)).filter(item => item.type === 'seat.state' && item.data?.startRetry === true)
+    assert.equal(retries.length, 1)
+    const starts = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')
+    assert.notEqual(starts[0]?.[starts[0].indexOf('--pane') + 1], starts[1]?.[starts[1].indexOf('--pane') + 1])
+    if (!succeedsOnRetry) assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
+  }
+})
+
+test('close clears the stale Claude lock once the pane is gone, and leaves a live pid or a foreign lock alone', async () => {
+  const cases = [
+    { name: 'dead pid', reason: `claude session w-a (pid ${deadPid()} start Sat Oct 10 06:32:48 2026)`, unlocked: true },
+    { name: 'live pid', reason: `claude session w-a (pid ${process.pid})`, unlocked: false },
+    { name: 'foreign lock', reason: 'held by hand', unlocked: false },
+  ]
+  for (const { name, reason, unlocked } of cases) {
+    const fake = new FakeHerdr()
+    const { deps, identity, repo } = await setup(fake)
+    await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+    await lockWorktree(repo, 'w-a', reason)
+    const closed = await commands.close(deps, identity, 'w-a', false)
+    assert.equal(closed.ok, true, `${name}: ${closed.text}`)
+    assert.equal(await isLocked(repo, 'w-a'), !unlocked, name)
+    const unlock = fake.calls.findIndex(call => call.includes('unlock'))
+    const paneClose = fake.calls.findIndex(call => call[1] === 'pane' && call[2] === 'close')
+    assert.equal(unlock >= 0, unlocked, name)
+    if (unlocked) assert.ok(paneClose < unlock, `${name}: the lock is cleared after the pane closes`)
+    if (name === 'live pid') assert.match(closed.text, /locked by a running Claude/)
+  }
+})
+
+test('promote takes the session id from the session-start hook when the roster has none yet', async () => {
+  const { appendJsonl } = await import('../src/store.ts')
+  const fake = new FakeHerdr({ startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief, model: 'gpt-5.5' })
+  await settleSeat(deps, fake, 'w-cx')
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, sessionId: undefined })) }))
+  const refused = await commands.promote(deps, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'high' })
+  assert.equal(!refused.ok && refused.code, 'no-session')
+  await appendJsonl(join(seatDir(deps.home, RUN, 'w-cx'), 'hooks.jsonl'), { at: '2026-10-10T12:39:17.330Z', agent: 'codex', event: 'session-start', sessionId: 'thread-from-hook' })
+  const promoted = await commands.promote(deps, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')[1] ?? []
+  const after = restart.slice(restart.indexOf('--') + 1)
+  assert.deepEqual(after.slice(0, 2), ['resume', 'thread-from-hook'])
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.sessionId, 'thread-from-hook')
+})
+
+test('promote of a codex seat without a model keeps the seat model, and the resumed launch line carries no role', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief, model: 'gpt-5.5' })
+  await settleSeat(deps, fake, 'w-cx')
+  const promoted = await commands.promote(deps, identity, { seat: 'w-cx', model: '', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')[1] ?? []
+  const argv = restart.slice(restart.indexOf('--') + 1)
+  assert.equal(argv[argv.indexOf('-m') + 1], 'gpt-5.5')
+  assert.ok(argv.includes('model_reasoning_effort="high"'))
+  assert.ok(!argv.some(arg => arg.startsWith('developer_instructions=')))
 })

@@ -64,8 +64,10 @@ test('codex worker spec matches the golden file', () => {
   assert.equal(spec.env.DROVE_AGENT, 'codex')
   assert.ok(spec.argv.includes('--dangerously-bypass-approvals-and-sandbox'))
   for (const gone of ['-s', '--add-dir', 'sandbox_workspace_write.network_access=true']) assert.ok(!spec.argv.includes(gone), gone)
-  assert.equal(spec.files.length, 0)
+  assert.deepEqual(spec.files.map(file => file.path), [shimOf(spec)])
 })
+
+const shimOf = (spec: { files: readonly { path: string }[] }): string => spec.files[0]?.path ?? ''
 
 test('codex worker keeps the old sandbox when bypassSandbox is false', () => {
   const spec = launch.codexWorkerSpec(request({ kind: 'codex', bypassSandbox: false }))
@@ -85,16 +87,16 @@ test('the guard PreToolUse hook is present in both codex worker sandbox modes', 
   for (const bypassSandbox of [true, false]) {
     const spec = launch.codexWorkerSpec(request({ kind: 'codex', bypassSandbox }))
     const hook = spec.argv.find(arg => arg.startsWith('hooks.PreToolUse='))
-    assert.ok(hook?.includes('guard pre-tool-use'), `bypassSandbox=${bypassSandbox}`)
+    assert.ok(hook?.includes(`${shimOf(spec)} pre-tool-use`), `bypassSandbox=${bypassSandbox}`)
     assert.ok(hook?.includes(launch.CODEX_GUARDED_TOOLS))
   }
 })
 
 test('the codex mcp server takes the identity from env_vars names, so no value is typed into the shell', () => {
   const spec = launch.codexWorkerSpec(request({ kind: 'codex' }))
-  const names = spec.argv.find(arg => arg.startsWith('mcp_servers.drove.env_vars='))
-  assert.equal(names, 'mcp_servers.drove.env_vars=["DROVE_HOME", "DROVE_RUN", "DROVE_ROLE", "DROVE_SEAT", "DROVE_TOKEN"]')
-  assert.ok(!spec.argv.some(arg => arg.startsWith('mcp_servers.drove.env=')))
+  const server = spec.argv.find(arg => arg.startsWith('mcp_servers.drove='))
+  assert.ok(server?.includes('env_vars=["DROVE_HOME","DROVE_RUN","DROVE_ROLE","DROVE_SEAT","DROVE_TOKEN"]'), server)
+  assert.ok(!server?.includes('env={'))
   assert.ok(!spec.argv.some(arg => arg.includes(TOKEN)))
 })
 
@@ -167,8 +169,25 @@ test('the claude planner mcp.json has the identity env without a token', () => {
 test('codex specs install the UserPromptSubmit hook for workers and planners', () => {
   for (const identity of [worker, planner]) {
     const spec = launch.specFor(request({ identity, kind: 'codex' }))
-    assert.ok(spec.argv.some(arg => arg.startsWith('hooks.UserPromptSubmit=') && arg.includes('guard user-prompt-submit')))
+    assert.ok(spec.argv.some(arg => arg.startsWith('hooks.UserPromptSubmit=') && arg.includes(`${shimOf(spec)} user-prompt-submit`)))
   }
+})
+
+test('the codex hook shim is named by the drove entry and execs it with the event as an argument', () => {
+  const first = launch.codexWorkerSpec(request({ kind: 'codex' }))
+  const other = launch.codexWorkerSpec(request({ kind: 'codex', droveEntry: '/elsewhere/cli.ts' }))
+  assert.equal(first.files[0]?.content, '#!/bin/sh\nexec node /opt/drove/src/cli.ts guard "$@"\n')
+  assert.equal(first.files[0]?.mode, 0o700)
+  assert.notEqual(shimOf(first), shimOf(other))
+  assert.equal(shimOf(first), shimOf(launch.codexWorkerSpec(request({ kind: 'codex', cwd: '/x' }))))
+})
+
+// The readiness gate in commands.ts (DROVE-23) is what makes a line over 1024 bytes safe to type; this budget only
+// stops the line from growing unnoticed. Measured with these fixtures: 1054 bytes; the budget leaves a small margin.
+test('the typed Codex launch line stays within its pinned budget', () => {
+  const BUDGET = 1100
+  const spec = launch.codexWorkerSpec(request({ kind: 'codex', roleText: '', initialPrompt: undefined }))
+  assert.ok(typedBytes(spec) <= BUDGET, `${typedBytes(spec)} bytes`)
 })
 
 test('hook commands quote an entry path that has spaces', () => {
@@ -256,6 +275,15 @@ test('the codex developer_instructions override escapes newlines as two characte
   const override = spec.argv.find(arg => arg.startsWith('developer_instructions='))
   assert.equal(override, 'developer_instructions="You are a worker.\\nQuote: \\"yes\\" and \\\\ backslash with `ticks`"')
   assert.ok(!/[\u0000-\u001f]/.test(override ?? ''))
+})
+
+const typedBytes = (spec: { kind: string; argv: readonly string[] }): number => Buffer.byteLength([spec.kind, ...spec.argv].join(' '))
+
+test('the typed Claude launch line stays well under the 1024-byte tty limit with a long role and long paths', () => {
+  const longRole = 'You are a worker. '.repeat(400)
+  const longPaths = { repo: `/Users/someone/${'projects/'.repeat(8)}repo`, cwd: `/Users/someone/${'projects/'.repeat(8)}repo/.claude/worktrees/w-api` }
+  const spec = launch.claudeWorkerSpec(request({ ...longPaths, roleText: longRole, initialPrompt: undefined }))
+  assert.ok(typedBytes(spec) < 700, `${typedBytes(spec)} bytes`)
 })
 
 test('execArgv puts the agent binary first', () => {

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { chmod, mkdir, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { ENV, plannerDir, seatDir } from './paths.ts'
@@ -109,30 +110,38 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
 
 export type CodexLaunchRequest = LaunchRequest & { bypassSandbox?: boolean }
 
-const codexHook = (droveEntry: string, event: string, matcher?: string): string =>
-  `[{${matcher ? `matcher=${tomlString(matcher)}, ` : ''}hooks=[{type="command", command=${tomlString(hookCommand(droveEntry, event))}, timeout=${HOOK_TIMEOUT_S}}]}]`
+// The Codex launch line is typed into a shell, so every byte counts (DROVE-23). One shim per drove entry, named by a
+// hash of it so two checkouts sharing a home never overwrite each other, replaces `node <entry> guard` in all hooks.
+const guardShim = (identity: Identity, droveEntry: string): LaunchFile => ({
+  path: `${identity.home}/g-${createHash('sha1').update(droveEntry).digest('hex').slice(0, 8)}`,
+  content: `#!/bin/sh\nexec node ${shellQuote(droveEntry)} guard "$@"\n`,
+  mode: 0o700,
+})
+
+const codexHook = (shim: string, event: string, matcher?: string): string =>
+  `[{${matcher ? `matcher=${tomlString(matcher)},` : ''}hooks=[{type="command",command=${tomlString(`${shellQuote(shim)} ${event}`)},timeout=${HOOK_TIMEOUT_S}}]}]`
+
+const compactTomlArray = (values: readonly string[]): string => `[${values.map(tomlString).join(',')}]`
 
 const codexSpec = (request: CodexLaunchRequest): LaunchSpec => {
   const { identity } = request
   const isWorker = identity.role === 'worker'
   const isBypass = isWorker && request.bypassSandbox !== false
   const env = identityEnv(identity)
+  const shim = guardShim(identity, request.droveEntry)
   const writableRoots = isWorker ? [`${request.repo}/.git`] : [`${request.repo}/.git`, `${identity.home}/runs/${identity.run}`]
   const overrides = [
     `model_reasoning_effort=${tomlString(request.effort)}`,
     ...(isWorker ? ['check_for_update_on_startup=false'] : []),
     ...(isBypass ? [] : [CODEX_NETWORK_FLAG]),
     ...(isWorker ? [`projects.${tomlString(request.cwd)}.trust_level="trusted"`] : []),
-    `mcp_servers.drove.command="node"`,
-    `mcp_servers.drove.args=${tomlArray([request.droveEntry, 'mcp'])}`,
-    `mcp_servers.drove.env_vars=${tomlArray(Object.keys(env))}`,
-    `mcp_servers.drove.default_tools_approval_mode="approve"`,
+    `mcp_servers.drove={command="node",args=${compactTomlArray([request.droveEntry, 'mcp'])},env_vars=${compactTomlArray(Object.keys(env))},default_tools_approval_mode="approve"}`,
     ...(request.roleText ? [`developer_instructions=${tomlString(request.roleText)}`] : []),
-    `hooks.PreToolUse=${codexHook(request.droveEntry, 'pre-tool-use', CODEX_GUARDED_TOOLS)}`,
-    `hooks.SessionStart=${codexHook(request.droveEntry, 'session-start')}`,
-    `hooks.UserPromptSubmit=${codexHook(request.droveEntry, 'user-prompt-submit')}`,
-    `hooks.Stop=${codexHook(request.droveEntry, 'stop')}`,
-    `hooks.PermissionRequest=${codexHook(request.droveEntry, 'permission-request')}`,
+    `hooks.PreToolUse=${codexHook(shim.path, 'pre-tool-use', CODEX_GUARDED_TOOLS)}`,
+    `hooks.SessionStart=${codexHook(shim.path, 'session-start')}`,
+    `hooks.UserPromptSubmit=${codexHook(shim.path, 'user-prompt-submit')}`,
+    `hooks.Stop=${codexHook(shim.path, 'stop')}`,
+    `hooks.PermissionRequest=${codexHook(shim.path, 'permission-request')}`,
   ]
   const argv = [
     ...(request.resumeId ? ['resume', request.resumeId] : []),
@@ -145,7 +154,7 @@ const codexSpec = (request: CodexLaunchRequest): LaunchSpec => {
     ...(request.initialPrompt ? [request.initialPrompt] : []),
   ]
   assertShellSafeArgs(isWorker || !request.initialPrompt ? argv : argv.slice(0, -1))
-  return { kind: 'codex', role: identity.role, cwd: request.cwd, env: { ...env, DROVE_AGENT: 'codex' }, argv, files: [] }
+  return { kind: 'codex', role: identity.role, cwd: request.cwd, env: { ...env, DROVE_AGENT: 'codex' }, argv, files: [shim] }
 }
 
 const requireRole = <T extends LaunchRequest>(request: T, role: Role): T => {
