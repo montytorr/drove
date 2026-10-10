@@ -1,0 +1,14 @@
+◆ drove Build Drove v1 pieces P1 to P5 in parallel                                       ▰▱▱▱▱ 1/5 done · 5/5 open · 42m
+
+⌘  lead          Opus 5.5 · h  waiting · owes 1 review                                                             41m
+├─ ▌ ✓  w-core     Sonnet·m  DROVE-3  owes you a review · P1 core state and protocol finished, 48 tests green      7m
+├─ ▌ ⛔ w-guard    codex gp… DROVE-4  a trust dialog waits in its pane                                             40m
+├─ ▌ ⚙  w-runtime  Sonnet·m  DROVE-5  ⠋ editing src/herdr.ts                                             ▰▱▱▱ 31%  39m
+├─ ▌ ·  w-store    Sonnet·m  DROVE-6  store written                                                                22m
+└─ ▌ ?  w-board    Sonnet·m  DROVE-7  Which width is the minimum?                                                  37m
+
+── timeline ──────────────────────────────────────────────────────────────────────────────── drove-20261009-1000-a3f1 ──
+10:01 ➤  ⌘          → w-core     brief     brief
+10:35 ✓  w-core     → ⌘          done      expects review · P1 core state and protocol finished, 48 tests green
+10:36 ✕  w-old      → ⌘          gone      its pane closed
+10:38 ⚠  w-guard    → you        attention dialog: a trust dialog waits in its pane
