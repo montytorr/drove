@@ -5,6 +5,7 @@ import { readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
+import { agentName } from '../src/herdr.ts'
 import { seatDir } from '../src/paths.ts'
 import { deriveState } from '../src/detect.ts'
 import { approvedText } from '../src/prompts.ts'
@@ -44,7 +45,7 @@ test('spawn opens the tab at the repo root, then starts the agent, which creates
   assert.deepEqual(fake.calls.filter(call => call[0] === 'git' && call.includes('worktree')), [])
 
   const start = fake.find('herdr', 'agent', 'start') ?? []
-  assert.equal(start[3], 'w-api')
+  assert.equal(start[3], 'w-api-a3f1')
   assert.equal(start[start.indexOf('--kind') + 1], 'claude')
   assert.equal(start[start.indexOf('--worktree') + 1], 'w-api')
   assert.ok(start.includes('--session-id'))
@@ -177,8 +178,8 @@ test('a failed start saves the pane output, logs seat.start_failed and hints at 
   assert.equal((await stat(file)).mode & 0o777, 0o600)
   const reads = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'read')
   assert.deepEqual(reads.map(call => call.slice(3)), [
-    ['w-api', '--source', 'visible', '--lines', '60'],
-    ['w-api', '--source', 'recent-unwrapped', '--lines', '60'],
+    ['w-api-a3f1', '--source', 'visible', '--lines', '60'],
+    ['w-api-a3f1', '--source', 'recent-unwrapped', '--lines', '60'],
   ])
   assert.ok(fake.calls.findIndex(call => call[2] === 'read') < fake.calls.findIndex(call => call[1] === 'tab' && call[2] === 'close'))
   const event = (await readEvents(deps)).find(item => item.type === 'seat.start_failed')
@@ -538,7 +539,7 @@ test('a report filed while herdr starts the agent survives the spawn bookkeeping
     await updateRoster(deps.home, RUN, roster => ({
       ...roster,
       seats: roster.seats.map(seat =>
-        seat.name === name ? { ...seat, owes: 'review', lastReport: { id: 'r1', kind: 'done', expects: 'review', summary: 'early', at: deps.clock.now().toISOString() } } : seat,
+        agentName(RUN, seat.name) === name ? { ...seat, owes: 'review', lastReport: { id: 'r1', kind: 'done', expects: 'review', summary: 'early', at: deps.clock.now().toISOString() } } : seat,
       ),
     }))
   }
@@ -850,7 +851,7 @@ test('up --seat keeps a seat whose agent start timed out but is up in the pane, 
     assert.equal(fake.herdrCalls().filter(call => call === 'pane close').length, closesBefore, mode)
     const seat = (await loadRoster(deps.home, RUN)).seats[0]
     assert.equal(seat?.state, 'working', mode)
-    assert.equal(seat?.paneId, fake.agents.get('w-a')?.paneId, mode)
+    assert.equal(seat?.paneId, fake.seatAgent('w-a')?.paneId, mode)
     assert.equal(fake.prompts.some(item => item.text.includes('Resumed by Drove')), mode === 'prompt', mode)
   }
 
@@ -899,7 +900,7 @@ test('promote keeps the restarted seat when agent start timed out but the agent 
   assert.equal(promoted.ok, true, promoted.text)
   assert.match(promoted.text, /timed out but the agent is up in the pane/)
   const seat = (await loadRoster(deps.home, RUN)).seats[0]
-  assert.deepEqual([seat?.model, seat?.state, seat?.paneId], ['claude-opus-5-5', 'working', fake.agents.get('w-api')?.paneId])
+  assert.deepEqual([seat?.model, seat?.state, seat?.paneId], ['claude-opus-5-5', 'working', fake.seatAgent('w-api')?.paneId])
   assert.match(fake.prompts.at(-1)?.text ?? '', /kind=promote/)
   const sent = (await readEvents(deps)).filter(item => item.type === 'control.sent').at(-1)
   assert.equal(sent?.data?.startTimeout, true)

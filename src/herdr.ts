@@ -1,4 +1,5 @@
-import type { AgentKind, Exec, ExecResult, HerdrAgent, HerdrStatus } from './types.ts'
+import { createHash } from 'node:crypto'
+import type { AgentKind, Exec, ExecResult, HerdrAgent, HerdrStatus, Seat } from './types.ts'
 
 export type HerdrResult<T> = { ok: true; value: T } | { ok: false; code: string; output: string }
 
@@ -8,6 +9,27 @@ export const BUSY_RETRY_INTERVAL_MS = 500
 export const DEFAULT_START_TIMEOUT_MS = 60_000
 export const DEFAULT_PROMPT_TIMEOUT_MS = 8_000
 const ATTEMPT_TIMEOUT_MS = 90_000
+
+const AGENT_NAME_MAX = 32
+const TAG_LENGTH = 4
+
+const digestOf = (text: string): string => createHash('sha1').update(text).digest('hex')
+
+// herdr agent names are unique per herdr server, not per workspace, so two runs that both have a seat `w-core`
+// would reach each other's worker by the bare name. Every name Drove gives herdr carries the run's own tag.
+export const runTag = (runId: string): string => /-([0-9a-f]{4})$/.exec(runId)?.[1] ?? digestOf(runId).slice(0, TAG_LENGTH)
+
+export const agentName = (runId: string, seat: string): string => {
+  const tag = runTag(runId)
+  const name = `${seat}-${tag}`
+  if (name.length <= AGENT_NAME_MAX) return name
+  const keep = AGENT_NAME_MAX - tag.length - TAG_LENGTH - 2
+  return `${seat.slice(0, keep)}-${digestOf(seat).slice(0, TAG_LENGTH)}-${tag}`
+}
+
+// A seat with a pane is addressed by the pane id, which is unique and also reaches agents started before names
+// carried a run tag. Only a seat that has no pane yet can be addressed by name.
+export const agentTarget = (runId: string, seat: Pick<Seat, 'name' | 'paneId'>): string => seat.paneId ?? agentName(runId, seat.name)
 
 const envFlags = (env: Record<string, string>): string[] => Object.entries(env).flatMap(([key, value]) => ['--env', `${key}=${value}`])
 

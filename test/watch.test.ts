@@ -236,7 +236,7 @@ test('an idle seat that has fired no hook yet has its visible screen read for a 
   const { ports } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'idle' }], deriveState })
   const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
   await watcher.tick()
-  assert.ok(ctx.calls.some((argv) => argv[2] === 'read' && argv[3] === 'w-api' && argv[5] === 'visible'))
+  assert.ok(ctx.calls.some((argv) => argv[2] === 'read' && argv[3] === 'p-w-api' && argv[5] === 'visible'))
   const roster = await rosterOf(ctx)
   assert.equal(roster.seats[0]?.state, 'blocked')
   assert.equal(roster.seats[0]?.attention[0]?.reason, 'hook-trust')

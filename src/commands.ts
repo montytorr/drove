@@ -1,7 +1,7 @@
 import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { applyDerived, deriveState, findDialog, matchDialog, shouldReadScreen } from './detect.ts'
@@ -148,10 +148,10 @@ type Stopped = { stopped: boolean; paneClosed: boolean; detail?: string }
 // Claude's /exit in a worktree session opens a keep-or-remove dialog that Drove must never answer, so a Claude
 // seat is stopped by closing its pane: the transcript is written as it goes and resumes by session id.
 const stopAgent = async (deps: Deps, seat: Seat, waitMs: number): Promise<Stopped> => {
-  const target = seat.paneId ?? seat.name
+  const target = seat.paneId
+  if (!target) return { stopped: true, paneClosed: false }
   if (seat.kind === 'claude') {
-    if (!seat.paneId) return { stopped: true, paneClosed: false }
-    const closed = await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
+    const closed = await herdr.run(deps.exec, herdr.paneCloseArgv(target))
     if (!closed.ok && !isPaneMissing(closed)) return { stopped: false, paneClosed: false, detail: clip(closed.output) }
     return { stopped: await settle(isGone(deps, target), waitMs), paneClosed: true }
   }
@@ -190,7 +190,7 @@ const START_FAILURE_LINES = 60
 
 const captureStartFailure = async (deps: Deps, run: RunMeta, seat: string, paneId: string | undefined, failure: { code: string; output: string }): Promise<{ hint?: string; file: string }> => {
   const readBoth = async (source: herdr.ReadSource) => {
-    const byAgent = await herdr.readScreen(deps.exec, seat, START_FAILURE_LINES, source)
+    const byAgent = await herdr.readScreen(deps.exec, herdr.agentName(run.id, seat), START_FAILURE_LINES, source)
     return byAgent.ok || !paneId ? byAgent : await herdr.readPane(deps.exec, paneId, START_FAILURE_LINES, source)
   }
   const section = (title: string, read: herdr.HerdrResult<string>): string => `== ${title} ==\n${read.ok ? read.value : `(could not read the pane: ${read.code})\n${read.output}`}`.trimEnd()
@@ -241,9 +241,9 @@ export const refreshRoster = async (deps: Deps, run: RunMeta): Promise<void> => 
   const seats = openSeats(await loadRoster(deps.home, run.id))
   const derived = await Promise.all(
     seats.map(async seat => {
-      const live = listed.value.find(agent => (seat.paneId ? agent.paneId === seat.paneId : agent.name === seat.name))
+      const live = listed.value.find(agent => (seat.paneId ? agent.paneId === seat.paneId : agent.name === herdr.agentName(run.id, seat.name)))
       const hooks = await hooksOf(deps, run.id, seat.name)
-      const screen = shouldReadScreen(live, hooks) ? await herdr.readScreen(deps.exec, seat.paneId ?? seat.name, 40, 'visible') : undefined
+      const screen = shouldReadScreen(live, hooks) ? await herdr.readScreen(deps.exec, herdr.agentTarget(run.id, seat), 40, 'visible') : undefined
       const sessionId = live?.sessionId ?? [...hooks].reverse().find(hook => hook.event === 'session-start' && hook.sessionId)?.sessionId
       return { seat, sessionId, derived: deriveState(seat, { herdr: live, hooks, ...(seat.lastReport ? { lastReport: seat.lastReport } : {}), ...(screen?.ok ? { screen: screen.value } : {}) }, now) }
     }),
@@ -380,8 +380,9 @@ const startWithRetry = async (
 ): Promise<StartAttempt> => {
   const attempt = async (paneId: string): Promise<Pick<StartAttempt, 'started' | 'adopted'>> => {
     await awaitShellPrompt(deps, paneId)
-    const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(start.seat, start.kind, paneId, start.argv), BUSY_RETRY_MS)
-    const adopted = !started.ok && started.code !== 'agent_not_ready' ? await adoptFailedStart(deps, start.seat, start.kind, paneId) : undefined
+    const name = herdr.agentName(run.id, start.seat)
+    const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(name, start.kind, paneId, start.argv), BUSY_RETRY_MS)
+    const adopted = !started.ok && started.code !== 'agent_not_ready' ? await adoptFailedStart(deps, name, start.kind, paneId) : undefined
     return { started, adopted }
   }
   const first = await attempt(start.paneId)
@@ -402,6 +403,19 @@ const keptWatcherFields = (recorded: Seat | undefined): Partial<Seat> => ({
   ...(recorded?.lastReport ? { lastReport: recorded.lastReport, owes: recorded.owes } : {}),
   ...(recorded?.hasNudged !== undefined ? { hasNudged: recorded.hasNudged } : {}),
 })
+
+// Runs on one repo share `.claude/worktrees/<seat>` and the seat's branch, so a seat that another run still holds
+// open must not be spawned again under the same name: both workers would write into one worktree.
+const heldByAnotherRun = async (deps: Deps, run: RunMeta, seat: Pick<Seat, 'name' | 'worktree' | 'branch'>): Promise<string | undefined> => {
+  const names = await readdir(join(deps.home, 'runs')).catch(() => [] as string[])
+  for (const name of names.filter(entry => entry !== run.id)) {
+    const other = await loadRun(deps.home, name).catch(() => undefined)
+    if (other?.repo !== run.repo) continue
+    const held = openSeats(await loadRoster(deps.home, other.id)).find(entry => entry.worktree === seat.worktree || entry.branch === seat.branch)
+    if (held) return `seat ${seat.name} would use worktree ${seat.worktree} and branch ${seat.branch}, which the open seat ${held.name} of run ${other.id} in this repo already holds; pick another seat name, or stop that seat first (drove close, or drove down --run ${other.id})`
+  }
+  return undefined
+}
 
 export const spawn = async (deps: Deps, identity: Identity, request: SpawnRequest): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
@@ -432,6 +446,9 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), model, effort, worktree, branch,
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
   }
+
+  const clash = await heldByAnotherRun(deps, run, seat)
+  if (clash) return failed('seat-taken', clash)
 
   try {
     await updateRoster(deps.home, run.id, roster => {
@@ -502,11 +519,11 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     seat: seat.name, kind, argv: spec.argv, paneId: placement.paneId, createdTab: placement.createdTab,
     place: () => placePane(deps, run, placed, launchCwd, spec.env),
   })
-  const live = started.ok ? await herdr.getAgent(deps.exec, seat.name) : undefined
+  const live = started.ok ? await herdr.getAgent(deps.exec, paneId) : undefined
   const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
 
   if (!started.ok && started.code === 'agent_not_ready') {
-    const screen = await herdr.readScreen(deps.exec, seat.name, 40, 'visible')
+    const screen = await herdr.readScreen(deps.exec, paneId, 40, 'visible')
     const dialog = screen.ok ? matchDialog(seat.name, screen.value, now) : undefined
     const attention = dialog ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at: iso }
     await updateRoster(deps.home, run.id, current => upsertSeat(current, { ...seat, paneId, state: 'blocked', attention: [attention] }))
@@ -757,7 +774,7 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
   if ('error' in located) return located.error
   const seat = findSeat(await loadRoster(deps.home, located.run.id), seatName)
   if (!seat) return failed('no-seat', `no seat named ${seatName}`)
-  const screen = await herdr.readScreen(deps.exec, seat.paneId ?? seat.name, Number.isFinite(lines) && lines > 0 ? lines : 80)
+  const screen = await herdr.readScreen(deps.exec, herdr.agentTarget(located.run.id, seat), Number.isFinite(lines) && lines > 0 ? lines : 80)
   return screen.ok ? ok(screen.value) : failed('herdr', `could not read ${seat.name}: ${screen.code}`)
 }
 
@@ -823,7 +840,7 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
   const unsaved: string[] = []
 
   for (const seat of seats) {
-    const target = seat.paneId ?? seat.name
+    const target = herdr.agentTarget(run.id, seat)
     let sessionId = seat.sessionId
     if (seat.state !== 'gone' && seat.state !== 'down') {
       const live = await herdr.getAgent(deps.exec, target)

@@ -24,7 +24,7 @@ export const codexQueueArgv = (thread: string, text: string): string[] => ['code
 
 export type UnconfirmedDelivery = { ok: true; via: Transport; unconfirmed: true }
 
-const targetOf = (seat: Seat): string => seat.paneId ?? seat.name
+const targetOf = (seat: Seat): string => seat.paneId ?? ''
 const clip = (text: string, max = 300): string => text.replace(/\s+/g, ' ').trim().slice(0, max)
 
 export const recordEvent = async (deps: Deps, run: string, event: Omit<DroveEvent, 'at'>): Promise<void> => {
@@ -33,7 +33,7 @@ export const recordEvent = async (deps: Deps, run: string, event: Omit<DroveEven
 
 export const herdrPromptAdapter = (deps: Deps): DeliveryAdapter => ({
   transport: 'herdr-prompt',
-  canDeliver: seat => Boolean(seat.paneId ?? seat.name),
+  canDeliver: seat => Boolean(seat.paneId),
   deliver: async (seat, text): Promise<Delivery | UnconfirmedDelivery> => {
     const target = targetOf(seat)
     const ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
@@ -80,6 +80,7 @@ export const chooseAdapter = (seat: Seat, adapters: readonly DeliveryAdapter[]):
 export const isDeliverable = async (deps: Deps, seat: Seat): Promise<{ ok: true } | { ok: false; reason: string }> => {
   if (DEAD_STATES.has(seat.state)) return { ok: false, reason: `${seat.name} is ${seat.state}` }
   if (seat.state === 'needs-input') return { ok: false, reason: `${seat.name} is waiting for an approval` }
+  if (!seat.paneId) return { ok: false, reason: `${seat.name} has no pane yet` }
   const live = await getAgent(deps.exec, targetOf(seat))
   if (!live.ok) return { ok: false, reason: live.code === 'unparseable' ? `${seat.name}: herdr gave no state` : `${seat.name}: ${live.code}` }
   if (live.value.status === 'blocked') return { ok: false, reason: `${seat.name} is blocked at a dialog` }

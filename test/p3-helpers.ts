@@ -81,8 +81,11 @@ export class FakeHerdr {
 
   herdrCalls = (): string[] => this.calls.filter(call => call[0] === 'herdr').map(call => call.slice(1, 3).join(' '))
   find = (...parts: string[]): string[] | undefined => this.calls.find(call => parts.every((part, index) => call[index] === part))
-  setStatus = (name: string, status: HerdrStatus) => {
-    const agent = this.agents.get(name)
+  // A seat name resolves to its agent whether herdr holds it under the bare name or `<seat>-<run tag>`.
+  seatAgent = (seat: string): FakeAgent | undefined =>
+    this.agents.get(seat) ?? [...this.agents.values()].find(agent => agent.paneId === seat || (agent.name.startsWith(`${seat}-`) && /^[0-9a-f]{4}$/.test(agent.name.slice(seat.length + 1))))
+  setStatus = (seat: string, status: HerdrStatus) => {
+    const agent = this.seatAgent(seat)
     if (agent) agent.status = status
   }
 
@@ -162,6 +165,8 @@ export class FakeHerdr {
     }
     const name = argv[3] ?? ''
     const paneId = argv[argv.indexOf('--pane') + 1] ?? ''
+    const holder = this.agents.get(name)
+    if (holder && holder.paneId !== paneId) return herdrFail('agent_name_taken', `an agent named ${name} is already live in ${holder.paneId}`)
     if (argv.slice(argv.indexOf('--') + 1).some(arg => UNSAFE_AGENT_ARG.test(arg))) return herdrFail('invalid_agent_argument', 'agent arguments cannot be encoded safely for the target shell')
     if (this.startFails) {
       if (this.startFails === 'agent_not_ready') this.agents.set(name, { name, paneId, tabId: `w1:t${this.counter}`, status: 'blocked' })

@@ -395,11 +395,12 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     const current = await ports.loadRoster(deps.home, run.id)
     const derived = new Map<string, { state: Seat['state']; attention: Attention[]; sessionId?: string }>()
     for (const seat of ports.openSeats(current).filter((open) => open.state !== 'closing')) {
-      const agent = listed.value.find((candidate) => candidate.name === seat.name) ?? listed.value.find((candidate) => seat.paneId !== undefined && candidate.paneId === seat.paneId)
+      const target = herdr.agentTarget(run.id, seat)
+      const agent = listed.value.find((candidate) => candidate.paneId === seat.paneId) ?? listed.value.find((candidate) => candidate.name === herdr.agentName(run.id, seat.name))
       const hooks = await hooksFor(run, seat.name)
       let screen: string | undefined
       if (detect.shouldReadScreen(agent, hooks)) {
-        const read = await deps.exec(ports.agentReadArgv(seat.name, 40, 'visible'))
+        const read = await deps.exec(ports.agentReadArgv(target, 40, 'visible'))
         screen = read.code === 0 ? read.stdout : undefined
       }
       const result = ports.deriveState(seat, { herdr: agent, hooks, lastReport: seat.lastReport, screen }, now)
