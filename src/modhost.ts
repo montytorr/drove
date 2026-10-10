@@ -121,7 +121,8 @@ type Acquired = { ok: true } | { ok: false; holder: BridgeLock }
 export const acquireBridge = async (deps: Deps, run: string, mine: BridgeLock, io: BridgeIo, takeoverMs = TAKEOVER_MS): Promise<Acquired> =>
   withLock(lockDir(deps.home, run), async () => {
     const holder = await readJson<BridgeLock>(lockFile(deps.home, run)).catch(() => undefined)
-    if (holder && holder.pid !== mine.pid && io.isAlive(holder.pid)) {
+    // A released lock holds pid 0, and kill(0) signals this whole process group, Claude Code included.
+    if (holder && holder.pid > 0 && holder.pid !== mine.pid && io.isAlive(holder.pid)) {
       if (holder.sessionId !== mine.sessionId) return { ok: false, holder }
       io.kill(holder.pid, 'SIGTERM')
       for (let waited = 0; io.isAlive(holder.pid) && waited < takeoverMs; waited += 100) await io.sleep(100)

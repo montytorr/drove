@@ -124,6 +124,15 @@ test('the bridge lock replaces a leftover bridge of the same session and stands 
   assert.deepEqual(await acquireBridge(ctx.deps, ctx.run.id, { pid: 43, sessionId: 's-2', startedAt: 'z' }, other), { ok: true })
 })
 
+test('the bridge lock never signals pid 0, the marker a released bridge leaves behind', async () => {
+  const ctx = await setup()
+  await writeJsonAtomic(join(plannerDir(ctx.home, ctx.run.id), 'bridge.json'), { pid: 0, sessionId: 's-1', startedAt: 'x' })
+  const io = fakeIo(42)
+  io.alive.add(0)
+  assert.deepEqual(await acquireBridge(ctx.deps, ctx.run.id, { pid: 42, sessionId: 's-1', startedAt: 'y' }, io), { ok: true })
+  assert.deepEqual(io.killed, [])
+})
+
 const modRun = async () => setup({ planner: { kind: 'claude', viaMod: true, sessionId: 's-1', paneId: 'w1:p1' } })
 
 test('the bridge streams the run, the roster with mod status, events and wakes, then stops when its parent goes', async () => {

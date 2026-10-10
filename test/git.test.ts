@@ -145,4 +145,6 @@ test('isPidAlive is true for this process and false for an exited one', () => {
   assert.equal(drovegit.isPidAlive(process.pid), true)
   const exited = spawnSync(process.execPath, ['-e', ''])
   assert.equal(drovegit.isPidAlive(exited.pid), false)
+  assert.equal(drovegit.isPidAlive(0), false)
+  assert.equal(drovegit.isPidAlive(-1), false)
 })
