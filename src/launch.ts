@@ -59,6 +59,7 @@ export const claudeSettings = (droveEntry: string, _role: Role): Record<string, 
   hooks: {
     PreToolUse: [{ matcher: CLAUDE_GUARDED_TOOLS, hooks: [claudeHook(droveEntry, 'pre-tool-use')] }],
     SessionStart: [{ hooks: [claudeHook(droveEntry, 'session-start')] }],
+    UserPromptSubmit: [{ hooks: [claudeHook(droveEntry, 'user-prompt-submit')] }],
     Stop: [{ hooks: [claudeHook(droveEntry, 'stop')] }],
     Notification: [{ hooks: [claudeHook(droveEntry, 'notification')] }],
   },

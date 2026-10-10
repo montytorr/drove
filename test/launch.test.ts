@@ -161,7 +161,8 @@ test('claude settings and mcp config carry the guard hooks and the drove server'
   const settings = launch.claudeSettings(ENTRY, 'worker') as { hooks: Record<string, { matcher?: string; hooks: { command: string }[] }[]> }
   assert.equal(settings.hooks.PreToolUse?.[0]?.matcher, launch.CLAUDE_GUARDED_TOOLS)
   assert.equal(settings.hooks.PreToolUse?.[0]?.hooks[0]?.command, `node ${ENTRY} guard pre-tool-use`)
-  assert.deepEqual(Object.keys(settings.hooks), ['PreToolUse', 'SessionStart', 'Stop', 'Notification'])
+  assert.deepEqual(Object.keys(settings.hooks), ['PreToolUse', 'SessionStart', 'UserPromptSubmit', 'Stop', 'Notification'])
+  assert.equal(settings.hooks.UserPromptSubmit?.[0]?.hooks[0]?.command, `node ${ENTRY} guard user-prompt-submit`)
   assert.deepEqual(launch.claudeMcpConfig(ENTRY), { mcpServers: { drove: { command: 'node', args: [ENTRY, 'mcp'] } } })
 })
 

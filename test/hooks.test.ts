@@ -212,6 +212,18 @@ const submit = (prompt: string, extra: Record<string, unknown> = {}) =>
   JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's1', turn_id: 't1', cwd: '/work/repo', model: 'gpt-5.5', permission_mode: 'bypassPermissions', transcript_path: null, prompt, ...extra })
 const notice = (result: hooks.HookResult) => JSON.parse(result.stdout) as { hookSpecificOutput: { hookEventName: string; additionalContext: string }; systemMessage: string }
 
+test('user-prompt-submit: a Claude worker records the event with no detail and outputs nothing', async () => {
+  const { deps, written } = fakeDeps()
+  const prompt = `${formatControl(CONTROL, TOKEN)}\nextra text`
+  const result = await hooks.runHook('user-prompt-submit', JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's1', cwd: '/work/repo', prompt }), { ...WORKER, DROVE_AGENT: 'claude', DROVE_TOKEN: TOKEN }, deps)
+  assert.deepEqual(result, PASSES)
+  assert.equal(written.length, 1)
+  assert.equal(written[0]?.value.agent, 'claude')
+  assert.equal(written[0]?.value.event, 'user-prompt-submit')
+  assert.equal(written[0]?.value.detail, undefined)
+  assert.doesNotMatch(JSON.stringify(written[0]?.value), /extra text/)
+})
+
 test('user-prompt-submit: a Codex worker passes a verified envelope unchanged and records the prompt event', async () => {
   const { deps, written } = fakeDeps()
   const result = await hooks.runHook('user-prompt-submit', submit(formatControl(CONTROL, TOKEN)), CODEX_WORKER, deps)
