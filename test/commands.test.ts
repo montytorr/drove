@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
 import { seatDir } from '../src/paths.ts'
+import { deriveState } from '../src/detect.ts'
 import { approvedText } from '../src/prompts.ts'
 import { loadRoster, loadRun, updateRoster } from '../src/roster.ts'
 import type { Deps, Identity, RunMeta } from '../src/types.ts'
@@ -617,6 +618,22 @@ test('promote on a codex worker quits with /quit and resumes the thread', async 
   assert.deepEqual(argv.slice(0, 2), ['resume', 'thread-xyz'])
   assert.equal(argv[argv.indexOf('-m') + 1], 'gpt-big')
   assert.ok(argv.includes('model_reasoning_effort="xhigh"'))
+})
+
+test('a codex promote marks the seat starting before the agent stops, so the restart window never reads gone', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, lastReport: { id: 'r-1', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })) }))
+  let seen: { state?: string; derived?: string; attention?: number; agents?: number } = {}
+  fake.onStart = async () => {
+    const seat = (await loadRoster(deps.home, RUN)).seats[0]
+    const derived = seat ? deriveState(seat, { hooks: [] }, deps.clock.now()) : undefined
+    seen = { state: seat?.state, derived: derived?.state, attention: derived?.attention.length, agents: fake.agents.size }
+  }
+  const promoted = await commands.promote(deps, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.deepEqual(seen, { state: 'starting', derived: 'starting', attention: 0, agents: 0 })
 })
 
 test('promote mid-turn is queued until the seat is idle, not restarted', async () => {
