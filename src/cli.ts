@@ -88,9 +88,9 @@ export const COMMANDS: Record<string, Spec> = {
       ),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH]',
+    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME]',
     why: 'open a worker in its own worktree and pane, and brief it',
-    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' } },
+    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' } },
     run: async (values, positionals, io) => {
       const brief = need(str(values, 'brief'), '--brief')
       return print(
@@ -102,6 +102,7 @@ export const COMMANDS: Record<string, Spec> = {
           model: str(values, 'model'),
           effort: str(values, 'effort') as Effort | undefined,
           base: str(values, 'base'),
+          mcp: str(values, 'mcp')?.split(',').map(name => name.trim()).filter(Boolean),
         }),
         io,
       )
@@ -168,6 +169,13 @@ export const COMMANDS: Record<string, Spec> = {
     why: 'one line per seat',
     options: { json: { type: 'boolean' }, run: { type: 'string' } },
     run: async (values, _positionals, io) => print(await commands.roster(commands.defaultDeps(), runRef(values), values.json === true), io),
+  },
+  reports: {
+    usage: 'drove reports [<seat>] [--all] [--json] [--run ID]',
+    why: "the workers' reports in full, those not yet read (a seat's latest when it has none unread); --all for every report",
+    options: { all: { type: 'boolean' }, json: { type: 'boolean' }, run: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(await commands.reports(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { seat: positionals[0], all: values.all === true, asJson: values.json === true }), io),
   },
   capture: {
     usage: 'drove capture <seat> [--lines N] [--run ID]',

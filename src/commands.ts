@@ -4,14 +4,14 @@ import { existsSync } from 'node:fs'
 import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, matchDialog, shouldReadScreen } from './detect.ts'
+import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
-import { type CodexLaunchRequest, execArgv, isShellSafeArg, readCodexHome, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
+import { type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readCodexHome, redactSpec, specFor, userClaudeConfig, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
-import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
-import { formatControl } from './protocol.ts'
+import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
+import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
@@ -28,6 +28,7 @@ export const timing = { pollMs: 500, exitWaitMs: EXIT_WAIT_MS, closeWaitMs: 3_00
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
 const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
+const MCP_NAME_RE = /^[^\s,]+$/
 
 export const DEFAULT_CONFIG: DroveConfig = {
   humanName: 'the human',
@@ -86,11 +87,18 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
 const envOf = (value: unknown): Record<string, string> =>
   value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([name, text]) => ENV_NAME_RE.test(name) && typeof text === 'string')) : {}
 
+const namesOf = (value: unknown): string[] | undefined =>
+  Array.isArray(value) ? [...new Set(value.filter((name): name is string => typeof name === 'string').map(name => name.trim()).filter(Boolean))] : undefined
+
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const file = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const mcp = namesOf(workerMcp)
+  const skills = namesOf(workerSkills)
   return {
     ...DEFAULT_CONFIG,
     ...file,
+    ...(mcp ? { workerMcp: mcp } : {}),
+    ...(skills ? { workerSkills: skills } : {}),
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
     workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel },
     promotedModel: { ...DEFAULT_CONFIG.promotedModel, ...file.promotedModel },
@@ -201,6 +209,50 @@ const launchRequest = (
 // (DROVE-34). A seat with none recorded started before Drove owned one and keeps the inline launch line and ~/.codex.
 const codexHomeOf = async (deps: Deps, seat: Seat): Promise<Pick<CodexLaunchRequest, 'codexHome'>> =>
   seat.kind === 'codex' && seat.codexHome ? { codexHome: await readCodexHome(seat.codexHome, deps.codexUserHome ?? userCodexHome(deps.home)) } : {}
+
+// No allowlist anywhere keeps the user's whole MCP setup (DROVE-72); workerMcp or a seat's --mcp makes the seat lean:
+// Drove's server plus the union of both lists.
+const seatMcpAllow = (config: DroveConfig, seat: Pick<Seat, 'mcp'>): string[] | undefined =>
+  config.workerMcp === undefined && seat.mcp === undefined ? undefined : [...new Set([...(config.workerMcp ?? []), ...(seat.mcp ?? [])])]
+
+type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[] }
+
+const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
+  const mcpAllow = seatMcpAllow(config, seat)
+  if (seat.kind === 'claude') {
+    if (!mcpAllow) return { parts: {}, missing: [] }
+    const userMcp = await readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo)
+    return { parts: { mcpAllow, userMcp }, missing: mcpAllow.filter(name => name !== 'drove' && userMcp[name] === undefined) }
+  }
+  const { codexHome } = await codexHomeOf(deps, seat)
+  const known = codexHome ? codexMcpNames(codexHome.userConfig) : []
+  return {
+    parts: {
+      ...(codexHome ? { codexHome } : {}),
+      ...(mcpAllow ? { mcpAllow } : {}),
+      ...(config.workerMcp ? { homeMcpAllow: config.workerMcp } : {}),
+      ...(config.workerSkills ? { skillAllow: config.workerSkills } : {}),
+    },
+    missing: codexHome && mcpAllow ? mcpAllow.filter(name => name !== 'drove' && !known.includes(name)) : [],
+  }
+}
+
+const missingMcpNote = (seat: Seat, missing: readonly string[]): string[] =>
+  missing.length > 0 ? [`MCP server${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not in the user's ${seat.kind === 'claude' ? 'Claude' : 'Codex'} setup, so ${seat.name} runs without ${missing.length > 1 ? 'them' : 'it'}.`] : []
+
+// A Codex seat without a Drove-owned home got its role inside its brief, so a relaunch adds none.
+const seatRoleText = (run: RunMeta, config: DroveConfig, seat: Seat): string => (seat.kind === 'codex' && !seat.codexHome ? '' : workerRole(run, config))
+
+const LOCKFILES = ['yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock'] as const
+
+const repoVerifyCommands = async (repo: string): Promise<string[]> => {
+  const read = (name: string): Promise<string | undefined> => readFile(join(repo, name), 'utf8').catch(() => undefined)
+  return verifyCommands({
+    packageJson: await read('package.json'),
+    makefile: (await read('Makefile')) ?? (await read('makefile')),
+    lockfiles: LOCKFILES.filter(name => existsSync(join(repo, name))),
+  })
+}
 
 const writeLaunchJson = async (deps: Deps, run: string, seat: string, spec: Parameters<typeof redactSpec>[0]): Promise<void> => {
   await writeJsonAtomic(join(seatDir(deps.home, run, seat), 'launch.json'), redactSpec(spec))
@@ -549,6 +601,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (request.kind !== 'claude' && request.kind !== 'codex') return failed('usage', '--kind must be claude or codex')
   if (request.cairn && !CAIRN_RE.test(request.cairn)) return failed('usage', `--cairn must look like DROVE-5; got "${request.cairn}"`)
   if (request.effort && !EFFORTS.includes(request.effort)) return failed('usage', `--effort must be one of ${EFFORTS.join(', ')}`)
+  const badMcp = request.mcp?.find(name => !MCP_NAME_RE.test(name))
+  if (badMcp !== undefined) return failed('usage', `--mcp takes server names separated by commas; got "${badMcp}"`)
   const brief = request.brief.trim()
   if (!brief) return failed('usage', 'a worker needs a brief')
   const located = await locateFor(deps, identity, 'up')
@@ -570,7 +624,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const launchCwd = isClaude ? run.repo : worktree
   const sessionId = kind === 'claude' ? randomUUID() : undefined
   const seat: Seat = {
-    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), model, effort, worktree, branch,
+    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}), model, effort, worktree, branch,
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
     ...(isClaude ? {} : { codexHome: codexHomeDir(deps.home, run.id) }),
   }
@@ -632,15 +686,15 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
   const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const isBriefInline = isShellSafeArg(brief.trim())
-  const footer = isBriefInline ? `${brief.trim()} ${briefFooter(seat.name, request.cairn).trimStart()}` : `${brief}${briefFooter(seat.name, request.cairn)}`
-  const isRoleInBrief = kind === 'codex'
-  const roleText = workerRole(seat, run, config)
-  const briefText = isRoleInBrief ? `${roleText}\n\n${footer}` : footer
+  const footerText = briefFooter(seat.name, request.cairn, { branch, verify: await repoVerifyCommands(run.repo) })
+  const briefText = isBriefInline ? `${brief.trim()} ${footerText.trimStart()}` : `${brief}${footerText}`
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
   await saveBrief(deps, run.id, seat.name, briefText)
+  const extras = await launchExtrasOf(deps, run, config, seat)
+  baseNotes.push(...missingMcpNote(seat, extras.missing))
   const spec = specFor(
-    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}), ...(await codexHomeOf(deps, seat)) }, config),
+    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: workerRole(run, config), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -866,7 +920,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     const controlText = formatControl(control, token)
     const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
     const spec = specFor(
-      launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seat.kind === 'codex' ? '' : workerRole(updated, run, config), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await codexHomeOf(deps, seat)) }, config),
+      launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seatRoleText(run, config, seat), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config),
     )
     await writeLaunchFiles(spec)
     await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -958,13 +1012,18 @@ const gitOutput = async (deps: Deps, worktree: string, args: readonly string[]):
 
 const reportLine = (report: Report): string => `- ${report.at} ${report.kind} (expects ${report.expects}): ${report.summary}${report.details ? `\n  ${clip(report.details, 600)}` : ''}`
 
-// A Codex brief carries the worker role in front (Claude gets it as a file), and the role names no kind, so it is cut
-// here and the new kind gets it its own way.
-const gatherHandoff = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, reason: string | undefined): Promise<Handoff> => {
+const ROLE_START = '# Worker mode'
+const ROLE_END = 'says how to reply.'
+
+// A Codex brief saved before DROVE-72 carries the worker role in front. The new agent gets the role its own way, so it is cut.
+const briefOf = (saved: string): string => {
+  const end = saved.indexOf(ROLE_END)
+  return saved.startsWith(ROLE_START) && end >= 0 ? saved.slice(end + ROLE_END.length).trim() : saved
+}
+
+const gatherHandoff = async (deps: Deps, run: RunMeta, seat: Seat, reason: string | undefined): Promise<Handoff> => {
   const dir = seatDir(deps.home, run.id, seat.name)
-  const role = workerRole(seat, run, config)
-  const saved = (await readFile(join(dir, 'brief.md'), 'utf8').catch(() => '')).trim()
-  const brief = saved.startsWith(role) ? saved.slice(role.length).trim() : saved
+  const brief = briefOf((await readFile(join(dir, 'brief.md'), 'utf8').catch(() => '')).trim())
   const log = await gitOutput(deps, seat.worktree, ['log', '--oneline', `${run.base}..HEAD`])
   const diffStat = await gitOutput(deps, seat.worktree, ['diff', '--stat', 'HEAD'])
   const status = await gitOutput(deps, seat.worktree, ['status', '--short'])
@@ -998,7 +1057,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
   const effort = request.effort ?? seat.effort
   const iso = deps.clock.now().toISOString()
   const oldSession = seat.sessionId ?? (await hookSessionId(deps, run.id, seat.name))
-  const briefBody = handoffText(await gatherHandoff(deps, run, config, seat, request.reason))
+  const briefText = handoffText(await gatherHandoff(deps, run, seat, request.reason))
   const before = await markRestarting(deps, run.id, seat.name)
   try {
     const stop = await stopAgent(deps, seat, timing.exitWaitMs)
@@ -1026,11 +1085,11 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
       ...(kind === 'codex' ? { codexHome: codexHomeDir(deps.home, run.id) } : {}),
       migratedFrom: { kind: seat.kind, ...(oldSession ? { sessionId: oldSession } : {}), model: seat.model, at: iso, ...(request.reason ? { reason: request.reason } : {}) },
     }
-    const roleText = workerRole(migrated, run, config)
-    const briefText = kind === 'codex' ? `${roleText}\n\n${briefBody}` : briefBody
     const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+    const extras = await launchExtrasOf(deps, run, config, migrated)
+    notes.push(...missingMcpNote(migrated, extras.missing))
     const spec = specFor(
-      launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: seat.worktree, model, effort, roleText: kind === 'codex' ? '' : roleText, inWorktree: true, ...(sessionId ? { sessionId } : {}), ...(await codexHomeOf(deps, migrated)) }, config),
+      launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: seat.worktree, model, effort, roleText: workerRole(run, config), inWorktree: true, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
     )
     await writeLaunchFiles(spec)
     await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -1103,6 +1162,43 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
   if (!seat) return failed('no-seat', `no seat named ${seatName}`)
   const screen = await herdr.readScreen(deps.exec, herdr.agentTarget(located.run.id, seat), Number.isFinite(lines) && lines > 0 ? lines : 80)
   return screen.ok ? ok(screen.value) : failed('herdr', `could not read ${seat.name}: ${screen.code}`)
+}
+
+// ---------- reports ----------
+
+// The planner reads its workers' reports in full here: a wake shows it one line per report. Read ids are kept in the planner's folder.
+export type ReportsRequest = { seat?: string; all?: boolean; asJson?: boolean }
+
+const readReportsPath = (home: string, run: string): string => join(plannerDir(home, run), 'reports-read.json')
+
+const seatReports = async (deps: Deps, run: RunMeta, seat: string): Promise<Report[]> => {
+  const dir = seatDir(deps.home, run.id, seat)
+  const token = await readToken(join(dir, 'token'))
+  if (!token) return []
+  const { items } = await readJsonlFrom<Partial<Report> | null>(join(dir, 'outbox.jsonl'), { offset: 0 })
+  return items.filter((item): item is Report =>
+    item?.v === 1 && item.run === run.id && item.seat === seat && item.token === token && typeof item.id === 'string' && typeof item.summary === 'string' && item.kind !== 'progress' && REPORT_KINDS.includes(item.kind as Report['kind']),
+  )
+}
+
+export const reports = async (deps: Deps, identity: Identity, ref: RunRef, request: ReportsRequest): Promise<CommandResult> => {
+  const denied = requirePlanner(identity)
+  if (denied) return denied
+  const located = await locateRun(deps, ref, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  const roster = await loadRoster(deps.home, run.id)
+  if (request.seat && !findSeat(roster, request.seat)) return failed('no-seat', `no seat named ${request.seat}`)
+  const seats = request.seat ? [request.seat] : roster.seats.map(seat => seat.name)
+  const all = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().sort((a, b) => a.at.localeCompare(b.at))
+  const read = new Set((await readJson<string[]>(readReportsPath(deps.home, run.id))) ?? [])
+  const unread = all.filter(report => !read.has(report.id))
+  const picked = request.all ? all : unread.length > 0 || !request.seat ? unread : all.slice(-1)
+  if (picked.some(report => !read.has(report.id))) await writeJsonAtomic(readReportsPath(deps.home, run.id), [...read, ...picked.filter(report => !read.has(report.id)).map(report => report.id)])
+  const shown = picked.map(({ v: _v, token: _token, run: _run, ...rest }) => rest)
+  if (request.asJson) return ok(JSON.stringify({ run: run.id, reports: shown }, null, 2), { run: run.id, reports: shown })
+  if (picked.length === 0) return ok(request.seat ? `${request.seat} has not reported yet` : 'no unread reports', { run: run.id, reports: shown })
+  return ok(renderReports(picked, (await loadConfig(deps.home)).humanName), { run: run.id, reports: shown })
 }
 
 // ---------- close ----------
@@ -1221,7 +1317,7 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
   const identity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const resumeText = resumePrompt(seat)
   const isInline = resolveBriefVia(config) === 'launch-arg'
-  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seat.kind === 'codex' ? '' : workerRole(seat, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}), ...(await codexHomeOf(deps, seat)) }, config))
+  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seatRoleText(run, config, seat), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config))
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
@@ -1275,6 +1371,40 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   return relaunched
 }
 
+type PaneLiveness = { state: 'alive' | 'gone' } | { state: 'unverified'; detail: string }
+
+const paneLiveness = async (deps: Deps, target: string): Promise<PaneLiveness> => {
+  const live = await herdr.getAgent(deps.exec, target)
+  if (live.ok) return { state: 'alive' }
+  return isPaneMissing(live) ? { state: 'gone' } : { state: 'unverified', detail: clip(live.output || live.code, 160) }
+}
+
+const adoptAsDown = async (deps: Deps, run: RunMeta, seat: Seat): Promise<Seat> => {
+  const sessionId = seat.sessionId ?? (await hookSessionId(deps, run.id, seat.name))
+  const { restartingSince: _cleared, ...rest } = seat
+  const adopted: Seat = { ...rest, ...(sessionId ? { sessionId } : {}), state: 'down', stateAt: deps.clock.now().toISOString(), attention: [] }
+  await updateRoster(deps.home, run.id, roster => upsertSeat(roster, adopted))
+  return adopted
+}
+
+// An `up` run whose planner and seat panes are all gone is a crash: nothing ran `down`, and the watcher died too.
+const probeCrashedRun = async (deps: Deps, run: RunMeta): Promise<{ seats: Seat[] } | { error: CommandResult }> => {
+  const now = deps.clock.now()
+  const seats = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state !== 'closed')
+  const probes = [
+    ...(run.planner.paneId ? [{ label: `the planner pane ${run.planner.paneId}`, target: run.planner.paneId }] : []),
+    ...seats.filter(seat => seat.state !== 'gone' && seat.state !== 'down').map(seat => ({ label: `${seat.name} (pane ${seat.paneId ?? herdr.agentTarget(run.id, seat)})`, target: herdr.agentTarget(run.id, seat) })),
+  ]
+  const results = await Promise.all(probes.map(async probe => ({ ...probe, liveness: await paneLiveness(deps, probe.target) })))
+  const alive = results.filter(result => result.liveness.state === 'alive').map(result => result.label)
+  if (alive.length) return { error: failed('not-down', `run ${run.id} is up and still has live panes: ${alive.join(', ')}; nothing to recover`) }
+  const unverified = results.find(result => result.liveness.state === 'unverified')
+  if (unverified && unverified.liveness.state === 'unverified') return { error: failed('herdr', `herdr could not say whether ${unverified.label} is alive: ${unverified.liveness.detail}`) }
+  const restarting = seats.filter(seat => isRestarting(seat, now)).map(seat => seat.name)
+  if (restarting.length) return { error: failed('not-down', `run ${run.id} has a restart in flight for ${restarting.join(', ')}; try again shortly`) }
+  return { seats }
+}
+
 export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<CommandResult> => {
   const located = seatName ? await locateRun(deps, ref, 'up') : await locateRun(deps, ref, 'down')
   if ('error' in located) return located.error
@@ -1282,17 +1412,31 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
   const config = await loadConfig(deps.home)
 
   if (seatName) {
-    const seat = findSeat(await loadRoster(deps.home, run.id), seatName)
+    let seat = findSeat(await loadRoster(deps.home, run.id), seatName)
     if (!seat || seat.state === 'closed') return failed('no-seat', `no seat named ${seatName} to relaunch`)
-    if (seat.state !== 'gone' && seat.state !== 'down') return failed('not-dead', `${seatName} is ${seat.state}; only a gone or down seat is relaunched`)
+    if (seat.state !== 'gone' && seat.state !== 'down') {
+      if (isRestarting(seat, deps.clock.now())) return failed('not-dead', `${seatName} is ${seat.state} and is being restarted; try again shortly`)
+      const probed = await paneLiveness(deps, herdr.agentTarget(run.id, seat))
+      if (probed.state === 'alive') return failed('not-dead', `${seatName} is ${seat.state}; only a gone or down seat is relaunched`)
+      if (probed.state === 'unverified') return failed('herdr', `herdr could not say whether ${seatName}'s pane ${seat.paneId ?? '?'} is alive: ${probed.detail}`)
+      seat = await adoptAsDown(deps, run, seat)
+    }
     const placed = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
     const relaunched = await relaunchSeat(deps, run, config, seat, placed)
     return 'error' in relaunched ? failed('relaunch', relaunched.error) : ok(`Relaunched ${seatName} in pane ${relaunched.seat.paneId} with resume.${relaunched.note ? ` Note: ${relaunched.note}.` : ''}`,{ paneId: relaunched.seat.paneId })
   }
 
-  if (run.status !== 'down') return failed('not-down', `run ${run.id} is ${run.status}; nothing to resume`)
   const paneId = process.env.HERDR_PANE_ID
   if (!paneId) return failed('not-in-herdr', 'drove up must run inside a herdr pane (HERDR_PANE_ID is unset); the planner resumes in this pane')
+  let recovered: Seat[] | undefined
+  if (run.status === 'up') {
+    const crashed = await probeCrashedRun(deps, run)
+    if ('error' in crashed) return crashed.error
+    recovered = await Promise.all(crashed.seats.map(seat => adoptAsDown(deps, run, seat)))
+    const plannerId = run.planner.sessionId ?? (await plannerSessionId(deps, run))
+    run = { ...run, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } }
+    await recordEvent(deps, run.id, { type: 'run.recovered', data: { seats: recovered.map(seat => seat.name), unsaved: recovered.filter(seat => !seat.sessionId).map(seat => seat.name), plannerPane: run.planner.paneId, pane: paneId } })
+  }
   run = { ...run, status: 'up', tabId: undefined, planner: { ...run.planner, paneId } }
   await saveRun(deps.home, run)
   const seats = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state === 'down').sort(SPAWNED_ORDER)
@@ -1319,7 +1463,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
     launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: plannerRole(run, config, planner.kind), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
   )
   await writeLaunchFiles(spec)
-  const summary = `Run ${run.id} is up: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}`
+  const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}`
   return ok(summary, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
 }
 

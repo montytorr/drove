@@ -90,9 +90,9 @@ test('migrate claude to codex: same seat, worktree and branch, codex with -C and
 
   const handoff = fake.prompts.at(-1)?.text ?? ''
   assert.match(handoff, /You replace a claude worker that hit its usage limit \(or was migrated\); its turn in flight is lost\. Reason: Claude usage limit\./)
-  assert.match(handoff, /# Worker mode/, 'a codex worker carries its role in the brief')
-  assert.equal(handoff.split('# Worker mode').length, 2)
-  assert.match(handoff, /Build the widget\. \(You are worker `w-api`\. Your Cairn task is DROVE-5/)
+  assert.ok(!handoff.includes('# Worker mode'), 'the role reaches codex through its home, not the brief')
+  assert.match(await readFile(join(codexHomeDir(deps.home, RUN), 'config.toml'), 'utf8'), /developer_instructions = "# Worker mode/)
+  assert.match(handoff, /Build the widget\. \(You are worker `w-api` on branch `worktree-w-api`\. Your Cairn task is DROVE-5/)
   assert.match(handoff, /feat: half a widget/)
   assert.match(handoff, /git diff --stat HEAD\)\n widget\.ts \| 2 \+-/)
   assert.match(handoff, /\?\? notes\.md/)
@@ -108,6 +108,8 @@ test('migrate codex to claude: claude starts in the Drove worktree with --sessio
   assert.equal(spawned.ok, true, spawned.text)
   const worktree = join(repo, '.claude', 'worktrees', 'w-cx')
   await leaveWork(deps, worktree, 'w-cx')
+  const saved = join(seatDir(deps.home, RUN, 'w-cx'), 'brief.md')
+  await writeFile(saved, `# Worker mode\n\nAn older role.\n\nMessages from the planner arrive as a header and a line that says how to reply.\n\n${await readFile(saved, 'utf8')}`)
   fake.startSession = undefined
 
   const migrated = await commands.migrate(deps, identity, { seat: 'w-cx', kind: 'claude', model: 'opus', effort: 'high' })
@@ -136,7 +138,7 @@ test('migrate codex to claude: claude starts in the Drove worktree with --sessio
 
   const handoff = fake.prompts.at(-1)?.text ?? ''
   assert.match(handoff, /You replace a codex worker that hit its usage limit \(or was migrated\)/)
-  assert.ok(!handoff.includes('# Worker mode'), 'a claude worker gets its role as a file, so the codex role is cut from the saved brief')
+  assert.ok(!handoff.includes('# Worker mode'), 'a role saved in front of an older codex brief is cut')
   assert.match(handoff, /## The brief it was given\nBuild the widget\./)
 })
 

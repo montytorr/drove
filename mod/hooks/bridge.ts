@@ -95,9 +95,14 @@ export const splitWake = (wake: string): WakeBlock[] =>
 
 export const toastOf = (blocks: readonly WakeBlock[]): string => oneLine(blocks.map(({ seat, kind }) => `${seat}: ${kind}`).join(', '), 80)
 
-// What the person sees of a wake: each block's head, `w-auth · done · expects review`, one line per report. The rest goes to the model as hidden context.
-export const wakeHeadlines = (blocks: readonly WakeBlock[]): string =>
-  blocks.map(({ text }) => (text.split('\n')[0] ?? '').replace(/^\[worker /, '').replace(/\]$/, '')).join('\n')
+export const HEADLINE_SUMMARY_MAX = 100
 
-export const wakeContext = (wake: string): string =>
-  `The full worker reports behind this wake's one-line headlines, in Drove's words. The person sees only the headlines, so tell them what matters.\n\n${wake}`
+// What the person and the planner see of a wake, one line per report: `w-auth · done · expects review — <its summary>`. The full reports are read with read_reports.
+export const wakeHeadlines = (blocks: readonly WakeBlock[]): string =>
+  blocks
+    .map(({ text }) => {
+      const [head = '', summary = ''] = text.split('\n')
+      const line = head.replace(/^\[worker /, '').replace(/\]$/, '')
+      return summary.startsWith('→ ') || !summary.trim() ? line : `${line} — ${oneLine(summary, HEADLINE_SUMMARY_MAX)}`
+    })
+    .join('\n')

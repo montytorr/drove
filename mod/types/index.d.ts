@@ -58,6 +58,7 @@ export type Seat = {
   paneId?: string
   sessionId?: string
   codexHome?: string
+  mcp?: string[]
   worktree: string
   branch: string
   state: SeatState
@@ -84,6 +85,7 @@ export type Roster = {
 export type DroveEventType =
   | 'run.up'
   | 'run.down'
+  | 'run.recovered'
   | 'seat.spawn'
   | 'seat.start_failed'
   | 'seat.relaunch'

@@ -39,6 +39,11 @@ test('claude worker spec matches the golden file', () => {
   assert.ok(spec.argv.includes('--dangerously-skip-permissions'))
 })
 
+test('a lean claude worker matches the golden file', () => {
+  const spec = launch.claudeWorkerSpec(request({ cwd: '/work/repo', sessionId: '11111111-2222-3333-4444-555555555555', mcpAllow: ['mongodb'], userMcp: { mongodb: { command: 'mongo-mcp', args: ['--read-only'] }, notion: { command: 'notion-mcp' } } }))
+  assertGolden('claude-worker-lean', spec)
+})
+
 test('claude worker resume replaces --session-id with --resume', () => {
   const spec = launch.claudeWorkerSpec(request({ resumeId: 'abc', sessionId: 'ignored', initialPrompt: undefined, workerEnv: { WORKER_FLAG: '1' } }))
   assertGolden('claude-worker-resume', spec)
@@ -380,7 +385,7 @@ const codexHome = (overrides: Partial<launch.CodexHome> = {}): launch.CodexHome 
   dir: CODEX_DIR, user: USER_CODEX, userConfig: USER_CONFIG, userHooks: USER_HOOKS, links: ['auth.json', 'AGENTS.md'], skills: ['cairn', 'croft'], ...overrides,
 })
 const homeRequest = (overrides: Partial<launch.CodexLaunchRequest> = {}) =>
-  request({ kind: 'codex', model: 'gpt-x', effort: 'high', roleText: '', initialPrompt: undefined, codexHome: codexHome(), ...overrides })
+  request({ kind: 'codex', model: 'gpt-x', effort: 'high', initialPrompt: undefined, codexHome: codexHome(), ...overrides })
 const fileOf = (spec: { files: readonly { path: string; content: string }[] }, name: string): string => spec.files.find(file => file.path.endsWith(`/${name}`))?.content ?? ''
 
 test('codexHookHash reproduces Codex\'s trusted_hash (checked against values codex-cli 0.162.0 wrote; the paths here are generic)', () => {
@@ -498,4 +503,96 @@ test('readCodexHome reads the user home without writing to it, and writeLaunchFi
   assert.equal(await readlink(join(home.dir, 'auth.json')), join(home.user, 'auth.json'), 'an older symlink is re-pointed')
   assert.deepEqual((await readdir(user)).sort(), before, 'nothing was written into the user Codex home')
   assert.ok(!(await readdir(home.dir)).some(name => name.endsWith('.tmp')))
+})
+
+// ---------- lean, cacheable spawns (DROVE-72) ----------
+
+const USER_MCP = { mongodb: { command: 'mongo-mcp', args: [] }, notion: { type: 'http', url: 'https://mcp.example/notion' }, drove: { command: 'stale' } }
+
+const mcpServersOf = (spec: { files: readonly { path: string; content: string }[] }): Record<string, { command?: string; args?: string[] }> =>
+  (JSON.parse(fileOf(spec, 'mcp.json') || '{}') as { mcpServers: Record<string, { command?: string; args?: string[] }> }).mcpServers
+
+test('a claude worker without an allowlist loads the user MCP setup as before; with one it runs --strict-mcp-config', () => {
+  const open = launch.claudeWorkerSpec(request({ userMcp: USER_MCP }))
+  assert.ok(!open.argv.includes('--strict-mcp-config'))
+  assert.deepEqual(Object.keys(mcpServersOf(open)), ['drove'])
+
+  const lean = launch.claudeWorkerSpec(request({ mcpAllow: ['mongodb', 'drove', 'missing'], userMcp: USER_MCP }))
+  const strict = lean.argv.indexOf('--strict-mcp-config')
+  assert.ok(strict >= 0)
+  assert.equal(lean.argv[strict + 1], '--mcp-config')
+  const servers = mcpServersOf(lean)
+  assert.deepEqual(Object.keys(servers), ['mongodb', 'drove'])
+  assert.deepEqual(servers.drove?.args, [ENTRY, 'mcp'], 'a user server named drove never shadows Drove\'s')
+
+  const droveOnly = launch.claudeWorkerSpec(request({ mcpAllow: [], userMcp: USER_MCP }))
+  assert.ok(droveOnly.argv.includes('--strict-mcp-config'))
+  assert.deepEqual(Object.keys(mcpServersOf(droveOnly)), ['drove'])
+  assert.ok(!launch.claudePlannerSpec(request({ identity: planner, mcpAllow: [] })).argv.includes('--strict-mcp-config'), 'the planner keeps the user setup')
+})
+
+test('readClaudeMcp merges user, project (.mcp.json) and local scope, local winning, and writes nothing', async () => {
+  const { mkdir, writeFile: write, readdir } = await import('node:fs/promises')
+  const root = await tmp('claude-mcp')
+  const repo = join(root, 'repo')
+  await mkdir(repo)
+  const config = join(root, '.claude.json')
+  await write(config, JSON.stringify({ mcpServers: { a: { command: 'user-a' }, b: { command: 'user-b' } }, projects: { [repo]: { mcpServers: { b: { command: 'local-b' } } } } }))
+  await write(join(repo, '.mcp.json'), JSON.stringify({ mcpServers: { a: { command: 'project-a' }, c: { command: 'project-c' } } }))
+  assert.deepEqual(await launch.readClaudeMcp(config, repo), { a: { command: 'project-a' }, b: { command: 'local-b' }, c: { command: 'project-c' } })
+  assert.deepEqual(await launch.readClaudeMcp(join(root, 'missing.json'), join(root, 'nowhere')), {})
+  assert.deepEqual((await readdir(root)).sort(), ['.claude.json', 'repo'])
+})
+
+const MCP_CONFIG = [USER_CONFIG, '', '[mcp_servers.mongodb]', 'command = "mongo-mcp"', 'enabled = true', '', '[mcp_servers.off]', 'command = "off"', 'enabled = false'].join('\n')
+
+test('the codex home config.toml carries the shared role as developer_instructions, never the launch line', () => {
+  const spec = launch.codexWorkerSpec(homeRequest({ roleText: ROLE }))
+  const config = fileOf(spec, 'config.toml')
+  assert.ok(config.includes('check_for_update_on_startup = false\ndeveloper_instructions = "You are a worker.\\nQuote: \\"yes\\" and \\\\ backslash with `ticks`"\n'), config)
+  assert.ok(config.indexOf('developer_instructions') < config.indexOf('['), 'a root key, before any table')
+  assert.ok(!spec.argv.some(arg => arg.includes('developer_instructions')))
+  const other = launch.codexWorkerSpec(homeRequest({ roleText: ROLE, identity: { ...worker, seat: 'w-web' }, cwd: '/work/repo/.claude/worktrees/w-web' }))
+  assert.equal(fileOf(other, 'config.toml'), config, 'every seat writes the same config.toml')
+  const resumed = launch.codexWorkerSpec(homeRequest({ roleText: ROLE, resumeId: 'thread-1' }))
+  assert.equal(fileOf(resumed, 'config.toml'), config, 'a resume keeps the role')
+})
+
+test('workerMcp disables the other user servers in the shared codex home; a seat list differs only by enabled overrides', () => {
+  const home = codexHome({ userConfig: MCP_CONFIG })
+  const open = launch.codexWorkerSpec(homeRequest({ codexHome: home }))
+  assert.ok(fileOf(open, 'config.toml').includes('[mcp_servers.docs]\ncommand = "npx"\nargs = [\n  "docs-mcp",\n]\n\n'))
+  assert.ok(!open.argv.some(arg => arg.startsWith('mcp_servers.')))
+
+  const lean = launch.codexWorkerSpec(homeRequest({ codexHome: home, homeMcpAllow: ['mongodb'], mcpAllow: ['mongodb'] }))
+  const config = fileOf(lean, 'config.toml')
+  assert.ok(config.includes('[mcp_servers.docs]\ncommand = "npx"\nargs = [\n  "docs-mcp",\n]\nenabled = false\n\n[mcp_servers.docs.env]\nTOKEN_FILE = "/home/user/.docs"\n'), config)
+  assert.ok(config.includes('[mcp_servers.mongodb]\ncommand = "mongo-mcp"\nenabled = true\n'))
+  assert.ok(config.includes('[mcp_servers.off]\ncommand = "off"\nenabled = false\n'))
+  assert.ok(!lean.argv.some(arg => arg.startsWith('mcp_servers.')))
+
+  const extra = launch.codexWorkerSpec(homeRequest({ codexHome: home, homeMcpAllow: ['mongodb'], mcpAllow: ['mongodb', 'docs', 'off'] }))
+  assert.equal(fileOf(extra, 'config.toml'), config, 'the seat list never changes the shared file')
+  assert.deepEqual(extra.argv.filter(arg => arg.startsWith('mcp_servers.')), ['mcp_servers.docs.enabled=true'], 'a server the user disabled stays off')
+
+  const seatOnly = launch.codexWorkerSpec(homeRequest({ codexHome: home, mcpAllow: [] }))
+  assert.deepEqual(seatOnly.argv.filter(arg => arg.startsWith('mcp_servers.')), ['mcp_servers.docs.enabled=false', 'mcp_servers.mongodb.enabled=false'])
+  assert.deepEqual(launch.codexMcpNames(MCP_CONFIG), ['docs', 'mongodb', 'off'])
+})
+
+test('workerSkills links only the named skills into the codex home and unlinks the others it linked before', () => {
+  const spec = launch.codexWorkerSpec(homeRequest({ codexHome: codexHome({ linkedSkills: ['cairn', 'croft', 'old'] }), skillAllow: ['croft'] }))
+  assert.deepEqual(spec.links?.filter(link => link.path.includes('/skills/')).map(link => link.path), [`${CODEX_DIR}/skills/croft`])
+  assert.deepEqual(spec.unlinks, [`${CODEX_DIR}/skills/cairn`, `${CODEX_DIR}/skills/old`])
+  assert.equal(launch.codexWorkerSpec(homeRequest({ codexHome: codexHome({ linkedSkills: ['cairn', 'croft'] }) })).unlinks, undefined)
+})
+
+test('writeLaunchFiles removes an unlinked skill symlink but never a real folder', async () => {
+  const { mkdir, symlink, lstat } = await import('node:fs/promises')
+  const root = await tmp('unlink')
+  await mkdir(join(root, 'skills', 'real'), { recursive: true })
+  await symlink('/somewhere/skill', join(root, 'skills', 'linked'))
+  await launch.writeLaunchFiles({ kind: 'codex', role: 'worker', cwd: root, env: {}, argv: [], files: [], unlinks: [join(root, 'skills', 'linked'), join(root, 'skills', 'real'), join(root, 'skills', 'none')] })
+  await assert.rejects(lstat(join(root, 'skills', 'linked')))
+  assert.ok((await lstat(join(root, 'skills', 'real'))).isDirectory())
 })

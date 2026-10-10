@@ -65,6 +65,13 @@ const oneOf = <T extends string>(args: Args, key: string, allowed: readonly T[],
   return value as T
 }
 
+const names = (args: Args, key: string): string[] | undefined => {
+  const value = args[key]
+  if (value === undefined || value === null) return undefined
+  if (!Array.isArray(value) || value.some(name => typeof name !== 'string')) throw new ArgError(`${key} must be an array of strings`)
+  return (value as string[]).map(name => name.trim()).filter(Boolean)
+}
+
 const flag = (args: Args, key: string): boolean => {
   const value = args[key]
   if (value === undefined) return false
@@ -130,6 +137,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         model: { type: 'string', description: 'Optional model override.' },
         effort: { type: 'string', enum: EFFORTS, description: 'Optional reasoning effort override.' },
         base: { type: 'string', description: 'Optional base branch for a Codex worktree (default: origin/main, or main without a remote). Ignored for Claude, which branches from the main checkout\'s current HEAD.' },
+        mcp: { type: 'array', items: { type: 'string' }, description: 'Optional: the user MCP servers this worker needs, by name (e.g. ["mongodb"]). Given, the worker loads Drove\'s server, these and the configured workerMcp only; [] for Drove\'s alone. Left out, it loads what workerMcp allows, or everything when that is unset.' },
       },
       ['seat', 'kind', 'brief'],
       async (args) => {
@@ -145,6 +153,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
             model: text(args, 'model', false),
             effort: oneOf(args, 'effort', EFFORTS, false),
             base: text(args, 'base', false),
+            ...(args.mcp != null ? { mcp: names(args, 'mcp') } : {}),
           }),
         )
       },

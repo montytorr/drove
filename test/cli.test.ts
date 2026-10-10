@@ -22,7 +22,7 @@ beforeEach(async () => {
 })
 
 test('cli knows the commands from the design', () => {
-  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'spawn', 'send', 'prompt', 'promote', 'migrate', 'roster', 'capture', 'close', 'board', 'down', 'up', 'budget', 'guard', 'mcp', 'mod'])
+  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'spawn', 'send', 'prompt', 'promote', 'migrate', 'roster', 'reports', 'capture', 'close', 'board', 'down', 'up', 'budget', 'guard', 'mcp', 'mod'])
 })
 
 test('cli --help prints usage and exits 0', async () => {
