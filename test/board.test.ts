@@ -20,7 +20,7 @@ const stripAnsi = (text: string): string => text.replace(/\x1b\[[0-9;?]*[A-Za-z]
 const RUN: RunMeta = {
   v: 1,
   id: 'drove-20261009-1000-a3f1',
-  repo: '/Users/cal/maestro-dev/drove',
+  repo: '/Users/test/src/drove',
   base: 'main',
   hasRemote: false,
   createdAt: '2026-10-09T10:00:00.000Z',

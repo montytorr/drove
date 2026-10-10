@@ -3,7 +3,7 @@
   "role": "worker",
   "cwd": "/work/repo/.claude/worktrees/w-api",
   "env": {
-    "DROVE_HOME": "/home/cal/.drove",
+    "DROVE_HOME": "/home/user/.drove",
     "DROVE_RUN": "drove-20261009-1042-a3f1",
     "DROVE_ROLE": "worker",
     "DROVE_SEAT": "w-api",
@@ -25,21 +25,21 @@
     "-c",
     "mcp_servers.drove={command=\"node\",args=[\"/opt/drove/src/cli.ts\",\"mcp\"],env_vars=[\"DROVE_HOME\",\"DROVE_RUN\",\"DROVE_ROLE\",\"DROVE_SEAT\",\"DROVE_TOKEN\"],default_tools_approval_mode=\"approve\"}",
     "-c",
-    "hooks.PreToolUse=[{matcher=\"Bash|shell|exec_command|apply_patch\",hooks=[{type=\"command\",command=\"/home/cal/.drove/g-d43caf1d pre-tool-use\",timeout=10}]}]",
+    "hooks.PreToolUse=[{matcher=\"Bash|shell|exec_command|apply_patch\",hooks=[{type=\"command\",command=\"/home/user/.drove/g-d43caf1d pre-tool-use\",timeout=10}]}]",
     "-c",
-    "hooks.SessionStart=[{hooks=[{type=\"command\",command=\"/home/cal/.drove/g-d43caf1d session-start\",timeout=10}]}]",
+    "hooks.SessionStart=[{hooks=[{type=\"command\",command=\"/home/user/.drove/g-d43caf1d session-start\",timeout=10}]}]",
     "-c",
-    "hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"/home/cal/.drove/g-d43caf1d user-prompt-submit\",timeout=10}]}]",
+    "hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"/home/user/.drove/g-d43caf1d user-prompt-submit\",timeout=10}]}]",
     "-c",
-    "hooks.Stop=[{hooks=[{type=\"command\",command=\"/home/cal/.drove/g-d43caf1d stop\",timeout=10}]}]",
+    "hooks.Stop=[{hooks=[{type=\"command\",command=\"/home/user/.drove/g-d43caf1d stop\",timeout=10}]}]",
     "-c",
-    "hooks.PermissionRequest=[{hooks=[{type=\"command\",command=\"/home/cal/.drove/g-d43caf1d permission-request\",timeout=10}]}]",
+    "hooks.PermissionRequest=[{hooks=[{type=\"command\",command=\"/home/user/.drove/g-d43caf1d permission-request\",timeout=10}]}]",
     "--dangerously-bypass-hook-trust",
     "go"
   ],
   "files": [
     {
-      "path": "/home/cal/.drove/g-d43caf1d",
+      "path": "/home/user/.drove/g-d43caf1d",
       "content": "#!/bin/sh\nexec node /opt/drove/src/cli.ts guard \"$@\"\n",
       "mode": 448
     }

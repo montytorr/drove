@@ -152,7 +152,7 @@ test("the mod's guard input is read by Drove's real hook, and its verdicts parse
   const ctx = await setup({ planner: { kind: 'claude', viaMod: true, sessionId: 's-1' } })
   const env = { DROVE_HOME: ctx.home, DROVE_RUN: ctx.run.id, DROVE_ROLE: 'planner', DROVE_SEAT: 'planner' }
   const decide = async (tool: string, input: Record<string, unknown>) => {
-    const result = await runHook('pre-tool-use', mod.guardStdin(tool, { tool, tool_use_id: 't', ...input }, '/Users/cal/repo', 's-1'), env)
+    const result = await runHook('pre-tool-use', mod.guardStdin(tool, { tool, tool_use_id: 't', ...input }, '/Users/test/repo', 's-1'), env)
     return mod.guardVerdictOf({ exitCode: result.code, stdout: result.stdout, stderr: result.stderr }, '/x/src/cli.ts')
   }
   assert.deepEqual(await decide('Bash', { command: 'git status' }), { allow: true })
@@ -160,7 +160,7 @@ test("the mod's guard input is read by Drove's real hook, and its verdicts parse
   const denied = await decide('Bash', { command: 'npm test' })
   assert.equal(denied.allow, false)
   assert.match(denied.allow ? '' : denied.reason, /^Drove planner:/)
-  const edit = await decide('Edit', { file_path: '/Users/cal/repo/src/a.ts', old_string: 'a', new_string: 'b' })
+  const edit = await decide('Edit', { file_path: '/Users/test/repo/src/a.ts', old_string: 'a', new_string: 'b' })
   assert.equal(edit.allow, false)
 })
 

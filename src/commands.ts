@@ -41,6 +41,7 @@ export const DEFAULT_CONFIG: DroveConfig = {
   codexWorkerSandbox: 'bypass',
   claudeChannel: false,
   briefVia: 'prompt',
+  workerEnv: {},
 }
 
 export const nodeExec: Exec = (argv, options = {}) =>
@@ -80,6 +81,11 @@ const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(r
 const clip = (text: string, max = 300): string => text.replace(/\s+/g, ' ').trim().slice(0, max)
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
 
+const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
+
+const envOf = (value: unknown): Record<string, string> =>
+  value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([name, text]) => ENV_NAME_RE.test(name) && typeof text === 'string')) : {}
+
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
   const file = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   return {
@@ -88,6 +94,7 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
     workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel },
     promotedModel: { ...DEFAULT_CONFIG.promotedModel, ...file.promotedModel },
+    workerEnv: envOf(file.workerEnv),
   }
 }
 
@@ -186,6 +193,7 @@ const launchRequest = (
   droveEntry: DROVE_ENTRY,
   bypassHookTrust: parts.kind === 'codex' && config.codexBypassHookTrust,
   bypassSandbox: config.codexWorkerSandbox !== 'workspace-write',
+  workerEnv: config.workerEnv,
   ...parts,
 })
 

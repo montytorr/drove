@@ -30,6 +30,7 @@ export type DroveConfig = {
   codexWorkerSandbox: 'bypass' | 'workspace-write'
   claudeChannel: boolean
   briefVia: 'prompt' | 'launch-arg'
+  workerEnv: Record<string, string>
 }
 
 export type PlannerMeta = {
@@ -249,6 +250,7 @@ export type LaunchRequest = {
   droveEntry: string
   bypassHookTrust?: boolean
   channel?: boolean
+  workerEnv?: Record<string, string>
 }
 
 export type Transport = 'launch-arg' | 'herdr-prompt' | 'codex-queue' | 'mod' | 'channel' | 'piggyback'

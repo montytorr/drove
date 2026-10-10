@@ -1,5 +1,7 @@
 # drove
 
+[![CI](https://github.com/montytorr/drove/actions/workflows/ci.yml/badge.svg)](https://github.com/montytorr/drove/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 Drove runs one planner and several worker agents side by side in [herdr](https://herdr.dev) panes. You choose the planner: Claude Code or Codex. It splits work into Cairn tasks, starts a worker for each, reviews their diffs and merges. The workers write the code, each in its own pane and its own git worktree, and they are Claude Code or Codex under either planner.
 
 **Why the name.** A drove is a herd driven together, and the drover drives it: Drove runs on herdr and keeps one planner's workers moving. Drove roads were the old Scottish cattle routes the drovers walked to market, which fits the names in this family (Bothy, Cairn, Croft, Trig, Holloway).
@@ -21,13 +23,13 @@ There is no daemon. The planner's own MCP server (or, for a Claude planner with 
 - Node 22.18 or newer. Drove runs its TypeScript directly, so there is no build step.
 - herdr 0.9 or newer. The planner runs inside a herdr pane (`HERDR_ENV=1`).
 - `claude` and/or `codex` on `PATH`.
-- Cairn for the tasks. Each worker is spawned with one Cairn ref.
+- [Cairn](https://cairn.montytorr.com), a task tracker and shared memory for agents. Drove has no work queue of its own: every worker is spawned with one Cairn task ref (`--cairn DROVE-12`), claims that task, records what it found and tried on it, and leaves it in review, so the work outlives the pane and the planner can see what each worker did.
 
 ## Install
 
 ```sh
 npm install      # dev dependencies only: typescript, @types/node
-ln -sf ~/maestro-dev/drove/src/cli.ts ~/.local/bin/drove   # any directory on PATH
+ln -sf ~/src/drove/src/cli.ts ~/.local/bin/drove   # the path of your clone; any directory on PATH
 ```
 
 Recommended: the symlink survives `nvm use`. `src/cli.ts` is executable and runs under whichever `node` is on PATH, which must be Node 22.18+.
@@ -79,7 +81,7 @@ Planner messages are signed with a per-seat token. The signature covers the head
 | `drove roster [--json] [--run ID]` | one line per seat |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
-| `drove board [--once] [--run ID]` | live plain-text board (this repo's latest run unless `--run` or `DROVE_RUN`) |
+| `drove board [--once] [--run ID]` | live coloured board, the orchestrator mod's layout on your terminal's own background; one frame with `--once` or when piped; no colour when piped or with `NO_COLOR` (this repo's latest run unless `--run` or `DROVE_RUN`) |
 | `drove down [--run ID]` / `drove up [--run ID] [--seat SEAT]` | stop and resume a run |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only; agents are denied) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
@@ -96,15 +98,15 @@ Planner messages are signed with a per-seat token. The signature covers the head
 
 ## State and config
 
-State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel` and `briefVia`. Defaults are in `src/commands.ts`.
+State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia` and `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`). Defaults are in `src/commands.ts`.
 
 Codex workers run with approvals and the sandbox bypassed, like Claude workers with `--dangerously-skip-permissions`. Drove's guard hook still denies pushes. Set `codexWorkerSandbox` to `"workspace-write"` to turn that off.
 
 ## Known limits
 
 - **Codex sessions of a Drove-owned run live under the run's `codex-home/`**, not `~/.codex`, so `codex resume` outside Drove does not see them. A Codex seat spawned before this change keeps the old launch line (about 1100 bytes) and relies on the shell-prompt wait; another shell that draws a prompt before its init has finished could still defeat that wait for such a seat.
-- **A Claude worker may start from a base without your unpushed work.** Claude creates its own worktree (`claude --worktree`) and Drove cannot set its base: `--base` is ignored for Claude seats, and `spawn` only adds a note when the main checkout's HEAD is not at the run base. Claude branches the worktree from `origin/main`, not from the local `main` or the main checkout's HEAD, so work merged locally but not pushed is missing. Push, or run `git merge --ff-only main` in the worker's worktree, before you give it work that needs that code. Codex workers start from the run base.
-- **Seen working live** (DROVE-49, 2026-10-10): a Codex planner with Codex workers woken by `codex queue`; the sixth-pane budget dialog in Claude (the mod) and in Codex (MCP elicitation); two runs side by side with the same seat name; a Claude planner without the mod woken by the channel; and message signatures in Claude and Codex workers (a forged promote is flagged). The fixes of 2026-10-10 passed a live run ([DROVE-35](https://tasks.montytorr.com/projects/DROVE/tasks/35)).
+- **Claude picks its own worktree base.** Claude creates its worktree from `origin/main`; `spawn` then fast-forwards it to the freshest of local `main` and `origin/main`, so unpushed local work is included. `--base` is ignored for Claude seats, and a worktree that diverged from the base is left as is, with a note in `spawn`'s result. Codex workers start from `--base` or the run base, resolved the same way.
+- **Seen working live** (DROVE-49, 2026-10-10): a Codex planner with Codex workers woken by `codex queue`; the sixth-pane budget dialog in Claude (the mod) and in Codex (MCP elicitation); two runs side by side with the same seat name; a Claude planner without the mod woken by the channel; and message signatures in Claude and Codex workers (a forged promote is flagged). The fixes of 2026-10-10 passed a live run (DROVE-35).
 - **The channel prints a cosmetic line.** A Claude planner launched with the dev channel shows `server:drove · no MCP server configured with that name` at launch, and the channel works anyway. An idle session does take a turn when a report arrives through it. The channel is a research preview in Claude Code and asks for one confirmation per launch.
 - The Codex planner and a Codex seat that has no Drove-owned home may still ask once to approve Drove's hooks in the pane; Drove never answers that dialog, and shows it on the board.
 - The mod cannot import Drove's code. It runs the CLI, so Node 22.18 or newer must be on `PATH` (or set the mod's `nodePath`).
@@ -126,3 +128,7 @@ claude plugin test mod
 ```
 
 If `claude` is a shell function or wrapper, call the real binary (for example `~/.local/bin/claude`); a wrapper that adds flags before `plugin` breaks it. The mod's type check needs the generated `mod/.claude-plugin/types`, which is not in the repo.
+
+## License
+
+[MIT](LICENSE). To report a security issue, see [SECURITY.md](SECURITY.md).

@@ -99,7 +99,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     kind: 'claude',
     role: identity.role,
     cwd: request.cwd,
-    env: { ...(isWorker ? { _CC_ACCT_PINNED: '1' } : {}), ...identityEnv(identity), DROVE_AGENT: 'claude', ...(!isWorker && request.channel ? { DROVE_CHANNEL: '1' } : {}) },
+    env: { ...(isWorker ? request.workerEnv : {}), ...identityEnv(identity), DROVE_AGENT: 'claude', ...(!isWorker && request.channel ? { DROVE_CHANNEL: '1' } : {}) },
     argv,
     files: [
       jsonFile(mcpPath, claudeMcpConfig(request.droveEntry, identityEnv(identity))),
@@ -369,7 +369,7 @@ const codexSpec = (request: CodexLaunchRequest): LaunchSpec => {
     kind: 'codex',
     role: identity.role,
     cwd: request.cwd,
-    env: { ...env, DROVE_AGENT: 'codex', ...(codexHome ? { CODEX_HOME: codexHome.dir } : {}) },
+    env: { ...(isWorker ? request.workerEnv : {}), ...env, DROVE_AGENT: 'codex', ...(codexHome ? { CODEX_HOME: codexHome.dir } : {}) },
     argv,
     files: [shim, ...(home?.files ?? [])],
     ...(home ? { links: home.links } : {}),

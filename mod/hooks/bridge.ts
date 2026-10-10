@@ -1,5 +1,5 @@
 import type { DroveEvent, OrchFeedEntry, OrchModStatus, Roster, RunMeta } from '../types/index.d.ts'
-import { oneLine } from './protocol.ts'
+import { HUMAN, oneLine } from './protocol.ts'
 
 // What `drove mod bridge` writes, one JSON object per line (src/modhost.ts BridgeLine).
 export type BridgeLine =
@@ -63,7 +63,7 @@ export const feedOf = (event: DroveEvent, bodies: Map<string, string[]>): FeedDr
     case 'seat.state': {
       const to = text(data.to)
       if (to === 'gone') return { at, from: seat, to: '⌘', kind: 'gone', summary: 'its pane closed' }
-      if (BLOCKED[to]) return { at, from: seat, to: 'Cal', kind: 'blocked', summary: BLOCKED[to] ?? to }
+      if (BLOCKED[to]) return { at, from: seat, to: HUMAN, kind: 'blocked', summary: BLOCKED[to] ?? to }
       return undefined
     }
     case 'seat.close':
@@ -75,7 +75,7 @@ export const feedOf = (event: DroveEvent, bodies: Map<string, string[]>): FeedDr
         ? { at, from: '⌘', to: seat, kind: 'failed', summary: `relaunch failed: ${text(data.error)}` }
         : { at, from: '⌘', to: seat, kind: 'relaunch', summary: `relaunched${data.resumed ? ' (resumed)' : ''}${data.pane ? ` in pane ${text(data.pane)}` : ''}` }
     case 'attention':
-      return text(data.reason) === 'report-rejected' ? { at, from: seat, to: '⌘', kind: 'attention', summary: `report rejected: ${text(data.why)}` } : { at, from: seat, to: 'Cal', kind: 'attention', summary: `${text(data.reason)}${data.detail ? `: ${text(data.detail)}` : ''}` }
+      return text(data.reason) === 'report-rejected' ? { at, from: seat, to: '⌘', kind: 'attention', summary: `report rejected: ${text(data.why)}` } : { at, from: seat, to: HUMAN, kind: 'attention', summary: `${text(data.reason)}${data.detail ? `: ${text(data.detail)}` : ''}` }
     default:
       return undefined
   }
