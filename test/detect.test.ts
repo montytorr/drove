@@ -183,6 +183,13 @@ test('a done worker that takes a hook turn after its report raises nothing and i
   assert.equal(detect.needsNudge({ ...seat, owes: 'none' }, NOW), false)
 })
 
+test('a done Codex seat promoted with a notice that takes a turn raises nothing', () => {
+  const seat = seatOf({ kind: 'codex', state: 'idle', lastWorkingAt: ago(60), stateAt: ago(30), lastReport: report('done', 'none', 100), owes: 'none' })
+  const derived = detect.deriveState(seat, { herdr: live('idle'), hooks: [], lastReport: seat.lastReport }, NOW)
+  assert.deepEqual(derived.attention, [])
+  assert.equal(detect.needsNudge(seat, NOW), false)
+})
+
 test('a worker messaged after its done report and then silent is still flagged', () => {
   const seat = seatOf({ state: 'idle', lastWorkingAt: ago(60), stateAt: ago(30), lastReport: report('done', 'review', 100), lastSentAt: ago(80) })
   const derived = detect.deriveState(seat, { herdr: live('idle'), hooks: [], lastReport: seat.lastReport }, NOW)

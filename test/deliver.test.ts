@@ -309,3 +309,13 @@ test('isDeliverable explains why a seat cannot be reached', async () => {
   assert.equal(missing.ok, false)
   assert.match(!missing.ok ? missing.reason : '', /agent_not_found/)
 })
+
+test('only a control that owes a report back stamps lastSentAt; a promote notice or an expects-none message does not', async () => {
+  const { deps, run } = await setup(makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1' }))
+  const stamp = async () => (await loadRoster(deps.home, run.id)).seats[0]?.lastSentAt
+  assert.equal((await deliver.deliverControl(deps, run, control('w-api', { id: 'c-1', kind: 'promote', expects: 'none' }))).ok, true)
+  assert.equal((await deliver.deliverControl(deps, run, control('w-api', { id: 'c-2', kind: 'message', expects: 'none' }))).ok, true)
+  assert.equal(await stamp(), undefined)
+  assert.equal((await deliver.deliverControl(deps, run, control('w-api', { id: 'c-3', kind: 'message', expects: 'answer' }))).ok, true)
+  assert.equal(await stamp(), deps.clock.now().toISOString())
+})
