@@ -5,6 +5,7 @@ import type { HerdrAgent } from '../src/types.ts'
 import { join } from 'node:path'
 import { appendJsonl } from '../src/store.ts'
 import { deriveState, needsNudge } from '../src/detect.ts'
+import * as detect from '../src/detect.ts'
 import { updateRoster } from '../src/roster.ts'
 import { eventsOf, fakePorts, fileReport, rosterOf, setup } from './p4-helpers.ts'
 
@@ -533,4 +534,67 @@ test('the poll copies a hook session id into the live seat record once', async (
   await watcher.tick()
   seat = (await rosterOf(ctx)).seats[0]
   assert.equal(seat?.sessionId, 'sess-1', 'an id already saved is kept')
+})
+
+const markRestarting = (ctx: Awaited<ReturnType<typeof setup>>, state: 'starting' | 'idle' = 'starting') =>
+  updateRoster(ctx.deps.home, ctx.run.id, (roster) => ({ ...roster, seats: roster.seats.map((seat) => ({ ...seat, state, restartingSince: ctx.clock.now().toISOString() })) }))
+
+test('a poll while the old agent is still alive does not overwrite a seat that is restarting', async () => {
+  const ctx = await setup()
+  await markRestarting(ctx)
+  const { ports } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'done' }], deriveState: detect.deriveState })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.state, 'starting')
+  assert.ok(seat?.restartingSince)
+})
+
+test('a restart that lands between the poll reading the roster and merging it is not overwritten', async () => {
+  const ctx = await setup()
+  const { ports } = fakePorts({
+    agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'done' }],
+    deriveState: (seat, signals, now) => {
+      const derived = detect.deriveState(seat, signals, now)
+      void markRestarting(ctx)
+      return derived
+    },
+  })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.state, 'starting')
+  assert.ok(seat?.restartingSince)
+})
+
+test('polls with no agent raise no gone while a seat is restarting', async () => {
+  const ctx = await setup()
+  await markRestarting(ctx, 'idle')
+  const { ports } = fakePorts({ agents: () => [], deriveState: detect.deriveState })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  for (let i = 0; i < 4; i++) {
+    await watcher.tick()
+    ctx.clock.advance(5000)
+  }
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.state, 'idle')
+  assert.deepEqual(seat?.attention, [])
+  assert.equal((await eventsOf(ctx)).filter((event) => event.type === 'attention').length, 0)
+  assert.equal(await watcher.piggyback('r'), 'r')
+})
+
+test('a restart that never finishes reads gone once the bound has passed', async () => {
+  const ctx = await setup()
+  await markRestarting(ctx)
+  const { ports } = fakePorts({ agents: () => [], deriveState: detect.deriveState })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  assert.equal((await rosterOf(ctx)).seats[0]?.state, 'starting')
+  ctx.clock.advance(detect.RESTART_BOUND_MS + 1000)
+  await watcher.tick()
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.state, 'gone')
+  assert.deepEqual(seat?.attention.map((item) => item.reason), ['gone'])
+  assert.equal((await eventsOf(ctx)).filter((event) => event.type === 'attention' && event.data?.reason === 'gone').length, 1)
 })

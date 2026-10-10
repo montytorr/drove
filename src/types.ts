@@ -89,6 +89,7 @@ export type Seat = {
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
+  restartingSince?: string
   attention: Attention[]
 }
 

@@ -1,3 +1,4 @@
+import { DEFAULT_START_TIMEOUT_MS } from './herdr.ts'
 import type { Attention, Derived, HerdrAgent, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
 
 export const DIALOGS: readonly { pattern: RegExp; reason: Attention['reason']; detail: string; hint: string }[] = [
@@ -36,6 +37,8 @@ export const DIALOGS: readonly { pattern: RegExp; reason: Attention['reason']; d
 ]
 
 export const HOOK_FRESH_MS = 10_000
+export const EXIT_WAIT_MS = 20_000
+export const RESTART_BOUND_MS = 2 * EXIT_WAIT_MS + DEFAULT_START_TIMEOUT_MS
 export const NUDGE_GRACE_MS = 20_000
 
 const DERIVED_REASONS: ReadonlySet<Attention['reason']> = new Set(['dialog', 'permission', 'trust', 'hook-trust', 'channel-confirm', 'codex-version-mismatch', 'idle-without-report', 'gone'])
@@ -43,6 +46,11 @@ const SETTLED: ReadonlySet<SeatState> = new Set(['idle', 'done'])
 const PERMISSION_NOTICE = /permission|approv|elicitation|dialog|trust/i
 
 const ms = (at: string | undefined): number => (at ? Date.parse(at) : Number.NaN)
+
+export const isRestarting = (seat: Seat, now: Date): boolean => {
+  const since = ms(seat.restartingSince)
+  return !Number.isNaN(since) && now.getTime() - since < RESTART_BOUND_MS
+}
 
 export const findDialog = (screen: string): (typeof DIALOGS)[number] | undefined => DIALOGS.find(({ pattern }) => pattern.test(screen))
 
@@ -89,6 +97,7 @@ const idleWithoutReport = (seat: Seat, state: SeatState, reported: LastReport | 
 
 export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derived => {
   if (seat.state === 'closed' || seat.state === 'down' || seat.state === 'closing') return { state: seat.state, attention: [] }
+  if (isRestarting(seat, now)) return { state: seat.state, attention: [] }
   const at = now.toISOString()
   const nowMs = now.getTime()
   const attention: Attention[] = []
@@ -96,7 +105,7 @@ export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derive
   const { herdr, hooks } = signals
   const reported = signals.lastReport
 
-  if (!herdr && seat.state !== 'starting') {
+  if (!herdr && (seat.state !== 'starting' || seat.restartingSince !== undefined)) {
     add('gone', `pane ${seat.paneId ?? '?'} is gone; run \`drove up --seat ${seat.name}\` to relaunch it`)
     return { state: 'gone', attention }
   }
@@ -143,6 +152,7 @@ export const mergeAttention = (existing: readonly Attention[], derived: readonly
 ]
 
 export const applyDerived = (seat: Seat, derived: Derived, now: Date): Seat => {
+  if (isRestarting(seat, now)) return seat
   const at = now.toISOString()
   const isChange = derived.state !== seat.state
   const isWorking = derived.state === 'working'

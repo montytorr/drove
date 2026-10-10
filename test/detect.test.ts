@@ -123,6 +123,42 @@ test('an idle seat with no herdr agent is gone', () => {
   assert.equal(derived.attention[0]?.reason, 'gone')
 })
 
+const restarting = (seconds = 5): Partial<Seat> => ({ state: 'starting', restartingSince: ago(seconds) })
+
+test('a seat mid-restart keeps its state while herdr still lists the old agent', () => {
+  for (const status of ['done', 'idle', 'working', 'blocked'] as const) {
+    const derived = detect.deriveState(seatOf(restarting()), { herdr: live(status), hooks: [], screen: 'trust this folder' }, NOW)
+    assert.deepEqual(derived, { state: 'starting', attention: [] }, status)
+  }
+})
+
+test('a seat mid-restart with no agent raises no gone, whatever state the roster holds', () => {
+  for (const state of ['starting', 'idle', 'working', 'done'] as const) {
+    const derived = detect.deriveState(seatOf({ ...restarting(), state }), { hooks: [] }, NOW)
+    assert.deepEqual(derived, { state, attention: [] }, state)
+  }
+})
+
+test('applyDerived leaves a seat mid-restart untouched', () => {
+  const seat = seatOf(restarting())
+  assert.equal(detect.applyDerived(seat, { state: 'done', attention: [] }, NOW), seat)
+})
+
+test('past the restart bound a seat with no agent reads gone again, even while marked starting', () => {
+  const seat = seatOf(restarting(detect.RESTART_BOUND_MS / 1000 + 1))
+  const derived = detect.deriveState(seat, { hooks: [] }, NOW)
+  assert.equal(derived.state, 'gone')
+  assert.equal(derived.attention[0]?.reason, 'gone')
+  assert.equal(detect.deriveState(seat, { herdr: live('idle'), hooks: [] }, NOW).state, 'idle')
+})
+
+test('the restart bound is twice the exit wait plus the start timeout', () => {
+  assert.equal(detect.RESTART_BOUND_MS, 2 * detect.EXIT_WAIT_MS + 60_000)
+  assert.equal(detect.isRestarting(seatOf({ restartingSince: ago(detect.RESTART_BOUND_MS / 1000 - 1) }), NOW), true)
+  assert.equal(detect.isRestarting(seatOf({ restartingSince: ago(detect.RESTART_BOUND_MS / 1000) }), NOW), false)
+  assert.equal(detect.isRestarting(seatOf(), NOW), false)
+})
+
 test('a starting seat that herdr does not list yet stays starting', () => {
   assert.equal(detect.deriveState(seatOf({ state: 'starting' }), { hooks: [] }, NOW).state, 'starting')
 })
