@@ -117,6 +117,9 @@ const setAttention = async (deps: Deps, run: string, seat: string, reason: Atten
   }))
 }
 
+const isReplyToOpenAsk = (seat: Seat, control: Control): boolean =>
+  (control.kind === 'message' || control.kind === 'answer') && (seat.lastReport?.kind === 'question' || seat.lastReport?.kind === 'blocked')
+
 const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): Promise<Delivery> => {
   const token = await readToken(join(seatDir(deps.home, run, seat.name), 'token'))
   if (!token) return { ok: false, queued: false, reason: `no token for ${seat.name}` }
@@ -124,7 +127,9 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
   if (!adapter) return { ok: false, queued: false, reason: `no transport can reach ${seat.name} yet (no pane or thread)` }
   const delivery = await adapter.deliver(seat, formatControl(control, token))
   if (delivery.ok) {
-    await appendJsonl(sentFile(deps, run, seat.name), { id: control.id, via: delivery.via, at: deps.clock.now().toISOString() } satisfies Sent)
+    const sentAt = deps.clock.now().toISOString()
+    await appendJsonl(sentFile(deps, run, seat.name), { id: control.id, via: delivery.via, at: sentAt } satisfies Sent)
+    if (control.expects !== 'none' || isReplyToOpenAsk(seat, control)) await updateRoster(deps.home, run, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? { ...entry, lastSentAt: sentAt } : entry)) }))
     const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
     await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
     attempts.delete(control.id)

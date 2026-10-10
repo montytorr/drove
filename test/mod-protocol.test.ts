@@ -149,7 +149,8 @@ test("the mod reads what the real CLI prints: attach's JSON and a command's fail
   const repo = await mkdtemp(join(tmpdir(), 'drove-mod-cli-repo-'))
   execFileSync('git', ['init', '-q', '-b', 'main', repo])
   execFileSync('git', ['-C', repo, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init'])
-  const saved = { home: process.env.DROVE_HOME, cwd: process.cwd() }
+  const saved = { env: Object.fromEntries(Object.entries(process.env).filter(([key]) => key.startsWith('DROVE_'))), cwd: process.cwd() }
+  for (const key of Object.keys(saved.env)) delete process.env[key]
   process.env.DROVE_HOME = home
   process.chdir(repo)
   try {
@@ -163,7 +164,7 @@ test("the mod reads what the real CLI prints: attach's JSON and a command's fail
     assert.equal(usage.ok, false)
   } finally {
     process.chdir(saved.cwd)
-    if (saved.home === undefined) delete process.env.DROVE_HOME
-    else process.env.DROVE_HOME = saved.home
+    for (const key of Object.keys(process.env)) if (key.startsWith('DROVE_')) delete process.env[key]
+    Object.assign(process.env, saved.env)
   }
 })

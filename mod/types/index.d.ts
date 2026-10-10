@@ -64,6 +64,7 @@ export type Seat = {
   spawnedAt: string
   lastWorkingAt?: string
   lastReport?: LastReport
+  lastSentAt?: string
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }

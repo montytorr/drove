@@ -419,6 +419,29 @@ test('a report that lands inside the working episode stops idle-without-report a
   assert.equal(controls.length, 0)
 })
 
+test('a done worker that takes a hook turn with no report is neither flagged nor nudged', async () => {
+  const ctx = await setup()
+  await markWorking(ctx)
+  let status: HerdrAgent['status'] = 'working'
+  const { ports, controls } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status }], deriveState, needsNudge })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await fileReport(ctx, 'w-api', 'done', 'finished', { expects: 'none' })
+  ctx.clock.advance(1000)
+  status = 'idle'
+  await watcher.tick()
+  ctx.clock.advance(5000)
+  status = 'working'
+  await watcher.tick()
+  ctx.clock.advance(5000)
+  status = 'idle'
+  await watcher.tick()
+  ctx.clock.advance(60_000)
+  await watcher.tick()
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.deepEqual(seat?.attention, [])
+  assert.equal(controls.length, 0)
+})
+
 test('a seat that stops without any report is still nudged', async () => {
   const ctx = await setup()
   await markWorking(ctx)
@@ -448,7 +471,7 @@ test('after a question is answered, a new silent stop is nudged', async () => {
   await watcher.tick()
   assert.equal(controls.length, 0)
 
-  await updateRoster(ctx.home, ctx.run.id, (current) => ({ ...current, seats: current.seats.map((seat) => ({ ...seat, owes: 'none' })) }))
+  await updateRoster(ctx.home, ctx.run.id, (current) => ({ ...current, seats: current.seats.map((seat) => ({ ...seat, owes: 'none', lastSentAt: ctx.deps.clock.now().toISOString() })) }))
   status = 'working'
   ctx.clock.advance(5000)
   await watcher.tick()
