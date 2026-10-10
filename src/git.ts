@@ -1,3 +1,4 @@
+import { realpath } from 'node:fs/promises'
 import type { Exec, ExecResult } from './types.ts'
 
 export const PROTECTED_BRANCH = 'production'
@@ -48,7 +49,43 @@ export const removeWorktree = async (exec: Exec, repo: string, path: string, for
   await must(exec, repo, ['worktree', 'remove', path])
 }
 
-export const claudeBranchName = (seat: string): string => `worktree-${seat}`
+const CLAUDE_LOCK_REASON = /^claude (?:agent|session) .{1,255} \(pid (\d{1,10})(?: start .{1,255})?\)$/
+
+export type WorktreeLock = { reason: string; claudePid?: number }
+
+const realOrSame = (path: string): Promise<string> => realpath(path).catch(() => path)
+
+export const worktreeLock = async (exec: Exec, repo: string, path: string): Promise<WorktreeLock | undefined> => {
+  const listed = await git(exec, repo, ['worktree', 'list', '--porcelain'])
+  if (listed.code !== 0) return undefined
+  const target = await realOrSame(path)
+  for (const block of listed.stdout.split(/\n\s*\n/)) {
+    const lines = block.split('\n')
+    const entry = lines.find(line => line.startsWith('worktree '))
+    if (!entry || (await realOrSame(entry.slice('worktree '.length).trim())) !== target) continue
+    const locked = lines.find(line => line === 'locked' || line.startsWith('locked '))
+    if (locked === undefined) return undefined
+    const reason = locked.slice('locked'.length).trim()
+    const pid = CLAUDE_LOCK_REASON.exec(reason)?.[1]
+    return { reason, ...(pid ? { claudePid: Number(pid) } : {}) }
+  }
+  return undefined
+}
+
+export const isPidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
+export const unlockWorktree = async (exec: Exec, repo: string, path: string): Promise<void> => {
+  await must(exec, repo, ['worktree', 'unlock', path])
+}
+
+export const claudeBranchName =(seat: string): string => `worktree-${seat}`
 
 export const headBranch = async (exec: Exec, repo: string): Promise<string | undefined> => {
   const result = await git(exec, repo, ['rev-parse', '--abbrev-ref', 'HEAD'])

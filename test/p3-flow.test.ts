@@ -9,7 +9,7 @@ import type { Identity } from '../src/types.ts'
 import { FakeHerdr, makeDeps, makeRepo, RUN, seedRun } from './p3-helpers.ts'
 
 beforeEach(() => {
-  Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20 })
+  Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20, lockWaitMs: 20 })
 })
 
 test('codex worker lifecycle: spawn, thread discovery from the session-start hook, queue delivery, review, close', async () => {

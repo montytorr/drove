@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -118,4 +119,30 @@ test('claude worktrees: branch name, HEAD checks, and a locked worktree is unloc
   await assert.rejects(drovegit.removeWorktree(nodeExec, repo, dirty), /git worktree remove/)
   await drovegit.removeWorktree(nodeExec, repo, dirty, true)
   assert.equal(existsSync(dirty), false)
+})
+
+test('worktreeLock reads the lock reason, and only a Claude-shaped reason carries a pid', async () => {
+  const repo = await makeRepo()
+  const path = join(repo, '.claude', 'worktrees', 'w-lock')
+  await git(repo, 'worktree', 'add', '--no-track', '-b', 'worktree-w-lock', path, 'HEAD')
+  assert.equal(await drovegit.worktreeLock(nodeExec, repo, path), undefined)
+  assert.equal(await drovegit.worktreeLock(nodeExec, repo, join(repo, 'nowhere')), undefined)
+
+  const reason = 'claude session w-lock (pid 4242 start Sat Oct 10 06:32:48 2026)'
+  await git(repo, 'worktree', 'lock', '--reason', reason, path)
+  assert.deepEqual(await drovegit.worktreeLock(nodeExec, repo, path), { reason, claudePid: 4242 })
+  await drovegit.unlockWorktree(nodeExec, repo, path)
+  assert.equal(await drovegit.worktreeLock(nodeExec, repo, path), undefined)
+
+  await git(repo, 'worktree', 'lock', '--reason', 'pid 4242 by hand', path)
+  assert.deepEqual(await drovegit.worktreeLock(nodeExec, repo, path), { reason: 'pid 4242 by hand' })
+  await drovegit.unlockWorktree(nodeExec, repo, path)
+  await git(repo, 'worktree', 'lock', path)
+  assert.deepEqual(await drovegit.worktreeLock(nodeExec, repo, path), { reason: '' })
+})
+
+test('isPidAlive is true for this process and false for an exited one', () => {
+  assert.equal(drovegit.isPidAlive(process.pid), true)
+  const exited = spawnSync(process.execPath, ['-e', ''])
+  assert.equal(drovegit.isPidAlive(exited.pid), false)
 })
