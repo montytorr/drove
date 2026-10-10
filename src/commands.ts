@@ -5,7 +5,7 @@ import { chmod, mkdir, readdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, matchDialog, shouldReadScreen } from './detect.ts'
-import { BUSY_RETRY_MS, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
+import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
 import { type CodexLaunchRequest, execArgv, isShellSafeArg, readCodexHome, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
@@ -597,7 +597,7 @@ const queueBrief = async (deps: Deps, run: RunMeta, seat: string, text: string):
     const entry = findSeat(current, seat)
     return entry && (entry.state === 'idle' || entry.state === 'starting') ? upsertSeat(current, { ...entry, state: 'working', stateAt: iso, lastWorkingAt: iso }) : current
   })
-  return 'unconfirmed' in delivery && delivery.unconfirmed ? `${delivery.via} (typed; herdr did not confirm the agent took it within its wait, which a long first turn explains)` : delivery.via
+  return 'unconfirmed' in delivery && delivery.unconfirmed ? `${delivery.via} (typed; herdr did not confirm the agent took it within its wait and no prompt hook record followed, which a long first turn explains)` : delivery.via
 }
 
 // ---------- send / prompt ----------
@@ -771,6 +771,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
       await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
       return failed('restart', `${seat.name} exited but did not come back: ${clip(started.output)}.${hintText(captured)} Relaunch it with \`drove up --seat ${seat.name}\`.`)
     }
+    const typedAt = deps.clock.now().getTime()
     const typed = isInline ? undefined : await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, controlText), BUSY_RETRY_MS)
     const via: Transport = isInline ? 'launch-arg' : 'herdr-prompt'
     if (typed && !typed.ok && typed.code !== 'timeout') {
@@ -778,7 +779,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
       return failed('delivery', `${seat.name} restarted on ${model || 'the default model'} at ${request.effort} effort, but herdr could not type the ${control.kind} notice into it: ${clip(typed.output)}`)
     }
     await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'working', lastWorkingAt: deps.clock.now().toISOString(), owes: 'none', hasNudged: false }))
-    const isUnconfirmed = typed !== undefined && !typed.ok
+    const isUnconfirmed = typed !== undefined && !typed.ok && !(await confirmedByHook(deps, run.id, seat, typedAt))
     await appendJsonl(join(seatDir(deps.home, run.id, seat.name), 'sent.jsonl'), { id: control.id, via, at: deps.clock.now().toISOString() })
     await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via, model, effort: request.effort, ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(adopted && !started.ok ? { startTimeout: started.code === 'timeout' } : {}) } })
     return ok(`${seat.name} restarted with resume on ${model || 'the default model'} at ${request.effort} effort.${adopted && !started.ok ? ` Note: herdr's agent start ${started.code === 'timeout' ? 'timed out' : `failed (${started.code})`} but the agent is up in the pane, so the seat was kept.` : ''}${isUnconfirmed ? ' The notice was typed; herdr did not confirm the agent took it.' : ''}${lockNote ? ` Note: ${lockNote}.` : ''}`)
@@ -824,6 +825,15 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
 
 // ---------- close ----------
 
+const releaseCairnClaim = async (deps: Deps, ref: string): Promise<string> => {
+  try {
+    const ran = await deps.exec(['cairn', 'release', ref, '--force'], { timeoutMs: 15_000 })
+    return ran.code === 0 ? `Released the Cairn claim on ${ref}.` : `Note: the Cairn claim on ${ref} was not released (cairn exited ${ran.code}: ${clip(ran.stderr || ran.stdout)}); release it by hand.`
+  } catch (error) {
+    return `Note: the Cairn claim on ${ref} was not released (${messageOf(error)}); release it by hand.`
+  }
+}
+
 export const close = async (deps: Deps, identity: Identity, seatName: string, removeWorktree: boolean): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
   if (denied) return denied
@@ -851,6 +861,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 
   const notes = [`Closed ${seat.name}${seat.paneId ? ` (pane ${seat.paneId})` : ''}.`]
   if (lockNote) notes.push(`Note: ${lockNote}.`)
+  if (seat.cairn) notes.push(await releaseCairnClaim(deps, seat.cairn))
   if (!removeWorktree) notes.push(`Its worktree ${seat.worktree} and branch ${seat.branch} are kept.`)
   else {
     const targets = [run.base, run.base.replace(/^origin\//, '')]
