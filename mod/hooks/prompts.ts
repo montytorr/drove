@@ -1,5 +1,16 @@
-import type { OrchOrchestrator } from '../types'
+import type { OrchOrchestrator, OrchWorkerSelf } from '../types'
 import { shortModel } from './protocol'
+
+const modelLine = (model: string | undefined, effort: unknown): string =>
+  `${model ? `${shortModel(model)} (${model})` : 'its current model'}${typeof effort === 'string' ? ` at ${effort} effort` : ''}`
+
+// A worker's system prompt is built at launch, so a promote cannot change the model it names; this section is composed on every request.
+export const workerModelSection = (self: OrchWorkerSelf): string | undefined =>
+  self.model ? `# Your model, from Drove\n\nDrove runs you on ${modelLine(self.model, self.effort)}. Drove can change a worker's model or effort while it works. If the model named elsewhere in your system prompt differs, this section is current: say ${shortModel(self.model)} when asked which model you are.` : undefined
+
+// The line a verified promote or demote notice ends with. It owes no report: the mod records the acknowledgement itself.
+export const modelNotice = (model: string | undefined, effort: unknown): string =>
+  `Applied from your next request: you now run on ${modelLine(model, effort)}. The "powered by" line in your system prompt is from launch and is out of date. This notice needs no reply and no report: carry on with what you were doing, or stop if you were waiting.`
 
 export type OrchestratorPromptConfig = { workerModel: string; promotedModel: string }
 

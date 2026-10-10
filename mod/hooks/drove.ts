@@ -35,7 +35,7 @@ export const messageArgs = (name: string, expects: Expects): string[] => ['send'
 
 export const verdictArgs = (name: string, verdict: 'approve' | 'changes'): string[] => ['send', name, '--kind', 'verdict', '--verdict', verdict, '-']
 
-export const promoteArgs = (name: string, model: string, effort: Effort, reason?: string): string[] => ['promote', name, '--model', model, '--effort', effort, ...(reason ? ['--reason', reason] : [])]
+export const promoteArgs = (name: string, model: string | undefined, effort: Effort, reason?: string): string[] => ['promote', name, ...(model ? ['--model', model] : []), '--effort', effort, ...(reason ? ['--reason', reason] : [])]
 
 export const closeArgs = (name: string, removeWorktree: boolean): string[] => ['close', name, ...(removeWorktree ? ['--remove-worktree'] : [])]
 
