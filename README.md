@@ -43,7 +43,7 @@ Pick the planner (the table above), then use one of these.
 **Claude Code with the mod.** From a Claude Code session:
 
 1. Start Claude in a herdr pane with `mod/` in `CLAUDE_CODE_PLUGIN_DIRS`.
-2. Type `/orchestrate <goal>`. The session becomes the planner and gets the tools `spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `close_worker` and `roster`. A board and a wake bridge run inside Claude. Typing `/orchestrate` again in the same session re-attaches to the run.
+2. Type `/orchestrate <goal>`. The session becomes the planner and gets the tools `spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `migrate_worker`, `close_worker` and `roster`. A board and a wake bridge run inside Claude. Typing `/orchestrate` again in the same session re-attaches to the run.
 
 **Claude Code without the mod, or Codex.** From any herdr pane:
 
@@ -71,6 +71,8 @@ Planner messages are signed with a per-seat token. The signature covers the head
 
 `promote` changes a worker's model or effort, `demote` moves it back. `--model` is optional, so a Codex worker on Codex's default model can be promoted by effort alone. A Claude worker with the mod switches on its next request and is told its new model; otherwise, and for Codex, Drove restarts the agent with resume once it is idle.
 
+A worker that hits its usage limit gets a `usage-limit` attention item and is never nudged. Drove sees it on the limit screen, and for Claude also through the `StopFailure` hook (`error: rate_limit` or `billing_error`), which keeps the item after the text has scrolled away, until the seat works again. The planner can then wait for the reset, close and respawn, or `migrate` the seat to the other kind: Drove stops the agent and starts the other kind fresh in the same worktree, without resume, with a handoff brief (the saved brief, the branch's commits, uncommitted changes, `git status` and the last three reports). The seat keeps its name, branch, token and Cairn task (Drove releases the old claim so the new agent can take it), and the roster records `migratedFrom`. The turn in flight is lost. A Claude seat moved from Codex runs in Drove's worktree with no `--worktree`, because Claude trusts a linked worktree through its main repo. If the new agent does not start, the seat goes back to its old kind, marked gone, and `drove up --seat` resumes the old session.
+
 `drove down` saves every session id and stops the run (and, for a run started from a Cairn task, writes a summary note on that task). `drove up` resumes it, and `drove up --seat <seat>` relaunches one dead seat. After a crash or a reboot, `drove up` also adopts a run that is still `up` once its planner and seat panes are all gone; it refuses and names any pane that is still alive.
 
 ## Commands
@@ -82,6 +84,7 @@ Planner messages are signed with a per-seat token. The signature covers the head
 | `drove send <seat> --kind message\|answer\|verdict [--verdict approve\|changes] [--expects review\|answer\|none] TEXT\|-` | send one control message |
 | `drove prompt <seat> TEXT\|-` | raw prompt into a seat of this run (guarded) |
 | `drove promote <seat> [--model M] --effort E [--reason TEXT]` | change a worker's model or effort |
+| `drove migrate <seat> --kind claude\|codex [--model M] [--effort E] [--reason TEXT]` | move a worker to the other kind in the same worktree, with a handoff brief |
 | `drove roster [--json] [--run ID]` | one line per seat |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
@@ -90,7 +93,7 @@ Planner messages are signed with a per-seat token. The signature covers the head
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only; agents are denied) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
 
-`drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `close`, `roster`, `capture` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
+`drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `roster`, `capture` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
 
 ## Rules Drove enforces
 
