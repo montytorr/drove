@@ -442,6 +442,32 @@ test('a done worker that takes a hook turn with no report is neither flagged nor
   assert.equal(controls.length, 0)
 })
 
+test('an idle seat with no report has its screen read, and a usage limit on it raises attention and no nudge', async () => {
+  const limit = "⎿ You've hit your session limit · resets 2pm"
+  const ctx = await setup({ respond: (argv) => (argv[2] === 'read' ? { stdout: limit } : {}) })
+  await markWorking(ctx)
+  await appendJsonl(join(ctx.home, 'runs', ctx.run.id, 'seats', 'w-api', 'hooks.jsonl'), { at: ctx.clock.now().toISOString(), agent: 'claude', event: 'session-start' })
+  let status: HerdrAgent['status'] = 'working'
+  const { ports, controls } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status }], deriveState, needsNudge })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  assert.equal(ctx.calls.some((argv) => argv[2] === 'read'), false, 'a working seat is not read')
+  ctx.clock.advance(5000)
+  status = 'idle'
+  await watcher.tick()
+  assert.ok(ctx.calls.some((argv) => argv[2] === 'read' && argv[3] === 'p-w-api' && argv[5] === 'visible'), 'the idle seat with no report is read although its hooks fired')
+  ctx.clock.advance(60_000)
+  await watcher.tick()
+  const seat = (await rosterOf(ctx)).seats[0]
+  assert.equal(seat?.state, 'blocked')
+  assert.deepEqual(seat?.attention.map((item) => item.reason), ['usage-limit'])
+  assert.equal(seat?.attention[0]?.detail, 'hit its usage limit (resets 2pm)')
+  assert.equal(controls.length, 0)
+  assert.equal(seat?.hasNudged ?? false, false)
+  const wake = await watcher.piggyback('roster')
+  assert.match(wake, /⚠ w-api hit its usage limit \(resets 2pm\)/)
+})
+
 test('a seat that stops without any report is still nudged', async () => {
   const ctx = await setup()
   await markWorking(ctx)

@@ -50,14 +50,18 @@ Pick the planner (the table above), then use one of these.
 ```sh
 drove plan --kind claude    # Claude Code without the mod
 drove plan --kind codex     # Codex; add --goal "..." to either for a first instruction
+drove plan --from-cairn DROVE-12   # the goal is that Cairn task's title and body
+drove plan --next DROVE            # the goal is the top task `cairn next --project DROVE` ranks
 drove board                 # in a spare pane: live seats, states and what needs a human
 ```
 
 `drove plan` creates a run, records the pane as the planner pane and replaces itself with `claude` or `codex`, with Drove's MCP server, guard hooks and role text attached.
 
+`--from-cairn REF` and `--next PROJECT` start a run from a Cairn task. The planner's first prompt carries the task's title and body and says it is the run's goal task, which the planner holds; Drove stores the ref as the run's `cairn`. The task must exist and be open (a done or cancelled one is refused), and `--goal` cannot be combined with either flag. `drove down` then writes a summary note on that task: the seats, which are closed, their branches and what is still open (best effort: a failure to write it never holds the run up).
+
 ## How a worker's life goes
 
-1. **Spawn.** The planner calls `spawn` with a seat name, a kind, a Cairn ref and a brief. Drove opens a pane, waits for the shell prompt, then starts the agent. If the agent does not appear it resets the pane and tries once more. The brief is sent after the agent is up, never as a launch argument. For a Codex worker the worker role text rides at the top of the brief, and the agent runs under a `CODEX_HOME` Drove keeps for the run (see State and config).
+1. **Spawn.** The planner calls `spawn` with a seat name, a kind, a Cairn ref and a brief. Drove first checks with `cairn show` that the task exists and is open, and refuses one that is done or cancelled (if `cairn` is missing or errors, it carries on and says it did not check). Drove opens a pane, waits for the shell prompt, then starts the agent. If the agent does not appear it resets the pane and tries once more. The brief is sent after the agent is up, never as a launch argument. For a Codex worker the worker role text rides at the top of the brief, and the agent runs under a `CODEX_HOME` Drove keeps for the run (see State and config).
 2. **Work.** A Claude worker gets its worktree from `claude --worktree` (branch `worktree-<seat>`). A Codex worker gets one made by Drove (branch `drove/<seat>`). The worker never pushes; a hook denies it.
 3. **Report.** The worker calls its `report` tool: `done`, `question`, `blocked`, `promote` or `progress`. Anything but `progress` wakes the planner.
 4. **Verdict.** The planner reads the diff and sends `approve` or `changes`. After an approve the worker commits its own paths and reports `done` again.
@@ -67,13 +71,13 @@ Planner messages are signed with a per-seat token. The signature covers the head
 
 `promote` changes a worker's model or effort, `demote` moves it back. `--model` is optional, so a Codex worker on Codex's default model can be promoted by effort alone. A Claude worker with the mod switches on its next request and is told its new model; otherwise, and for Codex, Drove restarts the agent with resume once it is idle.
 
-`drove down` saves every session id and stops the run. `drove up` resumes it, and `drove up --seat <seat>` relaunches one dead seat. After a crash or a reboot, `drove up` also adopts a run that is still `up` once its planner and seat panes are all gone; it refuses and names any pane that is still alive.
+`drove down` saves every session id and stops the run (and, for a run started from a Cairn task, writes a summary note on that task). `drove up` resumes it, and `drove up --seat <seat>` relaunches one dead seat. After a crash or a reboot, `drove up` also adopts a run that is still `up` once its planner and seat panes are all gone; it refuses and names any pane that is still alive.
 
 ## Commands
 
 | Command | Use |
 |---|---|
-| `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT] [--run ID]` | start a planner in this pane |
+| `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT \| --from-cairn REF \| --next PROJECT] [--run ID]` | start a planner in this pane; `--from-cairn` makes a Cairn task the run's goal, `--next` the top task of a Cairn project |
 | `drove spawn <seat> --kind claude\|codex --cairn REF --brief TEXT\|- [--model M] [--effort E] [--base BRANCH]` | open a worker and brief it |
 | `drove send <seat> --kind message\|answer\|verdict [--verdict approve\|changes] [--expects review\|answer\|none] TEXT\|-` | send one control message |
 | `drove prompt <seat> TEXT\|-` | raw prompt into a seat of this run (guarded) |

@@ -248,3 +248,57 @@ test('a Codex hook-review dialog on an idle pane with no hooks yet blocks the se
   assert.equal(derived.state, 'blocked')
   assert.equal(derived.attention[0]?.reason, 'hook-trust')
 })
+
+const CLAUDE_LIMIT = "  ⎿ You've hit your session limit · resets 2pm (Europe/Paris)\n\n> "
+const CODEX_LIMIT = "■ You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus),\n  or try again at Oct 11th, 2026 2:00 PM."
+
+test('usage limit: a Claude limit screen becomes a usage-limit item carrying the reset time', () => {
+  const hit = detect.matchDialog('w-api', CLAUDE_LIMIT, NOW)
+  assert.equal(hit?.reason, 'usage-limit')
+  assert.equal(hit?.detail, 'hit its usage limit (resets 2pm (Europe/Paris))')
+  assert.equal(detect.matchDialog('w-api', "You've hit your weekly limit · resets Oct 14, 9am", NOW)?.detail, 'hit its usage limit (resets Oct 14, 9am)')
+  assert.equal(detect.matchDialog('w-api', "You've hit your Opus limit", NOW)?.detail, 'hit its usage limit')
+  assert.equal(detect.matchDialog('w-api', "You're out of extra usage · resets 11:30pm", NOW)?.reason, 'usage-limit')
+  assert.match(detect.findDialog(CLAUDE_LIMIT)?.hint ?? '', /^Claude hit its usage limit/)
+})
+
+test('usage limit: a Codex limit screen becomes a usage-limit item, with the reset time across a wrapped line', () => {
+  const hit = detect.matchDialog('w-cx', CODEX_LIMIT, NOW)
+  assert.equal(hit?.reason, 'usage-limit')
+  assert.equal(hit?.detail, 'hit its usage limit (resets Oct 11th, 2026 2:00 PM)')
+  assert.equal(detect.matchDialog('w-cx', 'You’ve hit your usage limit.', NOW)?.detail, 'hit its usage limit')
+  assert.match(detect.findDialog(CODEX_LIMIT)?.hint ?? '', /^Codex hit its usage limit/)
+})
+
+test('usage limit: the fast-mode cooldown, quoted text and a diff do not match', () => {
+  assert.equal(detect.matchDialog('s', "You've hit your fast limit · resets in 3m", NOW), undefined)
+  assert.equal(detect.matchDialog('s', "  42 +  assert.match(screen, /You've hit your usage limit/)", NOW), undefined)
+  assert.equal(detect.matchDialog('s', "The worker said: you've hit your usage limit earlier", NOW), undefined)
+})
+
+test('usage limit: an idle seat that stopped without a report is blocked with the item, not flagged idle-without-report', () => {
+  const seat = seatOf({ state: 'idle', lastWorkingAt: ago(100), stateAt: ago(40), lastReport: report('progress', 'none', 200) })
+  const derived = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('session-start', 300)], screen: CLAUDE_LIMIT }, NOW)
+  assert.equal(derived.state, 'blocked')
+  assert.deepEqual(derived.attention.map(item => item.reason), ['usage-limit'])
+  assert.equal(derived.attention[0]?.detail, 'hit its usage limit (resets 2pm (Europe/Paris))')
+})
+
+test('usage limit: needsNudge never fires for a seat carrying the item', () => {
+  const base = seatOf({ state: 'idle', stateAt: ago(25), lastWorkingAt: ago(60) })
+  assert.equal(detect.needsNudge(base, NOW), true)
+  const limited = { ...base, attention: [{ seat: 'w-api', reason: 'usage-limit' as const, detail: 'hit its usage limit', at: ago(5) }] }
+  assert.equal(detect.needsNudge(limited, NOW), false)
+})
+
+test('shouldReadScreen: a seat that went idle with no report since it worked is read even after its hooks fired', () => {
+  const started = [hook('session-start', 500), hook('user-prompt-submit', 400)]
+  const silent = seatOf({ state: 'idle', lastWorkingAt: ago(100), stateAt: ago(40) })
+  assert.equal(detect.shouldReadScreen(live('idle'), started, silent), true)
+  assert.equal(detect.shouldReadScreen(live('done'), started, silent), true)
+  assert.equal(detect.shouldReadScreen(live('working'), started, silent), false)
+  assert.equal(detect.shouldReadScreen(live('idle'), started, { ...silent, lastReport: report('progress', 'none', 200) }), true)
+  assert.equal(detect.shouldReadScreen(live('idle'), started, { ...silent, lastReport: report('done', 'review', 30), owes: 'review' }), false)
+  assert.equal(detect.shouldReadScreen(live('idle'), started, { ...silent, lastWorkingAt: undefined }), false)
+  assert.equal(detect.shouldReadScreen(live('idle'), started), false)
+})
