@@ -138,6 +138,20 @@ test('planner tools map their arguments onto the commands', async () => {
   ])
 })
 
+test('the spawn tool passes owns, maxTurns and maxTokens through, and checks their shape', async () => {
+  const { fake, tool } = await plannerWith()
+  await tool('spawn').call({ seat: 'w-ui', kind: 'claude', brief: 'x', owns: ['src/ui/**', ' ', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000 })
+  assert.deepEqual(fake.calls, [
+    { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, owns: ['src/ui/**', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000 }] },
+  ])
+  const schema = tool('spawn').inputSchema as { properties: Record<string, { type: string }> }
+  assert.deepEqual([schema.properties.owns?.type, schema.properties.maxTurns?.type, schema.properties.maxTokens?.type], ['array', 'integer', 'integer'])
+  for (const args of [{ owns: 'src/**' }, { owns: [1] }, { maxTurns: 0 }, { maxTurns: '5' }, { maxTokens: 1.5 }]) {
+    assert.equal((await tool('spawn').call({ seat: 'w-db', kind: 'claude', brief: 'x', ...args })).isError, true, JSON.stringify(args))
+  }
+  assert.equal(fake.calls.length, 1)
+})
+
 test('planner tools reject bad arguments before calling a command', async () => {
   const { fake, tool } = await plannerWith()
   const bad: [string, Record<string, unknown>][] = [

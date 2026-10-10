@@ -1,6 +1,6 @@
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { baseName, parseShell, unwrap } from './shell.ts'
 import type { Segment } from './shell.ts'
 import type { GuardDecision, GuardInput, Role } from './types.ts'
@@ -8,8 +8,8 @@ import type { GuardDecision, GuardInput, Role } from './types.ts'
 export const EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch'])
 export const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'shell', 'exec_command'])
 
-type Context = Pick<GuardInput, 'writableRoots' | 'openSeats'> & { cwd?: string }
-type Scope = { role: Role; roots: readonly string[]; seats: readonly string[]; cwd: string }
+type Context = Pick<GuardInput, 'writableRoots' | 'openSeats' | 'owns'> & { cwd?: string }
+type Scope = { role: Role; roots: readonly string[]; seats: readonly string[]; cwd: string; owns?: readonly string[] }
 
 const MAX_NESTING = 6
 const HARMLESS_TARGETS = new Set(['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'])
@@ -103,6 +103,121 @@ export const isInside = (path: string, roots: readonly string[], cwd: string = p
     const base = canonical(root, cwd)
     return target === base || target.startsWith(base.endsWith('/') ? base : `${base}/`)
   })
+}
+
+// A worker's owns globs are relative to its worktree: `*` stays inside one directory, `**` crosses them, `{a,b}` alternates,
+// and a glob that names a directory owns everything under it. Writes outside the worktree are refused, except scratch
+// space (the temp directories and Claude's per-project memory), which is not project files.
+const CLAUDE_MEMORY = '.claude/projects/*/memory/**'
+const REGEXP_SPECIALS = /[.*+?^${}()|[\]\\]/g
+
+const globToRegExp = (glob: string): RegExp => {
+  let source = ''
+  let depth = 0
+  for (let i = 0; i < glob.length; i += 1) {
+    const char = glob[i] ?? ''
+    if (char === '*') {
+      if (glob[i + 1] !== '*') source += '[^/]*'
+      else if (glob[i + 2] === '/') {
+        source += '(?:.*/)?'
+        i += 2
+      } else {
+        source += '.*'
+        i += 1
+      }
+    } else if (char === '?') source += '[^/]'
+    else if (char === '{') {
+      depth += 1
+      source += '(?:'
+    } else if (char === '}' && depth > 0) {
+      depth -= 1
+      source += ')'
+    } else if (char === ',' && depth > 0) source += '|'
+    else source += char.replace(REGEXP_SPECIALS, '\\$&')
+  }
+  return depth > 0 ? new RegExp(`^${glob.replace(REGEXP_SPECIALS, '\\$&')}$`) : new RegExp(`^${source}$`)
+}
+
+const matchesGlob = (path: string, glob: string): boolean => globToRegExp(glob.replace(/^\.\//, '')).test(path)
+
+const worktreeRoot = (start: string): string => {
+  let dir = start
+  for (;;) {
+    if (existsSync(join(dir, '.git'))) return dir
+    const parent = dirname(dir)
+    if (parent === dir) return start
+    dir = parent
+  }
+}
+
+const isScratch = (target: string): boolean =>
+  isInside(target, ['/tmp', '/private/tmp', tmpdir()], '/') || matchesGlob(relative(homedir(), target), CLAUDE_MEMORY)
+
+export const isOwned = (path: string, owns: readonly string[], cwd: string): boolean => {
+  const target = canonical(path, cwd)
+  const relation = relative(canonical(worktreeRoot(cwd), cwd), target)
+  if (relation === '') return false
+  if (relation === '..' || relation.startsWith('../')) return isScratch(target)
+  const parts = relation.split('/')
+  const candidates = parts.map((_, i) => parts.slice(0, i + 1).join('/'))
+  return owns.some(glob => candidates.some(candidate => matchesGlob(candidate, glob)))
+}
+
+const ownsText = (path: string, owns: readonly string[]): string =>
+  `${path}: this file is outside the paths your brief gives you (${owns.join(', ')}); ask the planner with the drove report tool`
+
+// A path with a variable or a substitution cannot be resolved, so only literal paths are checked.
+const ownsReason = (path: string, scope: Scope): string | undefined => {
+  if (scope.owns === undefined || HARMLESS_TARGETS.has(path) || /[$`]/.test(path)) return undefined
+  return isOwned(path, scope.owns, scope.cwd) ? undefined : ownsText(path, scope.owns)
+}
+
+const OPTIONS_WITH_VALUE: Record<string, ReadonlySet<string>> = {
+  cp: new Set(['-t', '--target-directory', '-S', '--suffix']),
+  mv: new Set(['-t', '--target-directory', '-S', '--suffix']),
+  install: new Set(['-t', '--target-directory', '-S', '--suffix', '-m', '--mode', '-o', '--owner', '-g', '--group']),
+  ln: new Set(['-t', '--target-directory', '-S', '--suffix']),
+  mkdir: new Set(['-m', '--mode']),
+  touch: new Set(['-d', '--date', '-t', '-r', '--reference']),
+  truncate: new Set(['-s', '--size', '-r', '--reference']),
+  sed: new Set(['-e', '--expression', '-f', '--file', '-l', '--line-length']),
+  perl: new Set(['-e', '-E', '-I', '-M', '-m', '-F', '-l']),
+}
+
+const positionalsOf = (words: readonly string[], withValue: ReadonlySet<string> = new Set()): string[] => {
+  const found: string[] = []
+  let isRest = false
+  for (let i = 1; i < words.length; i += 1) {
+    const word = words[i] ?? ''
+    if (isRest || word === '-' || !word.startsWith('-')) found.push(word)
+    else if (word === '--') isRest = true
+    else if (withValue.has(word)) i += 1
+  }
+  return found
+}
+
+const isInPlaceEdit = (head: string, words: readonly string[]): boolean =>
+  (head === 'sed' || head === 'perl') && words.some(word => /^-[a-zA-Z]*i/.test(word) || word.startsWith('--in-place'))
+
+// The paths a file-writing command changes, where its arguments say so. Anything more indirect (a script, an interpreter,
+// a checkout) is not parsed, so this is a seatbelt against mistakes and not a sandbox.
+const writeTargets = (head: string, words: readonly string[]): string[] => {
+  const withValue = OPTIONS_WITH_VALUE[head]
+  if (head === 'rm' || head === 'rmdir' || head === 'touch' || head === 'tee' || head === 'mkdir' || head === 'truncate') return positionalsOf(words, withValue)
+  if (head === 'chmod' || head === 'chown' || head === 'chgrp') return positionalsOf(words).slice(1)
+  if (head === 'dd') return words.filter(word => word.startsWith('of=')).map(word => word.slice(3))
+  if (head === 'mv' || head === 'cp' || head === 'install' || head === 'ln') {
+    const directory = optionValue(words, '-t') ?? optionValue(words, '--target-directory')
+    const positionals = positionalsOf(words, withValue)
+    if (head === 'mv') return [...positionals, ...(directory ? [directory] : [])]
+    return directory ? [directory] : positionals.slice(-1)
+  }
+  if (isInPlaceEdit(head, words)) {
+    const files = positionalsOf(words, withValue).filter(Boolean)
+    const hasScript = head === 'perl' || words.some(word => /^(-e|-f|--expression|--file)(=|$)/.test(word))
+    return hasScript ? files : files.slice(1)
+  }
+  return []
 }
 
 const firstPositional = (words: readonly string[], from: number, withValue: ReadonlySet<string> = new Set()): number => {
@@ -278,10 +393,19 @@ const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
     const reason = redirectReason(segment.stdoutFile, scope)
     if (reason) return reason
   }
+  if (scope.role === 'worker' && scope.owns && segment.stdoutFile !== undefined) {
+    const reason = ownsReason(segment.stdoutFile, scope)
+    if (reason) return reason
+  }
   const { words } = unwrap(segment.words)
   const first = words[0]
   if (first === undefined) return undefined
   const head = baseName(first)
+  if (scope.role === 'worker' && scope.owns) {
+    const reason = writeTargets(head, words).map(target => ownsReason(target, scope)).find(Boolean)
+    if (reason) return reason
+    if (head === 'apply_patch') return patchPaths(segment.stdin.join('\n')).map(path => ownsReason(path, scope)).find(Boolean)
+  }
   if (head === 'apply_patch' && scope.role === 'planner') return patchReason(segment.stdin.join('\n'), scope)
   if (head === 'git') return gitReason(words, scope)
   if (head === 'herdr') return herdrReason(words, scope)
@@ -306,7 +430,7 @@ const commandReason = (command: string, scope: Scope, depth: number): string | u
 }
 
 export const bashReason = (command: string, role: Role, context: Context): string | undefined =>
-  commandReason(command, { role, roots: context.writableRoots, seats: context.openSeats, cwd: context.cwd ?? process.cwd() }, 0)
+  commandReason(command, { role, roots: context.writableRoots, seats: context.openSeats, cwd: context.cwd ?? process.cwd(), ...(context.owns && context.owns.length > 0 ? { owns: context.owns } : {}) }, 0)
 
 const quoteWord = (word: string): string => (/^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", `'\\''`)}'`)
 
@@ -339,15 +463,20 @@ const workdirOf = (input: GuardInput): string => (typeof input.input.workdir ===
 export const decide = (input: GuardInput): GuardDecision => {
   const { role, tool } = input
   if (EDIT_TOOLS.has(tool)) {
-    if (role === 'worker') return ALLOW
+    const owns = role === 'worker' && input.owns && input.owns.length > 0 ? input.owns : undefined
+    if (role === 'worker' && !owns) return ALLOW
     const paths = editPathsOf(tool, input.input)
     if (paths.length === 0) return denied(role, `${tool} changes code and no path could be read from it`)
+    if (owns) {
+      const outside = paths.find(path => !isOwned(path, owns, input.cwd))
+      return outside === undefined ? ALLOW : denied(role, ownsText(outside, owns))
+    }
     const outside = paths.find(path => !isInside(path, input.writableRoots, input.cwd))
     return outside === undefined ? ALLOW : denied(role, `${tool} on ${outside} changes code`)
   }
   if (!SHELL_TOOLS.has(tool)) return ALLOW
   const command = commandOf(input.input)
   if (command === undefined) return role === 'planner' ? denied(role, 'there is no command text to check') : ALLOW
-  const reason = bashReason(command, role, { writableRoots: input.writableRoots, openSeats: input.openSeats, cwd: workdirOf(input) })
+  const reason = bashReason(command, role, { writableRoots: input.writableRoots, openSeats: input.openSeats, cwd: workdirOf(input), ...(input.owns ? { owns: input.owns } : {}) })
   return reason ? denied(role, reason) : ALLOW
 }

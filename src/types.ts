@@ -16,6 +16,7 @@ export type Identity = {
   role: Role
   seat: string
   token?: string
+  owns?: string[]
 }
 
 export type DroveConfig = {
@@ -33,6 +34,7 @@ export type DroveConfig = {
   workerEnv: Record<string, string>
   workerMcp?: string[]
   workerSkills?: string[]
+  maxTurns?: number
 }
 
 export type PlannerMeta = {
@@ -84,6 +86,10 @@ export type Seat = {
   sessionId?: string
   codexHome?: string
   mcp?: string[]
+  owns?: string[]
+  maxTurns?: number
+  maxTokens?: number
+  budgetNoticed?: boolean
   worktree: string
   branch: string
   state: SeatState
@@ -184,6 +190,7 @@ export type HookRecord = {
   event: HookEventName
   sessionId?: string
   detail?: string
+  transcript?: string
 }
 
 export type HookInput = {
@@ -194,6 +201,7 @@ export type HookInput = {
   tool?: string
   toolInput?: Record<string, unknown>
   detail?: string
+  transcript?: string
 }
 
 export type GuardInput = {
@@ -204,6 +212,7 @@ export type GuardInput = {
   cwd: string
   writableRoots: readonly string[]
   openSeats: readonly string[]
+  owns?: readonly string[]
 }
 
 export type GuardDecision = { allow: true } | { allow: false; reason: string }
@@ -286,6 +295,9 @@ export type SpawnRequest = {
   effort?: Effort
   base?: string
   mcp?: string[]
+  owns?: string[]
+  maxTurns?: number
+  maxTokens?: number
 }
 
 export type SendRequest = {

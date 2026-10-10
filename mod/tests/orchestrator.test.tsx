@@ -90,6 +90,8 @@ describe('drove client', () => {
     expect(spawnArgs({ name: 'w-x', kind: 'codex', effort: 'low' })).toEqual(['spawn', 'w-x', '--kind', 'codex', '--brief', '-', '--effort', 'low'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', mcp: ['mongodb', 'notion'] }).slice(-2)).toEqual(['--mcp', 'mongodb,notion'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', mcp: [] }).slice(-2)).toEqual(['--mcp', ''])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: ['src/a.ts', 'test/**'], maxTurns: 25, maxTokens: 1000000 }).slice(-6)).toEqual(['--owns', 'src/a.ts,test/**', '--max-turns', '25', '--max-tokens', '1000000'])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: [] })).toEqual(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low' }))
   })
 
   test('failures, JSON results and guard verdicts are read from what the CLI prints', () => {
@@ -485,6 +487,8 @@ describe('orchestrator session', () => {
     expect(denial((await callTool($, 'spawn_worker', { name: 'Bad Name', brief: 'x' })) as never)).toContain('must match')
     expect(denial((await callTool($, 'spawn_worker', { name: 'w-z', brief: 'x', kind: 'gemini' })) as never)).toContain('claude or codex')
     expect(droveCalls(world, 'spawn')).toHaveLength(2)
+    await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many' })
+    expect(droveCalls(world, 'spawn')[2]?.args.slice(-4)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20'])
   })
 
   test('a full pane budget asks the human; yes raises the budget by one and spawns, no refuses', async ($, on) => {

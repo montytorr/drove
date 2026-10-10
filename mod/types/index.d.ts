@@ -59,6 +59,10 @@ export type Seat = {
   sessionId?: string
   codexHome?: string
   mcp?: string[]
+  owns?: string[]
+  maxTurns?: number
+  maxTokens?: number
+  budgetNoticed?: boolean
   worktree: string
   branch: string
   state: SeatState

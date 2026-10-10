@@ -2,7 +2,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, readdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
-import { ENV, plannerDir, seatDir } from './paths.ts'
+import { ENV, identityEnv, plannerDir, seatDir } from './paths.ts'
 import type { Identity, LaunchFile, LaunchLink, LaunchRequest, LaunchSpec, Role } from './types.ts'
 
 export const CLAUDE_GUARDED_TOOLS = 'Bash|Edit|Write|MultiEdit|NotebookEdit'
@@ -45,14 +45,6 @@ export const assertShellSafeArgs = (argv: readonly string[]): void => {
 const shellQuote = (value: string): string => (/^[A-Za-z0-9_\/.:@%+=,-]+$/.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`)
 
 const hookCommand = (droveEntry: string, event: string): string => `node ${shellQuote(droveEntry)} guard ${event}`
-
-const identityEnv = (identity: Identity): Record<string, string> => ({
-  [ENV.home]: identity.home,
-  [ENV.run]: identity.run,
-  [ENV.role]: identity.role,
-  [ENV.seat]: identity.seat,
-  ...(identity.token ? { [ENV.token]: identity.token } : {}),
-})
 
 const claudeHook = (droveEntry: string, event: string) => ({ type: 'command', command: hookCommand(droveEntry, event), timeout: HOOK_TIMEOUT_S })
 
