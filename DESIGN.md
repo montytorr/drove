@@ -38,6 +38,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove budget <n>` | human only | Raises the pane budget for the current run. The guard denies it to every agent, so it is the human's OK for a 6th pane when the client cannot show a dialog (§3). |
 | `drove guard <event>` | hooks only | The hook entry point for Claude and Codex. For `pre-tool-use` it prints the guard's decision. For `session-start`, `stop`, `notification`, `permission-request` and `user-prompt-submit` it records state in the seat's `hooks.jsonl`. Identity comes from the env, so the command string is identical across launches (this matters for Codex hook trust, §6). |
 | `drove mcp` | agents only | The stdio MCP server. Its role comes from `DROVE_ROLE`: the planner gets the planner tools plus the outbox watcher, and a worker gets `report`. |
+| `drove mod attach\|bridge\|report` | the Claude orchestrator mod only | The mod's entry points (§10): `attach` makes the calling Claude session the planner of a run (`viaMod`, no exec) and prints JSON; `bridge` runs the outbox watcher for that session and streams wakes, the roster and events as JSON lines; `report` is the worker's `mcp__orchestrator__report` alias. The guard denies `drove mod` to agents. |
 
 Not in v1: a queue command (Cairn is the queue), workflows, snapshots beyond session ids, `send-keys`.
 
@@ -114,7 +115,7 @@ Approved. Commit only your own paths now …
 ```
 
 - `kind`: `brief | message | answer | verdict | promote | demote | nudge`.
-- `mac`: the first 16 hex characters of `HMAC-SHA256(seat token, id + "\n" + body)`. A worker-side checker (the mod's `session.receive`, or a Claude `UserPromptSubmit` hook) can mark a header with a bad MAC as unverified, like the mod's `UNVERIFIED` today. Codex workers do not verify in v1. They trust their own pane, which only Drove and the human type into.
+- `mac`: the first 16 hex characters of `HMAC-SHA256(seat token, id + "\n" + body)`. A worker-side checker (the mod's `prompt.submit` hook in a Claude worker, which computes the HMAC on `crypto.subtle.digest`) marks a header with a bad MAC as unverified and acts on a `promote` only when it verifies. Codex workers do not verify in v1. They trust their own pane, which only Drove and the human type into.
 - The reply line is generated from `kind` and `expects`, so the receiver always knows how to answer: openrig's best idea, and it is free.
 - Verdict `approve` carries the mod's `APPROVED` text: commit only your own paths, do not push, then confirm with `done` and `expects: none`. Verdict `changes` requires notes and expects `review`.
 - `promote` and `demote` carry `model=` and `effort=`. `answer` and `message` differ only in how the board labels them.
@@ -132,7 +133,7 @@ Approved. Commit only your own paths now …
 | Planner \\ Worker | Claude worker | Codex worker |
 |---|---|---|
 | **First brief** (both planners) | `herdr agent start` with **no prompt argument**, which returns once the agent is ready (idle); then the brief goes as the first control by `herdr agent prompt <seat> --wait` [proven in the mod and in the first real runs]. The launch-argument path (`claude … "<brief>"`) stays behind `briefVia: "launch-arg"` / `DROVE_BRIEF_VIA=launch-arg`, but a first turn longer than the start timeout makes `agent start` time out (§13 Q7). | Same: `codex …` with no prompt, then `herdr agent prompt --wait`. The thread id appears when the first turn ends, so messages sent before that go by `herdr agent prompt` too (`codex queue` needs the thread). |
-| **Later messages, Claude planner with the mod** | The mod's `$.session.send` to the worker's session id [proven] | `codex queue --thread <thread> --message <text>` [proven] |
+| **Later messages, Claude planner with the mod** | `herdr agent prompt <seat>`: the mod runs `drove send`, so Drove's guarded send applies (§10; `$.session.send` is not a transport) | `codex queue --thread <thread> --message <text>` [proven] |
 | **Later messages, Claude planner without the mod** | `herdr agent prompt <seat>` [proven] | `codex queue` [proven] |
 | **Later messages, Codex planner** | `herdr agent prompt <seat>` [proven transport] | `codex queue` [proven] |
 
@@ -151,7 +152,7 @@ All reports go through the outbox. Only the wake differs:
 | Planner | Wake transport, in order |
 |---|---|
 | Codex | `codex queue --thread <planner thread> --message <rendered report>` [proven transport]. The planner thread is known because `drove plan` launches Codex with an initial prompt, and the session id comes from the planner's `session-start` hook or herdr. While the planner is mid-turn, the message queues as its next turn [proven]. |
-| Claude with the mod | The mod's watcher hands the report to the session (`session.receive` path) [proven pattern] |
+| Claude with the mod | `drove mod bridge` runs the watcher with the `mod` wake transport: it writes the rendered reports to its stdout as a `wake` line, and the mod submits them with `$.prompt.submit`, a turn of their own once the session is idle (§10) |
 | Claude without the mod | (1) A channel: `notifications/claude/channel` from the planner's own MCP server, when `drove plan` launched it with `--dangerously-load-development-channels server:drove` [docs: research preview; one confirmation prompt at launch; verify that an idle session takes a turn]. (2) Else `herdr agent prompt <planner pane>` when the planner pane is `idle` or `done`, and never while it is `blocked` [proven transport]. |
 | Any | Piggyback: every planner tool result ends with any reports still pending. |
 
@@ -339,27 +340,27 @@ A restart is refused while the seat owes a report or is mid-turn. `promote` retu
 
 ## 10. The mod as a thin layer
 
-The mod imports Drove from `src/mod.ts`, a stable facade that re-exports a curated API, so the mod never depends on internal module layout:
+The Claude orchestrator mod lives in this repo at `mod/` (loaded by pointing `CLAUDE_CODE_PLUGIN_DIRS` at it). It keeps `/orchestrate` and the tool names (`mcp__orchestrator__spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `close_worker`, `roster`, and a worker's `report`) and adds Codex workers (`spawn_worker` takes `kind: claude|codex`).
 
-| From Drove | Used by the mod for |
+**It cannot import Drove** (DROVE-9; this answers §13 Q5). Claude Code's plugin runtime has no Node and imports only files of the plugin, and every Drove module uses `node:fs`, `node:crypto` or `node:child_process`. So the mod reaches Drove through its CLI, `node <drove>/src/cli.ts …` (the path is `<mod>/../src/cli.ts`, or the mod's `droveEntry` setting), and keeps a copy of the run-state types in `mod/types/index.d.ts` that `test/mod-types.test.ts` holds to `src/types.ts`. `src/mod.ts` stays the facade for Node callers.
+
+| Drove | How the mod uses it |
 |---|---|
-| `protocol` (envelopes, reports, controls, MAC, rendering) | parsing and rendering in `session.receive` and `prompt.submit` |
-| `guard.decide` | its `tool.call` guard, with no subprocess |
-| `store` and `roster` (run state, seat ops) | the board and roster tools, and persistence (replaces `$.store` for runs) |
-| `commands` (spawn, send, promote, close, capture, down/up) | the bodies of `mcp__orchestrator__*` tools |
-| `watch` (outbox reader with cursors) | its tick: reads reports and injects them with `session.send` |
-| `detect.deriveState` | board statuses |
-| `prompts` | the role sections in `prompt.compose` |
+| `drove mod attach --session <id> --pane <pane> [--goal] [--budget] [--run]` (`src/modhost.ts`) | `/orchestrate` and a session restore: creates (or re-attaches) a run whose planner is this Claude session, `viaMod: true`, with no launch files and no exec. A later attach of the same session to the latest up run re-attaches it. |
+| `drove mod bridge --run <id> --session <id>` | One long-lived child per planner session (`$.process.spawn`), supervised with backoff. It runs `createWatcher` with `modWake` (the first wake transport for a `viaMod` planner), so cursors, batching, herdr polling, nudges (never while the planner owes the seat), pending flushes and queued promotes are all Drove's. It writes JSON lines: `ready`, `busy`, `fatal`, `run` and `roster` (with each Claude worker's `seats/<seat>/mod.json`) when they change, `events` (the last 60, then each new one), `wake` and `error`. It exits when its parent pid changes, when its lock is taken, or (code 4) when the run goes down or is attached to another session. |
+| `planner/bridge.json` lock | One bridge per run. A live bridge of the **same** session is a leftover of a hot reload of the mod, so the new one sends it SIGTERM (SIGKILL after 3 s) and takes over; a live bridge of another session makes the new one stand down (`busy`, code 3). |
+| `drove spawn`, `send`, `promote`, `close`, `roster`, `budget`, `down` | The bodies of the `mcp__orchestrator__*` tools, run with the planner identity in the env (`DROVE_RUN`, `DROVE_ROLE=planner`, `DROVE_SEAT=planner`). An `over-budget` failure opens `$.ui.ask`; yes runs `drove budget <n+1>` without `DROVE_ROLE` (the human's OK) and retries. |
+| `drove guard pre-tool-use` | The planner's `tool.call` guard for Bash and the edit tools, fed the Claude PreToolUse JSON (about 95 ms a call). It fails closed with a denial that names Drove's CLI path when the guard cannot run. Workers are not guarded by the mod: Drove launched them with its own hook. |
+| `drove mod report` | A Claude worker's `mcp__orchestrator__report` alias (stdin JSON, identity from the env), so old briefs keep working beside `mcp__drove__report`. |
 
 What stays Claude-only in the mod:
-- per-request model and effort switching (`turn.step`);
-- the in-app board (React) and toasts;
-- `$.session.send` as a delivery adapter (registered with `deliver` as the `mod` transport for Claude seats and the Claude planner);
+- per-request model and effort switching (`turn.step`): the planner's floor, and in a Claude worker the seat's model and effort read from `roster.json` on each turn and from a verified `promote` control;
+- the in-app board (fed by the bridge stream), the pills and toasts;
 - `$.ui.ask` for the budget dialog;
-- AskUserQuestion state, and context % reporting;
-- `/orchestrate`, which becomes the equivalent of `drove plan` inside an existing Claude session: it creates a run with this pane and session as the planner, with no `exec`.
+- AskUserQuestion and permission state, context % and activity in a Claude worker, written to `seats/<seat>/mod.json`;
+- `/orchestrate` itself, and the orchestrator role section (`prompt.compose`), which maps the Drove wording of a wake ("drove send, kind verdict") to the mod's tools.
 
-The mod is loaded by Claude's runtime, not by Node. How it resolves the import (an absolute path to `src/mod.ts`, or a linked package) is Open question 5.
+**`$.session.send` is not a transport.** Drove's delivery runs inside short-lived CLI processes and the bridge, and a spawned child has no channel back into the mod (stdin is one-shot), so a `mod` delivery adapter would need a file handoff and an acknowledgement with two-phase failures. Claude workers therefore get Drove's guarded `herdr agent prompt` and Codex workers `codex queue`, the same as with any other planner. Workers spawned by the old mod (`⟦orch v1⟧` over `session.send`) are not adopted: the mod reports a leftover old-mod record once and deletes it.
 
 ## 11. Sequences
 
@@ -447,7 +448,7 @@ Five pieces with disjoint files. `src/types.ts` is frozen by this design: a piec
 - **Human-run:** a Claude planner with the dev channel (does an idle session take a turn?); a Codex planner woken by `codex queue`; MCP elicitation support for the budget in both clients.
 
 ### P5: board and mod facade
-- **Files:** `src/board.ts`, `src/mod.ts`, plus tests. The mod changes themselves are a later piece in `~/.claude/mods/orchestrator`, after P1 to P4 land.
+- **Files:** `src/board.ts`, `src/mod.ts`, plus tests. The mod itself was rebuilt over Drove in `mod/` (DROVE-9, §10).
 - **Provides:** `renderBoard(run, roster, events, attention, width)` (pure) and `runBoard` (refresh loop); `mod.ts` re-exports the facade listed in §10.
 - **Consumes:** P1, plus P3's `detect`.
 - **Acceptance:** golden frames at widths 80 and 140; the attention list is shown first; `mod.ts` exports exactly the documented names (a test pins the list).
@@ -463,7 +464,7 @@ Recommendations accepted by the planner on 2026-10-09; the human-run [verify] it
 2. **Claude planner wake without the mod.** A dev channel (research preview, one confirmation per launch, claude.ai auth only) or keystrokes into the human's pane. **Recommend: try the channel first, fall back to keystroke wake after 5 s idle, and always piggyback.** If the channel does not start turns when idle, drop it and document that the mod is the comfortable Claude planner.
 3. **Codex hook trust.** Constant command strings plus one approval by the human, or `--dangerously-bypass-hook-trust` per launch (which also runs any untrusted repo-local hooks). **Recommend constant strings and a one-time approval.** Bypass stays an explicit opt-in in `~/.drove/config.json`. Never prewrite trust hashes.
 4. **Codex worker network.** `network_access=true` lets workers run `cairn` and package installs, but also makes `git push` possible, so only the guard prevents it. **Recommend network on, with the guard denying push** (workers need Cairn). Revisit if the Codex hook is unreliable.
-5. **How the mod imports Drove.** An absolute path to `src/mod.ts`, or `npm link` plus a bare `drove/mod` import. **Recommend `npm link`, then `import … from 'drove/mod'`**, with `package.json` `exports` mapping `./mod` to `./src/mod.ts`. This depends on Claude's mod runtime resolving linked packages and handling `.ts` [verify].
+5. **How the mod imports Drove.** **Answered (DROVE-9): it does not.** The plugin runtime has no Node and imports only the plugin's own files, so neither an absolute path nor `npm link` can work. The mod runs the Drove CLI (`drove mod attach|bridge|report` plus the planner commands and `drove guard`) and keeps a drift-tested copy of the run-state types (§10).
 6. **Promote for a Codex worker** needs a restart today. **Recommend restart with resume for v1**, and verify whether `codex queue -m` changes the model per turn: if it does, it replaces the restart.
 7. **Does `herdr agent start` return ready when the agent begins with an initial prompt** (so it is `working` at once)? **Answered: no.** `agent start --timeout` waits until herdr considers the agent ready (idle). In run rig-lab-20261009-1810-b9d3 a Codex planner spawned a Claude worker with the brief as the launch argument ("First run: sleep 40. …"); Claude was working from the first second, `agent start` timed out at 60 s, and spawn rolled back and closed a healthy working worker (`seats/w-cl2/start-failure.txt` shows its screen mid-turn). The earlier Claude test only passed because the task took under 15 s. **Decision:** launch with no prompt argument and send the brief with `herdr agent prompt --wait` as the first control (default, both kinds; `briefVia` and `DROVE_BRIEF_VIA` restore the launch argument), treat a prompt `timeout` as delivered-unconfirmed, and, if `agent start` times out anyway, keep the seat when the agent is up in the pane (§5). Only Codex then lacks a thread until its first turn ends; later messages wait for the thread id or go by `herdr agent prompt`.
 8. **A long-poll `wait` tool for the planner** (block up to N seconds for the next report) would give both planners a wake with no keystrokes. It occupies the planner's turn, and Codex MCP tool timeouts are short by default. **Recommend not in v1**; reconsider if both the channel and keystroke wake disappoint.
