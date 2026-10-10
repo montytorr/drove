@@ -1,7 +1,37 @@
 import { DEFAULT_START_TIMEOUT_MS } from './herdr.ts'
 import type { Attention, Derived, HerdrAgent, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
 
-export const DIALOGS: readonly { pattern: RegExp; reason: Attention['reason']; detail: string; hint: string }[] = [
+type Dialog = { pattern: RegExp; reason: Attention['reason']; detail: string; hint: string; detailOf?: (screen: string) => string }
+
+const CODEX_LIMIT = /^[^\w\n]*You['’]ve hit your usage limit/m
+const CLAUDE_LIMIT = /^[^\w\n]*(?:You['’]ve (?:hit|reached) your (?!fast limit)|You['’]re out of (?:extra )?usage|Your org is out of usage)/m
+const CODEX_RESET = /try again at ([^.]{1,40})\./i
+const CLAUDE_RESET = /resets (?:at )?([^·\n]+?)\s*(?:·|$)/m
+
+const resetAfter = (screen: string, start: RegExp, reset: RegExp, wraps: boolean): string | undefined => {
+  const at = screen.search(start)
+  if (at < 0) return undefined
+  const tail = screen.slice(at, at + 400)
+  return reset.exec(wraps ? tail.replace(/\s+/g, ' ') : tail)?.[1]?.trim()
+}
+
+const limitDetail = (reset: string | undefined): string => `hit its usage limit${reset ? ` (resets ${reset})` : ''}`
+
+export const DIALOGS: readonly Dialog[] = [
+  {
+    pattern: CODEX_LIMIT,
+    reason: 'usage-limit',
+    detail: limitDetail(undefined),
+    detailOf: screen => limitDetail(resetAfter(screen, CODEX_LIMIT, CODEX_RESET, true)),
+    hint: 'Codex hit its usage limit; wait for the reset, close and respawn, or migrate the worker',
+  },
+  {
+    pattern: CLAUDE_LIMIT,
+    reason: 'usage-limit',
+    detail: limitDetail(undefined),
+    detailOf: screen => limitDetail(resetAfter(screen, CLAUDE_LIMIT, CLAUDE_RESET, false)),
+    hint: 'Claude hit its usage limit; wait for the reset, close and respawn, or migrate the worker',
+  },
   {
     pattern: /Background server has incompatible feature settings/,
     reason: 'codex-version-mismatch',
@@ -41,7 +71,7 @@ export const EXIT_WAIT_MS = 20_000
 export const RESTART_BOUND_MS = 2 * EXIT_WAIT_MS + DEFAULT_START_TIMEOUT_MS
 export const NUDGE_GRACE_MS = 20_000
 
-const DERIVED_REASONS: ReadonlySet<Attention['reason']> = new Set(['dialog', 'permission', 'trust', 'hook-trust', 'channel-confirm', 'codex-version-mismatch', 'idle-without-report', 'gone'])
+const DERIVED_REASONS: ReadonlySet<Attention['reason']> = new Set(['dialog', 'permission', 'trust', 'hook-trust', 'channel-confirm', 'codex-version-mismatch', 'usage-limit', 'idle-without-report', 'gone'])
 const SETTLED: ReadonlySet<SeatState> = new Set(['idle', 'done'])
 const PERMISSION_NOTICE = /permission|approv|elicitation|dialog|trust/i
 
@@ -52,17 +82,27 @@ export const isRestarting = (seat: Seat, now: Date): boolean => {
   return !Number.isNaN(since) && now.getTime() - since < RESTART_BOUND_MS
 }
 
-export const findDialog = (screen: string): (typeof DIALOGS)[number] | undefined => DIALOGS.find(({ pattern }) => pattern.test(screen))
+export const findDialog = (screen: string): Dialog | undefined => DIALOGS.find(({ pattern }) => pattern.test(screen))
 
-export const shouldReadScreen = (agent: HerdrAgent | undefined, hooks: readonly HookRecord[]): boolean => {
+// A seat that stopped after working, with nothing reported since, may be sitting at a usage-limit screen.
+const isSilentSinceWork = (seat: Seat, reported: LastReport | undefined): boolean => {
+  if (!seat.lastWorkingAt) return false
+  const last = reported ?? seat.lastReport
+  const reportedAt = ms(last?.at)
+  if (reportedAt >= ms(seat.lastWorkingAt)) return false
+  return !(last && last.kind !== 'progress' && !(ms(seat.lastSentAt) > reportedAt))
+}
+
+export const shouldReadScreen = (agent: HerdrAgent | undefined, hooks: readonly HookRecord[], seat?: Seat): boolean => {
   if (!agent) return false
   if (agent.status === 'blocked') return true
-  return agent.status !== 'working' && !hooks.some(hook => hook.event === 'session-start' || hook.event === 'user-prompt-submit')
+  if (agent.status === 'working') return false
+  return (seat !== undefined && isSilentSinceWork(seat, undefined)) || !hooks.some(hook => hook.event === 'session-start' || hook.event === 'user-prompt-submit')
 }
 
 export const matchDialog = (seat: string, screen: string, at: Date): Attention | undefined => {
   const hit = findDialog(screen)
-  return hit ? { seat, reason: hit.reason, detail: hit.detail, at: at.toISOString() } : undefined
+  return hit ? { seat, reason: hit.reason, detail: hit.detailOf?.(screen) ?? hit.detail, at: at.toISOString() } : undefined
 }
 
 const latest = (hooks: readonly HookRecord[], events: readonly HookRecord['event'][]): HookRecord | undefined =>
@@ -88,14 +128,8 @@ const hookWorkingAfter = (hooks: readonly HookRecord[], since: number, now: numb
   return work !== undefined && at > since && now - at <= freshMs
 }
 
-const idleWithoutReport = (seat: Seat, state: SeatState, reported: LastReport | undefined, now: Date): boolean => {
-  if (!SETTLED.has(state) || !seat.lastWorkingAt) return false
-  const last = reported ?? seat.lastReport
-  const reportedAt = ms(last?.at)
-  if (reportedAt >= ms(seat.lastWorkingAt)) return false
-  if (last && last.kind !== 'progress' && !(ms(seat.lastSentAt) > reportedAt)) return false
-  return now.getTime() - ms(seat.stateAt) >= NUDGE_GRACE_MS
-}
+const idleWithoutReport = (seat: Seat, state: SeatState, reported: LastReport | undefined, now: Date): boolean =>
+  SETTLED.has(state) && isSilentSinceWork(seat, reported) && now.getTime() - ms(seat.stateAt) >= NUDGE_GRACE_MS
 
 export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derived => {
   if (seat.state === 'closed' || seat.state === 'down' || seat.state === 'closing') return { state: seat.state, attention: [] }
@@ -145,6 +179,7 @@ export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derive
 
 export const needsNudge = (seat: Seat, now: Date): boolean => {
   if (!SETTLED.has(seat.state) || seat.hasNudged || seat.owes !== 'none') return false
+  if (seat.attention.some(item => item.reason === 'usage-limit')) return false
   return idleWithoutReport(seat, seat.state, undefined, now)
 }
 

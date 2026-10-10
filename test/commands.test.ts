@@ -87,6 +87,21 @@ test('a codex worker still gets a Drove git worktree on drove/<seat> and launche
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.branch, 'drove/w-cx')
 })
 
+test('spawn saves the full brief to seats/<seat>/brief.md, mode 600, for both kinds', async () => {
+  const { deps, identity } = await setup()
+  for (const [seat, kind] of [['w-cl', 'claude'], ['w-cx', 'codex']] as const) {
+    const spawned = await commands.spawn(deps, identity, { seat, kind, cairn: 'DROVE-5', brief })
+    assert.equal(spawned.ok, true, spawned.text)
+    const file = join(seatDir(deps.home, RUN, seat), 'brief.md')
+    const saved = await readFile(file, 'utf8')
+    assert.match(saved, /Build the widget\. \(You are worker `/)
+    assert.match(saved, new RegExp(`You are worker \`${seat}\``))
+    assert.match(saved, /Your Cairn task is DROVE-5/)
+    assert.equal(saved.startsWith('# Worker mode') || saved.startsWith('Build the widget.'), true, 'Codex carries its role in the brief, Claude does not')
+    assert.equal((await stat(file)).mode & 0o777, 0o600)
+  }
+})
+
 const commitOn = async (repo: string, file: string): Promise<string> => {
   await writeFile(join(repo, file), 'x\n')
   await git(repo, 'add', file)
@@ -1552,4 +1567,122 @@ test('a codex seat with no recorded CODEX_HOME resumes the old way: inline overr
   assert.ok(!placedEnv(fake).some(entry => entry.startsWith('CODEX_HOME=')))
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.codexHome, undefined)
   assert.ok(!existsSync(join(deps.home, 'runs', RUN, 'codex-home')))
+})
+
+const settled = async (fake: FakeHerdr, deps: Deps, ...names: string[]) => {
+  for (const name of names) fake.setStatus(name, 'idle')
+  await markIdle(deps)
+}
+
+test('up adopts an up run whose planner and seat panes are all gone, keeps the session ids and resumes', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-1', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await commands.spawn(deps, identity, { seat: 'w-b', kind: 'codex', brief })
+  await settled(fake, deps, 'w-a', 'w-b')
+  const before = (await loadRoster(deps.home, RUN)).seats.map(seat => seat.sessionId)
+  assert.ok(before.every(Boolean))
+  fake.agents.clear()
+  process.env.HERDR_PANE_ID = 'w1:p77'
+
+  const upped = await commands.up(deps, { run: RUN, repo: '/x' })
+  assert.equal(upped.ok, true, upped.text)
+  assert.match(upped.text, /recovered after a crash: 2 seat\(s\) adopted/)
+  assert.match(upped.text, /resumed w-a, w-b/)
+  const starts = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').slice(2)
+  assert.equal(starts.length, 2)
+  assert.ok(starts[0]?.includes('--resume'))
+  assert.ok(starts[1]?.includes('resume'))
+  const seats = (await loadRoster(deps.home, RUN)).seats
+  assert.deepEqual(seats.map(seat => seat.state), ['idle', 'idle'])
+  assert.ok(seats.every(seat => seat.paneId?.startsWith('w1:p') && seat.paneId !== 'w1:p77'))
+  assert.deepEqual(seats.map(seat => seat.sessionId), before)
+  const plan = upped.ok ? (upped.data as commands.ProcessPlan) : undefined
+  assert.equal(plan?.argv[plan.argv.indexOf('--resume') + 1], 'planner-session')
+  const run = await loadRun(deps.home, RUN)
+  assert.deepEqual([run?.status, run?.planner.paneId], ['up', 'w1:p77'])
+  const recovered = (await readEvents(deps)).filter(item => item.type === 'run.recovered')
+  assert.equal(recovered.length, 1)
+  assert.deepEqual(recovered[0]?.data?.seats, ['w-a', 'w-b'])
+})
+
+test('up refuses an up run that still has a live pane and names it', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-1', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await commands.spawn(deps, identity, { seat: 'w-b', kind: 'claude', brief })
+  await settled(fake, deps, 'w-a', 'w-b')
+  fake.agents.delete([...fake.agents.keys()].find(name => name.startsWith('w-a')) as string)
+  const livePane = fake.seatAgent('w-b')?.paneId
+  assert.ok(livePane)
+  process.env.HERDR_PANE_ID = 'w1:p77'
+  const startsBefore = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').length
+
+  const refused = await commands.up(deps, { run: RUN, repo: '/x' })
+  assert.equal(!refused.ok && refused.code, 'not-down')
+  assert.match(refused.text, new RegExp(`w-b \\(pane ${livePane}\\)`))
+  assert.doesNotMatch(refused.text, /w-a/)
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats.map(seat => seat.state), ['idle', 'idle'])
+  assert.equal(fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').length, startsBefore)
+  assert.equal((await readEvents(deps)).filter(item => item.type === 'run.recovered').length, 0)
+
+  fake.agents.clear()
+  fake.agents.set('planner', { name: 'planner', paneId: 'w1:p0', tabId: 'w1:t1', status: 'idle' })
+  const plannerLive = await commands.up(deps, { run: RUN, repo: '/x' })
+  assert.equal(!plannerLive.ok && plannerLive.code, 'not-down')
+  assert.match(plannerLive.text, /the planner pane w1:p0/)
+})
+
+test('up refuses to adopt when herdr cannot say whether a pane is alive', async () => {
+  const fake = new FakeHerdr()
+  const { deps } = await setup(fake)
+  const exec = fake.exec
+  const unreachable = { ...deps, exec: async (argv: readonly string[]) => (argv[1] === 'agent' && argv[2] === 'get' ? { code: 1, stdout: '', stderr: 'failed to connect to herdr socket' } : exec(argv)) }
+  process.env.HERDR_PANE_ID = 'w1:p77'
+  const refused = await commands.up(unreachable, { run: RUN, repo: '/x' })
+  assert.equal(!refused.ok && refused.code, 'herdr')
+  assert.match(refused.text, /could not say whether/)
+  assert.equal((await loadRun(deps.home, RUN))?.planner.paneId, 'w1:p0')
+})
+
+test('up --seat relaunches a stale seat the roster still calls working when its pane is gone', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-1', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  const spawned = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.ok(spawned && !['gone', 'down', 'closed'].includes(spawned.state))
+  assert.ok(spawned.sessionId)
+  fake.agents.clear()
+
+  const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  const argv = startArgv(fake)
+  assert.equal(argv[argv.indexOf('--resume') + 1], spawned.sessionId)
+  const events = (await readEvents(deps)).filter(item => item.type === 'seat.relaunch')
+  assert.equal(events.at(-1)?.data?.ok, true)
+})
+
+test('up --seat refuses a stale-looking seat whose pane is still alive', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-1', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const })) }))
+  const refused = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(!refused.ok && refused.code, 'not-dead')
+})
+
+test('a recovered codex seat keeps its CODEX_HOME through the adopt and the relaunch', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  await settled(fake, deps, 'w-cx')
+  const recorded = join(deps.home, 'runs', RUN, 'codex-home')
+  fake.agents.clear()
+  process.env.HERDR_PANE_ID = 'w1:p77'
+
+  const upped = await commands.up(deps, { run: RUN, repo: '/x' })
+  assert.equal(upped.ok, true, upped.text)
+  assert.deepEqual(startArgv(fake).slice(0, 2), ['resume', 'thread-xyz'])
+  assert.ok(placedEnv(fake).includes(`CODEX_HOME=${await realpath(recorded)}`), placedEnv(fake).join(' '))
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.codexHome, recorded)
 })

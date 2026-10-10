@@ -195,7 +195,7 @@ const reportedThisEpisode = (seat: Seat): boolean => {
   return episodeStart !== undefined && Date.parse(report.at) >= Date.parse(episodeStart)
 }
 
-const attentionLine = (item: Attention) => `⚠ ${item.seat}: ${item.reason}: ${item.detail}`
+const attentionLine = (item: Attention) => (item.reason === 'usage-limit' ? `⚠ ${item.seat} ${item.detail}` : `⚠ ${item.seat}: ${item.reason}: ${item.detail}`)
 
 const clip = (text: string, max = 300) => (text.length > max ? `${text.slice(0, max)}…` : text)
 
@@ -399,7 +399,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       const agent = listed.value.find((candidate) => candidate.paneId === seat.paneId) ?? listed.value.find((candidate) => candidate.name === herdr.agentName(run.id, seat.name))
       const hooks = await hooksFor(run, seat.name)
       let screen: string | undefined
-      if (detect.shouldReadScreen(agent, hooks)) {
+      if (detect.shouldReadScreen(agent, hooks, seat)) {
         const read = await deps.exec(ports.agentReadArgv(target, 40, 'visible'))
         screen = read.code === 0 ? read.stdout : undefined
       }

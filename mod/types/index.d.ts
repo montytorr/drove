@@ -44,7 +44,7 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
   detail: string
   at: string
 }
@@ -83,6 +83,7 @@ export type Roster = {
 export type DroveEventType =
   | 'run.up'
   | 'run.down'
+  | 'run.recovered'
   | 'seat.spawn'
   | 'seat.start_failed'
   | 'seat.relaunch'

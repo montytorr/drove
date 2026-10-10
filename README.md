@@ -71,7 +71,7 @@ Planner messages are signed with a per-seat token. The signature covers the head
 
 `promote` changes a worker's model or effort, `demote` moves it back. `--model` is optional, so a Codex worker on Codex's default model can be promoted by effort alone. A Claude worker with the mod switches on its next request and is told its new model; otherwise, and for Codex, Drove restarts the agent with resume once it is idle.
 
-`drove down` saves every session id and stops the run (and, for a run started from a Cairn task, writes a summary note on that task). `drove up` resumes it, and `drove up --seat <seat>` relaunches one dead seat.
+`drove down` saves every session id and stops the run (and, for a run started from a Cairn task, writes a summary note on that task). `drove up` resumes it, and `drove up --seat <seat>` relaunches one dead seat. After a crash or a reboot, `drove up` also adopts a run that is still `up` once its planner and seat panes are all gone; it refuses and names any pane that is still alive.
 
 ## Commands
 
