@@ -1,6 +1,6 @@
-import type { OrchEffort, OrchFeedEntry, OrchLead, OrchOrchestrator, OrchWorker, OrchWorkerStatus } from '../types'
+import type { Effort, OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus, OrchOrchestrator, Seat, SeatState } from '../types'
 import { shortModel } from './protocol'
-import { openWorkers, statusGlyph } from './roster'
+import { isAsking, openSeats, spawnedMs, statusGlyph } from './roster'
 
 export const BOARD_ID = 'orchestra'
 
@@ -24,15 +24,18 @@ export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 export const PULSE_MS = 6_000
 const GAUGE = { full: '▰', empty: '▱' }
 
-const STATUS_TONE: Record<OrchWorkerStatus, Tone> = {
+const STATUS_TONE: Record<SeatState, Tone> = {
   starting: 'muted',
   working: 'working',
   idle: 'good',
   done: 'good',
   blocked: 'alert',
+  'needs-input': 'alert',
   unknown: 'muted',
-  closed: 'dim',
   gone: 'dim',
+  closing: 'dim',
+  closed: 'dim',
+  down: 'dim',
 }
 
 const FEED_ICON: Record<string, string> = {
@@ -51,6 +54,9 @@ const FEED_ICON: Record<string, string> = {
   nudge: '⟳',
   close: '⏻',
   gone: '✕',
+  queued: '⏸',
+  failed: '✕',
+  attention: '⚠',
 }
 
 const FEED_TONE: Record<string, Tone> = {
@@ -63,9 +69,12 @@ const FEED_TONE: Record<string, Tone> = {
   gone: 'alert',
   promote: 'warn',
   demote: 'warn',
+  queued: 'warn',
+  failed: 'alert',
+  attention: 'alert',
 }
 
-const effortShort = (effort: OrchEffort | undefined): string => (effort === undefined ? '' : effort === 'xhigh' ? 'xh' : effort.charAt(0))
+const effortShort = (effort: Effort | undefined): string => (effort === undefined ? '' : effort === 'xhigh' ? 'xh' : effort.charAt(0))
 
 export const since = (ms: number): string => {
   const minutes = Math.floor(Math.max(0, ms) / 60_000)
@@ -88,9 +97,9 @@ const ctxTone = (percent: number): Tone => (percent > 70 ? 'alert' : percent >= 
 
 const isBusy = (activity: string | undefined): boolean => activity !== undefined && !/^(idle|waiting)/.test(activity)
 
-export const needsAnimation = (lead: OrchLead | null, workers: readonly OrchWorker[], now: number): boolean =>
+export const needsAnimation = (lead: OrchLead | null, seats: readonly Seat[], asksAt: Readonly<Record<string, number>>, now: number): boolean =>
   isBusy(lead?.activity) ||
-  openWorkers(workers).some(({ status, asksAt }) => status === 'working' || status === 'starting' || (asksAt !== undefined && now - asksAt < PULSE_MS))
+  openSeats(seats).some(({ name, state }) => state === 'working' || state === 'starting' || (asksAt[name] !== undefined && now - (asksAt[name] ?? 0) < PULSE_MS))
 
 const personOf = (name: string): { text: string; tone: Tone } =>
   name === '⌘' ? { text: '⌘', tone: 'lead' } : name === 'Cal' ? { text: 'you', tone: 'you' } : { text: name, tone: 'working' }
@@ -116,28 +125,40 @@ export const fixedRows = (openCount: number): number => 5 + Math.max(openCount, 
 
 export const timelineRoom = (rows: number, openCount: number): number => Math.max(1, rows - fixedRows(openCount))
 
-export const progressOf = (workers: readonly OrchWorker[]): { done: number; total: number } => {
-  const counted = workers.filter(({ status, lastReport }) => status !== 'gone' || lastReport?.kind === 'done')
-  return { done: counted.filter(({ lastReport, status }) => lastReport?.kind === 'done' || status === 'done').length, total: counted.length }
+export const progressOf = (seats: readonly Seat[]): { done: number; total: number } => {
+  const counted = seats.filter(({ state, lastReport }) => (state !== 'gone' && state !== 'down') || lastReport?.kind === 'done')
+  return { done: counted.filter(({ lastReport, state }) => lastReport?.kind === 'done' || state === 'done').length, total: counted.length }
 }
 
-const workerDoing = (worker: OrchWorker, spin: string): Cell => {
-  if (worker.isAsking) return { text: worker.activity ?? 'waiting for you in its pane', tone: 'alert' }
-  if (worker.status === 'blocked') return { text: 'waiting on a dialog in its pane', tone: 'alert' }
-  if (worker.status === 'starting') return { text: `${spin} starting`, tone: 'muted' }
-  if (worker.status === 'done' && worker.lastReport) return { text: worker.lastReport.summary, tone: 'text' }
-  const doing = worker.activity ?? worker.lastReport?.summary ?? ''
-  return { text: worker.status === 'working' && doing ? `${spin} ${doing}` : doing, tone: 'text' }
+const seatDoing = (seat: Seat, status: OrchModStatus | undefined, spin: string): Cell => {
+  if (status?.asking) return { text: status.asking, tone: 'alert' }
+  if (seat.state === 'needs-input') return { text: 'needs an approval in its pane', tone: 'alert' }
+  if (seat.state === 'blocked') return { text: seat.attention[0]?.detail ?? 'waiting on a dialog in its pane', tone: 'alert' }
+  if (seat.state === 'starting') return { text: `${spin} starting`, tone: 'muted' }
+  if (seat.owes !== 'none' && seat.lastReport) return { text: `owes you ${seat.owes === 'review' ? 'a review' : 'an answer'} · ${seat.lastReport.summary}`, tone: 'warn' }
+  if (seat.state === 'done' && seat.lastReport) return { text: seat.lastReport.summary, tone: 'text' }
+  const doing = status?.activity ?? seat.lastReport?.summary ?? ''
+  return { text: seat.state === 'working' && doing ? `${spin} ${doing}` : doing, tone: 'text' }
+}
+
+const BRIDGE_NOTE: Record<OrchBridge['state'], string | undefined> = {
+  starting: 'connecting to Drove…',
+  up: undefined,
+  busy: 'another session is this run’s planner; reports go there',
+  failed: 'Drove bridge failed',
+  stopped: 'Drove bridge stopped',
 }
 
 export const buildBoard = (input: {
   orchestrator: OrchOrchestrator
-  workers: readonly OrchWorker[]
+  seats: readonly Seat[]
+  status: Readonly<Record<string, OrchModStatus>>
+  asksAt: Readonly<Record<string, number>>
+  bridge: OrchBridge | null
   feed: readonly OrchFeedEntry[]
   lead: OrchLead | null
   leadModel: string
-  leadEffort: OrchEffort
-  maxWorkers: number
+  leadEffort: Effort
   now: number
   frame: number
   scrollBack?: number
@@ -146,15 +167,15 @@ export const buildBoard = (input: {
   columns: number
   rows: number
 }): BoardModel => {
-  const { orchestrator, workers, feed, lead, now, columns, frame } = input
-  const open = openWorkers(workers).sort((a, b) => a.spawnedAt - b.spawnedAt)
+  const { orchestrator, seats, status, asksAt, feed, lead, now, columns, frame } = input
+  const open = openSeats(seats).sort((a, b) => spawnedMs(a) - spawnedMs(b))
   const isWide = columns >= 70
-  const names = [...workers.map(({ name }) => name), ...feed.flatMap(({ from, to }) => [from, to])]
+  const names = [...seats.map(({ name }) => name), ...feed.flatMap(({ from, to }) => [from, to])]
   const nameWidth = Math.min(16, Math.max(8, ...names.map(name => name.length + 1)))
   const spin = SPINNER[frame % SPINNER.length] ?? '⠋'
   const isPulseOn = frame % 2 === 0
-  const { done, total } = progressOf(workers)
-  const isAllDone = total > 0 && done === total && open.every(({ status }) => status === 'done' || status === 'idle')
+  const { done, total } = progressOf(seats)
+  const isAllDone = total > 0 && done === total && open.every(({ state }) => state === 'done' || state === 'idle')
 
   const title: Cell[] = [
     { text: '◆ orchestra', tone: 'lead', isBold: true },
@@ -165,36 +186,43 @@ export const buildBoard = (input: {
     ? [{ text: `✓ all done · ${elapsed}`, tone: 'good', isBold: true }]
     : [
         ...(total > 0 ? [{ text: gauge((done / total) * 100, Math.min(10, Math.max(5, total))), tone: 'good' as const }] : []),
-        { text: `${total > 0 ? `${done}/${total} done · ` : ''}${open.length}/${input.maxWorkers} open · ${elapsed}`, tone: 'muted' },
+        { text: `${total > 0 ? `${done}/${total} done · ` : ''}${open.length}/${orchestrator.budget} open · ${elapsed}`, tone: 'muted' },
       ]
 
   const leadBusy = isBusy(lead?.activity)
+  const bridgeNote = input.bridge ? BRIDGE_NOTE[input.bridge.state] : undefined
   const leadRow: BoardRow = {
     key: 'lead',
     cells: [
       { text: '⌘', tone: 'lead', width: 2 },
       { text: 'lead', tone: 'lead', width: nameWidth + 3, isBold: true },
       ...(isWide ? [{ text: `${shortModel(input.leadModel)} · ${effortShort(input.leadEffort)}`, tone: 'muted' as const, width: 13 }] : []),
-      { text: `${leadBusy ? `${spin} ` : ''}${lead?.activity ?? 'idle'}`, tone: leadBusy ? 'text' : 'muted' },
+      bridgeNote
+        ? { text: `${bridgeNote}${input.bridge?.detail ? `: ${input.bridge.detail}` : ''}`, tone: input.bridge?.state === 'starting' ? 'muted' : 'alert' }
+        : { text: `${leadBusy ? `${spin} ` : ''}${lead?.activity ?? 'idle'}`, tone: leadBusy ? 'text' : 'muted' },
       ...(lead ? [{ text: since(now - lead.since), tone: 'dim' as const, width: 5 }] : []),
     ],
   }
 
-  const workerRows: BoardRow[] = open.map((worker, index) => {
-    const isPulsing = worker.isAsking === true && worker.asksAt !== undefined && now - worker.asksAt < PULSE_MS
-    const stripeTone: Tone = isPulsing ? (isPulseOn ? 'alert' : 'dim') : STATUS_TONE[worker.status]
+  const workerRows: BoardRow[] = open.map((seat, index) => {
+    const mine = status[seat.name]
+    const asking = isAsking(seat, mine)
+    const asked = asksAt[seat.name]
+    const isPulsing = asking && asked !== undefined && now - asked < PULSE_MS
+    const stripeTone: Tone = isPulsing ? (isPulseOn ? 'alert' : 'dim') : asking ? 'alert' : STATUS_TONE[seat.state]
+    const model = seat.kind === 'codex' ? `codex${seat.model ? ` ${seat.model}` : ''}` : (shortModel(seat.model).split(' ')[0] ?? '')
     return {
-      key: `w:${worker.name}`,
+      key: `w:${seat.name}`,
       cells: [
         { text: index === open.length - 1 ? '└─' : '├─', tone: 'dim', width: 2 },
         { text: '▌', tone: stripeTone, width: 1 },
-        { text: worker.isAsking ? '?' : statusGlyph(worker.status), tone: STATUS_TONE[worker.status], width: 2 },
-        { text: worker.name, tone: STATUS_TONE[worker.status], width: nameWidth, isBold: true },
-        ...(isWide ? [{ text: `${shortModel(worker.model).split(' ')[0] ?? ''}·${effortShort(worker.effort)}`, tone: 'muted' as const, width: 9 }] : []),
-        ...(isWide && worker.cairnRef ? [{ text: worker.cairnRef, tone: 'dim' as const, width: 8 }] : []),
-        workerDoing(worker, spin),
-        ...(isWide && worker.ctx !== undefined ? [{ text: `${gauge(worker.ctx, 4)} ${String(worker.ctx).padStart(2)}%`, tone: ctxTone(worker.ctx), width: 9 }] : []),
-        { text: since(now - (worker.lastReport?.at ?? worker.spawnedAt)), tone: 'dim', width: 5 },
+        { text: asking ? '?' : statusGlyph(seat.state), tone: asking ? 'alert' : STATUS_TONE[seat.state], width: 2 },
+        { text: seat.name, tone: STATUS_TONE[seat.state], width: nameWidth, isBold: true },
+        ...(isWide ? [{ text: clip(`${model}·${effortShort(seat.effort)}`, 9), tone: 'muted' as const, width: 9 }] : []),
+        ...(isWide && seat.cairn ? [{ text: seat.cairn, tone: 'dim' as const, width: 8 }] : []),
+        seatDoing(seat, mine, spin),
+        ...(isWide && mine?.ctx !== undefined ? [{ text: `${gauge(mine.ctx, 4)} ${String(mine.ctx).padStart(2)}%`, tone: ctxTone(mine.ctx), width: 9 }] : []),
+        { text: since(now - (Date.parse(seat.lastReport?.at ?? seat.spawnedAt) || now)), tone: 'dim', width: 5 },
       ],
     }
   })

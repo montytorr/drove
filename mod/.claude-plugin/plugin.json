@@ -1,7 +1,7 @@
 {
   "name": "orchestrator",
-  "version": "0.1.0",
-  "description": "/orchestrate turns this session into an Opus orchestrator that plans, delegates and reviews but never edits code. It spawns Sonnet worker sessions in herdr panes; they report back over session messaging and can ask to be promoted.",
+  "version": "0.2.0",
+  "description": "/orchestrate turns this session into a Drove planner: Opus plans, delegates to Claude or Codex workers in herdr panes (each in its own worktree), and reviews, but never edits code. A thin layer over Drove (../src): run state, delivery, guard and wakes are Drove's.",
   "author": {
     "name": "Cal",
     "email": "cal@dispofi.fr"
@@ -18,7 +18,12 @@
       "type": "string",
       "title": "Orchestrator effort floor",
       "description": "An orchestrator's requests never go below this effort; a higher /effort you set is kept.",
-      "options": ["medium", "high", "xhigh", "max"],
+      "options": [
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ],
       "default": "high"
     },
     "workerModel": {
@@ -37,13 +42,18 @@
       "type": "string",
       "title": "Default worker effort",
       "description": "Effort a worker starts at when the orchestrator does not choose one.",
-      "options": ["low", "medium", "high", "xhigh"],
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ],
       "default": "medium"
     },
     "maxWorkers": {
       "type": "number",
       "title": "Worker panes without asking",
-      "description": "How many worker panes may be open at once before a new one needs your yes in a dialog.",
+      "description": "The run's pane budget: how many worker panes may be open at once before a new one needs your yes in a dialog.",
       "default": 5
     },
     "effortRouting": {
@@ -51,6 +61,18 @@
       "title": "Lower effort for routing turns",
       "description": "Run turns woken by a worker's question, block or promotion request at medium effort. Off until its effect on the prompt cache is measured.",
       "default": false
+    },
+    "droveEntry": {
+      "type": "string",
+      "title": "Drove CLI entry",
+      "description": "Path to drove's src/cli.ts. Empty: the src/cli.ts beside this mod's folder (drove/mod → drove/src/cli.ts).",
+      "default": ""
+    },
+    "nodePath": {
+      "type": "string",
+      "title": "Node binary",
+      "description": "The node (22.18 or newer) that runs Drove's CLI.",
+      "default": "node"
     }
   }
 }

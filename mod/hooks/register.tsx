@@ -1,60 +1,18 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { OrchEffort, OrchFeedEntry, OrchOrchestrator, OrchWorker, OrchWorkerSelf, OrchWorkerStatus } from '../types'
+import type { AgentKind, Effort, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat } from '../types'
 import { BOARD_ID, EXPAND_INDENT, buildBoard, needsAnimation, timelineRoom } from './board'
 import type { BoardRow, Cell, Tone } from './board'
-import { EDIT_TOOLS, WORKER_FORBIDDEN, bashReason, editPathOf, isInside, orchestratorDeny } from './guard'
-import { BRIEF_FOOTER, orchestratorSection, workerSection } from './prompts'
-import {
-  NAME_RE,
-  UNVERIFIED,
-  defaultExpects,
-  formatEnvelope,
-  isEffort,
-  isExpects,
-  isReportKind,
-  locateEnvelope,
-  replaceEnvelope,
-  raiseEffort,
-  renderControl,
-  renderReport,
-  shortModel,
-  stripToken,
-} from './protocol'
-import type { Expects, Located } from './protocol'
-import {
-  LIST_ARGV,
-  agentStatusOf,
-  closeArgv,
-  effortLetter,
-  findWorker,
-  gridSlot,
-  herdrError,
-  makeToken,
-  observe,
-  oneLine,
-  openWorkers,
-  parseAgents,
-  parseSplit,
-  parseTab,
-  promptArgv,
-  pushFeed,
-  replaceWorker,
-  retryWhileBusy,
-  rosterLines,
-  splitArgv,
-  startArgv,
-  statusGlyph,
-  tabCloseArgv,
-  tabCreateArgv,
-  tabGetArgv,
-  workerEnvPairs,
-} from './roster'
+import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf } from './bridge'
+import type { BridgeLine, FeedDraft } from './bridge'
+import * as drove from './drove'
+import { orchestratorSection } from './prompts'
+import { CAIRN_RE, DROVE_OPEN, NAME_RE, isEffort, isExpects, locateEnvelope, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
+import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
 
-const TICK_MS = 5_000
-const SLOW_TICKS = 6
-const STORE_PREFIX = 'session:'
+const STORE_PREFIX = 'drove:session:'
+const LEGACY_PREFIX = 'session:'
 const STORE_MAX_AGE_MS = 14 * 24 * 3_600_000
 const COLOR = {
   crust: '#11111b',
@@ -70,7 +28,10 @@ const COLOR = {
 } as const
 
 const orchestratorAtom = atom({ plugin: 'orchestrator', key: 'orchestrator' } as const, null)
-const workersAtom = atom({ plugin: 'orchestrator', key: 'workers' } as const, [] as OrchWorker[])
+const seatsAtom = atom({ plugin: 'orchestrator', key: 'seats' } as const, [] as Seat[])
+const statusAtom = atom({ plugin: 'orchestrator', key: 'status' } as const, {} as Record<string, OrchModStatus>)
+const asksAtAtom = atom({ plugin: 'orchestrator', key: 'asksAt' } as const, {} as Record<string, number>)
+const bridgeAtom = atom({ plugin: 'orchestrator', key: 'bridge' } as const, null)
 const workerAtom = atom({ plugin: 'orchestrator', key: 'worker' } as const, null)
 const feedAtom = atom({ plugin: 'orchestrator', key: 'feed' } as const, [] as OrchFeedEntry[])
 const leadAtom = atom({ plugin: 'orchestrator', key: 'lead' } as const, null)
@@ -82,15 +43,20 @@ let feedCount = 0
 const FULL_MAX = 4000
 const BOARD_BG = '#1e1e2e'
 const FRAME_MS = 250
+const SPAWN_TIMEOUT_MS = 300_000
+const COMMAND_TIMEOUT_MS = 120_000
+const GUARD_TIMEOUT_MS = 15_000
 
 type Config = {
   orchestratorModel: string
-  orchestratorEffort: OrchEffort
+  orchestratorEffort: Effort
   workerModel: string
   promotedModel: string
-  workerEffort: OrchEffort
+  workerEffort: Effort
   maxWorkers: number
   effortRouting: boolean
+  droveEntry: string
+  nodePath: string
 }
 
 const config: Config = {
@@ -101,6 +67,8 @@ const config: Config = {
   workerEffort: 'medium',
   maxWorkers: 5,
   effortRouting: false,
+  droveEntry: '',
+  nodePath: 'node',
 }
 
 const configure = (options: PluginOptions) => {
@@ -108,6 +76,8 @@ const configure = (options: PluginOptions) => {
   config.orchestratorModel = text(options.orchestratorModel, config.orchestratorModel)
   config.workerModel = text(options.workerModel, config.workerModel)
   config.promotedModel = text(options.promotedModel, config.promotedModel)
+  config.droveEntry = text(options.droveEntry, config.droveEntry)
+  config.nodePath = text(options.nodePath, config.nodePath)
   if (isEffort(options.orchestratorEffort)) config.orchestratorEffort = options.orchestratorEffort
   if (isEffort(options.workerEffort)) config.workerEffort = options.workerEffort
   const max = Number(options.maxWorkers)
@@ -123,12 +93,28 @@ const resolveModel = (value: unknown, fallback: string): string => {
   return value.trim()
 }
 
-let ticker: { cancel: () => void } | undefined
-let isTicking = false
-let tickCount = 0
+const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
+
+// Background work (timers, the bridge loop) can outlive the module's environment, so it never rejects.
+const quietly = async (work: () => Promise<unknown>) => {
+  try {
+    await work()
+  } catch {
+    // the environment went away, or the engine refused the call
+  }
+}
+
+const soon = ($: EngineInterface, ms: number, work: () => Promise<unknown>) => $.clock.after(ms, () => void quietly(work))
+
 let animator: { cancel: () => void } | undefined
 let pendingRouting = false
 let routingTurnId: string | undefined
+let isDrovePlanner = false
+let bridgeEpoch = 0
+let bridgeTries = 0
+let bridgeStream: { return: (value?: never) => Promise<unknown> } | undefined
+let lastRun: RunMeta | undefined
+const bodies = new Map<string, string[]>()
 
 const isSummariser = async ($: EngineInterface): Promise<boolean> => {
   try {
@@ -143,30 +129,6 @@ const isSummariser = async ($: EngineInterface): Promise<boolean> => {
   }
 }
 
-const readWorkerEnv = async ($: EngineInterface): Promise<OrchWorkerSelf | null> => {
-  try {
-    const [parentSessionId, parentName, name, token, model, effort] = await Promise.all([
-      $.env.get('CLAUDE_ORCH_PARENT'),
-      $.env.get('CLAUDE_ORCH_PARENT_NAME'),
-      $.env.get('CLAUDE_ORCH_WORKER'),
-      $.env.get('CLAUDE_ORCH_TOKEN'),
-      $.env.get('CLAUDE_ORCH_MODEL'),
-      $.env.get('CLAUDE_ORCH_EFFORT'),
-    ])
-    if (!parentSessionId || !name || !token) return null
-    return {
-      name,
-      parentSessionId,
-      parentName: parentName || undefined,
-      token,
-      model: model || undefined,
-      effort: isEffort(effort) ? effort : undefined,
-    }
-  } catch {
-    return null
-  }
-}
-
 const herdrPane = async ($: EngineInterface): Promise<string | undefined> => {
   try {
     return (await $.env.get('HERDR_PANE_ID')) || undefined
@@ -175,47 +137,59 @@ const herdrPane = async ($: EngineInterface): Promise<string | undefined> => {
   }
 }
 
-const herdrWorkspace = async ($: EngineInterface): Promise<string | undefined> => {
+const droveHome = async ($: EngineInterface): Promise<string | undefined> => {
   try {
-    return (await $.env.get('HERDR_WORKSPACE_ID')) || undefined
+    return (await $.env.get('DROVE_HOME')) || undefined
   } catch {
     return undefined
   }
 }
 
-const closeTabIfEmpty = async ($: EngineInterface) => {
-  const [orchestrator, workers] = await Promise.all([read($, orchestratorAtom), read($, workersAtom)])
-  if (!orchestrator?.tabId || openWorkers(workers).some(worker => worker.paneId)) return
-  await herdr($, tabCloseArgv(orchestrator.tabId))
-  await update($, orchestratorAtom, current => (current ? { ...current, tabId: undefined } : current))
-  await persist($)
-}
+const homeDir = async ($: EngineInterface): Promise<string> => (await droveHome($)) ?? `${(await $.env.get('HOME')) ?? ''}/.drove`
 
-const writableRoots = async ($: EngineInterface): Promise<string[]> => {
-  const home = await $.env.get('HOME')
-  return ['/tmp', '/private/tmp', ...(home ? [`${home}/.claude/plans`] : [])]
-}
+const entryOf = ($: EngineInterface): string => drove.entryOf($.plugin.root, config.droveEntry)
 
-type Ran = { isOk: boolean; output: string }
+type RunInit = { env?: Record<string, string>; stdin?: string; timeoutMs?: number; cwd?: string }
 
-const herdr = async ($: EngineInterface, argv: readonly string[], timeoutMs = 30_000): Promise<Ran> => {
+const runDrove = async ($: EngineInterface, args: readonly string[], init: RunInit = {}): Promise<drove.Ran> => {
   try {
-    const { exitCode, stdout, stderr } = await $.process.run([...argv], { timeoutMs })
-    const output = `${stdout}\n${stderr}`.trim()
-    return { isOk: exitCode === 0 && herdrError(stdout) === undefined, output }
+    const ran = await $.process.run([config.nodePath, entryOf($), ...args], {
+      ...(init.cwd ? { cwd: init.cwd } : {}),
+      env: init.env ?? {},
+      ...(init.stdin !== undefined ? { stdin: init.stdin } : {}),
+      timeoutMs: init.timeoutMs ?? COMMAND_TIMEOUT_MS,
+    })
+    return { exitCode: ran.exitCode, stdout: ran.stdout, stderr: ran.stderr }
   } catch (error) {
-    return { isOk: false, output: error instanceof Error ? error.message : String(error) }
+    return { exitCode: -1, stdout: '', stderr: `drove-unavailable: ${messageOf(error)}` }
   }
 }
 
+const plannerRun = async ($: EngineInterface, args: readonly string[], init: RunInit = {}): Promise<drove.Ran> => {
+  const orchestrator = await read($, orchestratorAtom)
+  if (!orchestrator) return { exitCode: 1, stdout: '', stderr: 'off: Orchestrator mode is off.' }
+  return runDrove($, args, { ...init, cwd: orchestrator.repo, env: drove.plannerEnv(orchestrator.run, await droveHome($)) })
+}
+
+type ToolAnswer = { deny: string } | { result: string }
+
+const answerOf = (ran: drove.Ran): ToolAnswer => {
+  if (ran.exitCode === 0) return { result: ran.stdout.trim() }
+  const failure = drove.failureOf(ran)
+  return { deny: `Drove: ${failure.text} [${failure.code}]` }
+}
+
+const pushBody = (key: string, text: string) => bodies.set(key, [...(bodies.get(key) ?? []), text])
+const dropBody = (key: string) => bodies.set(key, (bodies.get(key) ?? []).slice(0, -1))
+
 const persist = async ($: EngineInterface) => {
   try {
-    const [orchestrator, workers, sessionId, now] = await Promise.all([read($, orchestratorAtom), read($, workersAtom), $.session.id(), $.clock.now()])
+    const [orchestrator, sessionId, now] = await Promise.all([read($, orchestratorAtom), $.session.id(), $.clock.now()])
     const key = `${STORE_PREFIX}${sessionId}`
-    if (orchestrator) await $.store.set(key, { orchestrator, workers, savedAt: now })
+    if (orchestrator) await $.store.set(key, { run: orchestrator.run, goal: orchestrator.goal, startedAt: orchestrator.startedAt, savedAt: now })
     else await $.store.delete(key)
   } catch {
-    // persistence is best effort: the session's own state still holds
+    // persistence is best effort: the run itself lives in Drove's state
   }
 }
 
@@ -223,7 +197,7 @@ const pruneStore = async ($: EngineInterface) => {
   try {
     const now = await $.clock.now()
     for (const key of await $.store.keys()) {
-      if (!key.startsWith(STORE_PREFIX)) continue
+      if (!key.startsWith(STORE_PREFIX) && !key.startsWith(LEGACY_PREFIX)) continue
       const saved = (await $.store.get(key)) as { savedAt?: number } | undefined
       if (!saved || typeof saved.savedAt !== 'number' || now - saved.savedAt > STORE_MAX_AGE_MS) await $.store.delete(key)
     }
@@ -232,26 +206,20 @@ const pruneStore = async ($: EngineInterface) => {
   }
 }
 
-const patchWorker = async ($: EngineInterface, worker: OrchWorker) => {
-  await update($, workersAtom, workers => replaceWorker(workers, worker))
-  await persist($)
-}
-
 const ORCHESTRATOR_TOOLS = [
   {
     name: 'spawn_worker',
     description:
-      'Orchestrator mode: start a worker Claude session in a new herdr pane and give it a brief. It runs on Sonnet unless you say otherwise, reports back to you through the orchestrator mod, and can ask to be promoted. Up to the pane budget (5 open) without asking; beyond it Cal is asked in a dialog. Returns once the brief is delivered.',
+      'Orchestrator mode: start a worker through Drove in a new herdr pane, in its own git worktree, and give it a brief. kind claude (default, Sonnet unless you say otherwise) or codex. It reports back to you through Drove and can ask to be promoted. Up to the pane budget (5 open) without asking; beyond it Cal is asked in a dialog. Returns once the brief is delivered.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'short unique name, [a-z][a-z0-9_-]{0,31}, e.g. w-auth' },
-        brief: { type: 'string', description: 'the full, standalone task: goal, files it owns, what not to touch, acceptance criteria, how to verify, git rules' },
+        brief: { type: 'string', description: 'the full, standalone task: goal, files it owns, what not to touch, acceptance criteria, how to verify' },
+        kind: { type: 'string', enum: ['claude', 'codex'], description: 'claude (default) or codex' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh'], description: 'low: mechanical; medium: standard (default); high: tricky logic or debugging' },
-        model: { type: 'string', description: 'sonnet (default) or opus, or a full model id' },
-        worktree: { type: 'boolean', description: 'true to give the worker its own git worktree and branch (overlapping or risky work)' },
+        model: { type: 'string', description: 'Claude: sonnet (default) or opus, or a full model id. Codex: a model id, or leave out for Drove’s default' },
         cairn: { type: 'string', description: 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
-        cwd: { type: 'string', description: 'directory to start in; default: this session cwd' },
       },
       required: ['name', 'brief'],
     },
@@ -284,12 +252,12 @@ const ORCHESTRATOR_TOOLS = [
   },
   {
     name: 'promote_worker',
-    description: 'Orchestrator mode: move a worker up. Raise its effort on Sonnet first (model: sonnet, effort: high or xhigh); move it to Opus (model: opus) when the problem needs deeper reasoning. Takes effect from its next request; a model change re-sends its context once.',
+    description: 'Orchestrator mode: move a worker up. Raise its effort on Sonnet first (model: sonnet, effort: high or xhigh); move it to Opus (model: opus) when the problem needs deeper reasoning. A Claude worker switches from its next request; a Codex worker is restarted with resume once it is idle.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string' },
-        model: { type: 'string', description: 'opus (default) or sonnet, or a full model id' },
+        model: { type: 'string', description: 'opus (default) or sonnet, or a full model id (Codex: a model id; default its current model)' },
         effort: { type: 'string', enum: ['medium', 'high', 'xhigh', 'max'], description: 'default high' },
         reason: { type: 'string' },
       },
@@ -298,21 +266,21 @@ const ORCHESTRATOR_TOOLS = [
   },
   {
     name: 'demote_worker',
-    description: 'Orchestrator mode: move a promoted worker back to Sonnet once the hard part is done.',
+    description: 'Orchestrator mode: move a promoted worker back to Sonnet (or a Codex worker to a lower effort) once the hard part is done.',
     inputSchema: {
       type: 'object',
-      properties: { name: { type: 'string' }, effort: { type: 'string', enum: ['low', 'medium', 'high'] } },
+      properties: { name: { type: 'string' }, effort: { type: 'string', enum: ['low', 'medium', 'high'] }, model: { type: 'string', description: 'Codex only: a model id' } },
       required: ['name'],
     },
   },
   {
     name: 'close_worker',
-    description: 'Orchestrator mode: close a worker pane you opened, once its work is approved and committed or no longer needed.',
-    inputSchema: { type: 'object', properties: { name: { type: 'string' } }, required: ['name'] },
+    description: 'Orchestrator mode: close a worker pane you opened, once its work is approved and committed or no longer needed. Its worktree and branch are kept unless remove_worktree is true and the branch is merged.',
+    inputSchema: { type: 'object', properties: { name: { type: 'string' }, remove_worktree: { type: 'boolean' } }, required: ['name'] },
   },
   {
     name: 'roster',
-    description: 'Orchestrator mode: list the workers, their status, model, effort and last report.',
+    description: 'Orchestrator mode: list the workers, their state, model, effort, last report and what you owe them.',
     inputSchema: { type: 'object', properties: {} },
   },
 ] as const
@@ -320,7 +288,7 @@ const ORCHESTRATOR_TOOLS = [
 const REPORT_TOOL = {
   name: 'report',
   description:
-    'Worker mode: report to your orchestrator. kind: done (finished and verified; expects review), question (you need a decision; for: cal when only Cal can decide), blocked, promote (you need a stronger model or more effort; say why), progress (optional, expects nothing). summary is one line; details carries the rest (branch, files, test output).',
+    "Worker mode: report to your planner (the same as Drove's own report tool, mcp__drove__report). kind: done (finished and verified; expects review), question (you need a decision; for: cal when only Cal can decide), blocked, promote (you need a stronger model or more effort; say why), progress (optional, expects nothing). summary is one line; details carries the rest (branch, files, test output).",
   inputSchema: {
     type: 'object',
     properties: {
@@ -338,32 +306,11 @@ const registerOrchestratorTools = async ($: EngineInterface) => {
   for (const tool of ORCHESTRATOR_TOOLS) await $.tool.register(tool as never)
 }
 
-const sessionName = async ($: EngineInterface): Promise<string | undefined> => {
-  try {
-    const [home, sessionId] = await Promise.all([$.env.get('HOME'), $.session.id()])
-    if (!home) return undefined
-    const dir = `${home}/.claude/sessions`
-    for (const { name, kind } of await $.fs.list(dir)) {
-      if (kind !== 'file' || !/^\d+\.json$/.test(name)) continue
-      try {
-        const entry = JSON.parse(await $.fs.read(`${dir}/${name}`)) as { sessionId?: string; name?: string }
-        if (entry.sessionId === sessionId && typeof entry.name === 'string') return entry.name
-      } catch {
-        // a registry file being rewritten
-      }
-    }
-  } catch {
-    // no registry
-  }
-  return undefined
-}
-
-const record = async ($: EngineInterface, entry: Omit<OrchFeedEntry, 'at'>) => {
-  const at = await $.clock.now()
+const record = async ($: EngineInterface, entry: FeedDraft) => {
   feedCount += 1
-  const id = `${at.toString(36)}-${feedCount}`
-  const full = entry.summary.trim().slice(0, FULL_MAX)
-  await update($, feedAtom, feed => pushFeed(feed, { ...entry, id, full, summary: oneLine(entry.summary), at }))
+  const id = `${entry.at.toString(36)}-${feedCount}`
+  const full = (entry.full ?? entry.summary).trim().slice(0, FULL_MAX)
+  await update($, feedAtom, feed => pushFeed(feed, { ...entry, id, full, summary: oneLine(entry.summary) }))
   await update($, scrollAtom, back => (back > 0 ? back + 1 : 0))
 }
 
@@ -380,7 +327,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__message_worker: input => `messaging ${String(input.name ?? '')}`,
   mcp__orchestrator__review_verdict: input => `sending ${String(input.verdict ?? '')} to ${String(input.name ?? '')}`,
   mcp__orchestrator__promote_worker: input => `promoting ${String(input.name ?? '')}`,
-  mcp__orchestrator__demote_worker: input => `moving ${String(input.name ?? '')} back to Sonnet`,
+  mcp__orchestrator__demote_worker: input => `moving ${String(input.name ?? '')} back down`,
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
   mcp__orchestrator__roster: () => 'checking the roster',
   Bash: input => `running ${oneLine(String(input.command ?? ''), 60)}`,
@@ -398,248 +345,322 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
 
 const describeLeadTool = (tool: string, input: Record<string, unknown>): string => LEAD_TOOL[tool]?.(input) ?? `using ${tool.replace(/^mcp__[^_]+__/, '')}`
 
-const sendControl = async (
-  $: EngineInterface,
-  worker: OrchWorker,
-  kind: string,
-  expects: Expects,
-  body: string,
-  extra: Record<string, string | undefined> = {},
-): Promise<string | undefined> => {
-  if (!worker.sessionId) return `${worker.name} has not checked in yet (no session id); try again in a few seconds`
-  const text = formatEnvelope({ to: worker.name, kind, expects, ...extra, token: worker.token }, body)
-  try {
-    const sent = await $.session.send({ to: { sessionId: worker.sessionId }, text })
-    if (sent.isDelivered) await record($, { from: '⌘', to: worker.name, kind, summary: extra.verdict ? `${extra.verdict}: ${body}` : body })
-    return sent.isDelivered ? undefined : sent.reason
-  } catch (error) {
-    return error instanceof Error ? error.message : String(error)
-  }
-}
+// ---------- the planner's tools: each is one drove command ----------
 
-const deliverBrief = async ($: EngineInterface, name: string, paneId: string, text: string): Promise<string | undefined> => {
-  const ran = await herdr($, promptArgv(name, text), 20_000)
-  const code = herdrError(ran.output)
-  if (code === undefined || code === 'timeout') return undefined
-  if (code !== 'agent_prompt_stalled') return `${code}: ${ran.output.slice(0, 300)}`
-  const listed = await herdr($, LIST_ARGV, 10_000)
-  const status = agentStatusOf(parseAgents(listed.output.split('\n')[0] ?? ''), paneId)
-  return status === 'working' || status === 'blocked' ? undefined : 'herdr typed the brief but saw no activity within 5 s (agent_prompt_stalled); it may still have landed, so check the pane before sending it again'
-}
-
-const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>) => {
+const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
   const name = String(input.name ?? '').trim()
   const brief = String(input.brief ?? '').trim()
   if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
   if (!brief) return { deny: 'A worker needs a brief.' }
+  if (input.kind !== undefined && input.kind !== 'claude' && input.kind !== 'codex') return { deny: 'kind must be claude or codex.' }
+  const kind: AgentKind = input.kind === 'codex' ? 'codex' : 'claude'
+  const cairnText = typeof input.cairn === 'string' ? input.cairn.trim() : ''
+  if (cairnText && !CAIRN_RE.test(cairnText)) return { deny: `cairn must look like CCS-12; got "${cairnText}".` }
   const effort = isEffort(input.effort) ? input.effort : config.workerEffort
-  const model = resolveModel(input.model, config.workerModel)
-  const isWorktree = input.worktree === true
-  const cairnRef = typeof input.cairn === 'string' && /^[A-Z][A-Z0-9]*-\d+$/.test(input.cairn.trim()) ? input.cairn.trim() : undefined
-  const cwd = typeof input.cwd === 'string' && input.cwd.trim() ? input.cwd.trim() : await $.session.cwd()
-
-  const sourcePane = await herdrPane($)
-  if (!sourcePane) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
-  const workers = await read($, workersAtom)
-  if (findWorker(workers, name)) return { deny: `A worker named ${name} is already open. Pick another name or message it.` }
-  const open = openWorkers(workers)
-  if (open.length >= config.maxWorkers) {
+  const model = kind === 'claude' ? resolveModel(input.model, config.workerModel) : typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
+  if (!(await herdrPane($))) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}) })
+  const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
+  pushBody(`${name}:brief`, `${label} · ${brief}`)
+  let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
+  if (ran.exitCode !== 0 && drove.failureOf(ran).code === 'over-budget') {
+    const [orchestrator, seats] = await Promise.all([read($, orchestratorAtom), read($, seatsAtom)])
+    const open = openSeats(seats).length
+    const budget = orchestrator?.budget ?? config.maxWorkers
     let answer = ''
     try {
-      answer = await $.ui.ask(`Open worker pane ${open.length + 1} (${name}, ${shortModel(model)} ${effort})? ${open.length} are open; the budget is ${config.maxWorkers}.`, {
-        header: 'Worker pane',
-        options: ['Open it', 'Not now'],
-      })
+      answer = await $.ui.ask(`Open worker pane ${open + 1} (${name}, ${label})? ${open} are open; the budget is ${budget}.`, { header: 'Worker pane', options: ['Open it', 'Not now'] })
     } catch {
       answer = ''
     }
-    if (answer !== 'Open it') return { deny: `Cal did not approve worker pane ${open.length + 1}. Reuse or close an open worker first.` }
-  }
-
-  const [parentSessionId, parentName, now] = await Promise.all([$.session.id(), sessionName($), $.clock.now()])
-  const entry: OrchWorker = { name, token: makeToken(now), cwd, model, effort, isWorktree, status: 'starting', spawnedAt: now, cairnRef }
-  await update($, workersAtom, list => [...list.filter(worker => worker.name !== name), entry])
-  await persist($)
-
-  const env = workerEnvPairs({ parentSessionId, parentName, name, token: entry.token, model, effort })
-  const placed = open.filter(worker => worker.paneId)
-  const orchestrator = await read($, orchestratorAtom)
-  const knownTab = orchestrator?.tabId
-  const isTabAlive = knownTab !== undefined && (await herdr($, tabGetArgv(knownTab), 10_000)).isOk
-  let createdTab: string | undefined
-
-  const drop = async (paneId?: string) => {
-    if (createdTab) await herdr($, tabCloseArgv(createdTab))
-    else if (paneId) await herdr($, closeArgv(paneId))
-    await update($, workersAtom, list => list.filter(worker => worker.token !== entry.token))
-    await persist($)
-  }
-
-  let paneId: string | undefined
-  let failure = ''
-  const slot = isTabAlive ? gridSlot(placed) : undefined
-  if (slot) {
-    const split = await herdr($, splitArgv(slot.anchor, slot.direction, cwd, env))
-    paneId = split.isOk ? parseSplit(split.output.split('\n')[0] ?? '') : undefined
-    failure = split.output
-  } else {
-    if (isTabAlive && knownTab) await herdr($, tabCloseArgv(knownTab))
-    const workspace = (await herdrWorkspace($)) ?? sourcePane.split(':')[0] ?? ''
-    const made = await herdr($, tabCreateArgv(workspace, cwd, `workers · ${parentName ?? 'orchestrator'}`, env))
-    const tab = made.isOk ? parseTab(made.output.split('\n')[0] ?? '') : undefined
-    failure = made.output
-    if (tab) {
-      createdTab = tab.tabId
-      paneId = tab.paneId
-      await update($, orchestratorAtom, current => (current ? { ...current, tabId: tab.tabId } : current))
+    if (answer !== 'Open it' || !orchestrator) {
+      dropBody(`${name}:brief`)
+      return { deny: `Cal did not approve worker pane ${open + 1}. Reuse or close an open worker first.` }
     }
-  }
-  if (!paneId) {
-    await drop()
-    return { deny: `herdr could not open a worker pane: ${failure.slice(0, 300)}` }
-  }
-
-  const started = await herdr($, retryWhileBusy(startArgv(name, paneId, model, effort, isWorktree ? name : undefined)), 120_000)
-  if (!started.isOk) {
-    if (herdrError(started.output) === 'agent_not_ready') {
-      await patchWorker($, { ...entry, paneId, status: 'blocked' })
-      $.ui.toast(`Worker ${name} is waiting on a dialog in pane ${paneId}`, { timeoutMs: 10_000 })
-      return { result: `Worker ${name} started in pane ${paneId} but stopped on a dialog at startup (folder trust or similar). Ask Cal to answer it in that pane, then send the brief with message_worker.` }
+    const raised = await runDrove($, drove.budgetArgs(orchestrator.run, budget + 1), { cwd: orchestrator.repo, env: (await droveHome($)) ? { DROVE_HOME: (await droveHome($)) ?? '' } : {} })
+    if (raised.exitCode !== 0) {
+      dropBody(`${name}:brief`)
+      return answerOf(raised)
     }
-    await drop(paneId)
-    return { deny: `herdr could not start Claude in pane ${paneId}, so that pane was closed again and no worker exists: ${started.output.slice(0, 300)}` }
+    await update($, orchestratorAtom, current => (current ? { ...current, budget: budget + 1 } : current))
+    ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
   }
-
-  await patchWorker($, { ...entry, paneId, status: 'working', lastWorkingAt: now })
-  const briefError = await deliverBrief($, name, paneId, `${brief}${BRIEF_FOOTER(name, cairnRef)}`)
-  await record($, { from: '⌘', to: name, kind: 'brief', summary: `${shortModel(model)} ${effort}${isWorktree ? ' · worktree' : ''} · ${brief}` })
-  $.ui.toast(`Worker ${name}: ${shortModel(model)} ${effort}${isWorktree ? ', own worktree' : ''}`)
-  return {
-    result: [
-      `Worker ${name} is running in pane ${paneId} on ${shortModel(model)} at ${effort} effort${isWorktree ? ' in its own worktree' : ''}.`,
-      briefError ? `The brief may not have arrived: ${briefError}.` : 'The brief was delivered. Its reports will arrive here as messages; do not poll.',
-    ].join(' '),
+  if (ran.exitCode !== 0) {
+    dropBody(`${name}:brief`)
+    return answerOf(ran)
   }
+  $.ui.toast(`Worker ${name}: ${label}`)
+  return { result: `${ran.stdout.trim()} Its reports will arrive here as messages; do not poll.` }
 }
 
-const workerOr = async ($: EngineInterface, input: Record<string, unknown>) => {
+const messageWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
   const name = String(input.name ?? '').trim()
-  const worker = findWorker(await read($, workersAtom), name)
-  return { name, worker }
-}
-
-const messageWorker = async ($: EngineInterface, input: Record<string, unknown>) => {
-  const { name, worker } = await workerOr($, input)
-  if (!worker) return { deny: `No open worker is named ${name}.` }
   const text = String(input.text ?? '').trim()
   if (!text) return { deny: 'The message is empty.' }
   const expects = isExpects(input.expects) ? input.expects : 'none'
-  const failed = await sendControl($, worker, 'message', expects, text)
-  return failed ? { deny: `Not delivered to ${name}: ${failed}` } : { result: `Sent to ${name} (expects ${expects}).` }
+  pushBody(`${name}:message`, text)
+  const ran = await plannerRun($, drove.messageArgs(name, expects), { stdin: text })
+  if (ran.exitCode !== 0) dropBody(`${name}:message`)
+  return answerOf(ran)
 }
 
-const APPROVED =
-  'Approved. Commit only your own paths now (git add <paths>; never -A or .), on your branch. Do not push. Then confirm with a done report carrying the branch and commit sha, expects none, and stop.'
-
-const reviewVerdict = async ($: EngineInterface, input: Record<string, unknown>) => {
-  const { name, worker } = await workerOr($, input)
-  if (!worker) return { deny: `No open worker is named ${name}.` }
+const reviewVerdict = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
   const verdict = input.verdict === 'approve' ? 'approve' : input.verdict === 'changes' ? 'changes' : undefined
   if (!verdict) return { deny: 'verdict must be approve or changes.' }
   const notes = String(input.notes ?? '').trim()
   if (verdict === 'changes' && !notes) return { deny: 'Say which changes are needed in notes.' }
-  const body = verdict === 'approve' ? [notes, APPROVED].filter(Boolean).join('\n\n') : `${notes}\n\nFix these, verify again, then send a done report.`
-  const failed = await sendControl($, worker, 'verdict', verdict === 'approve' ? 'none' : 'review', body, { verdict })
-  if (failed) return { deny: `Not delivered to ${name}: ${failed}` }
-  await patchWorker($, { ...worker, status: 'working' })
-  return { result: `Verdict ${verdict} sent to ${name}.` }
+  pushBody(`${name}:verdict`, `${verdict}${notes ? `: ${notes}` : ''}`)
+  const ran = await plannerRun($, drove.verdictArgs(name, verdict), { stdin: notes })
+  if (ran.exitCode !== 0) dropBody(`${name}:verdict`)
+  return answerOf(ran)
 }
 
-const moveWorker = async ($: EngineInterface, input: Record<string, unknown>, direction: 'promote' | 'demote') => {
-  const { name, worker } = await workerOr($, input)
-  if (!worker) return { deny: `No open worker is named ${name}.` }
-  const model = direction === 'promote' ? resolveModel(input.model, config.promotedModel) : config.workerModel
+const moveWorker = async ($: EngineInterface, input: Record<string, unknown>, direction: 'promote' | 'demote'): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  const seat = findSeat(await read($, seatsAtom), name)
+  if (!seat) return { deny: `No open worker is named ${name}.` }
+  const given = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
+  const model = seat.kind === 'claude' ? (direction === 'promote' ? resolveModel(given, config.promotedModel) : config.workerModel) : (given ?? seat.model)
+  if (!model) return { deny: `Say which model ${name} (a Codex worker on Drove's default model) should move to.` }
   const effort = isEffort(input.effort) ? input.effort : direction === 'promote' ? 'high' : config.workerEffort
   const reason = String(input.reason ?? '').trim()
-  const body = direction === 'promote'
-    ? `Promoted to ${shortModel(model)} at ${effort} effort${reason ? `: ${reason}` : ''}. Carry on with the hard part.`
-    : `Moved back to ${shortModel(model)} at ${effort} effort. Carry on.`
-  const failed = await sendControl($, worker, direction, 'none', body, { model, effort })
-  if (failed) return { deny: `Not delivered to ${name}: ${failed}` }
-  await patchWorker($, { ...worker, model, effort })
+  pushBody(`${name}:${direction}`, `${shortModel(model)} ${effort}${reason ? `: ${reason}` : ''}`)
+  const ran = await plannerRun($, drove.promoteArgs(name, model, effort, reason || undefined), { timeoutMs: SPAWN_TIMEOUT_MS })
+  if (ran.exitCode !== 0) {
+    dropBody(`${name}:${direction}`)
+    return answerOf(ran)
+  }
   $.ui.toast(`${name} → ${shortModel(model)} ${effort}`)
-  return { result: `${name} now runs on ${shortModel(model)} at ${effort} effort from its next request.` }
+  return answerOf(ran)
 }
 
-const closeWorker = async ($: EngineInterface, input: Record<string, unknown>) => {
-  const { name, worker } = await workerOr($, input)
-  if (!worker) return { deny: `No open worker is named ${name}.` }
-  if (worker.paneId) {
-    const closed = await herdr($, closeArgv(worker.paneId))
-    if (!closed.isOk && !/not.?found|no such|unknown pane/i.test(closed.output)) return { deny: `herdr could not close pane ${worker.paneId}: ${closed.output.slice(0, 300)}` }
+const closeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> =>
+  answerOf(await plannerRun($, drove.closeArgs(String(input.name ?? '').trim(), input.remove_worktree === true)))
+
+const rosterTool = async ($: EngineInterface): Promise<ToolAnswer> => {
+  const orchestrator = await read($, orchestratorAtom)
+  return orchestrator ? answerOf(await plannerRun($, drove.rosterArgs(orchestrator.run))) : { deny: OFF }
+}
+
+// ---------- the bridge: Drove's watcher in a child process, streaming wakes, the roster and events ----------
+
+const onBridgeLine = async ($: EngineInterface, line: BridgeLine) => {
+  const now = await $.clock.now()
+  if (line.t === 'ready') {
+    bridgeTries = 0
+    await update($, bridgeAtom, () => ({ state: 'up', since: now }) satisfies OrchBridge)
+    return
   }
-  await patchWorker($, { ...worker, status: 'closed' })
-  await record($, { from: '⌘', to: name, kind: 'close', summary: 'pane closed' })
-  await closeTabIfEmpty($)
-  const worktree = worker.isWorktree ? ` Its worktree (.claude/worktrees/${name}, branch worktree-${name}) is still on disk and locked: merge the branch, then remove it with git worktree remove --force .claude/worktrees/${name}.` : ''
-  return { result: `Closed ${name}${worker.paneId ? ` (pane ${worker.paneId})` : ''}.${worktree}` }
+  if (line.t === 'busy') {
+    await update($, bridgeAtom, () => ({ state: 'busy', detail: `pid ${line.pid}`, since: now }) satisfies OrchBridge)
+    return
+  }
+  if (line.t === 'fatal') {
+    await update($, bridgeAtom, () => ({ state: 'failed', detail: line.text, since: now }) satisfies OrchBridge)
+    return
+  }
+  if (line.t === 'error') {
+    $.ui.log(`orchestrator: drove bridge ${line.step}: ${line.message}`, { to: 'debug' })
+    return
+  }
+  if (line.t === 'run') {
+    lastRun = line.run
+    await update($, orchestratorAtom, current => (current ? { ...current, budget: line.run.budget, goal: current.goal ?? line.run.goal } : current))
+    return
+  }
+  if (line.t === 'roster') {
+    const [before, asksAt] = await Promise.all([read($, statusAtom), read($, asksAtAtom)])
+    const nextAsks = { ...asksAt }
+    for (const seat of line.roster.seats) {
+      const was = before[seat.name]?.asking
+      const is = line.status[seat.name]?.asking
+      if (is && !was) {
+        nextAsks[seat.name] = now
+        $.ui.toast(`${seat.name} is waiting for you in its pane: ${oneLine(is, 120)}`, { timeoutMs: 15_000 })
+        await record($, { at: now, from: seat.name, to: 'Cal', kind: 'asking', summary: is })
+      } else if (!is && was) {
+        delete nextAsks[seat.name]
+        await record($, { at: now, from: 'Cal', to: seat.name, kind: 'answered', summary: 'answered in its pane' })
+      }
+    }
+    await update($, seatsAtom, () => line.roster.seats)
+    await update($, statusAtom, () => line.status)
+    await update($, asksAtAtom, () => nextAsks)
+    ensureAnimator($)
+    return
+  }
+  if (line.t === 'events') {
+    if (line.isInitial && (await read($, feedAtom)).length > 0) return
+    for (const event of line.events) {
+      const draft = feedOf(event, bodies)
+      if (!draft) continue
+      await record($, draft)
+      if (line.isInitial) continue
+      if (draft.kind === 'gone') $.ui.toast(`${draft.from}'s pane is gone`)
+      if (draft.kind === 'blocked') $.ui.toast(`${draft.from} is ${draft.summary}`, { timeoutMs: 10_000 })
+      if (draft.kind === 'failed' || draft.kind === 'attention') $.ui.toast(`${draft.from === '⌘' ? draft.to : draft.from}: ${oneLine(draft.summary, 100)}`, { timeoutMs: 10_000 })
+    }
+    return
+  }
+  const blocks = splitWake(line.text)
+  if (blocks.length > 0) {
+    await update($, feedAtom, feed => {
+      const next = [...feed]
+      for (const block of blocks) {
+        for (let at = next.length - 1; at >= 0; at -= 1) {
+          const entry = next[at]
+          if (entry && entry.from === block.seat && entry.kind === block.kind && entry.full === entry.summary) {
+            next[at] = { ...entry, full: block.text.slice(0, FULL_MAX) }
+            break
+          }
+        }
+      }
+      return next
+    })
+    $.ui.toast(toastOf(blocks))
+    if (config.effortRouting && blocks.some(({ kind }) => kind !== 'done')) pendingRouting = true
+  }
+  const text = line.text
+  soon($, 0, () => $.prompt.submit({ text }))
 }
 
-const sendReport = async ($: EngineInterface, input: Record<string, unknown>) => {
-  const self = await read($, workerAtom)
-  if (!self) return { deny: 'This session is not an orchestrator worker.' }
-  const kind = input.kind
-  if (!isReportKind(kind) || kind === 'hello' || kind === 'status') return { deny: 'kind must be done, question, blocked, promote or progress.' }
-  const summary = String(input.summary ?? '').split('\n')[0]?.trim() ?? ''
-  if (!summary) return { deny: 'A report needs a one-line summary.' }
-  const details = String(input.details ?? '').trim()
-  const expects = isExpects(input.expects) ? input.expects : defaultExpects(kind)
-  const forWho = kind === 'question' && input.for === 'cal' ? 'cal' : undefined
-  const text = formatEnvelope({ worker: self.name, kind, expects, for: forWho, token: self.token }, [summary, details].filter(Boolean).join('\n\n'))
+const superviseBridge = async ($: EngineInterface, run: string, epoch: number) => {
+  const [sessionId, home, startedAt] = await Promise.all([$.session.id(), droveHome($), $.clock.now()])
+  if (epoch !== bridgeEpoch) return
+  await update($, bridgeAtom, current => (current?.state === 'busy' ? current : ({ state: 'starting', since: startedAt }) satisfies OrchBridge))
+  let buffer = ''
+  let stderr = ''
+  let isBusy = false
+  let fatal: string | undefined
+  let code: number | null | undefined
   try {
-    const sent = await $.session.send({ to: { sessionId: self.parentSessionId }, text })
-    if (!sent.isDelivered) return { deny: `Not delivered to the orchestrator: ${sent.reason}. Tell Cal in your answer instead.` }
+    const stream = $.process.spawn({ argv: [config.nodePath, entryOf($), ...drove.bridgeArgs(run, sessionId)], env: home ? { DROVE_HOME: home } : {} })
+    bridgeStream = stream as never
+    for await (const chunk of stream) {
+      if (epoch !== bridgeEpoch) break
+      if (chunk.stream === 'stderr') {
+        stderr = `${stderr}${chunk.text}`.slice(-600)
+        continue
+      }
+      const split = splitLines(buffer + chunk.text)
+      buffer = split.rest
+      for (const raw of split.lines) {
+        const line = parseLine(raw)
+        if (!line) continue
+        if (line.t === 'busy') isBusy = true
+        if (line.t === 'fatal') fatal = line.text
+        await onBridgeLine($, line)
+      }
+    }
+    if (epoch === bridgeEpoch) code = (await stream.result.catch(() => undefined))?.code
   } catch (error) {
-    return { deny: `Not delivered to the orchestrator: ${error instanceof Error ? error.message : String(error)}` }
+    stderr = `${stderr}${messageOf(error)}`
   }
-  return { result: expects === 'none' ? 'Delivered. Nothing is expected back; carry on.' : `Delivered. The orchestrator owes you ${expects === 'review' ? 'a review' : 'an answer'}; wait for it (it arrives as a message) and end your turn now.` }
+  if (epoch !== bridgeEpoch) return
+  bridgeStream = undefined
+  const now = await $.clock.now()
+  if (code === BRIDGE_EXIT.detached) {
+    await detach($, run)
+    return
+  }
+  if (code === BRIDGE_EXIT.fatal || fatal) {
+    await update($, bridgeAtom, () => ({ state: 'failed', detail: oneLine(fatal ?? stderr, 160), since: now }) satisfies OrchBridge)
+    $.ui.toast(`Orchestrator: the Drove bridge stopped: ${oneLine(fatal ?? stderr, 120)}`, { timeoutMs: 15_000 })
+    return
+  }
+  bridgeTries = now - startedAt > 60_000 ? 0 : bridgeTries + 1
+  if (bridgeTries === 3) $.ui.toast(`Orchestrator: the Drove bridge keeps exiting (${oneLine(stderr || `exit ${code ?? '?'}`, 100)}); retrying`, { timeoutMs: 15_000 })
+  await update($, bridgeAtom, () => (isBusy ? { state: 'busy', since: now } : { state: 'starting', detail: oneLine(stderr || `exited ${code ?? '?'}`, 160), since: now }) satisfies OrchBridge)
+  soon($, backoffMs(bridgeTries, isBusy), async () => {
+    if (epoch === bridgeEpoch) await superviseBridge($, run, epoch)
+  })
 }
 
-const sayHello = async ($: EngineInterface, self: OrchWorkerSelf) => {
-  try {
-    const sessionId = await $.session.id()
-    const text = formatEnvelope({ worker: self.name, kind: 'hello', expects: 'none', session: sessionId, token: self.token }, `${self.name} is up.`)
-    await $.session.send({ to: { sessionId: self.parentSessionId }, text })
-  } catch {
-    // the orchestrator also learns the session id from herdr
-  }
+const startBridge = ($: EngineInterface, run: string) => {
+  bridgeEpoch += 1
+  bridgeTries = 0
+  const epoch = bridgeEpoch
+  void quietly(() => superviseBridge($, run, epoch))
 }
 
-let workerActivity = ''
+// Ending the stream kills the child; nothing waits on it, so turning the mode off never hangs on the bridge.
+const endBridge = () => {
+  bridgeEpoch += 1
+  const stream = bridgeStream
+  bridgeStream = undefined
+  if (stream) void quietly(() => stream.return())
+}
+
+const stopBridge = async ($: EngineInterface) => {
+  endBridge()
+  await update($, bridgeAtom, () => null)
+}
+
+const clearOrchestration = async ($: EngineInterface) => {
+  await stopBridge($)
+  await closeBoard($)
+  await update($, orchestratorAtom, () => null)
+  await update($, seatsAtom, () => [])
+  await update($, statusAtom, () => ({}))
+  await update($, asksAtAtom, () => ({}))
+  await update($, feedAtom, () => [])
+  await update($, scrollAtom, () => 0)
+  await update($, expandedAtom, () => null)
+  await update($, leadAtom, () => null)
+  await persist($)
+}
+
+const detach = async ($: EngineInterface, run: string) => {
+  const isDown = lastRun?.id === run && lastRun.status === 'down'
+  await clearOrchestration($)
+  $.ui.toast(isDown ? `Drove run ${run} is down; orchestrator mode is off.` : `Drove run ${run} has another planner now; orchestrator mode is off here.`, { timeoutMs: 15_000 })
+}
+
+// ---------- worker side: a Claude worker that Drove launched ----------
+
+let workerToken: string | undefined
+let workerStatus: OrchModStatus = {}
 let workerStatusAt = 0
-let isWorkerAsking = false
-let workerCtx: number | undefined
 let workerCtxSent: number | undefined
+let isWorkerAsking = false
 const STATUS_EVERY_MS = 10_000
 
-const sendStatus = async ($: EngineInterface, self: OrchWorkerSelf, state: 'working' | 'asking', text: string) => {
+const workerPaths = (self: OrchWorkerSelf) => ({
+  roster: `${self.home}/runs/${self.run}/roster.json`,
+  status: `${self.home}/runs/${self.run}/seats/${self.name}/mod.json`,
+})
+
+const refreshSelf = async ($: EngineInterface) => {
+  const self = await read($, workerAtom)
+  if (!self) return
   try {
-    const at = await $.clock.now()
-    workerStatusAt = at
-    workerActivity = text
-    workerCtxSent = workerCtx
-    const envelope = formatEnvelope({ worker: self.name, kind: 'status', expects: 'none', state, ctx: workerCtx === undefined ? undefined : String(workerCtx), token: self.token }, text)
-    await $.session.send({ to: { sessionId: self.parentSessionId }, text: envelope })
+    const roster = JSON.parse(await $.fs.read(workerPaths(self).roster)) as { seats?: Seat[] }
+    const seat = roster.seats?.find(({ name }) => name === self.name)
+    if (seat && (seat.model !== self.model || seat.effort !== self.effort)) await update($, workerAtom, current => (current ? { ...current, model: seat.model || undefined, effort: seat.effort } : current))
+  } catch {
+    // keep the last known model and effort
+  }
+}
+
+const writeStatus = async ($: EngineInterface, patch: OrchModStatus) => {
+  const self = await read($, workerAtom)
+  if (!self) return
+  try {
+    const now = await $.clock.now()
+    workerStatusAt = now
+    workerStatus = { ...workerStatus, ...patch, at: new Date(now).toISOString() }
+    workerCtxSent = workerStatus.ctx
+    await $.fs.write(workerPaths(self).status, JSON.stringify(workerStatus))
   } catch {
     // the board just misses one update
   }
 }
 
-const noteActivity = async ($: EngineInterface, self: OrchWorkerSelf, text: string) => {
-  if (isWorkerAsking || text === workerActivity) return
-  const at = await $.clock.now()
-  if (at - workerStatusAt < STATUS_EVERY_MS) return
-  await sendStatus($, self, 'working', text)
+const noteActivity = async ($: EngineInterface, text: string) => {
+  if (isWorkerAsking || text === workerStatus.activity) return
+  if ((await $.clock.now()) - workerStatusAt < STATUS_EVERY_MS) return
+  await writeStatus($, { activity: text })
 }
 
 const questionOf = (input: Record<string, unknown>): string => {
@@ -648,129 +669,61 @@ const questionOf = (input: Record<string, unknown>): string => {
   return typeof first?.question === 'string' ? first.question : 'a question'
 }
 
-const handleReport = async ($: EngineInterface, located: Located): Promise<{ consumed: string } | { text: string }> => {
-  const { fields, body } = located.envelope
-  const workers = await read($, workersAtom)
-  const worker = workers.find(item => item.name === fields.worker && item.token === fields.token)
-  const kind = fields.kind
-  if (!worker || !isReportKind(kind)) return { text: replaceEnvelope(located, `${UNVERIFIED}\n${stripToken(formatEnvelope(fields, body))}`) }
-  if (kind === 'status') {
-    const isAsking = fields.state === 'asking'
-    const at = await $.clock.now()
-    const status: OrchWorkerStatus = isAsking ? 'blocked' : worker.status === 'done' && !body ? 'done' : 'working'
-    const ctx = Number(fields.ctx)
-    await patchWorker($, {
-      ...worker,
-      isAsking,
-      status,
-      activity: oneLine(body, 160) || worker.activity,
-      ...(Number.isFinite(ctx) && fields.ctx !== undefined ? { ctx: Math.round(ctx) } : {}),
-      ...(isAsking ? (worker.isAsking ? {} : { asksAt: at }) : { lastWorkingAt: at, asksAt: undefined }),
-    })
-    ensureAnimator($)
-    if (isAsking && !worker.isAsking) {
-      $.ui.toast(`${worker.name} is waiting for you in its pane: ${oneLine(body, 120)}`, { timeoutMs: 15_000 })
-      await record($, { from: worker.name, to: 'Cal', kind: 'asking', summary: body })
-    } else if (!isAsking && worker.isAsking) {
-      await record($, { from: 'Cal', to: worker.name, kind: 'answered', summary: 'answered in its pane' })
-    }
-    return { consumed: `orchestrator: status from ${worker.name}` }
-  }
-  if (kind === 'hello') {
-    await patchWorker($, { ...worker, sessionId: fields.session ?? worker.sessionId })
-    await record($, { from: worker.name, to: '⌘', kind: 'hello', summary: 'checked in', isHidden: true })
-    return { consumed: `orchestrator: ${worker.name} checked in` }
-  }
-  const expects = isExpects(fields.expects) ? fields.expects : defaultExpects(kind)
-  const now = await $.clock.now()
-  const status: OrchWorkerStatus = kind === 'done' ? 'done' : kind === 'blocked' ? 'blocked' : worker.status
-  await patchWorker($, { ...worker, status, lastReport: { kind, summary: body.split('\n')[0] ?? '', at: now }, hasNudged: false })
-  const isSwallowed = kind === 'progress' && expects === 'none'
-  await record($, { from: worker.name, to: '⌘', kind, summary: `${expects !== 'none' ? `expects ${expects} · ` : ''}${body}`, isHidden: isSwallowed })
-  if (isSwallowed) return { consumed: `orchestrator: progress from ${worker.name}` }
-  if (config.effortRouting && kind !== 'done') pendingRouting = true
-  $.ui.toast(`${worker.name}: ${kind}`)
-  return { text: replaceEnvelope(located, renderReport(worker.name, kind, expects, body, fields.for === 'cal')) }
+const startWorker = async ($: EngineInterface) => {
+  const [run, seat, token, home] = await Promise.all([$.env.get('DROVE_RUN'), $.env.get('DROVE_SEAT'), $.env.get('DROVE_TOKEN'), homeDir($)])
+  if (!run || !seat) return
+  workerToken = token || undefined
+  await update($, workerAtom, current => (current?.name === seat && current.run === run ? current : { name: seat, run, home }))
+  await $.tool.register(REPORT_TOOL as never)
+  await refreshSelf($)
 }
 
-const handleControl = async ($: EngineInterface, located: Located): Promise<{ text: string }> => {
-  const { fields, body } = located.envelope
-  const self = await read($, workerAtom)
-  if (!self || fields.token !== self.token || fields.to !== self.name) return { text: replaceEnvelope(located, `${UNVERIFIED}\n${stripToken(formatEnvelope(fields, body))}`) }
-  const parent = self.parentName ?? 'parent'
-  const kind = fields.kind ?? 'message'
-  const expects = fields.expects ?? 'none'
-  if (kind === 'promote' || kind === 'demote') {
-    const model = fields.model ?? self.model
-    const effort = isEffort(fields.effort) ? fields.effort : self.effort
-    await update($, workerAtom, current => (current ? { ...current, model, effort } : current))
-    $.ui.toast(`${kind === 'promote' ? 'Promoted' : 'Moved'} to ${model ? shortModel(model) : 'the same model'} at ${effort ?? 'the same'} effort`)
-  }
-  return { text: replaceEnvelope(located, renderControl(parent, kind, expects, body, kind === 'verdict' && fields.verdict ? `: ${fields.verdict}` : '')) }
+const sendReport = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  if (!(await read($, workerAtom))) return { deny: 'This session is not a Drove worker.' }
+  const forWho = input.for === 'cal' || input.for === 'human' ? { for: 'human' } : {}
+  const args = { kind: input.kind, summary: input.summary, ...(input.details !== undefined ? { details: input.details } : {}), ...(input.expects !== undefined ? { expects: input.expects } : {}), ...forWho }
+  const result = drove.jsonResultOf(await runDrove($, ['mod', 'report'], { stdin: JSON.stringify(args) }))
+  return result.ok ? { result: result.text } : { deny: `Not recorded: ${result.text}. Use mcp__drove__report, or tell Cal in your answer.` }
 }
 
-const handleInbound = async ($: EngineInterface, text: string): Promise<{ consumed: string } | { text: string } | undefined> => {
+const handleControl = async ($: EngineInterface, text: string): Promise<string | undefined> => {
   const located = locateEnvelope(text)
   if (!located) return undefined
-  const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
-  if (orchestrator && located.envelope.fields.worker !== undefined) return handleReport($, located)
-  if (self && located.envelope.fields.to !== undefined) return handleControl($, located)
-  return { text: stripToken(text) }
-}
-
-const tick = async ($: EngineInterface) => {
-  if (isTicking) return
-  isTicking = true
-  try {
-    tickCount += 1
-    const [orchestrator, workers] = await Promise.all([read($, orchestratorAtom), read($, workersAtom)])
-    if (!orchestrator || !openWorkers(workers).some(worker => worker.paneId)) return
-    if (tickCount % SLOW_TICKS !== 0 && !(await isBoardOpen($))) return
-    const listed = await herdr($, LIST_ARGV, 10_000)
-    const agents = listed.isOk ? parseAgents(listed.output.split('\n')[0] ?? '') : undefined
-    if (!agents) return
-    const now = await $.clock.now()
-    const observed = workers.map(worker => observe(worker, agents, now))
-    if (observed.every(({ worker }, at) => worker === workers[at])) return
-    await update($, workersAtom, () => observed.map(({ worker }) => worker))
-    await persist($)
-    for (const { worker, events } of observed) {
-      if (events.includes('blocked')) $.ui.toast(`${worker.name} is blocked on a dialog in pane ${worker.paneId}`, { timeoutMs: 10_000 })
-      if (events.includes('gone')) {
-        $.ui.toast(`${worker.name}'s pane is gone`)
-        await record($, { from: worker.name, to: '⌘', kind: 'gone', summary: 'its pane closed' })
-      }
-      if (events.includes('blocked')) await record($, { from: worker.name, to: '⌘', kind: 'blocked', summary: 'waiting on a dialog in its pane' })
-      if (events.includes('idle-without-report')) {
-        await sendControl($, worker, 'nudge', 'answer', 'You stopped without a report. If you finished, send a done report; if you are stuck or need a decision, say so with a report.')
-      }
-    }
-  } finally {
-    isTicking = false
+  const isVerified = await verifyEnvelope(located.envelope, workerToken)
+  const { fields } = located.envelope
+  if (isVerified && (fields.kind === 'promote' || fields.kind === 'demote')) {
+    const effort = isEffort(fields.effort) ? fields.effort : undefined
+    await update($, workerAtom, current => (current ? { ...current, ...(fields.model ? { model: fields.model } : {}), ...(effort ? { effort } : {}) } : current))
+    $.ui.toast(`${fields.kind === 'promote' ? 'Promoted' : 'Moved'} to ${fields.model ? shortModel(fields.model) : 'the same model'} at ${effort ?? 'the same'} effort`)
   }
+  return `${located.before}${renderControl(located.envelope, isVerified)}`
 }
 
-const ensureTicker = ($: EngineInterface) => {
-  ticker ??= $.clock.every(TICK_MS, () => void tick($))
-}
+// ---------- board, pills, mode ----------
+
+let animatorRuns = false
 
 const animate = async ($: EngineInterface) => {
   try {
-    const [orchestrator, workers, lead, now] = await Promise.all([read($, orchestratorAtom), read($, workersAtom), read($, leadAtom), $.clock.now()])
-    if (!orchestrator || !needsAnimation(lead, workers, now) || !(await isBoardOpen($))) {
+    const [orchestrator, seats, asksAt, lead, now] = await Promise.all([read($, orchestratorAtom), read($, seatsAtom), read($, asksAtAtom), read($, leadAtom), $.clock.now()])
+    if (!orchestrator || !needsAnimation(lead, seats, asksAt, now) || !(await isBoardOpen($))) {
       animator?.cancel()
       animator = undefined
+      animatorRuns = false
       return
     }
     await update($, frameAtom, frame => (frame + 1) % 1000)
   } catch {
     animator?.cancel()
     animator = undefined
+    animatorRuns = false
   }
 }
 
 const ensureAnimator = ($: EngineInterface) => {
-  animator ??= $.clock.every(FRAME_MS, () => void animate($))
+  if (animatorRuns) return
+  animatorRuns = true
+  animator = $.clock.every(FRAME_MS, () => void animate($))
 }
 
 const isBoardOpen = async ($: EngineInterface): Promise<boolean> => {
@@ -798,90 +751,136 @@ const closeBoard = async ($: EngineInterface) => {
   }
 }
 
+type Attached = { ok: true; run: RunMeta } | { ok: false; text: string }
+
+const attachRun = async ($: EngineInterface, input: { goal?: string; run?: string; budget?: number }): Promise<Attached> => {
+  const [sessionId, paneId, cwd, home] = await Promise.all([$.session.id(), herdrPane($), $.session.cwd(), droveHome($)])
+  const ran = await runDrove(
+    $,
+    drove.attachArgs({ sessionId, paneId, goal: input.goal, model: config.orchestratorModel, effort: config.orchestratorEffort, budget: input.budget, run: input.run }),
+    { cwd, env: home ? { DROVE_HOME: home } : {} },
+  )
+  const result = drove.jsonResultOf<{ run: RunMeta }>(ran)
+  const run = drove.runOf(result)
+  return run ? { ok: true, run } : { ok: false, text: result.ok ? 'Drove returned no run' : `${result.text} [${result.code}]` }
+}
+
 const restore = async ($: EngineInterface) => {
   try {
-    const saved = (await $.store.get(`${STORE_PREFIX}${await $.session.id()}`)) as { orchestrator?: OrchOrchestrator; workers?: OrchWorker[] } | undefined
-    if (!saved?.orchestrator) return
-    await update($, orchestratorAtom, () => saved.orchestrator ?? null)
-    await update($, workersAtom, () => (Array.isArray(saved.workers) ? saved.workers : []))
+    const sessionId = await $.session.id()
+    const legacy = (await $.store.get(`${LEGACY_PREFIX}${sessionId}`)) as { orchestrator?: unknown; workers?: { status?: string }[] } | undefined
+    if (legacy?.orchestrator) {
+      const open = (legacy.workers ?? []).filter(({ status }) => status !== 'closed' && status !== 'gone').length
+      $.ui.toast(`An orchestration from the old orchestrator mod was found for this session; its ${open} open worker(s) were not adopted (they use the retired protocol). Close their panes by hand.`, { timeoutMs: 20_000 })
+      await $.store.delete(`${LEGACY_PREFIX}${sessionId}`)
+    }
+    const saved = (await $.store.get(`${STORE_PREFIX}${sessionId}`)) as { run?: string; goal?: string; startedAt?: number } | undefined
+    if (!saved?.run) return
+    const attached = await attachRun($, { run: saved.run })
+    if (!attached.ok) {
+      await $.store.delete(`${STORE_PREFIX}${sessionId}`)
+      await update($, orchestratorAtom, () => null)
+      $.ui.toast(`Orchestrator: run ${saved.run} could not be re-attached (${attached.text}); orchestrator mode is off.`, { timeoutMs: 15_000 })
+      return
+    }
+    const now = await $.clock.now()
+    await update($, orchestratorAtom, current => ({
+      run: attached.run.id,
+      repo: attached.run.repo,
+      goal: current?.goal ?? saved.goal ?? attached.run.goal,
+      startedAt: current?.startedAt ?? saved.startedAt ?? now,
+      budget: attached.run.budget,
+    }))
+    lastRun = attached.run
     await registerOrchestratorTools($)
     await openBoard($)
+    startBridge($, attached.run.id)
   } catch {
     // nothing saved
   }
 }
 
 const statusText = async ($: EngineInterface): Promise<string> => {
-  const [orchestrator, workers, now] = await Promise.all([read($, orchestratorAtom), read($, workersAtom), $.clock.now()])
+  const [orchestrator, bridge] = await Promise.all([read($, orchestratorAtom), read($, bridgeAtom)])
   if (!orchestrator) return 'Orchestrator mode is off. `/orchestrate <goal>` turns it on.'
-  return [`Orchestrator mode is on${orchestrator.goal ? ` · goal: ${orchestrator.goal}` : ''}.`, ...rosterLines(workers, now)].join('\n')
+  const roster = await plannerRun($, drove.rosterArgs(orchestrator.run))
+  return [
+    `Orchestrator mode is on · Drove run ${orchestrator.run}${orchestrator.goal ? ` · goal: ${orchestrator.goal}` : ''} · bridge ${bridge?.state ?? 'not started'}${bridge?.detail ? ` (${bridge.detail})` : ''}.`,
+    roster.exitCode === 0 ? roster.stdout.trim() : `roster unavailable: ${drove.failureOf(roster).text}`,
+  ].join('\n')
 }
 
 const turnOn = async ($: EngineInterface, goal: string) => {
-  const [current, now, pane] = await Promise.all([read($, orchestratorAtom), $.clock.now(), herdrPane($)])
-  await update($, orchestratorAtom, () => ({ goal: goal || current?.goal, startedAt: current?.startedAt ?? now }))
+  const current = await read($, orchestratorAtom)
+  if (current) {
+    if (goal) {
+      await update($, orchestratorAtom, state => (state ? { ...state, goal } : state))
+      await persist($)
+      soon($, 0, () => $.prompt.submit({ text: goal, asUser: true }))
+    }
+    return { text: `Orchestrator mode is already on (Drove run ${current.run}).` }
+  }
+  if (!(await herdrPane($))) return { text: 'This session is not in a herdr pane (HERDR_PANE_ID is unset), so it cannot orchestrate workers. Start Claude in a herdr pane first.' }
+  const attached = await attachRun($, { goal: goal || undefined, budget: config.maxWorkers })
+  if (!attached.ok) return { text: `Orchestrator mode could not start: Drove said ${attached.text}` }
+  const now = await $.clock.now()
+  await update($, orchestratorAtom, () => ({ run: attached.run.id, repo: attached.run.repo, goal: goal || attached.run.goal, startedAt: now, budget: attached.run.budget }) satisfies OrchOrchestrator)
+  lastRun = attached.run
   await registerOrchestratorTools($)
   await persist($)
   await setLead($, goal ? 'planning' : 'waiting for a goal')
   await openBoard($)
-  if (goal) $.clock.after(0, () => void $.prompt.submit({ text: goal, asUser: true }))
-  const lines = [
-    `Orchestrator mode is on: ${shortModel(config.orchestratorModel)} at ${config.orchestratorEffort} effort or more, no code edits, up to ${config.maxWorkers} worker panes before a dialog.`,
-    pane ? '' : 'This session is not in a herdr pane, so it cannot open workers.',
-    goal ? '' : 'Give it a goal in your next prompt.',
-  ]
+  startBridge($, attached.run.id)
+  if (goal) soon($, 0, () => $.prompt.submit({ text: goal, asUser: true }))
   return {
-    text: lines.filter(Boolean).join('\n'),
+    text: [
+      `Orchestrator mode is on: Drove run ${attached.run.id}, ${shortModel(config.orchestratorModel)} at ${config.orchestratorEffort} effort or more, no code edits, up to ${attached.run.budget} worker panes before a dialog.`,
+      goal ? '' : 'Give it a goal in your next prompt.',
+    ]
+      .filter(Boolean)
+      .join('\n'),
     context: [`Cal switched this session into orchestrator mode${goal ? ` for: ${goal}` : ''}. Follow the "Orchestrator mode" section of your instructions from now on.`],
   }
 }
 
 const turnOff = async ($: EngineInterface) => {
-  const [orchestrator, workers] = await Promise.all([read($, orchestratorAtom), read($, workersAtom)])
+  const [orchestrator, seats] = await Promise.all([read($, orchestratorAtom), read($, seatsAtom)])
   if (!orchestrator) return { text: 'Orchestrator mode is already off.' }
-  const open = openWorkers(workers).filter(worker => worker.paneId)
+  const open = openSeats(seats)
   let isClosing = false
   if (open.length > 0) {
     try {
-      isClosing = (await $.ui.ask(`Close the ${open.length} open worker pane(s): ${open.map(({ name }) => name).join(', ')}?`, ['Close them', 'Leave them running'])) === 'Close them'
+      isClosing = (await $.ui.ask(`Stop the ${open.length} open worker(s) (${open.map(({ name }) => name).join(', ')}) with drove down? Their sessions are saved for drove up.`, ['Stop them', 'Leave them running'])) === 'Stop them'
     } catch {
       isClosing = false
     }
   }
-  if (isClosing) {
-    for (const worker of open) if (worker.paneId) await herdr($, closeArgv(worker.paneId))
-    if (orchestrator.tabId) await herdr($, tabCloseArgv(orchestrator.tabId))
-  }
-  await closeBoard($)
-  await update($, orchestratorAtom, () => null)
-  await update($, workersAtom, () => [])
-  await update($, feedAtom, () => [])
-  await update($, scrollAtom, () => 0)
-  await update($, expandedAtom, () => null)
-  await update($, leadAtom, () => null)
-  await persist($)
+  const down = isClosing ? await runDrove($, drove.downArgs(orchestrator.run), { cwd: orchestrator.repo, env: (await droveHome($)) ? { DROVE_HOME: (await droveHome($)) ?? '' } : {} }) : undefined
+  await clearOrchestration($)
+  const closing = down ? (down.exitCode === 0 ? ` ${down.stdout.trim()}` : ` drove down failed: ${drove.failureOf(down).text}`) : open.length > 0 ? ` ${open.length} worker(s) left running in run ${orchestrator.run}; \`/orchestrate\` in this session re-attaches it.` : ''
   return {
-    text: `Orchestrator mode is off.${open.length > 0 ? isClosing ? ` Closed ${open.length} worker pane(s).` : ` ${open.length} worker(s) left running; their reports now arrive as plain messages.` : ''}`,
+    text: `Orchestrator mode is off.${closing}`,
     context: ['Cal turned orchestrator mode off: you may edit code again, and the orchestrator tools no longer work.'],
   }
 }
 
-type ToolAnswer = { deny: string } | { result: string }
-
 const OFF = 'Orchestrator mode is off.'
-const toolFailure = (error: unknown): string => `The orchestrator tool failed: ${error instanceof Error ? error.message : String(error)}`
+const toolFailure = (error: unknown): string => `The orchestrator tool failed: ${messageOf(error)}`
 
 type Pill = { key: string; text: string; bg: string }
 
-const STATUS_COLOR: Record<OrchWorkerStatus, string> = {
+const STATE_COLOR: Record<Seat['state'], string> = {
   starting: COLOR.surface1,
   working: COLOR.blue,
   idle: COLOR.green,
   done: COLOR.green,
   blocked: COLOR.red,
+  'needs-input': COLOR.red,
   unknown: COLOR.surface1,
-  closed: COLOR.surface1,
   gone: COLOR.surface1,
+  closing: COLOR.surface1,
+  closed: COLOR.surface1,
+  down: COLOR.surface1,
 }
 
 const TONE: Record<Tone, string> = {
@@ -896,24 +895,25 @@ const TONE: Record<Tone, string> = {
   you: COLOR.peach,
 }
 
-const modelLetter = (model: string): string => shortModel(model).charAt(0)
-
-export const pillsFor = (orchestrator: OrchOrchestrator | null, workers: readonly OrchWorker[], self: OrchWorkerSelf | null): Pill[] => {
+export const pillsFor = (orchestrator: OrchOrchestrator | null, seats: readonly Seat[], status: Readonly<Record<string, OrchModStatus>>, self: OrchWorkerSelf | null): Pill[] => {
   if (orchestrator) {
-    const open = openWorkers(workers)
+    const open = openSeats(seats)
     return [
-      { key: 'role', text: `⌘ orchestrator · ${open.length}/${config.maxWorkers}`, bg: COLOR.mauve },
-      ...open.map(worker => ({
-        key: `w:${worker.name}`,
-        text: `${statusGlyph(worker.status)} ${worker.name} ${modelLetter(worker.model)}·${effortLetter(worker.effort)}`,
-        bg: STATUS_COLOR[worker.status],
-      })),
+      { key: 'role', text: `⌘ orchestrator · ${open.length}/${orchestrator.budget}`, bg: COLOR.mauve },
+      ...open.map(seat => {
+        const asking = isAsking(seat, status[seat.name])
+        return {
+          key: `w:${seat.name}`,
+          text: `${asking ? '?' : statusGlyph(seat.state)} ${seat.name} ${modelLetter(seat)}·${effortLetter(seat.effort)}`,
+          bg: asking ? COLOR.red : STATE_COLOR[seat.state],
+        }
+      }),
     ]
   }
   if (self) {
     const model = self.model ?? config.workerModel
     return [
-      { key: 'role', text: `⚒ ${self.name} → ${self.parentName ?? 'orchestrator'}`, bg: COLOR.peach },
+      { key: 'role', text: `⚒ ${self.name} → planner`, bg: COLOR.peach },
       { key: 'model', text: `${shortModel(model)}${self.effort ? ` · ${self.effort}` : ''}`, bg: model === config.workerModel ? COLOR.surface1 : COLOR.yellow },
     ]
   }
@@ -926,18 +926,18 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     if (!e.isInteractive || (await isSummariser($))) return started
-    const self = await readWorkerEnv($)
-    if (self) {
-      await update($, workerAtom, () => self)
-      await $.tool.register(REPORT_TOOL as never)
-      $.clock.after(1500, () => void sayHello($, self))
+    const role = await $.env.get('DROVE_ROLE')
+    if (role === 'worker') {
+      await startWorker($)
       return started
     }
+    isDrovePlanner = role === 'planner'
     await $.command.register({
       name: 'orchestrate',
-      description: 'Turn this session into an orchestrator: Opus plans, delegates to Sonnet workers in herdr panes, and reviews; it never edits code',
+      description: 'Turn this session into a Drove planner: Opus plans, delegates to Claude or Codex workers in herdr panes, and reviews; it never edits code',
       argumentHint: '[goal] | status | board | board bg | off',
     })
+    if (isDrovePlanner) return started
     await restore($)
     try {
       if ((await $.store.get('boardBg')) === false) await update($, boardBgAtom, () => false)
@@ -945,12 +945,20 @@ export const register: Register = (on, options) => {
       // default: no background
     }
     void pruneStore($)
-    ensureTicker($)
     return started
   })
 
+  on('session.end', async ($, e, next) => {
+    endBridge()
+    animator?.cancel()
+    animator = undefined
+    animatorRuns = false
+    return next(e)
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
+
   on('command.run', { command: 'orchestrate' }, async ($, e) => {
-    if (await read($, workerAtom)) return { text: 'This session is an orchestrator worker; it cannot orchestrate.' }
+    if (await read($, workerAtom)) return { text: 'This session is a Drove worker; it cannot orchestrate.' }
+    if (isDrovePlanner) return { text: 'This session is already a Drove planner (started by drove plan); use its drove tools.' }
     const args = e.args.trim()
     if (args === 'status') return { text: await statusText($) }
     if (args === 'off') return turnOff($)
@@ -994,9 +1002,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__orchestrator__close_worker' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? closeWorker($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
-  on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($, e): Promise<ToolAnswer> =>
-    (await read($, orchestratorAtom)) ? statusText($).then(text => ({ result: text })) : { deny: OFF },
-  ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__report' as never }, async ($, e): Promise<ToolAnswer> => sendReport($, e as Record<string, unknown>)).catch(($, e, next) => ({
     deny: toolFailure(next.error),
   }))
@@ -1004,15 +1010,16 @@ export const register: Register = (on, options) => {
   on('tool.call', async ($, e, next) => {
     const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
     if (orchestrator) {
-      if (e.tool === 'Bash' || EDIT_TOOLS.has(e.tool)) {
-        const roots = await writableRoots($)
-        if (e.tool === 'Bash') {
-          const reason = bashReason(e.command, roots)
-          if (reason) return { deny: orchestratorDeny(reason) }
-        } else {
-          const path = editPathOf(e as Record<string, unknown>)
-          if (!path || !isInside(path, roots)) return { deny: orchestratorDeny(`${e.tool} on ${path ?? 'a file'} changes code`) }
-        }
+      if (drove.GUARDED_TOOLS.has(e.tool)) {
+        const [cwd, sessionId, home] = await Promise.all([$.session.cwd(), $.session.id(), droveHome($)])
+        const ran = await runDrove($, ['guard', 'pre-tool-use'], {
+          cwd,
+          env: drove.plannerEnv(orchestrator.run, home),
+          stdin: drove.guardStdin(e.tool, e as Record<string, unknown>, cwd, sessionId),
+          timeoutMs: GUARD_TIMEOUT_MS,
+        })
+        const verdict = drove.guardVerdictOf(ran, entryOf($))
+        if (!verdict.allow) return { deny: verdict.reason }
       }
       if (e.agentId !== undefined) return next(e)
       await setLead($, describeLeadTool(e.tool, e as Record<string, unknown>))
@@ -1023,28 +1030,24 @@ export const register: Register = (on, options) => {
       }
     }
     if (self) {
-      if (e.tool === 'Bash') {
-        const reason = WORKER_FORBIDDEN(e.command)
-        if (reason) return { deny: `Worker mode: ${reason}.` }
-      }
       if (e.agentId !== undefined) return next(e)
       if (e.tool === 'AskUserQuestion') {
         isWorkerAsking = true
-        await sendStatus($, self, 'asking', `asking in its pane: ${questionOf(e as Record<string, unknown>)}`)
+        await writeStatus($, { asking: `asking in its pane: ${questionOf(e as Record<string, unknown>)}` })
         try {
           return await next(e)
         } finally {
           isWorkerAsking = false
-          await sendStatus($, self, 'working', 'got an answer')
+          await writeStatus($, { asking: undefined, activity: 'got an answer' })
         }
       }
-      await noteActivity($, self, describeLeadTool(e.tool, e as Record<string, unknown>))
+      await noteActivity($, describeLeadTool(e.tool, e as Record<string, unknown>))
       try {
         return await next(e)
       } finally {
         if (isWorkerAsking) {
           isWorkerAsking = false
-          await sendStatus($, self, 'working', 'permission answered')
+          await writeStatus($, { asking: undefined, activity: 'permission answered' })
         }
       }
     }
@@ -1052,44 +1055,35 @@ export const register: Register = (on, options) => {
   }).catch(async ($, e, next) => {
     if (next.called) return undefined
     const orchestrator = await read($, orchestratorAtom)
-    return orchestrator ? { deny: orchestratorDeny('the guard could not check this call, so it is refused') } : next(e)
+    return orchestrator ? { deny: drove.brokenGuard(`the guard hook failed: ${messageOf(next.error)}`, entryOf($)) } : next(e)
   })
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
-    if (orchestrator) {
-      return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, config), scope: 'session' as const }] }
-    }
-    if (self) return { sections: [...composed.sections, { id: 'orchestrator:worker', text: workerSection(self), scope: 'session' as const }] }
+    const orchestrator = await read($, orchestratorAtom)
+    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, config), scope: 'session' as const }] }
     return composed
   })
 
-  on('session.receive', async ($, e, next) => {
-    if (e.agentId !== undefined) return next(e)
-    const handled = await handleInbound($, e.text)
-    if (!handled) return next(e)
-    return 'consumed' in handled ? handled : next({ ...e, text: handled.text })
-  }).catch(($, e, next) => (next.called ? undefined : next(e)))
-
   on('prompt.submit', async ($, e, next) => {
-    if (!e.text.includes('⟦orch v1')) {
-      const orchestrator = await read($, orchestratorAtom)
-      const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
-      if (orchestrator && !orchestrator.goal && isPerson && !e.text.trimStart().startsWith('/') && e.text.trim()) {
-        await update($, orchestratorAtom, current => (current ? { ...current, goal: oneLine(e.text, 100) } : current))
-        await persist($)
-        await setLead($, 'planning')
-      }
-      return next(e)
+    const self = await read($, workerAtom)
+    if (self && e.text.includes(DROVE_OPEN)) {
+      const text = await handleControl($, e.text)
+      return text === undefined ? next(e) : next({ ...e, text })
     }
-    const handled = await handleInbound($, e.text)
-    if (!handled) return next(e)
-    return 'consumed' in handled ? { drop: handled.consumed } : next({ ...e, text: handled.text })
+    const orchestrator = await read($, orchestratorAtom)
+    const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
+    if (orchestrator && !orchestrator.goal && isPerson && !e.text.trimStart().startsWith('/') && e.text.trim()) {
+      await update($, orchestratorAtom, current => (current ? { ...current, goal: oneLine(e.text, 100) } : current))
+      await persist($)
+      await setLead($, 'planning')
+    }
+    return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('turn.start', async ($, e, next) => {
     if (await read($, orchestratorAtom)) await setLead($, 'thinking')
+    if (await read($, workerAtom)) await refreshSelf($)
     if (pendingRouting) {
       routingTurnId = e.turnId
       pendingRouting = false
@@ -1116,8 +1110,8 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.props.hasSurvey) return next(e)
-    const [orchestrator, workers, self] = await Promise.all([read($, orchestratorAtom), read($, workersAtom), read($, workerAtom)])
-    const pills = pillsFor(orchestrator, workers, self)
+    const [orchestrator, seats, status, self] = await Promise.all([read($, orchestratorAtom), read($, seatsAtom), read($, statusAtom), read($, workerAtom)])
+    const pills = pillsFor(orchestrator, seats, status, self)
     if (pills.length === 0) return next(e)
     const { Box, Text } = $.ui.resolve(e)
     const below = await next(e)
@@ -1139,50 +1133,48 @@ export const register: Register = (on, options) => {
   })
 
   on('session.measure', async ($, e, next) => {
-    const self = await read($, workerAtom)
-    if (self) {
+    if (await read($, workerAtom)) {
       const { percent, tokens, window } = e.context
       const value = percent ?? (tokens !== undefined && window > 0 ? (tokens / window) * 100 : undefined)
       if (value !== undefined) {
-        workerCtx = Math.round(value)
-        if (workerCtxSent === undefined || Math.abs(workerCtx - workerCtxSent) >= 3) {
-          const at = await $.clock.now()
-          if (at - workerStatusAt >= STATUS_EVERY_MS && !isWorkerAsking) await sendStatus($, self, 'working', workerActivity)
-        }
+        const ctx = Math.round(value)
+        if ((workerCtxSent === undefined || Math.abs(ctx - workerCtxSent) >= 3) && !isWorkerAsking && (await $.clock.now()) - workerStatusAt >= STATUS_EVERY_MS) await writeStatus($, { ctx })
       }
     }
     return next(e)
   })
 
   on('classic.Notification', async ($, e, next) => {
-    const self = await read($, workerAtom)
-    if (self && /permission/i.test(`${e.notification_type} ${e.message}`) && !isWorkerAsking) {
+    if ((await read($, workerAtom)) && /permission/i.test(`${e.notification_type} ${e.message}`) && !isWorkerAsking) {
       isWorkerAsking = true
-      await sendStatus($, self, 'asking', `needs permission in its pane: ${oneLine(e.message, 140)}`)
+      await writeStatus($, { asking: `needs permission in its pane: ${oneLine(e.message, 140)}` })
     }
     return next(e)
-  })
+  }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined && (await read($, orchestratorAtom))) {
-      const hasWorkers = openWorkers(await read($, workersAtom)).length > 0
+      const hasWorkers = openSeats(await read($, seatsAtom)).length > 0
       await setLead($, hasWorkers ? 'waiting for workers' : 'idle')
     }
     return next(e)
   })
 
   on('ui.scroll', { component: 'Pane', requestId: BOARD_ID }, async ($, e) => {
-    const [feed, workers] = await Promise.all([read($, feedAtom), read($, workersAtom)])
-    const most = Math.max(0, feed.length - timelineRoom(e.bodyRows, openWorkers(workers).length))
+    const [feed, seats] = await Promise.all([read($, feedAtom), read($, seatsAtom)])
+    const most = Math.max(0, feed.length - timelineRoom(e.bodyRows, openSeats(seats).length))
     await update($, scrollAtom, back => Math.max(0, Math.min(most, Math.min(back, most) - e.by)))
     return {}
-  })
+  }).catch(() => ({}))
 
   on('ui.render', { component: 'Pane', requestId: BOARD_ID }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
-    const [orchestrator, workers, feed, lead, frame, isPainted, scrollBack, expanded, now] = await Promise.all([
+    const [orchestrator, seats, status, asksAt, bridge, feed, lead, frame, isPainted, scrollBack, expanded, now] = await Promise.all([
       read($, orchestratorAtom),
-      read($, workersAtom),
+      read($, seatsAtom),
+      read($, statusAtom),
+      read($, asksAtAtom),
+      read($, bridgeAtom),
       read($, feedAtom),
       read($, leadAtom),
       read($, frameAtom),
@@ -1196,12 +1188,14 @@ export const register: Register = (on, options) => {
     const rows = e.props.scroll.bodyRows
     const board = buildBoard({
       orchestrator,
-      workers,
+      seats,
+      status,
+      asksAt,
+      bridge,
       feed,
       lead,
       leadModel: config.orchestratorModel,
       leadEffort: config.orchestratorEffort,
-      maxWorkers: config.maxWorkers,
       now,
       frame,
       scrollBack,

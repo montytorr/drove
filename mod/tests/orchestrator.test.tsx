@@ -2,210 +2,175 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On, SessionStartInput } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
-import type { OrchWorker } from '../types'
-import { WORKER_FORBIDDEN, bashReason, editPathOf, isInside } from '../hooks/guard'
-import { UNVERIFIED, defaultExpects, formatEnvelope, locateEnvelope, parseEnvelope, raiseEffort, renderReport, shortModel, stripToken } from '../hooks/protocol'
+import type { RunMeta, Seat } from '../types'
 import { buildBoard, fixedRows, gauge, needsAnimation, progressOf } from '../hooks/board'
-import { agentStatusOf, observe, parseAgents, parseSplit, herdrError, retryWhileBusy, splitArgv, startArgv, workerEnvPairs } from '../hooks/roster'
+import { backoffMs, feedOf, parseLine, splitLines, splitWake } from '../hooks/bridge'
+import { attachArgs, failureOf, guardStdin, guardVerdictOf, jsonResultOf, spawnArgs } from '../hooks/drove'
+import { UNVERIFIED, hmacSha256, locateEnvelope, macOf, parseEnvelope, raiseEffort, renderControl, shortModel, verifyEnvelope } from '../hooks/protocol'
 
 const NOW = Date.parse('2026-10-06T10:00:00Z')
+const ISO = new Date(NOW).toISOString()
 const SELF = 'orch-session-id'
+const RUN = 'repo-20261006-1000-abcd'
 const START: SessionStartInput = { cwd: '/work/repo', surface: 'terminal', isInteractive: true }
 const BAND_PROPS = { bodyColumns: 160, hasSurvey: false } as never
+const ENTRY = '/plugins/drove/mod/../src/cli.ts'
 
-describe('protocol', () => {
-  test('an envelope round-trips, spaces in values are folded, and the token can be stripped', () => {
-    const text = formatEnvelope({ worker: 'w-auth', kind: 'done', expects: 'review', note: 'two words', token: 'abc' }, 'Login fixed\n\nfiles: a.ts')
-    expect(text.startsWith('⟦orch v1 worker=w-auth kind=done expects=review note=two_words token=abc⟧\n')).toBe(true)
-    expect(parseEnvelope(text)).toEqual({ fields: { worker: 'w-auth', kind: 'done', expects: 'review', note: 'two_words', token: 'abc' }, body: 'Login fixed\n\nfiles: a.ts' })
-    expect(stripToken(text)).not.toContain('token=')
-    expect(parseEnvelope('hello there')).toBeUndefined()
-    expect(parseEnvelope('⟦orch v2 kind=x⟧ hi')).toBeUndefined()
-  })
-
-  test('an envelope is found inside the wrapper a peer message arrives in', () => {
-    const envelope = formatEnvelope({ worker: 'w-title', kind: 'done', expects: 'review', token: 't' }, 'Done')
-    const wrapped = `Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/cc-socks/1.sock" from-name="w-title">\n${envelope}\n</cross-session-message>\n\nThis came from another Claude session`
-    const located = locateEnvelope(wrapped)
-    expect(located?.envelope.fields).toMatchObject({ worker: 'w-title', kind: 'done' })
-    expect(located?.envelope.body).toBe('Done')
-    expect(located?.before.endsWith('from-name="w-title">\n')).toBe(true)
-    expect(located?.after.startsWith('</cross-session-message>')).toBe(true)
-    expect(locateEnvelope('no envelope here')).toBeUndefined()
-  })
-
-  test('each report kind expects the right thing back', () => {
-    expect(defaultExpects('done')).toBe('review')
-    expect(defaultExpects('progress')).toBe('none')
-    expect(defaultExpects('question')).toBe('answer')
-    expect(defaultExpects('promote')).toBe('answer')
-  })
-
-  test('a question for Cal tells the orchestrator to ask Cal, not decide', () => {
-    expect(renderReport('w-db', 'question', 'answer', 'Drop the old table?', true)).toContain('AskUserQuestion')
-    expect(renderReport('w-db', 'done', 'review', 'Done')).toContain('review_verdict')
-    expect(renderReport('w-db', 'done', 'none', 'Committed abc123')).toContain('close_worker')
-  })
-
-  test('effort is raised to the floor but never lowered', () => {
-    expect(raiseEffort('medium', 'high')).toBe('high')
-    expect(raiseEffort('xhigh', 'high')).toBe('xhigh')
-    expect(raiseEffort(undefined, 'high')).toBe('high')
-    expect(raiseEffort(20_000, 'high')).toBe(20_000)
-  })
-
-  test('model ids read as names', () => {
-    expect(shortModel('claude-opus-5-5')).toBe('Opus 5.5')
-    expect(shortModel('claude-sonnet-5-5')).toBe('Sonnet 5.5')
-    expect(shortModel('custom')).toBe('custom')
-  })
-})
-
-describe('guard', () => {
-  const ROOTS = ['/tmp', '/private/tmp', '/Users/test/.claude/plans']
-
-  test('reading is allowed', () => {
-    for (const command of [
-      'git status',
-      'git -C ../api diff --stat',
-      'git log --oneline -5 | head',
-      'git branch',
-      'git branch -a',
-      'git stash list',
-      'rg "TODO" src | wc -l',
-      'cat package.json 2>/dev/null',
-      'ls -la && pwd',
-      'gh pr view 12 --json title',
-      'gh api repos/acme/api/pulls',
-      'herdr agent list',
-      'herdr agent read w-auth',
-      'cairn note CCS-43 "x" --kind finding',
-      'npm ls react',
-      'docker ps',
-      'curl -s https://example.com/health',
-      'sed -n 1,20p src/a.ts',
-      'echo hi > /tmp/plan.md',
-      'make -n build',
-      'git commit -m wip',
-      'git -C ../api push origin HEAD',
-      'git switch -c feature --no-track origin/main',
-      'git merge --no-ff worktree-w-slug',
-      'git worktree remove --force .claude/worktrees/w-slug',
-      'git stash',
-    ]) {
-      expect([command, bashReason(command, ROOTS)]).toEqual([command, undefined])
-    }
-  })
-
-  test('writing, building and running are refused', () => {
-    for (const command of [
-      'echo x > src/a.ts',
-      'cat >> notes.md <<EOF\nhi\nEOF',
-      'sed -i "" s/a/b/ src/a.ts',
-      'perl -pi -e s/a/b/ x',
-      'rm -rf dist',
-      'mv a b',
-      'npm install',
-      'npm test',
-      'pnpm run build',
-      'npx vitest',
-      'node scripts/migrate.js',
-      'python3 -c "print(1)"',
-      './deploy.sh',
-      'bash run.sh',
-      'gh pr merge 12',
-      'gh api -X POST repos/acme/api/issues -f title=x',
-      'herdr pane split --pane w1:p1',
-      'herdr agent prompt w-auth "go"',
-      'claude -p hello',
-      'curl -X POST https://x.test/api -d "{}"',
-      'echo $(rm -rf build)',
-      'docker compose up -d',
-      'tee out.txt < in.txt',
-    ]) {
-      expect([command, typeof bashReason(command, ROOTS)]).toEqual([command, 'string'])
-    }
-  })
-
-  test('edit paths are allowed only under the writable roots', () => {
-    expect(isInside('/tmp/claude-501/x/scratchpad/plan.md', ROOTS)).toBe(true)
-    expect(isInside('/Users/test/.claude/plans/p.md', ROOTS)).toBe(true)
-    expect(isInside('/Users/test/.claude/plansx/p.md', ROOTS)).toBe(false)
-    expect(isInside('/work/repo/src/a.ts', ROOTS)).toBe(false)
-    expect(editPathOf({ file_path: '/a' })).toBe('/a')
-    expect(editPathOf({ notebook_path: '/n.ipynb' })).toBe('/n.ipynb')
-  })
-
-  test('workers may do anything but push, drive panes or start sessions', () => {
-    expect(WORKER_FORBIDDEN('npm test && git commit -m x')).toBeUndefined()
-    expect(WORKER_FORBIDDEN('git push origin feature')).toContain('never push')
-    expect(WORKER_FORBIDDEN('herdr pane split')).toBeDefined()
-    expect(WORKER_FORBIDDEN('claude -p hi')).toBeDefined()
-  })
-})
-
-const worker = (patch: Partial<OrchWorker> = {}): OrchWorker => ({
+const seat = (overrides: Partial<Seat> = {}): Seat => ({
   name: 'w-auth',
-  token: 'tok-auth',
-  paneId: 'w1:p9',
-  sessionId: 's-auth',
-  cwd: '/work/repo',
+  kind: 'claude',
   model: 'claude-sonnet-5-5',
   effort: 'medium',
-  isWorktree: false,
-  status: 'working',
-  spawnedAt: NOW,
-  ...patch,
+  worktree: '/work/repo/.claude/worktrees/w-auth',
+  branch: 'worktree-w-auth',
+  state: 'working',
+  stateAt: ISO,
+  spawnedAt: ISO,
+  owes: 'none',
+  attention: [],
+  paneId: 'w1:p10',
+  ...overrides,
+})
+
+const runMeta = (overrides: Partial<RunMeta> = {}): RunMeta => ({
+  v: 1,
+  id: RUN,
+  repo: '/work/repo',
+  base: 'main',
+  hasRemote: true,
+  createdAt: ISO,
+  status: 'up',
+  budget: 5,
+  planner: { kind: 'claude', paneId: 'w1:p2', sessionId: SELF, model: 'claude-opus-5-5', effort: 'high', viaMod: true },
+  ...overrides,
+})
+
+// A Drove control as src/protocol.ts formatControl renders it (the mac is checked against Node's createHmac in drove's test/mod-protocol.test.ts).
+const control = async (token: string, fields: Record<string, string>, body: string, reply = '↩ Reply with the drove report tool (server drove): kind done, expects review.') => {
+  const id = fields.id ?? 'c-1'
+  const header = Object.entries({ run: RUN, from: 'planner', to: 'w-auth', id, ...fields, mac: await macOf(token, id, body) }).map(([key, value]) => ` ${key}=${value}`).join('')
+  return `⟦drove v1${header}⟧\n${body}\n${reply}`
+}
+
+describe('protocol', () => {
+  test('HMAC-SHA256 on digest matches the RFC 4231 vectors and Drove’s mac', async () => {
+    expect(await hmacSha256('Jefe', 'what do ya want for nothing?')).toBe('5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843')
+    expect(await macOf('tok', 'c-1', 'Approved.\n\nShip it')).toBe('fe5fef83a67a5c8b')
+  })
+
+  test('a control envelope is parsed, verified by its mac and rendered for the worker', async () => {
+    const text = await control('tok', { kind: 'verdict', verdict: 'approve', expects: 'none' }, 'Approved.\n\nShip it')
+    const located = locateEnvelope(`noise before\n${text}`)
+    expect(located?.before).toBe('noise before\n')
+    expect(located?.envelope.fields).toMatchObject({ kind: 'verdict', verdict: 'approve', to: 'w-auth' })
+    expect(located?.envelope.body).toBe('Approved.\n\nShip it')
+    expect(await verifyEnvelope(located!.envelope, 'tok')).toBe(true)
+    expect(await verifyEnvelope(located!.envelope, 'other')).toBe(false)
+    const rendered = renderControl(located!.envelope, true)
+    expect(rendered.startsWith('[planner · verdict: approve · expects none]\nApproved.')).toBe(true)
+    expect(rendered).not.toContain('mac=')
+    expect(renderControl(located!.envelope, false).startsWith(UNVERIFIED)).toBe(true)
+    expect(parseEnvelope('hello')).toBeUndefined()
+  })
+
+  test('effort is raised to the floor but never lowered, and model ids read as names', () => {
+    expect(raiseEffort('low', 'high')).toBe('high')
+    expect(raiseEffort('max', 'high')).toBe('max')
+    expect(raiseEffort(undefined, 'high')).toBe('high')
+    expect(shortModel('claude-opus-5-5')).toBe('Opus 5.5')
+    expect(shortModel('gpt-5')).toBe('gpt-5')
+  })
+})
+
+describe('drove client', () => {
+  test('argv for attach and spawn', () => {
+    expect(attachArgs({ sessionId: 's', paneId: 'w1:p2', goal: 'g', model: 'm', effort: 'high', budget: 5 })).toEqual(['mod', 'attach', '--session', 's', '--pane', 'w1:p2', '--goal', 'g', '--model', 'm', '--effort', 'high', '--budget', '5'])
+    expect(spawnArgs({ name: 'w-x', kind: 'codex', effort: 'low' })).toEqual(['spawn', 'w-x', '--kind', 'codex', '--brief', '-', '--effort', 'low'])
+  })
+
+  test('failures, JSON results and guard verdicts are read from what the CLI prints', () => {
+    expect(failureOf({ exitCode: 1, stdout: '', stderr: 'over-budget: the pane budget of 5 is full\n' })).toEqual({ code: 'over-budget', text: 'the pane budget of 5 is full' })
+    expect(jsonResultOf({ exitCode: 0, stdout: '{"ok":true,"text":"up","data":{"run":{"id":"r"}}}\n', stderr: '' })).toEqual({ ok: true, text: 'up', data: { run: { id: 'r' } } })
+    expect(jsonResultOf({ exitCode: 127, stdout: '', stderr: 'node: not found' })).toEqual({ ok: false, code: 'error', text: 'node: not found' })
+    const denied = { exitCode: 2, stdout: JSON.stringify({ hookSpecificOutput: { permissionDecision: 'deny', permissionDecisionReason: 'Drove planner: npm test runs code' } }), stderr: '' }
+    expect(guardVerdictOf(denied, ENTRY)).toEqual({ allow: false, reason: 'Drove planner: npm test runs code' })
+    expect(guardVerdictOf({ exitCode: 0, stdout: '', stderr: '' }, ENTRY)).toEqual({ allow: true })
+    const broken = guardVerdictOf({ exitCode: -1, stdout: '', stderr: 'spawn node ENOENT' }, ENTRY)
+    expect(broken.allow).toBe(false)
+    expect(broken.allow ? '' : broken.reason).toContain("Drove's guard could not run")
+    expect(broken.allow ? '' : broken.reason).toContain(ENTRY)
+    expect(JSON.parse(guardStdin('Bash', { tool: 'Bash', tool_use_id: 'x', command: 'ls' }, '/w', 's'))).toEqual({ hook_event_name: 'PreToolUse', session_id: 's', cwd: '/w', tool_name: 'Bash', tool_input: { command: 'ls' } })
+  })
+})
+
+describe('bridge stream', () => {
+  test('lines are split across chunks and parsed', () => {
+    expect(splitLines('{"t":"ready"}\n{"t":"wa')).toEqual({ lines: ['{"t":"ready"}'], rest: '{"t":"wa' })
+    expect(parseLine('{"t":"wake","text":"x"}')).toEqual({ t: 'wake', text: 'x' })
+    expect(parseLine('nope')).toBeUndefined()
+    expect(backoffMs(0, false)).toBe(1000)
+    expect(backoffMs(10, false)).toBe(30_000)
+    expect(backoffMs(0, true)).toBe(30_000)
+  })
+
+  test("Drove's events become timeline rows, with the lead's own text attached", () => {
+    const bodies = new Map([['w-auth:brief', ['Sonnet 5.5 medium · Do the auth work']]])
+    expect(feedOf({ at: ISO, type: 'control.sent', seat: 'w-auth', data: { kind: 'brief', via: 'herdr-prompt' } }, bodies)).toMatchObject({ from: '⌘', to: 'w-auth', kind: 'brief', summary: 'Sonnet 5.5 medium · Do the auth work', full: 'Sonnet 5.5 medium · Do the auth work' })
+    expect(feedOf({ at: ISO, type: 'report', seat: 'w-auth', data: { kind: 'done', expects: 'review', summary: 'Token bucket added' } }, bodies)).toMatchObject({ from: 'w-auth', kind: 'done', summary: 'expects review · Token bucket added' })
+    expect(feedOf({ at: ISO, type: 'report', seat: 'w-auth', data: { kind: 'progress', expects: 'none', summary: 'half way' } }, bodies)?.isHidden).toBe(true)
+    expect(feedOf({ at: ISO, type: 'control.sent', seat: 'w-auth', data: { kind: 'nudge' } }, bodies)?.summary).toBe('stopped without a report')
+    expect(feedOf({ at: ISO, type: 'seat.state', seat: 'w-auth', data: { from: 'working', to: 'gone' } }, bodies)?.kind).toBe('gone')
+    expect(feedOf({ at: ISO, type: 'report.delivered', seat: 'w-auth' }, bodies)).toBeUndefined()
+  })
+
+  test('a wake splits into one block per report', () => {
+    const blocks = splitWake('[worker w-a · done · expects review]\nAll green\n→ Review it\n\n[worker w-b · question for Cal · expects answer]\nWhich table?')
+    expect(blocks.map(({ seat, kind }) => [seat, kind])).toEqual([['w-a', 'done'], ['w-b', 'question']])
+  })
 })
 
 describe('board model', () => {
-  const base = { orchestrator: { goal: 'Ship it', startedAt: NOW }, feed: [], lead: { activity: 'thinking', since: NOW }, leadModel: 'claude-opus-5-5', leadEffort: 'high' as const, maxWorkers: 5, now: NOW + 60_000, offsetMinutes: 0, columns: 100, rows: 30 }
+  const orchestrator = { run: RUN, repo: '/work/repo', goal: 'Ship it', startedAt: NOW, budget: 5 }
+  const base = { orchestrator, status: {}, asksAt: {}, bridge: { state: 'up' as const, since: NOW }, feed: [], lead: { activity: 'thinking', since: NOW }, leadModel: 'claude-opus-5-5', leadEffort: 'high' as const, now: NOW + 60_000, offsetMinutes: 0, columns: 100, rows: 30 }
+  const done = { id: 'r-1', kind: 'done' as const, expects: 'review' as const, summary: 'ok', at: ISO }
 
   test('gauges, progress and the all-done heading', () => {
     expect(gauge(50, 4)).toBe('▰▰▱▱')
-    expect(progressOf([worker({ lastReport: { kind: 'done', summary: 'ok', at: NOW } }), worker({ name: 'w-b' })])).toEqual({ done: 1, total: 2 })
-    const done = buildBoard({ ...base, frame: 0, workers: [worker({ status: 'done', lastReport: { kind: 'done', summary: 'ok', at: NOW } })] })
-    expect(done.progress[0]?.text).toBe('✓ all done · 1m')
+    expect(progressOf([seat({ lastReport: done }), seat({ name: 'w-b' })])).toEqual({ done: 1, total: 2 })
+    const board = buildBoard({ ...base, frame: 0, seats: [seat({ state: 'done', lastReport: { ...done, expects: 'none' } })] })
+    expect(board.progress[0]?.text).toBe('✓ all done · 1m')
   })
 
-  test('workers hang off the lead as a tree, with a stripe, a spinner while working and a context gauge', () => {
-    const board = buildBoard({ ...base, frame: 2, workers: [worker({ activity: 'editing a.ts', ctx: 31 }), worker({ name: 'w-b', token: 't2', status: 'done', spawnedAt: NOW + 1 })] })
+  test('seats hang off the lead with a stripe, a spinner, the mod status and what the lead owes', () => {
+    const board = buildBoard({ ...base, frame: 2, status: { 'w-auth': { activity: 'editing a.ts', ctx: 31 } }, seats: [seat({ cairn: 'CCS-77' }), seat({ name: 'w-b', kind: 'codex', model: '', state: 'idle', owes: 'review', lastReport: done })] })
     const first = board.workers[0]?.cells.map(({ text }) => text) ?? []
     expect(first.slice(0, 3)).toEqual(['├─', '▌', '⚙'])
     expect(first).toContain('⠹ editing a.ts')
     expect(first).toContain('▰▱▱▱ 31%')
-    expect(board.workers[1]?.cells[0]?.text).toBe('└─')
-    expect(board.lead.cells.map(({ text }) => text)).toContain('⠹ thinking')
+    expect(first).toContain('CCS-77')
+    const second = board.workers[1]?.cells.map(({ text }) => text) ?? []
+    expect(second[0]).toBe('└─')
+    expect(second).toContain('owes you a review · ok')
+    expect(second).toContain('codex·m')
   })
 
-  test('an asking worker pulses for a few seconds, then stays red', () => {
-    const asking = worker({ status: 'blocked', isAsking: true, asksAt: NOW + 59_000, activity: 'asking in its pane: Which table?' })
-    const on = buildBoard({ ...base, frame: 0, workers: [asking] }).workers[0]?.cells[1]?.tone
-    const off = buildBoard({ ...base, frame: 1, workers: [asking] }).workers[0]?.cells[1]?.tone
+  test('an asking seat pulses for a few seconds, then stays red; a bridge problem shows on the lead row', () => {
+    const asking = { status: { 'w-auth': { asking: 'asking in its pane: Which table?' } }, asksAt: { 'w-auth': NOW + 59_000 }, seats: [seat()] }
+    const on = buildBoard({ ...base, ...asking, frame: 0 }).workers[0]?.cells[1]?.tone
+    const off = buildBoard({ ...base, ...asking, frame: 1 }).workers[0]?.cells[1]?.tone
     expect([on, off]).toEqual(['alert', 'dim'])
-    const later = buildBoard({ ...base, now: NOW + 70_000, frame: 1, workers: [asking] }).workers[0]?.cells[1]?.tone
-    expect(later).toBe('alert')
-  })
-
-  test('the timeline scrolls back through older messages and says where it is', () => {
-    const feed = Array.from({ length: 50 }, (_, index) => ({ at: NOW + index * 1000, from: '⌘', to: 'w-auth', kind: 'message', summary: `message ${index + 1}` }))
-    const latest = buildBoard({ ...base, rows: 20, frame: 0, workers: [worker()], feed })
-    expect(latest.feed.at(-1)?.cells.at(-1)?.text).toBe('message 50')
-    expect(latest.feedTitle).toContain('scroll for more')
-    const back = buildBoard({ ...base, rows: 20, frame: 0, workers: [worker()], feed, scrollBack: 10 })
-    expect(back.feed.at(-1)?.cells.at(-1)?.text).toBe('message 40')
-    expect(back.feedTitle).toMatch(/^timeline · \d+–40 of 50 · ↓ 10 newer$/)
-    const top = buildBoard({ ...base, rows: 20, frame: 0, workers: [worker()], feed, scrollBack: 999 })
-    expect(top.feed[0]?.cells.at(-1)?.text).toBe('message 1')
+    expect(buildBoard({ ...base, ...asking, now: NOW + 70_000, frame: 1 }).workers[0]?.cells[1]?.tone).toBe('alert')
+    const busy = buildBoard({ ...base, seats: [], frame: 0, bridge: { state: 'busy', since: NOW } })
+    expect(busy.lead.cells.map(({ text }) => text).join(' ')).toContain('another session')
   })
 
   test('every timeline row fits on one line, and the board never outgrows the pane', () => {
-    const long = 'You stopped without a report. If you finished, send a done report; if you are stuck or need a decision, say so with a report.'
+    const long = 'You stopped without a report: send done, question or blocked with the drove report tool.'
     const feed = Array.from({ length: 50 }, (_, index) => ({ id: `e${index}`, full: `${long}\n${'more '.repeat(60)}`, at: NOW + index * 1000, from: '⌘', to: 'w-browser-probe', kind: 'nudge', summary: long }))
     for (const columns of [60, 90, 140]) {
       for (const expanded of [null, 'e45', 'e49']) {
         const rows = 30
-        const board = buildBoard({ ...base, columns, rows, frame: 0, workers: [worker(), worker({ name: 'w-b', token: 't2' })], feed, expanded })
+        const board = buildBoard({ ...base, columns, rows, frame: 0, seats: [seat(), seat({ name: 'w-b' })], feed, expanded })
         for (const row of board.feed) {
           const widths = row.cells.map(({ width }) => width ?? 0)
           expect(widths.reduce((sum, width) => sum + width, 0) + row.cells.length - 1).toBe(columns)
@@ -215,127 +180,146 @@ describe('board model', () => {
         expect(used <= rows).toBe(true)
       }
     }
-    const named = buildBoard({ ...base, frame: 0, workers: [worker()], feed })
-    expect(named.feed[0]?.cells[4]?.text).toBe('w-browser-probe')
-  })
-
-  test('scrolling stops when the oldest message reaches the top', () => {
-    const feed = Array.from({ length: 50 }, (_, index) => ({ at: NOW + index, from: '⌘', to: 'w-auth', kind: 'message', summary: `m${index + 1}` }))
-    const top = buildBoard({ ...base, rows: 20, frame: 0, workers: [worker()], feed, scrollBack: 49 })
-    expect(top.feed.length).toBe(20 - fixedRows(1))
-    expect(top.feed[0]?.cells.at(-1)?.text).toBe('m1')
   })
 
   test('animation runs only while something moves', () => {
-    expect(needsAnimation({ activity: 'waiting for workers', since: NOW }, [worker({ status: 'done' })], NOW)).toBe(false)
-    expect(needsAnimation({ activity: 'thinking', since: NOW }, [], NOW)).toBe(true)
-    expect(needsAnimation(null, [worker()], NOW)).toBe(true)
+    expect(needsAnimation({ activity: 'waiting for workers', since: NOW }, [seat({ state: 'done' })], {}, NOW)).toBe(false)
+    expect(needsAnimation({ activity: 'thinking', since: NOW }, [], {}, NOW)).toBe(true)
+    expect(needsAnimation(null, [seat()], {}, NOW)).toBe(true)
   })
 })
 
-describe('roster', () => {
-  const agents = (status: string) => [{ paneId: 'w1:p9', status, sessionId: 's-auth' }]
+// ---------- the engine around the mod: a fake Drove CLI and bridge ----------
 
-  test('a worker that goes blocked or disappears raises an event', () => {
-    expect(observe(worker(), agents('blocked'), NOW).events).toEqual(['blocked'])
-    expect(observe(worker({ status: 'blocked' }), agents('blocked'), NOW).events).toEqual([])
-    expect(observe(worker(), [], NOW)).toMatchObject({ worker: { status: 'gone' }, events: ['gone'] })
-  })
-
-  test('going idle after work with no report since is nudged once', () => {
-    const busy = observe(worker(), agents('working'), NOW).worker
-    const idle = observe(busy, agents('idle'), NOW + 60_000)
-    expect(idle.events).toEqual(['idle-without-report'])
-    expect(observe(idle.worker, agents('idle'), NOW + 90_000).events).toEqual([])
-    const reported = observe({ ...busy, lastReport: { kind: 'done', summary: 'ok', at: NOW + 30_000 } }, agents('done'), NOW + 60_000)
-    expect(reported.events).toEqual([])
-  })
-
-  test('herdr argv carries the worker identity, model, effort and bypass flag', () => {
-    const env = workerEnvPairs({ parentSessionId: SELF, parentName: 'cal-7d', name: 'w-auth', token: 't', model: 'claude-sonnet-5-5', effort: 'low' })
-    expect(splitArgv('w1:p2', 'right', '/work', env)).toEqual(expect.arrayContaining(['--env', `CLAUDE_ORCH_PARENT=${SELF}`, '--env', 'CLAUDE_ORCH_TOKEN=t', '--no-focus']))
-    expect(env).toContain('_CC_ACCT_PINNED=1')
-    expect(startArgv('w-auth', 'w1:p9', 'claude-sonnet-5-5', 'low', 'w-auth')).toEqual([
-      'herdr', 'agent', 'start', 'w-auth', '--kind', 'claude', '--pane', 'w1:p9', '--timeout', '60000', '--',
-      '--dangerously-skip-permissions', '--model', 'claude-sonnet-5-5', '--effort', 'low', '-n', 'w-auth', '--worktree', 'w-auth',
-    ])
-  })
-
-  test('agent start is wrapped in a shell loop that retries only while the new pane is busy', () => {
-    const argv = retryWhileBusy(['herdr', 'agent', 'start', 'w-auth'])
-    expect(argv.slice(0, 2)).toEqual(['sh', '-c'])
-    expect(argv[2]).toContain('*agent_pane_busy*')
-    expect(argv.slice(3)).toEqual(['sh', 'herdr', 'agent', 'start', 'w-auth'])
-    expect(agentStatusOf([{ paneId: 'w1:p9', status: 'working' }], 'w1:p9')).toBe('working')
-  })
-
-  test('herdr output is parsed, errors included', () => {
-    expect(parseSplit('{"id":"cli","result":{"pane":{"pane_id":"w1:p9"}}}')).toBe('w1:p9')
-    expect(parseAgents('{"result":{"agents":[{"pane_id":"w1:p9","agent_status":"idle","agent_session":{"value":"s"}}]}}')).toEqual([{ paneId: 'w1:p9', status: 'idle', sessionId: 's' }])
-    expect(herdrError('{"id":"x","error":{"code":"agent_prompt_stalled","message":"m"}}')).toBe('agent_prompt_stalled')
-    expect(herdrError('{"id":"x","result":{}}')).toBeUndefined()
-  })
-})
+type Call = { args: string[]; stdin?: string; env?: Record<string, string>; cwd?: string }
 
 type World = {
   registeredTools: string[]
   commands: string[]
-  herdrCalls: string[][]
-  sent: { to: unknown; text: string }[]
+  calls: Call[]
+  spawned: string[][]
   submitted: string[]
   asked: string[]
   toasts: string[]
-  bash: string[]
   stepped: { model: string; effort?: unknown }[]
+  files: Record<string, string>
   answer: string
-  agentStatus: string
+  isOverBudget: boolean
+  isGuardBroken: boolean
+  bridge: { push: (text: string | null) => void }
+  bridgeCode: number
+  store: Map<string, unknown>
 }
 
-const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HERDR_PANE_ID: 'w1:p2' }) => {
-  const world: World = { registeredTools: [], commands: [], herdrCalls: [], sent: [], submitted: [], asked: [], toasts: [], bash: [], stepped: [], answer: 'Open it', agentStatus: 'working' }
+const channel = () => {
+  const items: (string | null)[] = []
+  let wake: (() => void) | undefined
+  return {
+    push: (text: string | null) => {
+      items.push(text)
+      wake?.()
+      wake = undefined
+    },
+    async *drain(signal?: AbortSignal): AsyncGenerator<string> {
+      const stop = () => {
+        wake?.()
+        wake = undefined
+      }
+      signal?.addEventListener('abort', stop)
+      try {
+        for (;;) {
+          while (items.length === 0 && !signal?.aborted) await new Promise<void>(resolve => (wake = resolve))
+          if (signal?.aborted) return
+          const item = items.shift()
+          if (item === null || item === undefined) return
+          yield item
+        }
+      } finally {
+        signal?.removeEventListener('abort', stop)
+      }
+    },
+  }
+}
+
+const ok = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } }) as never
+
+const fakeDrove = (world: World, call: Call) => {
+  const [command, action] = call.args
+  if (command === 'mod' && action === 'attach') {
+    const at = call.args.indexOf('--goal')
+    const budget = call.args.indexOf('--budget')
+    return ok(JSON.stringify({ ok: true, text: `Run ${RUN} is up`, data: { run: runMeta({ ...(at > 0 ? { goal: call.args[at + 1] } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}) }) } }))
+  }
+  if (command === 'mod' && action === 'report') return ok(JSON.stringify({ ok: true, text: 'report r-1 recorded (done, expects review).' }))
+  if (command === 'guard') {
+    if (world.isGuardBroken) return ok('', 127, 'env: node: No such file or directory')
+    const input = JSON.parse(call.stdin ?? '{}') as { tool_name?: string; tool_input?: { command?: string; file_path?: string } }
+    const command = input.tool_input?.command ?? ''
+    const path = input.tool_input?.file_path ?? ''
+    const reason = input.tool_name === 'Bash' && /\bnpm\b/.test(command) ? `Drove planner: ${command} runs code` : input.tool_name !== 'Bash' && !path.startsWith('/tmp') ? `Drove planner: ${input.tool_name} on ${path} changes code` : undefined
+    return reason ? ok(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }), 2) : ok('')
+  }
+  if (command === 'spawn') {
+    if (world.isOverBudget) return ok('', 1, 'over-budget: the pane budget of 5 is full; ask the human to run `drove budget 6`')
+    return ok(`Worker ${action} (claude claude-sonnet-5-5 low) is running in pane w1:p10, worktree /work/repo/.claude/worktrees/${action} on branch worktree-${action}. Brief: herdr-prompt. Its reports will come to you.`)
+  }
+  if (command === 'budget') {
+    world.isOverBudget = false
+    return ok(`Pane budget for run ${RUN} is now ${action}.`)
+  }
+  if (command === 'roster') return ok(`run ${RUN} · repo · up · budget 5\nw-auth working`)
+  return ok(`${command} ok`)
+}
+
+const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HERDR_PANE_ID: 'w1:p2' }, stored: Record<string, unknown> = {}) => {
+  const bridge = channel()
+  const world: World = {
+    registeredTools: [], commands: [], calls: [], spawned: [], submitted: [], asked: [], toasts: [], stepped: [], files: {},
+    answer: 'Open it', isOverBudget: false, isGuardBroken: false, bridge, bridgeCode: 0, store: new Map(Object.entries(stored)),
+  }
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, env)
-  mock.store(on)
-  let pane = 9
-  const tabs = new Set<string>()
+  on('store.get', ($, e) => ({ value: world.store.get(e.key) }))
+  on('store.set', ($, e) => (world.store.set(e.key, e.value), { value: undefined }))
+  on('store.delete', ($, e) => (world.store.delete(e.key), { value: undefined }))
+  on('store.keys', () => ({ value: [...world.store.keys()] }))
   const panes = new Set<string>()
   on('session.start', ($, e) => ({ cwd: e.cwd }))
-  on('session.id', () => ({ value: env.CLAUDE_ORCH_WORKER ? 's-auth' : SELF }))
+  on('session.id', () => ({ value: env.DROVE_ROLE === 'worker' ? 's-auth' : SELF }))
   on('session.cwd', () => ({ value: '/work/repo' }))
   on('tool.register', ($, e) => (world.registeredTools.push(e.name), { value: { tool: `mcp__orchestrator__${e.name}` } }))
   on('command.register', ($, e) => (world.commands.push(e.name), { value: { command: e.name } }))
-  on('fs.list', () => ({ value: [] }) as never)
   on('ui.toast', ($, e) => (world.toasts.push(e.text), { value: undefined }))
   on('prompt.submit', ($, e) => (world.submitted.push(e.text), { text: e.text, context: e.context ?? [] }))
-  on('session.send', ($, e) => (world.sent.push({ to: e.to, text: e.text }), { isDelivered: true }))
-  on('session.receive', ($, e) => ({ text: e.text }))
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* ($, e) {
     world.stepped.push({ model: e.model, effort: e.effort })
     return { turnId: e.turnId, index: 0, answer: 'ok', toolUses: [], stopReason: 'end_turn' } as never
   })
-  on('tool.call', { tool: 'Bash' }, ($, e) => (world.bash.push(e.command), { result: { stdout: 'ok', stderr: '', interrupted: false } }) as never)
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: 'ok', stderr: '', interrupted: false } }) as never)
   on('tool.call', { tool: 'Edit' }, () => ({ result: { filePath: '/x' } }) as never)
   on('tool.call', { tool: 'AskUserQuestion' }, async (_$, e) => {
     const question = e.questions[0]?.question ?? ''
     world.asked.push(question)
     return { result: { questions: e.questions, answers: { [question]: world.answer } } }
   })
+  on('fs.read', ($, e) => {
+    const text = world.files[e.path]
+    if (text === undefined) throw new Error(`ENOENT: ${e.path}`)
+    return { value: text } as never
+  })
+  on('fs.write', ($, e) => ((world.files[e.path] = e.text), { value: undefined }) as never)
   on('process.run', ($, e) => {
-    world.herdrCalls.push([...e.argv])
-    const [, group, action] = e.argv
-    const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }) as never
-    if (group === 'pane' && action === 'split') return ok(`{"id":"cli","result":{"pane":{"pane_id":"w1:p${(pane += 1)}"}}}`)
-    if (group === 'tab' && action === 'create') {
-      tabs.add('w1:t9')
-      return ok(`{"id":"cli","result":{"tab":{"tab_id":"w1:t9"},"root_pane":{"pane_id":"w1:p${(pane += 1)}"}}}`)
-    }
-    if (group === 'tab' && action === 'get') {
-      return tabs.has(e.argv[3] ?? '') ? ok('{"id":"cli","result":{"tab":{}}}') : ({ value: { exitCode: 1, stdout: '', stderr: '{"error":{"code":"tab_not_found"}}', isStdoutTruncated: false, isStderrTruncated: false } } as never)
-    }
-    if (group === 'tab' && action === 'close') tabs.delete(e.argv[3] ?? '')
-    if (group === 'agent' && action === 'list') return ok(`{"id":"cli","result":{"agents":[{"pane_id":"w1:p10","agent_status":"${world.agentStatus}","agent_session":{"value":"s-auth"}}]}}`)
-    return ok('{"id":"cli","result":{}}')
+    const [, , ...args] = e.argv
+    const init = e.init ?? {}
+    const call: Call = { args, ...(init.stdin !== undefined ? { stdin: init.stdin } : {}), ...(init.env ? { env: { ...init.env } } : {}), ...(init.cwd ? { cwd: init.cwd } : {}) }
+    world.calls.push(call)
+    return fakeDrove(world, call)
+  })
+  on('process.spawn', async function* ($, e, next) {
+    world.spawned.push([...e.argv])
+    for await (const text of bridge.drain(next.signal)) yield { stream: 'stdout' as const, text }
+    return { value: { code: world.bridgeCode, signal: null } }
   })
   on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
     const { Text } = $.ui.resolve(e)
@@ -344,7 +328,16 @@ const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HER
   on('ui.open', ($, e) => (panes.add(e.id), { value: { isPlaced: true } }) as never)
   on('ui.close', ($, e) => (panes.delete(e.id), { value: undefined }) as never)
   on('ui.panes', () => ({ value: [...panes].map(id => ({ id, title: id, isPlaced: true })) }) as never)
-  return { world, clock, tabs, panes }
+  return { world, clock, panes }
+}
+
+const settle = async (clock: { advance: (ms: number) => Promise<unknown> }) => {
+  for (let i = 0; i < 5; i += 1) await clock.advance(1)
+}
+
+const emit = async (world: World, clock: { advance: (ms: number) => Promise<unknown> }, ...lines: unknown[]) => {
+  world.bridge.push(lines.map(line => `${JSON.stringify(line)}\n`).join(''))
+  await settle(clock)
 }
 
 const runCommand = async ($: Engine, args: string) =>
@@ -352,8 +345,9 @@ const runCommand = async ($: Engine, args: string) =>
 
 const denial = (result: { deny?: string; text?: string; isError?: true }) => result.deny ?? (result.isError ? result.text : undefined)
 
-const spawn = async ($: Engine, name: string, extra: Record<string, unknown> = {}) =>
-  $.tool.call({ tool: 'mcp__orchestrator__spawn_worker', name, brief: `Do ${name}`, ...extra } as never) as Promise<{ deny?: string; result?: unknown }>
+const callTool = async ($: Engine, tool: string, input: Record<string, unknown>) => $.tool.call({ tool: `mcp__orchestrator__${tool}`, ...input } as never) as Promise<{ deny?: string; result?: unknown }>
+
+const droveCalls = (world: World, command: string) => world.calls.filter(({ args }) => args[0] === command)
 
 const step = async ($: Engine) => {
   const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-sonnet-5-5', effort: 'medium', messageCount: 1 })
@@ -361,29 +355,45 @@ const step = async ($: Engine) => {
   await stream.result
 }
 
+const PANE_PROPS = { title: 'orchestra', isFocused: false, bodyColumns: 90, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } as never
+
 describe('orchestrator session', () => {
-  test('/orchestrate turns the mode on, registers the tools and submits the goal', async ($, on) => {
+  test('/orchestrate attaches this session to a Drove run, registers the tools, starts the bridge and submits the goal', async ($, on) => {
     const { world, clock } = engine(on)
     await $.session.start(START)
     expect(world.commands).toEqual(['orchestrate'])
     expect(world.registeredTools).toEqual([])
-    const ran = (await runCommand($, 'Add rate limiting to the API')) as { text: string; context?: string[] }
-    expect(ran.text).toContain('Orchestrator mode is on')
-    expect(world.registeredTools).toEqual(expect.arrayContaining(['spawn_worker', 'message_worker', 'review_verdict', 'promote_worker', 'close_worker', 'roster']))
-    await clock.advance(10)
+    const ran = (await runCommand($, 'Add rate limiting to the API')) as { text: string }
+    expect(ran.text).toContain(`Drove run ${RUN}`)
+    const [attach] = droveCalls(world, 'mod')
+    expect(attach?.args).toEqual(['mod', 'attach', '--session', SELF, '--pane', 'w1:p2', '--goal', 'Add rate limiting to the API', '--model', 'claude-opus-5-5', '--effort', 'high', '--budget', '5'])
+    expect(attach?.cwd).toBe('/work/repo')
+    expect(world.registeredTools).toEqual(expect.arrayContaining(['spawn_worker', 'message_worker', 'review_verdict', 'promote_worker', 'demote_worker', 'close_worker', 'roster']))
+    await settle(clock)
+    expect(world.spawned[0]?.slice(2)).toEqual(['mod', 'bridge', '--run', RUN, '--session', SELF])
     expect(world.submitted).toEqual(['Add rate limiting to the API'])
   })
 
-  test('the orchestrator cannot edit code or run writes, but can read and write plans', async ($, on) => {
+  test("the orchestrator's edits and writes go through Drove's guard, which fails closed when it cannot run", async ($, on) => {
     const { world } = engine(on)
     await $.session.start(START)
     expect(denial(await $.tool.call({ tool: 'Edit', file_path: '/work/repo/a.ts', old_string: 'a', new_string: 'b' } as never))).toBeUndefined()
+    expect(droveCalls(world, 'guard')).toHaveLength(0)
     await runCommand($, '')
-    expect(denial(await $.tool.call({ tool: 'Edit', file_path: '/work/repo/a.ts', old_string: 'a', new_string: 'b' } as never))).toContain('Orchestrator mode')
+    expect(denial(await $.tool.call({ tool: 'Edit', file_path: '/work/repo/a.ts', old_string: 'a', new_string: 'b' } as never))).toContain('Drove planner')
     expect(denial(await $.tool.call({ tool: 'Edit', file_path: '/tmp/claude-501/plan.md', old_string: 'a', new_string: 'b' } as never))).toBeUndefined()
     expect(denial(await $.tool.call({ tool: 'Bash', command: 'npm test' } as never))).toContain('npm test')
-    expect(denial(await $.tool.call({ tool: 'Bash', command: 'git commit -am wip' } as never))).toBeUndefined()
-    expect(world.bash).toEqual(['git commit -am wip'])
+    expect(denial(await $.tool.call({ tool: 'Bash', command: "cairn add t --body - <<'EOF'\n<ref> `herdr pane split`\nEOF" } as never))).toBeUndefined()
+    const guard = droveCalls(world, 'guard').at(-1)
+    expect(guard?.args).toEqual(['guard', 'pre-tool-use'])
+    expect(guard?.env).toMatchObject({ DROVE_RUN: RUN, DROVE_ROLE: 'planner', DROVE_SEAT: 'planner' })
+    expect(JSON.parse(guard?.stdin ?? '{}')).toMatchObject({ tool_name: 'Bash', tool_input: { command: expect.stringContaining('cairn add') }, cwd: '/work/repo' })
+    world.isGuardBroken = true
+    const broken = denial(await $.tool.call({ tool: 'Bash', command: 'git status' } as never))
+    expect(broken).toContain("Drove's guard could not run")
+    expect(broken).toContain('node')
+    world.isGuardBroken = false
+    world.answer = 'Leave them running'
     await runCommand($, 'off')
     expect(denial(await $.tool.call({ tool: 'Bash', command: 'npm test' } as never))).toBeUndefined()
   })
@@ -400,7 +410,7 @@ describe('orchestrator session', () => {
     ])
   })
 
-  test('the system prompt gains the orchestrator section only in the mode', async ($, on) => {
+  test('the system prompt gains the orchestrator section, naming the run, only in the mode', async ($, on) => {
     engine(on)
     on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
     await $.session.start(START)
@@ -410,156 +420,81 @@ describe('orchestrator session', () => {
     const sections = (await compose()).sections
     expect(sections.map(({ id }) => id)).toEqual(['intro', 'orchestrator:role'])
     expect(sections[1]?.text).toContain('Ship it')
+    expect(sections[1]?.text).toContain(RUN)
+    expect(sections[1]?.text).toContain('kind: codex')
   })
 
-  test('spawn_worker opens a pane with the worker identity, starts Sonnet and sends the brief', async ($, on) => {
+  test('spawn_worker runs drove spawn with the brief on stdin, Claude or Codex', async ($, on) => {
     const { world } = engine(on)
     await $.session.start(START)
     await runCommand($, '')
-    const spawned = await spawn($, 'w-auth', { effort: 'low' })
+    const spawned = await callTool($, 'spawn_worker', { name: 'w-auth', brief: 'Do w-auth', effort: 'low', cairn: 'CCS-77' })
     expect(denial(spawned as never)).toBeUndefined()
     expect(String(spawned.result)).toContain('w1:p10')
-    const [tab, start, prompt] = world.herdrCalls
-    expect(tab?.slice(0, 5)).toEqual(['herdr', 'tab', 'create', '--workspace', 'w1'])
-    expect(tab).toEqual(expect.arrayContaining(['--no-focus', `CLAUDE_ORCH_PARENT=${SELF}`, 'CLAUDE_ORCH_WORKER=w-auth', 'CLAUDE_ORCH_MODEL=claude-sonnet-5-5', 'CLAUDE_ORCH_EFFORT=low']))
-    expect(start).toEqual(expect.arrayContaining(['agent', 'start', 'w-auth', '--dangerously-skip-permissions', '--model', 'claude-sonnet-5-5', '--effort', 'low']))
-    expect(prompt?.slice(0, 4)).toEqual(['herdr', 'agent', 'prompt', 'w-auth'])
-    expect(prompt?.[4]).toContain('Do w-auth')
-
-    await spawn($, 'w-ui')
-    expect(world.herdrCalls[3]?.slice(1, 4)).toEqual(['tab', 'get', 'w1:t9'])
-    expect(world.herdrCalls[4]?.slice(1, 7)).toEqual(['pane', 'split', '--pane', 'w1:p10', '--direction', 'right'])
-    await spawn($, 'w-db')
-    const third = world.herdrCalls.filter(argv => argv[1] === 'pane' && argv[2] === 'split').at(-1)
-    expect(third?.slice(3, 7)).toEqual(['--pane', 'w1:p10', '--direction', 'down'])
-    expect(denial((await spawn($, 'w-auth')) as never)).toContain('already open')
-    expect(denial((await spawn($, 'Bad Name')) as never)).toContain('must match')
+    const [first] = droveCalls(world, 'spawn')
+    expect(first?.args).toEqual(['spawn', 'w-auth', '--kind', 'claude', '--brief', '-', '--effort', 'low', '--model', 'claude-sonnet-5-5', '--cairn', 'CCS-77'])
+    expect(first?.stdin).toBe('Do w-auth')
+    expect(first?.env).toMatchObject({ DROVE_RUN: RUN, DROVE_ROLE: 'planner' })
+    await callTool($, 'spawn_worker', { name: 'w-cx', brief: 'Do it in Codex', kind: 'codex' })
+    expect(droveCalls(world, 'spawn')[1]?.args).toEqual(['spawn', 'w-cx', '--kind', 'codex', '--brief', '-', '--effort', 'medium'])
+    expect(denial((await callTool($, 'spawn_worker', { name: 'Bad Name', brief: 'x' })) as never)).toContain('must match')
+    expect(denial((await callTool($, 'spawn_worker', { name: 'w-z', brief: 'x', kind: 'gemini' })) as never)).toContain('claude or codex')
+    expect(droveCalls(world, 'spawn')).toHaveLength(2)
   })
 
-  test('a sixth open worker needs Cal in a dialog', async ($, on) => {
+  test('a full pane budget asks Cal; yes raises the budget by one and spawns, no refuses', async ($, on) => {
     const { world } = engine(on)
     await $.session.start(START)
     await runCommand($, '')
-    for (const name of ['w1', 'w2', 'w3', 'w4', 'w5']) await spawn($, name)
-    expect(world.asked).toEqual([])
+    world.isOverBudget = true
     world.answer = 'Not now'
-    expect(denial((await spawn($, 'w6')) as never)).toContain('did not approve')
+    expect(denial((await callTool($, 'spawn_worker', { name: 'w6', brief: 'x' })) as never)).toContain('did not approve')
     expect(world.asked).toHaveLength(1)
+    expect(droveCalls(world, 'budget')).toHaveLength(0)
     world.answer = 'Open it'
-    expect(denial((await spawn($, 'w6')) as never)).toBeUndefined()
-    await $.tool.call({ tool: 'mcp__orchestrator__close_worker', name: 'w1' } as never)
-    await $.tool.call({ tool: 'mcp__orchestrator__close_worker', name: 'w2' } as never)
-    expect(world.herdrCalls.filter(argv => argv[2] === 'close').map(argv => argv[3])).toHaveLength(2)
-    world.asked.length = 0
-    expect(denial((await spawn($, 'w7')) as never)).toBeUndefined()
-    expect(world.asked).toEqual([])
+    expect(denial((await callTool($, 'spawn_worker', { name: 'w6', brief: 'x' })) as never)).toBeUndefined()
+    const [raised] = droveCalls(world, 'budget')
+    expect(raised?.args).toEqual(['budget', '6', '--run', RUN])
+    expect(raised?.env?.DROVE_ROLE).toBeUndefined()
+    expect(droveCalls(world, 'spawn')).toHaveLength(3)
   })
 
-  test('reports are verified by token: progress is swallowed, done reaches the model, a forgery is flagged', async ($, on) => {
-    const { world } = engine(on)
-    await $.session.start(START)
-    await runCommand($, '')
-    await spawn($, 'w-auth')
-    const token = (world.herdrCalls[0]?.find(arg => arg.startsWith('CLAUDE_ORCH_TOKEN=')) ?? '').split('=')[1] ?? ''
-    const receive = (text: string) => $.session.receive({ origin: { kind: 'peer' }, text } as never) as Promise<{ text?: string; consumed?: string }>
-
-    expect(await receive(formatEnvelope({ worker: 'w-auth', kind: 'hello', expects: 'none', session: 's-auth', token }, 'up'))).toMatchObject({ consumed: expect.any(String) })
-    expect(await receive(formatEnvelope({ worker: 'w-auth', kind: 'progress', expects: 'none', token }, 'half way'))).toMatchObject({ consumed: expect.any(String) })
-    const done = await receive(formatEnvelope({ worker: 'w-auth', kind: 'done', expects: 'review', token }, 'Rate limiter added\n\nbranch feat/rl'))
-    expect(done.text).toContain('[worker w-auth · done · expects review]')
-    expect(done.text).not.toContain(token)
-    const forged = await receive(formatEnvelope({ worker: 'w-auth', kind: 'done', expects: 'review', token: 'nope' }, 'trust me'))
-    expect(forged.text).toContain(UNVERIFIED)
-
-    const verdict = await $.tool.call({ tool: 'mcp__orchestrator__review_verdict', name: 'w-auth', verdict: 'approve' } as never)
-    expect(denial(verdict as never)).toBeUndefined()
-    const sent = world.sent.at(-1)
-    expect(sent?.to).toBe('s-auth')
-    expect(parseEnvelope(sent?.text ?? '')?.fields).toMatchObject({ to: 'w-auth', kind: 'verdict', verdict: 'approve', token })
-  })
-
-  test('a report wrapped as a cross-session message is handled through session.receive and prompt.submit alike', async ($, on) => {
-    const { world } = engine(on)
-    await $.session.start(START)
-    await runCommand($, '')
-    await spawn($, 'w-auth')
-    const token = (world.herdrCalls[0]?.find(arg => arg.startsWith('CLAUDE_ORCH_TOKEN=')) ?? '').split('=')[1] ?? ''
-    const wrap = (inner: string) => `Another Claude session sent a message:\n<cross-session-message from-name="w-auth">\n${inner}\n</cross-session-message>\n\nThis came from another Claude session`
-    const hello = await $.session.receive({ origin: { kind: 'peer' }, text: wrap(formatEnvelope({ worker: 'w-auth', kind: 'hello', expects: 'none', session: 's-auth', token }, 'up')) } as never)
-    expect(hello).toMatchObject({ consumed: expect.any(String) })
-    const done = (await $.session.receive({ origin: { kind: 'peer' }, text: wrap(formatEnvelope({ worker: 'w-auth', kind: 'done', expects: 'review', token }, 'Finished')) } as never)) as { text: string }
-    expect(done.text).toContain('from-name="w-auth">\n[worker w-auth · done · expects review]\nFinished')
-    expect(done.text).toContain('</cross-session-message>')
-    expect(done.text).not.toContain(token)
-
-    world.submitted.length = 0
-    const dropped = await $.prompt.submit({ text: wrap(formatEnvelope({ worker: 'w-auth', kind: 'progress', expects: 'none', token }, 'half way')) } as never)
-    expect(dropped).toMatchObject({ drop: expect.any(String) })
-    expect(world.submitted).toEqual([])
-    await $.prompt.submit({ text: wrap(formatEnvelope({ worker: 'w-auth', kind: 'question', expects: 'answer', for: 'cal', token }, 'Drop the table?')) } as never)
-    expect(world.submitted[0]).toContain('[worker w-auth · question for Cal · expects answer]')
-    expect(world.submitted[0]).not.toContain(token)
-  })
-
-  test('a blocked worker raises a toast and a silent idle worker is nudged', async ($, on) => {
+  test('messages, verdicts, promotions and closes are drove commands', async ($, on) => {
     const { world, clock } = engine(on)
     await $.session.start(START)
     await runCommand($, '')
-    await spawn($, 'w-auth')
-    world.agentStatus = 'blocked'
-    await clock.advance(30_000)
-    expect(world.toasts.some(text => text.includes('blocked'))).toBe(true)
-    world.agentStatus = 'working'
-    await clock.advance(30_000)
-    world.agentStatus = 'idle'
-    await clock.advance(30_000)
-    expect(parseEnvelope(world.sent.at(-1)?.text ?? '')?.fields.kind).toBe('nudge')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat(), seat({ name: 'w-cx', kind: 'codex', model: 'gpt-5' })], updatedAt: ISO }, status: {} })
+    await callTool($, 'message_worker', { name: 'w-auth', text: 'Use the redis client', expects: 'answer' })
+    expect(droveCalls(world, 'send')[0]).toMatchObject({ args: ['send', 'w-auth', '--kind', 'message', '--expects', 'answer', '-'], stdin: 'Use the redis client' })
+    await callTool($, 'review_verdict', { name: 'w-auth', verdict: 'approve' })
+    expect(droveCalls(world, 'send')[1]).toMatchObject({ args: ['send', 'w-auth', '--kind', 'verdict', '--verdict', 'approve', '-'], stdin: '' })
+    expect(denial((await callTool($, 'review_verdict', { name: 'w-auth', verdict: 'changes' })) as never)).toContain('notes')
+    await callTool($, 'promote_worker', { name: 'w-auth', model: 'opus', reason: 'subtle race' })
+    expect(droveCalls(world, 'promote')[0]?.args).toEqual(['promote', 'w-auth', '--model', 'claude-opus-5-5', '--effort', 'high', '--reason', 'subtle race'])
+    await callTool($, 'demote_worker', { name: 'w-cx', effort: 'low' })
+    expect(droveCalls(world, 'promote')[1]?.args).toEqual(['promote', 'w-cx', '--model', 'gpt-5', '--effort', 'low'])
+    expect(denial((await callTool($, 'promote_worker', { name: 'w-none' })) as never)).toContain('No open worker')
+    await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })
+    expect(droveCalls(world, 'close')[0]?.args).toEqual(['close', 'w-auth', '--remove-worktree'])
+    expect(String((await callTool($, 'roster', {})).result)).toContain('w-auth working')
   })
 
-  test('the band shows the role and each worker above the other bands', async ($, on) => {
-    engine(on)
+  test('a wake from the bridge becomes a prompt of its own; the roster feeds the pills', async ($, on) => {
+    const { world, clock } = engine(on)
     await $.session.start(START)
     await runCommand($, '')
-    await spawn($, 'w-auth')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    world.submitted.length = 0
+    await emit(world, clock, { t: 'wake', text: '[worker w-auth · done · expects review]\nRate limiter added\n→ Review the work' })
+    expect(world.submitted).toEqual(['[worker w-auth · done · expects review]\nRate limiter added\n→ Review the work'])
+    expect(world.toasts).toContain('w-auth: done')
     const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
     expect((await ui.find({ type: 'Text', text: /orchestrator · 1\/5/ }))?.text).toContain('⌘')
     expect((await ui.find({ type: 'Text', text: /w-auth S·m/ }))?.text).toContain('⚙')
     expect(await ui.find({ type: 'Text', text: 'other band' })).toBeDefined()
     await ui.unmount()
-  })
-})
-
-describe('the board', () => {
-  const PANE_PROPS = { title: 'orchestra', isFocused: false, bodyColumns: 90, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } as never
-
-  test('opens on /orchestrate and shows the lead, each worker and the messages between them', async ($, on) => {
-    const { world, panes } = engine(on)
-    await $.session.start(START)
-    await runCommand($, 'Ship rate limiting')
-    expect([...panes]).toEqual(['orchestra'])
-    await spawn($, 'w-api', { effort: 'medium' })
-    const token = (world.herdrCalls[0]?.find(arg => arg.startsWith('CLAUDE_ORCH_TOKEN=')) ?? '').split('=')[1] ?? ''
-    await $.session.receive({ origin: { kind: 'peer' }, text: formatEnvelope({ worker: 'w-api', kind: 'hello', expects: 'none', session: 's-auth', token }, 'up') } as never)
-    await $.session.receive({ origin: { kind: 'peer' }, text: formatEnvelope({ worker: 'w-api', kind: 'progress', expects: 'none', token }, 'middleware done') } as never)
-    await $.session.receive({ origin: { kind: 'peer' }, text: formatEnvelope({ worker: 'w-api', kind: 'done', expects: 'review', token }, 'Token bucket added') } as never)
-
-    const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS } as never)
-    const texts = [...(await ui.findAll({ type: 'Text' })), ...(await ui.findAll({ type: 'Button' }))].map(({ text }) => text ?? '')
-    expect(texts).toContain('Ship rate limiting')
-    expect(texts).toContain('lead')
-    expect(texts).toContain('w-api')
-    expect(texts).toContain('Token bucket added')
-    expect(texts).toContain('➤')
-    expect(texts).toContain('◆ orchestra')
-    expect(texts).toContain('brief')
-    expect(texts).toContain('middleware done (not shown to the lead)')
-    expect(texts).toContain('expects review · Token bucket added')
-    await ui.unmount()
-
-    await runCommand($, 'board')
-    expect([...panes]).toEqual([])
-    await runCommand($, 'board')
-    expect([...panes]).toEqual(['orchestra'])
   })
 
   test('without a goal, the first prompt you type becomes the goal', async ($, on) => {
@@ -573,30 +508,90 @@ describe('the board', () => {
     await ui.unmount()
   })
 
-  test('a worker asking in its pane turns red on the board and stays blocked whatever herdr says', async ($, on) => {
+  test('a restarted session re-attaches its run from the store; an old-mod record is reported and dropped', async ($, on) => {
+    const { world, clock } = engine(on, undefined, {
+      [`drove:session:${SELF}`]: { run: RUN, goal: 'Ship it', startedAt: NOW, savedAt: NOW },
+      [`session:${SELF}`]: { orchestrator: { startedAt: NOW }, workers: [{ status: 'working' }, { status: 'closed' }], savedAt: NOW },
+    })
+    await $.session.start(START)
+    await settle(clock)
+    expect(droveCalls(world, 'mod')[0]?.args).toEqual(['mod', 'attach', '--session', SELF, '--pane', 'w1:p2', '--model', 'claude-opus-5-5', '--effort', 'high', '--run', RUN])
+    expect(world.registeredTools).toContain('spawn_worker')
+    expect(world.spawned).toHaveLength(1)
+    expect(world.toasts.some(text => text.includes('old orchestrator mod') && text.includes('1 open worker'))).toBe(true)
+    expect(world.store.has(`session:${SELF}`)).toBe(false)
+  })
+
+  test('off asks, stops the workers with drove down on yes, and forgets the run', async ($, on) => {
     const { world, clock } = engine(on)
     await $.session.start(START)
     await runCommand($, 'Ship it')
-    await spawn($, 'w-api', { cairn: 'CCS-77' })
-    expect(world.herdrCalls.find(argv => argv[2] === 'prompt')?.[4]).toContain('Your Cairn task is CCS-77: claim it first.')
-    const token = (world.herdrCalls[0]?.find(arg => arg.startsWith('CLAUDE_ORCH_TOKEN=')) ?? '').split('=')[1] ?? ''
-    const status = (state: string, body: string) => $.session.receive({ origin: { kind: 'peer' }, text: formatEnvelope({ worker: 'w-api', kind: 'status', expects: 'none', state, token }, body) } as never) as Promise<{ consumed?: string }>
-    expect(await status('asking', 'asking in its pane: Which table?')).toMatchObject({ consumed: expect.any(String) })
+    await settle(clock)
+    await emit(world, clock, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    world.answer = 'Stop them'
+    const off = (await runCommand($, 'off')) as { text: string }
+    expect(off.text).toContain('Orchestrator mode is off.')
+    expect(droveCalls(world, 'down')[0]?.args).toEqual(['down', '--run', RUN])
+    expect(world.store.has(`drove:session:${SELF}`)).toBe(false)
+    expect(denial((await callTool($, 'roster', {})) as never)).toContain('off')
+  })
+
+  test('the bridge stands by while another session holds the run, and a run taken down turns the mode off', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    world.bridgeCode = 4
+    await emit(world, clock, { t: 'run', run: runMeta({ status: 'down' }) })
+    world.bridge.push(null)
+    await settle(clock)
+    expect(world.toasts.some(text => text.includes('is down'))).toBe(true)
+    expect(denial((await callTool($, 'roster', {})) as never)).toContain('off')
+  })
+})
+
+describe('the board', () => {
+  test('shows the lead, each seat and the timeline built from Drove events', async ($, on) => {
+    const { world, clock, panes } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'Ship rate limiting')
+    expect([...panes]).toEqual(['orchestra'])
+    await settle(clock)
+    await callTool($, 'spawn_worker', { name: 'w-api', brief: 'Build the token bucket', effort: 'medium' })
+    await emit(
+      world,
+      clock,
+      { t: 'ready', run: RUN, pid: 9 },
+      { t: 'roster', roster: { v: 1, run: RUN, seats: [seat({ name: 'w-api' })], updatedAt: ISO }, status: { 'w-api': { asking: 'asking in its pane: Which table?' } } },
+      {
+        t: 'events',
+        isInitial: false,
+        events: [
+          { at: ISO, type: 'control.sent', seat: 'w-api', data: { kind: 'brief', via: 'herdr-prompt' } },
+          { at: ISO, type: 'report', seat: 'w-api', data: { kind: 'progress', expects: 'none', summary: 'middleware done' } },
+          { at: ISO, type: 'report', seat: 'w-api', data: { kind: 'done', expects: 'review', summary: 'Token bucket added' } },
+        ],
+      },
+    )
     expect(world.toasts.some(text => text.includes('waiting for you in its pane'))).toBe(true)
-    world.agentStatus = 'working'
-    await clock.advance(5_000)
     const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS } as never)
-    const texts = (await ui.findAll({ type: 'Text' })).map(({ text }) => text ?? '')
+    const texts = [...(await ui.findAll({ type: 'Text' })), ...(await ui.findAll({ type: 'Button' }))].map(({ text }) => text ?? '')
+    expect(texts).toContain('Ship rate limiting')
+    expect(texts).toContain('lead')
+    expect(texts).toContain('w-api')
+    expect(texts).toContain('◆ orchestra')
+    expect(texts).toContain('brief')
     expect(texts).toContain('?')
-    expect(texts).toContain('▌')
     expect(texts).toContain('asking in its pane: Which table?')
-    expect(texts).toContain('CCS-77')
-    expect(texts).toContain('asking')
+    expect(texts.some(text => text.includes('Build the token bucket'))).toBe(true)
+    expect(texts.some(text => text.includes('middleware done (not shown to the lead)'))).toBe(true)
+    expect(texts.some(text => text.includes('expects review · Token bucket added'))).toBe(true)
     await ui.unmount()
-    await status('working', 'got an answer')
-    const after = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS } as never)
-    expect((await after.findAll({ type: 'Text' })).map(({ text }) => text)).toContain('⚙')
-    await after.unmount()
+
+    await runCommand($, 'board')
+    expect([...panes]).toEqual([])
+    await runCommand($, 'board')
+    expect([...panes]).toEqual(['orchestra'])
   })
 
   test('the board is painted in the terminal background by default; /orchestrate board bg toggles it', async ($, on) => {
@@ -612,125 +607,78 @@ describe('the board', () => {
     expect(await painted()).toBe('#1e1e2e')
     expect(((await runCommand($, 'board bg')) as { text: string }).text).toContain('removed')
     expect(await painted()).toBeUndefined()
-    await runCommand($, 'board bg')
-    expect(await painted()).toBe('#1e1e2e')
   })
 
-  test('clicking a timeline message shows its full text, clicking again hides it', async ($, on) => {
-    const { world } = engine(on)
+  test('clicking a report shows the full text the wake carried, clicking again hides it', async ($, on) => {
+    const { world, clock } = engine(on)
     await $.session.start(START)
     await runCommand($, 'Ship it')
-    await spawn($, 'w-api')
-    const token = (world.herdrCalls[0]?.find(arg => arg.startsWith('CLAUDE_ORCH_TOKEN=')) ?? '').split('=')[1] ?? ''
-    const long = `Rate limiter added\n\n${'detail '.repeat(40)}\nbranch feat/rl`
-    await $.session.receive({ origin: { kind: 'peer' }, text: formatEnvelope({ worker: 'w-api', kind: 'done', expects: 'review', token }, long) } as never)
+    await settle(clock)
+    await emit(world, clock, { t: 'events', isInitial: false, events: [{ at: ISO, type: 'report', seat: 'w-api', data: { kind: 'done', expects: 'review', summary: 'Rate limiter added' } }] })
+    await emit(world, clock, { t: 'wake', text: '[worker w-api · done · expects review]\nRate limiter added\nbranch worktree-w-api\n→ Review the work' })
     const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS } as never)
     const button = (await ui.findAll({ type: 'Button' })).find(({ text }) => (text ?? '').startsWith('▸ expects review · Rate limiter added'))
     expect(button).toBeDefined()
-    expect(await ui.find({ type: 'Text', text: 'branch feat/rl' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'branch worktree-w-api' })).toBeUndefined()
     await ui.press({ key: (button as { key: string }).key })
-    expect(await ui.find({ type: 'Text', text: 'branch feat/rl' })).toBeDefined()
-    expect((await ui.findAll({ type: 'Button' })).some(({ text }) => (text ?? '').startsWith('▾ expects review'))).toBe(true)
+    expect(await ui.find({ type: 'Text', text: 'branch worktree-w-api' })).toBeDefined()
     await ui.press({ key: (button as { key: string }).key })
-    expect(await ui.find({ type: 'Text', text: 'branch feat/rl' })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'branch worktree-w-api' })).toBeUndefined()
     await ui.unmount()
-  })
-
-  test('the workers tab closes with its last worker', async ($, on) => {
-    const { tabs } = engine(on)
-    await $.session.start(START)
-    await runCommand($, '')
-    await spawn($, 'w-a')
-    await spawn($, 'w-b')
-    expect([...tabs]).toEqual(['w1:t9'])
-    await $.tool.call({ tool: 'mcp__orchestrator__close_worker', name: 'w-a' } as never)
-    expect([...tabs]).toEqual(['w1:t9'])
-    await $.tool.call({ tool: 'mcp__orchestrator__close_worker', name: 'w-b' } as never)
-    expect([...tabs]).toEqual([])
   })
 })
 
 describe('worker session', () => {
-  const WORKER_ENV = {
-    HOME: '/Users/test',
-    CLAUDE_ORCH_PARENT: SELF,
-    CLAUDE_ORCH_PARENT_NAME: 'cal-7d',
-    CLAUDE_ORCH_WORKER: 'w-auth',
-    CLAUDE_ORCH_TOKEN: 'tok',
-    CLAUDE_ORCH_MODEL: 'claude-sonnet-5-5',
-    CLAUDE_ORCH_EFFORT: 'medium',
-  }
+  const WORKER_ENV = { HOME: '/Users/test', DROVE_HOME: '/Users/test/.drove', DROVE_RUN: RUN, DROVE_ROLE: 'worker', DROVE_SEAT: 'w-auth', DROVE_TOKEN: 'tok' }
+  const ROSTER = `/Users/test/.drove/runs/${RUN}/roster.json`
+  const STATUS = `/Users/test/.drove/runs/${RUN}/seats/w-auth/mod.json`
 
-  test('a worker registers report, checks in, and reports to its parent with its token', async ($, on) => {
-    const { world, clock } = engine(on, WORKER_ENV)
+  test('a Drove worker registers the report alias, which records through drove mod report', async ($, on) => {
+    const { world } = engine(on, WORKER_ENV)
     await $.session.start(START)
     expect(world.commands).toEqual([])
     expect(world.registeredTools).toEqual(['report'])
-    await clock.advance(2000)
-    expect(parseEnvelope(world.sent[0]?.text ?? '')?.fields).toMatchObject({ worker: 'w-auth', kind: 'hello', session: 's-auth', token: 'tok' })
-    const reported = await $.tool.call({ tool: 'mcp__orchestrator__report', kind: 'done', summary: 'Rate limiter added', details: 'branch feat/rl' } as never)
-    expect(String((reported as { result?: unknown }).result)).toContain('wait')
-    const sent = world.sent.at(-1)
-    expect(sent?.to).toBe(SELF)
-    expect(parseEnvelope(sent?.text ?? '')).toMatchObject({ fields: { kind: 'done', expects: 'review', token: 'tok' }, body: 'Rate limiter added\n\nbranch feat/rl' })
+    const reported = await $.tool.call({ tool: 'mcp__orchestrator__report', kind: 'question', summary: 'Drop the table?', for: 'cal' } as never)
+    expect(String((reported as { result?: unknown }).result)).toContain('recorded')
+    const [call] = droveCalls(world, 'mod')
+    expect(call?.args).toEqual(['mod', 'report'])
+    expect(JSON.parse(call?.stdin ?? '{}')).toEqual({ kind: 'question', summary: 'Drop the table?', for: 'human' })
   })
 
-  test('a question in its pane and a permission prompt are reported as asking, then working again', async ($, on) => {
-    const { world, clock } = engine(on, WORKER_ENV)
-    on('classic.Notification', () => ({}))
-    await $.session.start(START)
-    await clock.advance(2000)
-    world.sent.length = 0
-    await $.tool.call({ tool: 'AskUserQuestion', questions: [{ question: 'Which table?', header: 'Table', options: [{ label: 'a', description: '' }, { label: 'b', description: '' }], multiSelect: false }] } as never)
-    const states = world.sent.map(({ text }) => parseEnvelope(text)).map(env => [env?.fields.kind, env?.fields.state, env?.body])
-    expect(states).toEqual([['status', 'asking', 'asking in its pane: Which table?'], ['status', 'working', 'got an answer']])
-
-    world.sent.length = 0
-    await $.classic.Notification({ message: 'Claude needs your permission to use Bash', notification_type: 'permission_prompt' } as never)
-    expect(parseEnvelope(world.sent[0]?.text ?? '')?.fields.state).toBe('asking')
-    await $.tool.call({ tool: 'Bash', command: 'rm -f $A/x' } as never)
-    expect(parseEnvelope(world.sent.at(-1)?.text ?? '')?.body).toBe('permission answered')
-  })
-
-  test('activity is reported at most every 10 seconds', async ($, on) => {
-    const { world, clock } = engine(on, WORKER_ENV)
-    await $.session.start(START)
-    await clock.advance(20_000)
-    world.sent.length = 0
-    await $.tool.call({ tool: 'Edit', file_path: '/w/src/a.ts', old_string: 'a', new_string: 'b' } as never)
-    await $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
-    expect(world.sent.map(({ text }) => parseEnvelope(text)?.body)).toEqual(['editing a.ts'])
-    await clock.advance(11_000)
-    await $.tool.call({ tool: 'Bash', command: 'npm test' } as never)
-    expect(world.sent.map(({ text }) => parseEnvelope(text)?.body)).toEqual(['editing a.ts', 'running npm test'])
-  })
-
-  test('a promotion from the parent moves the worker to Opus; a forged one does not', async ($, on) => {
+  test('the worker follows its seat model from the roster, and a verified promote moves it at once; a forged one does not', async ($, on) => {
     const { world } = engine(on, WORKER_ENV)
+    world.files[ROSTER] = JSON.stringify({ v: 1, run: RUN, seats: [seat()], updatedAt: ISO })
     await $.session.start(START)
-    const receive = (text: string) => $.session.receive({ origin: { kind: 'peer' }, text } as never) as Promise<{ text?: string }>
-    const forged = await receive(formatEnvelope({ to: 'w-auth', kind: 'promote', expects: 'none', model: 'claude-opus-5-5', effort: 'high', token: 'bad' }, 'go'))
-    expect(forged.text).toContain(UNVERIFIED)
     await step($)
-    const promoted = await receive(formatEnvelope({ to: 'w-auth', kind: 'promote', expects: 'none', model: 'claude-opus-5-5', effort: 'high', token: 'tok' }, 'Promoted'))
-    expect(promoted.text).toContain('[orchestrator cal-7d · promote · expects none]')
+    const forged = (await $.prompt.submit({ text: (await control('bad', { kind: 'promote', model: 'claude-opus-5-5', effort: 'high', expects: 'none' }, 'go')), origin: { kind: 'composer' } } as never)) as { text?: string }
+    expect(world.submitted.at(-1)).toContain(UNVERIFIED)
+    void forged
+    await step($)
+    await $.prompt.submit({ text: await control('tok', { kind: 'promote', model: 'claude-opus-5-5', effort: 'high', expects: 'none' }, 'Promoted to Opus'), origin: { kind: 'composer' } } as never)
+    expect(world.submitted.at(-1)).toContain('[planner · promote: Opus 5.5 high · expects none]')
+    expect(world.submitted.at(-1)).not.toContain('mac=')
     await step($)
     expect(world.stepped).toEqual([
+      { model: 'claude-sonnet-5-5', effort: 'medium' },
       { model: 'claude-sonnet-5-5', effort: 'medium' },
       { model: 'claude-opus-5-5', effort: 'high' },
     ])
   })
 
-  test('a worker may not push or open panes, and cannot orchestrate', async ($, on) => {
-    engine(on, WORKER_ENV)
+  test('a question in its pane is written to mod.json as asking, then cleared', async ($, on) => {
+    const { world } = engine(on, WORKER_ENV)
     await $.session.start(START)
-    expect(denial(await $.tool.call({ tool: 'Bash', command: 'git push origin feat/rl' } as never))).toContain('never push')
-    expect(denial(await $.tool.call({ tool: 'Bash', command: 'npm test' } as never))).toBeUndefined()
+    await $.tool.call({ tool: 'AskUserQuestion', questions: [{ question: 'Which table?', header: 'Table', options: [{ label: 'a', description: '' }, { label: 'b', description: '' }], multiSelect: false }] } as never)
+    const status = JSON.parse(world.files[STATUS] ?? '{}') as { asking?: string; activity?: string }
+    expect(status.asking).toBeUndefined()
+    expect(status.activity).toBe('got an answer')
   })
 
-  test('a summariser child of a worker is not a worker', async ($, on) => {
+  test('a worker does not run the guard itself (Drove launched it with its own hook), and a summariser is not a worker', async ($, on) => {
     const { world } = engine(on, { ...WORKER_ENV, CAIRN_SUMMARISER: '1' })
     await $.session.start(START)
     expect(world.registeredTools).toEqual([])
+    expect(denial(await $.tool.call({ tool: 'Bash', command: 'npm test' } as never))).toBeUndefined()
+    expect(droveCalls(world, 'guard')).toHaveLength(0)
   })
 })
