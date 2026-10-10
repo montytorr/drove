@@ -114,6 +114,13 @@ const locateRun = async (deps: Deps, ref: RunRef, status?: RunMeta['status']): P
   return run ? { run } : { error: failed('no-run', `no Drove run found for ${repo}; start one with \`drove plan\``) }
 }
 
+export const boardRun = async (deps: Deps, ref: RunRef): Promise<{ run: string } | { error: CommandResult }> => {
+  const located = await locateRun(deps, ref, 'up')
+  if ('run' in located) return { run: located.run.id }
+  const { error } = located
+  return { error: ref.run || error.ok ? error : failed('no-run', `${error.text}, or pass --run ID`) }
+}
+
 const locateFor = (deps: Deps, identity: Identity, status?: RunMeta['status']): Promise<Located> =>
   locateRun(deps, { run: identity.run || undefined, repo: process.cwd() }, status)
 

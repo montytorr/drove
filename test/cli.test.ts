@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
+import { realpath } from 'node:fs/promises'
 import { beforeEach, test } from 'node:test'
 import { COMMANDS, main } from '../src/cli.ts'
 import type { ProcessPlan } from '../src/commands.ts'
-import { tmp } from './p3-helpers.ts'
+import { saveRun } from '../src/roster.ts'
+import { makeRepo, makeRun, RUN, tmp } from './p3-helpers.ts'
 
 const capture = (stdin = '') => {
   const out: string[] = []
@@ -85,4 +87,35 @@ test('stdin feeds the text argument -', async () => {
   const sent = capture('body from stdin')
   assert.equal(await main(['send', 'w-api', '--kind', 'message', '-'], sent.io), 1)
   assert.match(sent.err.join('\n'), /no-run|no Drove run/)
+})
+
+const inDir = async <T>(dir: string, body: () => Promise<T>): Promise<T> => {
+  const before = process.cwd()
+  process.chdir(dir)
+  try {
+    return await body()
+  } finally {
+    process.chdir(before)
+  }
+}
+
+test('drove board with no --run picks the up run for the repo it is run in', async () => {
+  const repo = await realpath(await makeRepo('board-repo'))
+  await saveRun(process.env.DROVE_HOME as string, makeRun(repo))
+  const written: string[] = []
+  const realWrite = process.stdout.write
+  process.stdout.write = ((chunk: string | Uint8Array) => (written.push(String(chunk)), true)) as typeof process.stdout.write
+  try {
+    const { err, io } = capture()
+    assert.equal(await inDir(repo, () => main(['board', '--once'], io)), 0, err.join())
+  } finally {
+    process.stdout.write = realWrite
+  }
+  assert.ok(written.join('').includes(RUN))
+})
+
+test('drove board with no run anywhere names drove plan and --run', async () => {
+  const { err, io } = capture()
+  assert.equal(await inDir(await makeRepo('board-empty'), () => main(['board', '--once'], io)), 1)
+  assert.match(err.join('\n'), /drove plan.*--run/)
 })
