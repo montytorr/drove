@@ -1,0 +1,56 @@
+{
+  "name": "orchestrator",
+  "version": "0.1.0",
+  "description": "/orchestrate turns this session into an Opus orchestrator that plans, delegates and reviews but never edits code. It spawns Sonnet worker sessions in herdr panes; they report back over session messaging and can ask to be promoted.",
+  "author": {
+    "name": "Cal",
+    "email": "cal@dispofi.fr"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "orchestratorModel": {
+      "type": "string",
+      "title": "Orchestrator model",
+      "description": "Model id every main-thread request of an orchestrator session is sent to.",
+      "default": "claude-opus-5-5"
+    },
+    "orchestratorEffort": {
+      "type": "string",
+      "title": "Orchestrator effort floor",
+      "description": "An orchestrator's requests never go below this effort; a higher /effort you set is kept.",
+      "options": ["medium", "high", "xhigh", "max"],
+      "default": "high"
+    },
+    "workerModel": {
+      "type": "string",
+      "title": "Worker model",
+      "description": "Model id a new worker starts on.",
+      "default": "claude-sonnet-5-5"
+    },
+    "promotedModel": {
+      "type": "string",
+      "title": "Promotion model",
+      "description": "Model id a worker moves to when the orchestrator promotes it.",
+      "default": "claude-opus-5-5"
+    },
+    "workerEffort": {
+      "type": "string",
+      "title": "Default worker effort",
+      "description": "Effort a worker starts at when the orchestrator does not choose one.",
+      "options": ["low", "medium", "high", "xhigh"],
+      "default": "medium"
+    },
+    "maxWorkers": {
+      "type": "number",
+      "title": "Worker panes without asking",
+      "description": "How many worker panes may be open at once before a new one needs your yes in a dialog.",
+      "default": 5
+    },
+    "effortRouting": {
+      "type": "boolean",
+      "title": "Lower effort for routing turns",
+      "description": "Run turns woken by a worker's question, block or promotion request at medium effort. Off until its effect on the prompt cache is measured.",
+      "default": false
+    }
+  }
+}
