@@ -589,7 +589,7 @@ const queueBrief = async (deps: Deps, run: RunMeta, seat: string, text: string):
     const entry = findSeat(current, seat)
     return entry && (entry.state === 'idle' || entry.state === 'starting') ? upsertSeat(current, { ...entry, state: 'working', stateAt: iso, lastWorkingAt: iso }) : current
   })
-  return 'unconfirmed' in delivery && delivery.unconfirmed ? `${delivery.via} (typed; herdr did not confirm the agent took it within its wait, which a long first turn explains)` : delivery.via
+  return 'unconfirmed' in delivery && delivery.unconfirmed ? `${delivery.via} (typed; herdr did not confirm the agent took it within its wait and no prompt hook record followed, which a long first turn explains)` : delivery.via
 }
 
 // ---------- send / prompt ----------
@@ -816,6 +816,15 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
 
 // ---------- close ----------
 
+const releaseCairnClaim = async (deps: Deps, ref: string): Promise<string> => {
+  try {
+    const ran = await deps.exec(['cairn', 'release', ref, '--force'], { timeoutMs: 15_000 })
+    return ran.code === 0 ? `Released the Cairn claim on ${ref}.` : `Note: the Cairn claim on ${ref} was not released (cairn exited ${ran.code}: ${clip(ran.stderr || ran.stdout)}); release it by hand.`
+  } catch (error) {
+    return `Note: the Cairn claim on ${ref} was not released (${messageOf(error)}); release it by hand.`
+  }
+}
+
 export const close = async (deps: Deps, identity: Identity, seatName: string, removeWorktree: boolean): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
   if (denied) return denied
@@ -843,6 +852,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 
   const notes = [`Closed ${seat.name}${seat.paneId ? ` (pane ${seat.paneId})` : ''}.`]
   if (lockNote) notes.push(`Note: ${lockNote}.`)
+  if (seat.cairn) notes.push(await releaseCairnClaim(deps, seat.cairn))
   if (!removeWorktree) notes.push(`Its worktree ${seat.worktree} and branch ${seat.branch} are kept.`)
   else {
     const targets = [run.base, run.base.replace(/^origin\//, '')]

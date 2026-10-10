@@ -11,6 +11,7 @@ export const RETRY_MS = 3_000
 export const BUSY_RETRY_MS = 45_000
 export const PLANNER_QUIET_MS = 5_000
 export const MAX_ATTEMPTS = 5
+export const confirmTiming = { waitMs: 4_000, pollMs: 250 }
 
 const RANK: Partial<Record<Transport, number>> = { mod: 0, 'codex-queue': 1, 'herdr-prompt': 2 }
 const BLOCKING_STATES: ReadonlySet<Seat['state']> = new Set(['blocked', 'needs-input'])
@@ -23,6 +24,8 @@ const plannerIdleSince = new Map<string, number>()
 export const codexQueueArgv = (thread: string, text: string): string[] => ['codex', 'queue', '--thread', thread, '--message', text]
 
 export type UnconfirmedDelivery = { ok: true; via: Transport; unconfirmed: true }
+
+const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
 const targetOf = (seat: Seat): string => seat.paneId ?? ''
 const clip = (text: string, max = 300): string => text.replace(/\s+/g, ' ').trim().slice(0, max)
@@ -120,12 +123,26 @@ const setAttention = async (deps: Deps, run: string, seat: string, reason: Atten
 const isReplyToOpenAsk = (seat: Seat, control: Control): boolean =>
   (control.kind === 'message' || control.kind === 'answer') && (seat.lastReport?.kind === 'question' || seat.lastReport?.kind === 'blocked')
 
+const hooksFileOf = (deps: Deps, run: string, seat: Seat): string =>
+  join(seat.name === PLANNER_SEAT ? plannerDir(deps.home, run) : seatDir(deps.home, run, seat.name), 'hooks.jsonl')
+
+const confirmedByHook = async (deps: Deps, run: string, seat: Seat, since: number): Promise<boolean> => {
+  for (let waited = 0; ; waited += confirmTiming.pollMs) {
+    const { items } = await readJsonlFrom<HookRecord>(hooksFileOf(deps, run, seat), { offset: 0 })
+    if (items.some(hook => hook.event === 'user-prompt-submit' && Date.parse(hook.at) >= since)) return true
+    if (waited >= confirmTiming.waitMs) return false
+    await sleep(confirmTiming.pollMs)
+  }
+}
+
 const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): Promise<Delivery> => {
   const token = await readToken(join(seatDir(deps.home, run, seat.name), 'token'))
   if (!token) return { ok: false, queued: false, reason: `no token for ${seat.name}` }
   const adapter = chooseAdapter(seat, adaptersFor(deps))
   if (!adapter) return { ok: false, queued: false, reason: `no transport can reach ${seat.name} yet (no pane or thread)` }
-  const delivery = await adapter.deliver(seat, formatControl(control, token))
+  const typedAt = deps.clock.now().getTime()
+  const typed = await adapter.deliver(seat, formatControl(control, token))
+  const delivery: Delivery | UnconfirmedDelivery = typed.ok && 'unconfirmed' in typed && typed.unconfirmed && (await confirmedByHook(deps, run, seat, typedAt)) ? { ok: true, via: typed.via } : typed
   if (delivery.ok) {
     const sentAt = deps.clock.now().toISOString()
     await appendJsonl(sentFile(deps, run, seat.name), { id: control.id, via: delivery.via, at: sentAt } satisfies Sent)

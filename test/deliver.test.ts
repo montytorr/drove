@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { appendFile, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import * as deliver from '../src/deliver.ts'
@@ -8,6 +8,9 @@ import { seatDir } from '../src/paths.ts'
 import { loadRoster } from '../src/roster.ts'
 import type { Control, DeliveryAdapter, Report, RunMeta, Seat } from '../src/types.ts'
 import { FakeHerdr, herdrFail, makeDeps, makeSeat, seedRun } from './p3-helpers.ts'
+
+deliver.confirmTiming.waitMs = 60
+deliver.confirmTiming.pollMs = 10
 
 afterEach(() => deliver.unregisterAdapters())
 
@@ -203,6 +206,30 @@ test('a herdr wait timeout after typing is delivered-unconfirmed: recorded as se
   assert.equal(events.at(-1)?.type, 'control.sent')
   assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
   assert.equal(prompts, 1)
+})
+
+test('a herdr wait timeout is confirmed by a user-prompt-submit hook record newer than the send', async () => {
+  const fake = new FakeHerdr()
+  const base = fake.exec
+  fake.exec = async argv => (argv[2] === 'prompt' ? herdrFail('timeout', 'timed out waiting for agent status') : base(argv))
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  const hooks = join(seatDir(deps.home, run.id, 'w-ui'), 'hooks.jsonl')
+  const sentAt = deps.clock.now().getTime()
+  await appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt - 5_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`)
+  setTimeout(() => void appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt + 1_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`), 20)
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
+  const events = await lines(join(deps.home, 'runs', run.id, 'events.jsonl'))
+  assert.deepEqual(events.at(-1)?.data, { kind: 'message', via: 'herdr-prompt' })
+})
+
+test('a herdr wait timeout stays unconfirmed when only an older hook record exists', async () => {
+  const fake = new FakeHerdr()
+  const base = fake.exec
+  fake.exec = async argv => (argv[2] === 'prompt' ? herdrFail('timeout', 'timed out waiting for agent status') : base(argv))
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  const hooks = join(seatDir(deps.home, run.id, 'w-ui'), 'hooks.jsonl')
+  await appendFile(hooks, `${JSON.stringify({ at: new Date(deps.clock.now().getTime() - 5_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`)
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt', unconfirmed: true })
 })
 
 test('failures before typing (agent_blocked, agent_not_found) queue the control', async () => {

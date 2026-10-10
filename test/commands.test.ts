@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
+import * as deliver from '../src/deliver.ts'
 import { agentName } from '../src/herdr.ts'
 import { seatDir } from '../src/paths.ts'
 import { deriveState } from '../src/detect.ts'
@@ -14,6 +15,7 @@ import type { Deps, Identity, RunMeta } from '../src/types.ts'
 import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun } from './p3-helpers.ts'
 
 beforeEach(() => {
+  Object.assign(deliver.confirmTiming, { waitMs: 30, pollMs: 5 })
   Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20, lockWaitMs: 20, promptWaitMs: 5 })
   for (const key of ['DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_ROLE_IN_BRIEF', 'HERDR_PANE_ID']) delete process.env[key]
   process.env.DROVE_BRIEF_VIA = 'launch-arg'
@@ -549,6 +551,60 @@ test('close stops a Claude seat by closing its pane, never /exit, then closes th
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'closed')
   assert.ok(existsSync(join(repo, '.claude', 'worktrees', 'w-api')))
   assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
+})
+
+test('close releases the seat\'s Cairn claim with --force, best effort, and says so', async () => {
+  const fake = new FakeHerdr()
+  const base = fake.exec
+  const released: string[][] = []
+  fake.exec = async (argv, options) => (argv[0] === 'cairn' ? (released.push([...argv]), { code: 0, stdout: '', stderr: '' }) : base(argv, options))
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
+  const closed = await commands.close(deps, identity, 'w-api', false)
+  assert.equal(closed.ok, true, closed.text)
+  assert.deepEqual(released, [['cairn', 'release', 'DROVE-5', '--force']])
+  assert.match(closed.text, /Released the Cairn claim on DROVE-5/)
+})
+
+test('close still closes when cairn is not on PATH, with a note, and skips release for a seat without a ref', async () => {
+  for (const missing of ['exit', 'throw'] as const) {
+    const fake = new FakeHerdr()
+    const base = fake.exec
+    fake.exec = async (argv, options) => {
+      if (argv[0] !== 'cairn') return base(argv, options)
+      if (missing === 'throw') throw new Error('spawn cairn ENOENT')
+      return { code: 127, stdout: '', stderr: 'command not found' }
+    }
+    const { deps, identity } = await setup(fake)
+    await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
+    const closed = await commands.close(deps, identity, 'w-api', false)
+    assert.equal(closed.ok, true, closed.text)
+    assert.match(closed.text, /Cairn claim on DROVE-5 was not released/)
+    assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'closed')
+  }
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  await commands.close(deps, identity, 'w-api', false)
+  assert.equal(fake.calls.filter(call => call[0] === 'cairn').length, 0)
+})
+
+test('a first turn that outlasts the prompt wait is confirmed when the seat\'s hook record shows the prompt', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const fake = new FakeHerdr({ promptTimesOut: true })
+  const { deps, identity } = await setup(fake)
+  const base = deps.exec
+  deps.exec = async (argv, options) => {
+    if (argv[1] === 'agent' && argv[2] === 'prompt') {
+      await mkdir(seatDir(deps.home, RUN, 'w-api'), { recursive: true })
+      await appendFile(join(seatDir(deps.home, RUN, 'w-api'), 'hooks.jsonl'), `${JSON.stringify({ at: new Date(Date.now() + 60_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`)
+    }
+    return base(argv, options)
+  }
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /Brief: herdr-prompt(?! \(typed)/)
+  const sent = (await readEvents(deps)).find(item => item.type === 'control.sent')
+  assert.equal(sent?.data?.unconfirmed, undefined)
 })
 
 test('close marks the seat closing before the pane goes, so nothing the closing pane shows raises attention', async () => {
