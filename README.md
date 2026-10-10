@@ -40,15 +40,15 @@ drove board                 # in a spare pane: live seats, states and what needs
 
 ## How a worker's life goes
 
-1. **Spawn.** The planner calls `spawn` with a seat name, a kind, a Cairn ref and a brief. Drove opens a pane, waits for the shell prompt, then starts the agent. If the agent does not appear it resets the pane and tries once more. The brief is sent after the agent is up, never as a launch argument. For a Codex worker the worker role text rides at the top of the brief.
+1. **Spawn.** The planner calls `spawn` with a seat name, a kind, a Cairn ref and a brief. Drove opens a pane, waits for the shell prompt, then starts the agent. If the agent does not appear it resets the pane and tries once more. The brief is sent after the agent is up, never as a launch argument. For a Codex worker the worker role text rides at the top of the brief, and the agent runs under a `CODEX_HOME` Drove keeps for the run (see State and config).
 2. **Work.** A Claude worker gets its worktree from `claude --worktree` (branch `worktree-<seat>`). A Codex worker gets one made by Drove (branch `drove/<seat>`). The worker never pushes; a hook denies it.
 3. **Report.** The worker calls its `report` tool: `done`, `question`, `blocked`, `promote` or `progress`. Anything but `progress` wakes the planner.
 4. **Verdict.** The planner reads the diff and sends `approve` or `changes`. After an approve the worker commits its own paths and reports `done` again.
 5. **Close.** The planner merges, then closes the seat. A Claude seat is closed by closing its pane, never with `/exit`; Drove releases the worktree lock Claude leaves behind. Codex gets `/quit` first. A worktree is removed only on request and only when its branch is merged.
 
-Planner messages are signed with a per-seat token. A Claude worker with the mod marks any message that fails the check as unverified, and acts on a `promote` only when it verifies.
+Planner messages are signed with a per-seat token. A Claude worker with the mod marks any message that fails the check as unverified, and acts on a `promote` only when it verifies. Text that follows a signed message in the same paste is shown under a "not signed by Drove" label.
 
-`promote` changes a worker's model or effort, `demote` moves it back. `--model` is optional, so a Codex worker on Codex's default model can be promoted by effort alone. A Claude worker with the mod switches on its next request; otherwise, and for Codex, Drove restarts the agent with resume once it is idle.
+`promote` changes a worker's model or effort, `demote` moves it back. `--model` is optional, so a Codex worker on Codex's default model can be promoted by effort alone. A Claude worker with the mod switches on its next request and is told its new model; otherwise, and for Codex, Drove restarts the agent with resume once it is idle.
 
 `drove down` saves every session id and stops the run. `drove up` resumes it, and `drove up --seat <seat>` relaunches one dead seat.
 
@@ -73,23 +73,24 @@ Planner messages are signed with a per-seat token. A Claude worker with the mod 
 
 ## Rules Drove enforces
 
-- The planner does not edit code or run builds; a guard hook denies it. Workers never push, and nobody pushes to `production`.
+- The planner does not edit code or run builds; a guard hook denies it. Workers never push, and nobody pushes to `production`. A worker may run `claude plugin test`, and no other `claude` command.
 - At most 5 worker panes. A 6th needs the human's yes (`drove budget 6`, or a dialog in the mod).
 - Drove never answers a dialog an agent shows. It reports it on the board instead.
 - Drove never edits `~/.claude`, `~/.codex` or `~/.tmux.conf`, and never writes `AGENTS.md` or `CLAUDE.md` into a repo. Permissions are set per launch.
+- Several runs can be open at once, for example one per herdr workspace. herdr agent names are shared across the server, so Drove names each agent `<seat>-<run tag>`. Two runs of one repo share the worktree folder, so a spawn that would reuse a seat another run still holds is refused.
 
 ## State and config
 
-State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl` and a folder per seat holding its token, its report file and its launch spec. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel` and `briefVia`. Defaults are in `src/commands.ts`.
+State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel` and `briefVia`. Defaults are in `src/commands.ts`.
 
 Codex workers run with approvals and the sandbox bypassed, like Claude workers with `--dangerously-skip-permissions`. Drove's guard hook still denies pushes. Set `codexWorkerSandbox` to `"workspace-write"` to turn that off.
 
 ## Known limits
 
-- **The Codex launch line is still over 1024 bytes** ([DROVE-34](https://tasks.montytorr.com/projects/DROVE/tasks/34)). macOS cuts a typed line at 1024 bytes until the shell is reading input. Drove shrinks the line, starts every pane with `POWERLEVEL9K_INSTANT_PROMPT=off` so powerlevel10k does not draw a prompt before its init is done, and waits for a settled shell prompt before it types. Another shell that draws a prompt before its init has finished could still defeat the wait. The fix is a Drove-owned `CODEX_HOME`.
+- **Codex sessions of a Drove-owned run live under the run's `codex-home/`**, not `~/.codex`, so `codex resume` outside Drove does not see them. A Codex seat spawned before this change keeps the old launch line (about 1100 bytes) and relies on the shell-prompt wait; another shell that draws a prompt before its init has finished could still defeat that wait for such a seat.
 - **A Claude worker may start from a base without your unpushed work.** Claude creates its own worktree (`claude --worktree`) and Drove cannot set its base: `--base` is ignored for Claude seats, and `spawn` only adds a note when the main checkout's HEAD is not at the run base. Claude branches the worktree from `origin/main`, not from the local `main` or the main checkout's HEAD, so work merged locally but not pushed is missing. Push, or run `git merge --ff-only main` in the worker's worktree, before you give it work that needs that code. Codex workers start from the run base.
-- **Not yet run live**: a Codex planner with a Codex worker, the budget dialog in both clients, and the fixes of 2026-10-10 in a real run, including the message check of [DROVE-24](https://tasks.montytorr.com/projects/DROVE/tasks/24) ([DROVE-35](https://tasks.montytorr.com/projects/DROVE/tasks/35), [DROVE-19](https://tasks.montytorr.com/projects/DROVE/tasks/19)).
-- Codex may ask once to approve Drove's hooks in the pane; Drove never answers that dialog, and shows it on the board.
+- **Not yet run live**: a Codex planner with a Codex worker, the budget dialog in both clients, and two runs side by side. The fixes of 2026-10-10 passed a live run ([DROVE-35](https://tasks.montytorr.com/projects/DROVE/tasks/35)).
+- The Codex planner and a Codex seat that has no Drove-owned home may still ask once to approve Drove's hooks in the pane; Drove never answers that dialog, and shows it on the board.
 - The mod cannot import Drove's code. It runs the CLI, so Node 22.18 or newer must be on `PATH` (or set the mod's `nodePath`).
 
 ## Develop
@@ -102,10 +103,10 @@ npm run typecheck   # tsc --noEmit
 
 Run `npm test` in a normal shell. Inside a Drove worker `DROVE_*` is set in the environment, and `test/mod-protocol.test.ts` fails on it unless you unset those variables.
 
-The mod's tests run only through Claude Code, from a normal shell (a Drove worker's guard blocks `claude`):
+The mod's tests run only through Claude Code. A Drove worker's guard allows exactly this command and no other `claude`:
 
 ```sh
 claude plugin test mod
 ```
 
-If `claude` is a shell wrapper, call the real binary. The mod's type check needs the generated `mod/.claude-plugin/types`, which is not in the repo.
+If `claude` is a shell function or wrapper, call the real binary (for example `~/.local/bin/claude`); a wrapper that adds flags before `plugin` breaks it. The mod's type check needs the generated `mod/.claude-plugin/types`, which is not in the repo.
