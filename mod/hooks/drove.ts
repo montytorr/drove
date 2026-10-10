@@ -37,6 +37,13 @@ export const verdictArgs = (name: string, verdict: 'approve' | 'changes'): strin
 
 export const promoteArgs = (name: string, model: string | undefined, effort: Effort, reason?: string): string[] => ['promote', name, ...(model ? ['--model', model] : []), '--effort', effort, ...(reason ? ['--reason', reason] : [])]
 
+export const migrateArgs = (input: { name: string; kind: AgentKind; model?: string; effort?: Effort; reason?: string }): string[] => [
+  'migrate', input.name, '--kind', input.kind,
+  ...(input.model ? ['--model', input.model] : []),
+  ...(input.effort ? ['--effort', input.effort] : []),
+  ...(input.reason ? ['--reason', input.reason] : []),
+]
+
 export const closeArgs = (name: string, removeWorktree: boolean): string[] => ['close', name, ...(removeWorktree ? ['--remove-worktree'] : [])]
 
 export const rosterArgs = (run: string): string[] => ['roster', '--run', run]

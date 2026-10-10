@@ -502,6 +502,23 @@ describe('orchestrator session', () => {
     expect(String((await callTool($, 'roster', {})).result)).toContain('w-auth working')
   })
 
+  test('migrate_worker is drove migrate to the other kind, and refuses the same kind', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat(), seat({ name: 'w-cx', kind: 'codex', model: 'gpt-5' })], updatedAt: ISO }, status: {} })
+    expect(world.registeredTools).toContain('migrate_worker')
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-auth', kind: 'codex', reason: 'usage limit' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'migrate')[0]?.args).toEqual(['migrate', 'w-auth', '--kind', 'codex', '--reason', 'usage limit'])
+    await callTool($, 'migrate_worker', { name: 'w-cx', kind: 'claude', model: 'opus', effort: 'high' })
+    expect(droveCalls(world, 'migrate')[1]?.args).toEqual(['migrate', 'w-cx', '--kind', 'claude', '--model', 'claude-opus-5-5', '--effort', 'high'])
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-auth', kind: 'claude' })) as never)).toContain('already a claude worker')
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-auth', kind: 'gemini' })) as never)).toContain('kind must be')
+    expect(denial((await callTool($, 'migrate_worker', { name: 'w-none', kind: 'codex' })) as never)).toContain('No open worker')
+    expect(droveCalls(world, 'migrate')).toHaveLength(2)
+  })
+
   test('a wake from the bridge becomes a prompt of its own: the person sees one line per report, the model also reads the reports in a hidden row; the roster feeds the pills', async ($, on) => {
     const { world, clock } = engine(on)
     const session = mock.session(on)

@@ -47,6 +47,21 @@ test('claude worker resume replaces --session-id with --resume', () => {
   assert.equal(spec.cwd, '/work/repo/.claude/worktrees/w-api')
 })
 
+test('a claude worker started in an existing worktree gets --session-id and no --worktree', () => {
+  const spec = launch.claudeWorkerSpec(request({ inWorktree: true, sessionId: 'fresh-id', initialPrompt: undefined }))
+  assert.ok(!spec.argv.includes('--worktree'))
+  assert.ok(!spec.argv.includes('--resume'))
+  assert.equal(spec.argv[spec.argv.indexOf('--session-id') + 1], 'fresh-id')
+  assert.equal(spec.cwd, '/work/repo/.claude/worktrees/w-api')
+})
+
+test('claude settings wire StopFailure to drove guard stop-failure, for workers and planners', () => {
+  for (const role of ['worker', 'planner'] as const) {
+    const hooks = (launch.claudeSettings(ENTRY, role) as { hooks: Record<string, { hooks: { command: string }[] }[]> }).hooks
+    assert.equal(hooks.StopFailure?.[0]?.hooks[0]?.command, `node ${ENTRY} guard stop-failure`)
+  }
+})
+
 test('claude planner and codex worker never get --worktree', () => {
   assert.ok(!launch.claudePlannerSpec(request({ identity: planner })).argv.includes('--worktree'))
   assert.ok(!launch.codexWorkerSpec(request({ kind: 'codex' })).argv.includes('--worktree'))
@@ -172,7 +187,7 @@ test('claude settings and mcp config carry the guard hooks and the drove server'
   const settings = launch.claudeSettings(ENTRY, 'worker') as { hooks: Record<string, { matcher?: string; hooks: { command: string }[] }[]> }
   assert.equal(settings.hooks.PreToolUse?.[0]?.matcher, launch.CLAUDE_GUARDED_TOOLS)
   assert.equal(settings.hooks.PreToolUse?.[0]?.hooks[0]?.command, `node ${ENTRY} guard pre-tool-use`)
-  assert.deepEqual(Object.keys(settings.hooks), ['PreToolUse', 'SessionStart', 'UserPromptSubmit', 'Stop', 'Notification'])
+  assert.deepEqual(Object.keys(settings.hooks), ['PreToolUse', 'SessionStart', 'UserPromptSubmit', 'Stop', 'StopFailure', 'Notification'])
   assert.equal(settings.hooks.UserPromptSubmit?.[0]?.hooks[0]?.command, `node ${ENTRY} guard user-prompt-submit`)
   assert.deepEqual(launch.claudeMcpConfig(ENTRY), { mcpServers: { drove: { command: 'node', args: [ENTRY, 'mcp'] } } })
 })

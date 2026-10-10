@@ -6,7 +6,7 @@ import { identityFromEnv, plannerDir, runDir, seatDir } from './paths.ts'
 import { locateEnvelope, UNVERIFIED, verifyControl } from './protocol.ts'
 import type { AgentKind, GuardDecision, GuardInput, HookEventName, HookInput, HookRecord, Identity } from './types.ts'
 
-export const HOOK_EVENTS: readonly HookEventName[] = ['session-start', 'user-prompt-submit', 'pre-tool-use', 'stop', 'notification', 'permission-request']
+export const HOOK_EVENTS: readonly HookEventName[] = ['session-start', 'user-prompt-submit', 'pre-tool-use', 'stop', 'stop-failure', 'notification', 'permission-request']
 export const DENY_EXIT_CODE = 2
 
 const DETAIL_MAX = 200
@@ -52,6 +52,8 @@ export const detectAgent = (raw: Record<string, unknown>, env: NodeJS.ProcessEnv
 const detailOf = (event: HookEventName, raw: Record<string, unknown>, tool: string | undefined, toolInput: Record<string, unknown> | undefined): string | undefined => {
   if (event === 'notification') return text(raw.notification_type) ?? text(raw.message)
   if (event === 'session-start') return text(raw.source)
+  // Claude's StopFailure: the API error that ended the turn (rate_limit, billing_error, ...), then its details.
+  if (event === 'stop-failure') return [text(raw.error) ?? 'unknown', text(raw.error_details)].filter(Boolean).join(': ')
   if (event === 'permission-request') {
     const what = text(raw.reason) ?? (toolInput ? commandOf(toolInput) : undefined) ?? text(toolInput?.file_path)
     return [tool, what].filter(Boolean).join(': ') || undefined

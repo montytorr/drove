@@ -22,7 +22,7 @@ beforeEach(async () => {
 })
 
 test('cli knows the commands from the design', () => {
-  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'board', 'down', 'up', 'budget', 'guard', 'mcp', 'mod'])
+  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'spawn', 'send', 'prompt', 'promote', 'migrate', 'roster', 'capture', 'close', 'board', 'down', 'up', 'budget', 'guard', 'mcp', 'mod'])
 })
 
 test('cli --help prints usage and exits 0', async () => {
@@ -39,7 +39,7 @@ test('cli rejects an unknown command with 2', async () => {
 })
 
 test('cli reports usage errors with 2', async () => {
-  for (const argv of [['spawn', 'w-api'], ['send', 'w-api', '--kind', 'brief', 'x'], ['budget'], ['guard', 'nonsense'], ['promote', 'w-api', '--model', 'm'], ['spawn', '--bogus']]) {
+  for (const argv of [['spawn', 'w-api'], ['send', 'w-api', '--kind', 'brief', 'x'], ['budget'], ['guard', 'nonsense'], ['promote', 'w-api', '--model', 'm'], ['migrate', 'w-api'], ['spawn', '--bogus']]) {
     const { err, io } = capture()
     assert.equal(await main(argv, io), 2, argv.join(' '))
     assert.ok(err.join('\n').length > 0)

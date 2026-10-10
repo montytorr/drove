@@ -66,6 +66,17 @@ test('parseHookInput reads Claude and Codex shapes', () => {
   assert.ok((hooks.parseHookInput('notification', { message: 'x'.repeat(500) }, 'claude').detail ?? '').length <= 200)
 })
 
+test('stop-failure: Claude\'s StopFailure hook is recorded with the API error, then its details', async () => {
+  assert.ok(hooks.HOOK_EVENTS.includes('stop-failure'))
+  assert.equal(hooks.parseHookInput('stop-failure', { error: 'rate_limit', error_details: "You've hit your session limit · resets 3am" }, 'claude').detail, "rate_limit: You've hit your session limit · resets 3am")
+  assert.equal(hooks.parseHookInput('stop-failure', { error: 'billing_error' }, 'claude').detail, 'billing_error')
+  assert.equal(hooks.parseHookInput('stop-failure', {}, 'claude').detail, 'unknown')
+  const { deps, written } = fakeDeps()
+  const result = await hooks.runHook('stop-failure', JSON.stringify({ hook_event_name: 'StopFailure', session_id: 's1', error: 'rate_limit' }), WORKER, deps)
+  assert.equal(result.code, 0)
+  assert.deepEqual(written.map(item => [item.path, item.value.event, item.value.detail, item.value.sessionId]), [['/h/worker/w-api/hooks.jsonl', 'stop-failure', 'rate_limit', 's1']])
+})
+
 test('renderHookOutput: exit 2 and stderr for both, JSON for Claude', () => {
   assert.deepEqual(hooks.renderHookOutput('claude', { allow: true }), { stdout: '', stderr: '', code: 0 })
   const claude = hooks.renderHookOutput('claude', { allow: false, reason: 'no' })

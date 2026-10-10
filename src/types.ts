@@ -93,6 +93,7 @@ export type Seat = {
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
   restartingSince?: string
+  migratedFrom?: { kind: AgentKind; sessionId?: string; model: string; at: string; reason?: string }
   attention: Attention[]
 }
 
@@ -151,6 +152,7 @@ export type DroveEventType =
   | 'seat.spawn'
   | 'seat.start_failed'
   | 'seat.relaunch'
+  | 'seat.migrate'
   | 'seat.state'
   | 'seat.close'
   | 'report'
@@ -170,7 +172,7 @@ export type DroveEvent = {
   data?: Record<string, unknown>
 }
 
-export type HookEventName = 'session-start' | 'user-prompt-submit' | 'pre-tool-use' | 'stop' | 'notification' | 'permission-request'
+export type HookEventName = 'session-start' | 'user-prompt-submit' | 'pre-tool-use' | 'stop' | 'stop-failure' | 'notification' | 'permission-request'
 
 export type HookRecord = {
   at: string
@@ -246,6 +248,7 @@ export type LaunchRequest = {
   effort: Effort
   sessionId?: string
   resumeId?: string
+  inWorktree?: boolean
   roleText: string
   initialPrompt?: string
   droveEntry: string
@@ -288,6 +291,14 @@ export type PromoteRequest = {
   seat: string
   model: string
   effort: Effort
+  reason?: string
+}
+
+export type MigrateRequest = {
+  seat: string
+  kind: AgentKind
+  model?: string
+  effort?: Effort
   reason?: string
 }
 

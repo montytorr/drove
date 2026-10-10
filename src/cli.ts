@@ -147,6 +147,22 @@ export const COMMANDS: Record<string, Spec> = {
         io,
       ),
   },
+  migrate: {
+    usage: 'drove migrate <seat> --kind claude|codex [--model M] [--effort E] [--reason TEXT]',
+    why: 'move a worker to the other agent kind in the same worktree, with a handoff brief',
+    options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, reason: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(
+        await commands.migrate(commands.defaultDeps(), commands.identityOrPlanner(), {
+          seat: need(positionals[0], '<seat>'),
+          kind: need(str(values, 'kind'), '--kind') as AgentKind,
+          model: str(values, 'model'),
+          effort: str(values, 'effort') as Effort | undefined,
+          reason: str(values, 'reason'),
+        }),
+        io,
+      ),
+  },
   roster: {
     usage: 'drove roster [--json] [--run ID]',
     why: 'one line per seat',

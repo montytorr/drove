@@ -284,6 +284,21 @@ const ORCHESTRATOR_TOOLS = [
     },
   },
   {
+    name: 'migrate_worker',
+    description: 'Orchestrator mode: move a worker to the other agent kind (Claude to Codex, or Codex to Claude), usually because it hit its usage limit. It keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        kind: { type: 'string', enum: ['claude', 'codex'], description: 'the kind to move to' },
+        model: { type: 'string', description: 'Claude: opus or sonnet (default) or a model id; Codex: a model id (default Codex\'s worker model)' },
+        effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max'], description: 'default: its current effort' },
+        reason: { type: 'string' },
+      },
+      required: ['name', 'kind'],
+    },
+  },
+  {
     name: 'close_worker',
     description: 'Orchestrator mode: close a worker pane you opened, once its work is approved and committed or no longer needed. Its worktree and branch are kept unless remove_worktree is true and the branch is merged.',
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, remove_worktree: { type: 'boolean' } }, required: ['name'] },
@@ -338,6 +353,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__review_verdict: input => `sending ${String(input.verdict ?? '')} to ${String(input.name ?? '')}`,
   mcp__orchestrator__promote_worker: input => `promoting ${String(input.name ?? '')}`,
   mcp__orchestrator__demote_worker: input => `moving ${String(input.name ?? '')} back down`,
+  mcp__orchestrator__migrate_worker: input => `moving ${String(input.name ?? '')} to ${String(input.kind ?? '')}`,
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
   mcp__orchestrator__roster: () => 'checking the roster',
   Bash: input => `running ${oneLine(String(input.command ?? ''), 60)}`,
@@ -442,6 +458,27 @@ const moveWorker = async ($: EngineInterface, input: Record<string, unknown>, di
     return answerOf(ran)
   }
   $.ui.toast(`${name} → ${modelName} ${effort}`)
+  return answerOf(ran)
+}
+
+const migrateWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  const seat = findSeat(await read($, seatsAtom), name)
+  if (!seat) return { deny: `No open worker is named ${name}.` }
+  const kind = input.kind === 'claude' || input.kind === 'codex' ? input.kind : undefined
+  if (!kind) return { deny: 'kind must be claude or codex.' }
+  if (kind === seat.kind) return { deny: `${name} is already a ${kind} worker; use promote_worker or demote_worker to change its model or effort.` }
+  const given = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
+  const model = kind === 'claude' ? resolveModel(given, config.workerModel) : given
+  const effort = isEffort(input.effort) ? input.effort : undefined
+  const reason = String(input.reason ?? '').trim()
+  pushBody(`${name}:migrate`, `${kind}${model ? ` ${shortModel(model)}` : ''}${reason ? `: ${reason}` : ''}`)
+  const ran = await plannerRun($, drove.migrateArgs({ name, kind, ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(reason ? { reason } : {}) }), { timeoutMs: SPAWN_TIMEOUT_MS })
+  if (ran.exitCode !== 0) {
+    dropBody(`${name}:migrate`)
+    return answerOf(ran)
+  }
+  $.ui.toast(`${name} → ${kind}`)
   return answerOf(ran)
 }
 
@@ -1066,6 +1103,9 @@ export const register: Register = (on, options) => {
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__demote_worker' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? moveWorker($, e as Record<string, unknown>, 'demote') : { deny: OFF },
+  ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__migrate_worker' as never }, async ($, e): Promise<ToolAnswer> =>
+    (await read($, orchestratorAtom)) ? migrateWorker($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__close_worker' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? closeWorker($, e as Record<string, unknown>) : { deny: OFF },
