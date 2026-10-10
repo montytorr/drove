@@ -185,6 +185,21 @@ test('with local main behind origin/main the workers start at origin/main', asyn
   assert.doesNotMatch(claude.text, /Note:/)
 })
 
+test('with local main equal to origin/main the spawn says nothing about a base ahead', async () => {
+  const { deps, identity, repo } = await withRemote()
+  await commitOn(repo, 'a.txt')
+  const tip = await commitOn(repo, 'b.txt')
+  await git(repo, 'push', '-q', 'origin', 'main')
+  await git(repo, 'fetch', '-q', 'origin')
+  const codex = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(codex.ok, true, codex.text)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cx'), 'rev-parse', 'HEAD'), tip)
+  assert.doesNotMatch(codex.text, /ahead of/)
+  const claude = await commands.spawn(deps, identity, { seat: 'w-cl', kind: 'claude', brief })
+  assert.equal(claude.ok, true, claude.text)
+  assert.doesNotMatch(claude.text, /ahead of/)
+})
+
 test('with local main diverged from origin/main the workers start at origin/main and the result says so', async () => {
   const { deps, identity, repo } = await withRemote()
   const remoteTip = await commitOn(repo, 'a.txt')

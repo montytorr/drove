@@ -491,13 +491,13 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
       const resolved = await git.freshestBase(deps.exec, run.repo, wanted)
       claudeBase = resolved.ref
       if (request.base) baseNotes.push(`--base ${request.base} was ignored: Claude creates its own worktree, which Drove then fast-forwards to the run base ${claudeBase}.`)
-      if (resolved.ref !== wanted) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
+      if (resolved.ahead) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
       if (resolved.note) baseNotes.push(resolved.note)
     } else if (!existsSync(worktree)) {
       const wanted = await git.baseRef(deps.exec, run.repo, request.base ?? run.base)
       const resolved = await git.freshestBase(deps.exec, run.repo, wanted)
       await git.addWorktree(deps.exec, run.repo, worktree, branch, resolved.ref)
-      if (resolved.ref !== wanted) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
+      if (resolved.ahead) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
       if (resolved.note) baseNotes.push(resolved.note)
       isWorktreeNew = true
     }
