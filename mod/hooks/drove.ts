@@ -25,10 +25,11 @@ export const attachArgs = (input: { sessionId: string; paneId?: string; goal?: s
 
 export const bridgeArgs = (run: string, sessionId: string): string[] => ['mod', 'bridge', '--run', run, '--session', sessionId]
 
-export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string }): string[] => [
+export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[] }): string[] => [
   'spawn', input.name, '--kind', input.kind, '--brief', '-', '--effort', input.effort,
   ...(input.model ? ['--model', input.model] : []),
   ...(input.cairn ? ['--cairn', input.cairn] : []),
+  ...(input.mcp ? ['--mcp', input.mcp.join(',')] : []),
 ]
 
 export const messageArgs = (name: string, expects: Expects): string[] => ['send', name, '--kind', 'message', '--expects', expects, '-']

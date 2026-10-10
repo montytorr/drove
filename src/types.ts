@@ -31,6 +31,8 @@ export type DroveConfig = {
   claudeChannel: boolean
   briefVia: 'prompt' | 'launch-arg'
   workerEnv: Record<string, string>
+  workerMcp?: string[]
+  workerSkills?: string[]
 }
 
 export type PlannerMeta = {
@@ -80,6 +82,7 @@ export type Seat = {
   paneId?: string
   sessionId?: string
   codexHome?: string
+  mcp?: string[]
   worktree: string
   branch: string
   state: SeatState
@@ -212,6 +215,7 @@ export type Deps = {
   clock: Clock
   home: string
   codexUserHome?: string
+  claudeUserConfig?: string
 }
 
 export type HerdrAgent = {
@@ -234,6 +238,7 @@ export type LaunchSpec = {
   argv: string[]
   files: LaunchFile[]
   links?: LaunchLink[]
+  unlinks?: string[]
 }
 
 export type LaunchRequest = {
@@ -251,6 +256,8 @@ export type LaunchRequest = {
   bypassHookTrust?: boolean
   channel?: boolean
   workerEnv?: Record<string, string>
+  mcpAllow?: string[]
+  userMcp?: Record<string, unknown>
 }
 
 export type Transport = 'launch-arg' | 'herdr-prompt' | 'codex-queue' | 'mod' | 'channel' | 'piggyback'
@@ -273,6 +280,7 @@ export type SpawnRequest = {
   model?: string
   effort?: Effort
   base?: string
+  mcp?: string[]
 }
 
 export type SendRequest = {

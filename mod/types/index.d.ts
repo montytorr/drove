@@ -57,6 +57,7 @@ export type Seat = {
   paneId?: string
   sessionId?: string
   codexHome?: string
+  mcp?: string[]
   worktree: string
   branch: string
   state: SeatState

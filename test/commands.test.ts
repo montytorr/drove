@@ -52,7 +52,7 @@ test('spawn opens the tab at the repo root, then starts the agent, which creates
   assert.equal(start[start.indexOf('--kind') + 1], 'claude')
   assert.equal(start[start.indexOf('--worktree') + 1], 'w-api')
   assert.ok(start.includes('--session-id'))
-  assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-api`\. Your Cairn task is DROVE-5/)
+  assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-api` on branch `worktree-w-api`\. Your Cairn task is DROVE-5/)
   assert.equal(fake.prompts.length, 0)
   const tab = fake.find('herdr', 'tab', 'create') ?? []
   assert.equal(tab[tab.indexOf('--cwd') + 1], repo)
@@ -254,7 +254,7 @@ test('a codex worker is launched with the codex spec and an initial prompt', asy
   assert.ok(!start.includes('--add-dir') && !start.includes('-s'))
   assert.ok(start.includes('model_reasoning_effort="high"'))
   assert.ok(!start.includes('-m'))
-  assert.match(fake.prompts[0]?.text ?? '', /Build the widget/)
+  assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-cx` on branch `drove\/w-cx`\. Your Cairn task is DROVE-6/)
 })
 
 test('codexWorkerSandbox "workspace-write" restores the sandboxed codex worker spec', async () => {
@@ -446,7 +446,7 @@ test('a start timeout with a live agent in the pane keeps the seat instead of ro
       assert.ok(!fake.herdrCalls().includes('pane close') && !fake.herdrCalls().includes('tab close'))
       const seat = (await loadRoster(deps.home, RUN)).seats[0]
       assert.equal(seat?.paneId, 'w1:p1')
-      assert.equal(seat?.state, kind === 'codex' ? 'working' : status)
+      assert.equal(seat?.state, status)
       const events = await readEvents(deps)
       assert.equal(events.find(item => item.type === 'seat.spawn')?.data?.startTimeout, true)
       assert.equal(events.some(item => item.type === 'seat.start_failed'), false)
@@ -491,25 +491,59 @@ test('a start timeout rolls back when the agent is absent, blocked, or the scree
   }
 })
 
-test('the worker role names the branch each kind is already on', async () => {
+test('every seat of a run gets the same role text, and the brief footer names the seat and the branch it is on', async () => {
   delete process.env.DROVE_BRIEF_VIA
-  const claude = await setup()
-  await commands.spawn(claude.deps, claude.identity, { seat: 'w-api', kind: 'claude', brief })
-  const role = await readFile(join(seatDir(claude.deps.home, RUN, 'w-api'), 'role.md'), 'utf8')
-  assert.match(role, /already on your own branch \(`worktree-w-api`\) in your own worktree\. Commit there\. Do not create, switch or rebase branches unless the planner asks\./)
-  assert.doesNotMatch(role, /switch -c/)
-  const codex = await setup()
-  await commands.spawn(codex.deps, codex.identity, { seat: 'w-cx', kind: 'codex', brief })
-  assert.match(codex.fake.prompts[0]?.text ?? '', /already on your own branch \(`drove\/w-cx`\)/)
+  const { fake, deps, identity } = await setup()
+  for (const seat of ['w-api', 'w-web']) assert.equal((await commands.spawn(deps, identity, { seat, kind: 'claude', brief })).ok, true)
+  const roleOf = (seat: string) => readFile(join(seatDir(deps.home, RUN, seat), 'role.md'), 'utf8')
+  const role = await roleOf('w-api')
+  assert.equal(role, await roleOf('w-web'))
+  assert.doesNotMatch(role, /w-api|worktree-w-api/)
+  assert.match(role, /already on your own branch \(the brief names it\) in your own worktree\. Commit there\. Do not create, switch or rebase branches unless the planner asks\./)
+  assert.match(fake.prompts[0]?.text ?? '', /\(You are worker `w-api` on branch `worktree-w-api`\./)
+  assert.match(fake.prompts[1]?.text ?? '', /\(You are worker `w-web` on branch `worktree-w-web`\./)
+  assert.equal((await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })).ok, true)
+  assert.match(fake.prompts[2]?.text ?? '', /\nBuild the widget\. \(You are worker `w-cx` on branch `drove\/w-cx`\./)
 })
 
-test('a codex worker role rides in the brief, never in the typed launch line', async () => {
+test('a codex worker role goes in its CODEX_HOME config.toml as developer_instructions, never in the launch line or the brief', async () => {
   const { fake, deps, identity } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
   const start = fake.find('herdr', 'agent', 'start') ?? []
-  assert.ok(!start.some(arg => arg.startsWith('developer_instructions')))
-  assert.ok(!start.some(arg => arg.includes('# Worker mode')))
-  assert.match(fake.prompts[0]?.text ?? '', /# Worker mode[\s\S]*Build the widget/)
+  assert.ok(!start.some(arg => arg.startsWith('developer_instructions') || arg.includes('# Worker mode')))
+  const config = await readFile(join(deps.home, 'runs', RUN, 'codex-home', 'config.toml'), 'utf8')
+  assert.match(config, /^developer_instructions = "# Worker mode\\n\\nYou are a worker of Drove run /m)
+})
+
+test('the brief footer carries the repo verify commands from package.json', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  await writeFile(join(repo, 'package.json'), JSON.stringify({ scripts: { test: 'node --test', typecheck: 'tsc --noEmit', build: 'tsc' } }))
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const start = fake.find('herdr', 'agent', 'start') ?? []
+  assert.match(start.at(-1) ?? '', /Verify with `npm run typecheck`, `npm test`\. Report with the drove report tool/)
+})
+
+test('workerMcp and a spawn --mcp list make a claude seat strict with the union, read from the user Claude config', async () => {
+  const { fake, deps, identity } = await setup()
+  const claudeUserConfig = join(deps.home, 'claude.json')
+  await writeFile(claudeUserConfig, JSON.stringify({ mcpServers: { mongodb: { command: 'mongo-mcp' }, notion: { command: 'notion-mcp' }, filesystem: { command: 'fs-mcp' } } }))
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerMcp: ['notion'] }))
+  const spawned = await commands.spawn({ ...deps, claudeUserConfig }, identity, { seat: 'w-api', kind: 'claude', brief, mcp: ['mongodb', 'nope'] })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /MCP server nope is not in the user's Claude setup, so w-api runs without it\./)
+  assert.ok((fake.find('herdr', 'agent', 'start') ?? []).includes('--strict-mcp-config'))
+  const mcp = JSON.parse(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'mcp.json'), 'utf8')) as { mcpServers: object }
+  assert.deepEqual(Object.keys(mcp.mcpServers), ['notion', 'mongodb', 'drove'])
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats[0]?.mcp, ['mongodb', 'nope'])
+})
+
+test('with no workerMcp and no --mcp a claude seat keeps the user MCP setup and never reads it', async () => {
+  const { fake, deps, identity } = await setup()
+  const spawned = await commands.spawn({ ...deps, claudeUserConfig: join(deps.home, 'absent.json') }, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.ok(!(fake.find('herdr', 'agent', 'start') ?? []).includes('--strict-mcp-config'))
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.mcp, undefined)
+  assert.equal((await commands.spawn(deps, identity, { seat: 'w-bad', kind: 'claude', brief, mcp: ['a b'] })).ok, false)
 })
 
 test('a single-line brief stays a launch argument; the role text is a file, not an argument', async () => {
@@ -517,7 +551,7 @@ test('a single-line brief stays a launch argument; the role text is a file, not 
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief: '  Build the widget.  ' })
   assert.equal(spawned.ok, true, spawned.text)
   const start = fake.find('herdr', 'agent', 'start') ?? []
-  assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-api`\.\s/)
+  assert.match(start.at(-1) ?? '', /^Build the widget\. \(You are worker `w-api` on branch `worktree-w-api`\.\s/)
   assert.equal(fake.prompts.length, 0)
   const roleFlag = start.indexOf('--append-system-prompt-file')
   assert.equal(start[roleFlag + 1], join(seatDir(deps.home, RUN, 'w-api'), 'role.md'))
