@@ -24,7 +24,7 @@ export type ProcessPlan = { argv: string[]; env: Record<string, string>; cwd: st
 
 export const DROVE_ENTRY = fileURLToPath(new URL('./cli.ts', import.meta.url))
 export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
-export const timing = { pollMs: 500, exitWaitMs: EXIT_WAIT_MS, closeWaitMs: 3_000, lockWaitMs: 5_000, promptWaitMs: 4_000 }
+export const timing = { pollMs: 500, exitWaitMs: EXIT_WAIT_MS, closeWaitMs: 3_000, lockWaitMs: 5_000, promptWaitMs: 4_000, worktreeWaitMs: 15_000 }
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
 const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
@@ -483,12 +483,12 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   }
 
   const baseNotes: string[] = []
+  let claudeBase: string | undefined
   try {
     if (isClaude) {
       isWorktreeNew = !existsSync(worktree)
-      const base = await git.baseRef(deps.exec, run.repo, run.base)
-      if (request.base) baseNotes.push(`--base ${request.base} was ignored: Claude creates its own worktree.`)
-      if (!(await git.isHeadAt(deps.exec, run.repo, base))) baseNotes.push(`Claude branches ${branch} from the main checkout's current HEAD (${(await git.headBranch(deps.exec, run.repo)) ?? 'detached'}), which is not ${base}; rebase it if the base matters.`)
+      claudeBase = await git.baseRef(deps.exec, run.repo, run.base)
+      if (request.base) baseNotes.push(`--base ${request.base} was ignored: Claude creates its own worktree, which Drove then fast-forwards to the run base ${claudeBase}.`)
     } else if (!existsSync(worktree)) {
       await git.addWorktree(deps.exec, run.repo, worktree, branch, await git.baseRef(deps.exec, run.repo, request.base ?? run.base))
       isWorktreeNew = true
@@ -542,6 +542,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     return failed('herdr', `herdr could not start ${kind} in pane ${paneId}, so the pane was closed again and no worker exists: ${clip(started.output)}.${captured ? hintText(captured) : ''}`)
   }
 
+  if (isClaude && claudeBase) baseNotes.push(...(await alignClaudeWorktree(deps, worktree, branch, claudeBase)))
+
   const initialState: Seat['state'] = adopted ? adopted.state : isViaPrompt ? 'idle' : 'working'
   const liveSession = (live?.ok ? live.value.sessionId : undefined) ?? adopted?.sessionId
   await updateRoster(deps.home, run.id, current =>
@@ -563,6 +565,19 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const via = isViaPrompt ? await queueBrief(deps, run, seat.name, briefText) : 'launch-arg'
   if (!isViaPrompt) await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, data: { kind: 'brief', via: 'launch-arg' } })
   return ok(`Worker ${seat.name} (${kind}${model ? ` ${model}` : ''} ${effort}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${startNote ? ` Note: ${startNote}` : ''}${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch })
+}
+
+// Claude creates its worktree from origin/main once the agent is up; bring it to the run base before the brief goes in.
+const alignClaudeWorktree = async (deps: Deps, worktree: string, branch: string, base: string): Promise<string[]> => {
+  for (let waited = 0; !existsSync(worktree) && waited < timing.worktreeWaitMs; waited += timing.pollMs) await sleep(timing.pollMs)
+  if (!existsSync(worktree)) return [`Claude's worktree ${worktree} did not appear within ${Math.round(timing.worktreeWaitMs / 1000)}s, so ${branch} was not moved to ${base}; run \`git merge --ff-only ${base}\` in it if the base matters.`]
+  const moved = await git.fastForwardToBase(deps.exec, worktree, base)
+  switch (moved.outcome) {
+    case 'at-base': return []
+    case 'fast-forwarded': return [`Claude created ${branch} at ${moved.from}, behind ${base}; it was fast-forwarded to ${moved.to}.`]
+    case 'diverged': return [`Claude created ${branch} at ${moved.head}, which is not an ancestor of ${base}, so it was left as is; merge or rebase ${base} in the worktree if the base matters.`]
+    case 'failed': return [`Claude created ${branch} at ${moved.head} and fast-forwarding it to ${base} failed (${moved.error}), so it was left as is.`]
+  }
 }
 
 const queueBrief = async (deps: Deps, run: RunMeta, seat: string, text: string): Promise<string> => {

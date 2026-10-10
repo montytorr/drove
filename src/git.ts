@@ -102,3 +102,20 @@ export const isMerged = async (exec: Exec, repo: string, branch: string, into: s
   (await git(exec, repo, ['merge-base', '--is-ancestor', branch, into])).code === 0
 
 export const commonGitDir = async (exec: Exec, repo: string): Promise<string> => must(exec, repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
+
+export type FastForward =
+  | { outcome: 'at-base'; head: string }
+  | { outcome: 'fast-forwarded'; from: string; to: string }
+  | { outcome: 'diverged'; head: string }
+  | { outcome: 'failed'; head: string; error: string }
+
+// A worktree whose HEAD is behind `base` is moved up to it; one already at `base`, or not an ancestor of it, is left.
+export const fastForwardToBase = async (exec: Exec, worktree: string, base: string): Promise<FastForward> => {
+  const short = async (ref: string): Promise<string> => (await git(exec, worktree, ['rev-parse', '--short', ref])).stdout.trim() || ref
+  const head = await short('HEAD')
+  if (await isHeadAt(exec, worktree, base)) return { outcome: 'at-base', head }
+  if (!(await isMerged(exec, worktree, 'HEAD', base))) return { outcome: 'diverged', head }
+  const merged = await git(exec, worktree, ['merge', '--ff-only', base])
+  if (merged.code !== 0) return { outcome: 'failed', head, error: (merged.stderr || merged.stdout).trim().slice(0, 300) }
+  return { outcome: 'fast-forwarded', from: head, to: await short('HEAD') }
+}

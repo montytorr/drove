@@ -54,6 +54,7 @@ export class FakeHerdr {
   agentReadFails = false
   paneCwds = new Map<string, string>()
   claudeWorktrees: { path: string; branch: string }[] = []
+  claudeWorktreeFrom = 'HEAD'
   private counter = 0
 
   constructor(options: FakeHerdrOptions = {}) {
@@ -189,7 +190,7 @@ export class FakeHerdr {
     const path = join(cwd, '.claude', 'worktrees', name)
     const branch = `worktree-${name}`
     if (!existsSync(path)) {
-      const added = await nodeExec(['git', '-C', cwd, 'worktree', 'add', '--no-track', '-b', branch, path, 'HEAD'])
+      const added = await nodeExec(['git', '-C', cwd, 'worktree', 'add', '--no-track', '-b', branch, path, this.claudeWorktreeFrom])
       if (added.code !== 0) return herdrFail('agent_start_failed', added.stderr)
     }
     this.claudeWorktrees.push({ path, branch })
