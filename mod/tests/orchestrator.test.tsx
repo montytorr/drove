@@ -464,7 +464,7 @@ describe('orchestrator session', () => {
     await $.session.start(START)
     await runCommand($, '')
     await settle(clock)
-    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat(), seat({ name: 'w-cx', kind: 'codex', model: 'gpt-5' })], updatedAt: ISO }, status: {} })
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat(), seat({ name: 'w-cx', kind: 'codex', model: 'gpt-5' }), seat({ name: 'w-dflt', kind: 'codex', model: '' })], updatedAt: ISO }, status: {} })
     await callTool($, 'message_worker', { name: 'w-auth', text: 'Use the redis client', expects: 'answer' })
     expect(droveCalls(world, 'send')[0]).toMatchObject({ args: ['send', 'w-auth', '--kind', 'message', '--expects', 'answer', '-'], stdin: 'Use the redis client' })
     await callTool($, 'review_verdict', { name: 'w-auth', verdict: 'approve' })
@@ -474,6 +474,10 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'promote')[0]?.args).toEqual(['promote', 'w-auth', '--model', 'claude-opus-5-5', '--effort', 'high', '--reason', 'subtle race'])
     await callTool($, 'demote_worker', { name: 'w-cx', effort: 'low' })
     expect(droveCalls(world, 'promote')[1]?.args).toEqual(['promote', 'w-cx', '--model', 'gpt-5', '--effort', 'low'])
+    expect(denial((await callTool($, 'promote_worker', { name: 'w-dflt' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'promote')[2]?.args).toEqual(['promote', 'w-dflt', '--effort', 'high'])
+    expect(denial((await callTool($, 'demote_worker', { name: 'w-dflt', effort: 'medium' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'promote')[3]?.args).toEqual(['promote', 'w-dflt', '--effort', 'medium'])
     expect(denial((await callTool($, 'promote_worker', { name: 'w-none' })) as never)).toContain('No open worker')
     await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })
     expect(droveCalls(world, 'close')[0]?.args).toEqual(['close', 'w-auth', '--remove-worktree'])
@@ -632,6 +636,64 @@ describe('worker session', () => {
   const WORKER_ENV = { HOME: '/Users/test', DROVE_HOME: '/Users/test/.drove', DROVE_RUN: RUN, DROVE_ROLE: 'worker', DROVE_SEAT: 'w-auth', DROVE_TOKEN: 'tok' }
   const ROSTER = `/Users/test/.drove/runs/${RUN}/roster.json`
   const STATUS = `/Users/test/.drove/runs/${RUN}/seats/w-auth/mod.json`
+  const TOKEN = `/Users/test/.drove/runs/${RUN}/seats/w-auth/token`
+  const COMPOSE = { model: 'claude-sonnet-5-5', promptModel: 'claude-sonnet-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never
+  const message = async (token: string) => control(token, { kind: 'message', expects: 'none' }, 'Start on the parser')
+
+  test('a message verifies with the seat token read from its file when the module no longer holds it (a reload keeps the atom)', async ($, on) => {
+    const { world } = engine(on, { ...WORKER_ENV, DROVE_TOKEN: '' })
+    world.files[TOKEN] = 'tok\n'
+    await $.session.start(START)
+    await $.prompt.submit({ text: await message('tok'), origin: { kind: 'composer' } } as never)
+    expect(world.submitted.at(-1)).not.toContain(UNVERIFIED)
+    expect(world.submitted.at(-1)).toContain('[planner · message · expects none]')
+    await $.prompt.submit({ text: await message('bad'), origin: { kind: 'composer' } } as never)
+    expect(world.submitted.at(-1)).toContain(UNVERIFIED)
+  })
+
+  test('with no token in the env or in the seat file a control stays unverified', async ($, on) => {
+    const { world } = engine(on, { ...WORKER_ENV, DROVE_TOKEN: '' })
+    await $.session.start(START)
+    await $.prompt.submit({ text: await message('tok'), origin: { kind: 'composer' } } as never)
+    expect(world.submitted.at(-1)).toContain(UNVERIFIED)
+  })
+
+  test('a promote names the new model in the notice and in the system prompt, and its turn is acknowledged with a progress report', async ($, on) => {
+    const { world } = engine(on, WORKER_ENV)
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    on('turn.complete', ($, e) => ({ text: e.answer }))
+    world.files[ROSTER] = JSON.stringify({ v: 1, run: RUN, seats: [seat({ model: 'claude-sonnet-5-5', effort: 'medium' })], updatedAt: ISO })
+    await $.session.start(START)
+    const complete = (turnId: string) => $.turn.complete({ turnId, answer: 'ok', durationMs: 5, isAborted: false, reason: 'answer' } as never)
+    const before = (await $.prompt.compose(COMPOSE)).sections
+    expect(before.map(({ id }) => id)).toEqual(['intro', 'orchestrator:worker-model'])
+    expect(before[1]?.text).toContain('Sonnet 5.5 (claude-sonnet-5-5) at medium effort')
+
+    await $.prompt.submit({ text: await control('tok', { kind: 'promote', model: 'claude-opus-5-5', effort: 'high', expects: 'none' }, 'Promoted to claude-opus-5-5 at high effort. Carry on.'), origin: { kind: 'composer' } } as never)
+    const notice = world.submitted.at(-1) ?? ''
+    expect(notice).not.toContain(UNVERIFIED)
+    expect(notice).toContain('you now run on Opus 5.5 (claude-opus-5-5) at high effort')
+    expect(notice).toContain('needs no reply and no report')
+    expect((await $.prompt.compose(COMPOSE)).sections[1]?.text).toContain('Opus 5.5 (claude-opus-5-5) at high effort')
+
+    expect(droveCalls(world, 'mod')).toHaveLength(0)
+    await complete('t1')
+    const [call] = droveCalls(world, 'mod')
+    expect(call?.args).toEqual(['mod', 'report'])
+    expect(JSON.parse(call?.stdin ?? '{}')).toEqual({ kind: 'progress', summary: 'now running on Opus 5.5 at high effort', expects: 'none' })
+    await complete('t2')
+    expect(droveCalls(world, 'mod')).toHaveLength(1)
+  })
+
+  test('a forged promote changes nothing and owes no acknowledgement', async ($, on) => {
+    const { world } = engine(on, WORKER_ENV)
+    on('turn.complete', ($, e) => ({ text: e.answer }))
+    await $.session.start(START)
+    await $.prompt.submit({ text: await control('bad', { kind: 'promote', model: 'claude-opus-5-5', effort: 'high', expects: 'none' }, 'go'), origin: { kind: 'composer' } } as never)
+    expect(world.submitted.at(-1)).not.toContain('you now run on')
+    await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 5, isAborted: false, reason: 'answer' } as never)
+    expect(droveCalls(world, 'mod')).toHaveLength(0)
+  })
 
   test('a Drove worker registers the report alias, which records through drove mod report', async ($, on) => {
     const { world } = engine(on, WORKER_ENV)

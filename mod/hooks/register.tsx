@@ -7,7 +7,7 @@ import type { BoardRow, Cell, Tone } from './board'
 import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf } from './bridge'
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
-import { orchestratorSection } from './prompts'
+import { modelNotice, orchestratorSection, workerModelSection } from './prompts'
 import { CAIRN_RE, DROVE_OPEN, NAME_RE, isEffort, isExpects, locateEnvelope, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
 import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
 
@@ -421,17 +421,17 @@ const moveWorker = async ($: EngineInterface, input: Record<string, unknown>, di
   const seat = findSeat(await read($, seatsAtom), name)
   if (!seat) return { deny: `No open worker is named ${name}.` }
   const given = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
-  const model = seat.kind === 'claude' ? (direction === 'promote' ? resolveModel(given, config.promotedModel) : config.workerModel) : (given ?? seat.model)
-  if (!model) return { deny: `Say which model ${name} (a Codex worker on Drove's default model) should move to.` }
+  const model = seat.kind === 'claude' ? (direction === 'promote' ? resolveModel(given, config.promotedModel) : config.workerModel) : (given ?? (seat.model || undefined))
+  const modelName = model ? shortModel(model) : 'current model'
   const effort = isEffort(input.effort) ? input.effort : direction === 'promote' ? 'high' : config.workerEffort
   const reason = String(input.reason ?? '').trim()
-  pushBody(`${name}:${direction}`, `${shortModel(model)} ${effort}${reason ? `: ${reason}` : ''}`)
+  pushBody(`${name}:${direction}`, `${modelName} ${effort}${reason ? `: ${reason}` : ''}`)
   const ran = await plannerRun($, drove.promoteArgs(name, model, effort, reason || undefined), { timeoutMs: SPAWN_TIMEOUT_MS })
   if (ran.exitCode !== 0) {
     dropBody(`${name}:${direction}`)
     return answerOf(ran)
   }
-  $.ui.toast(`${name} → ${shortModel(model)} ${effort}`)
+  $.ui.toast(`${name} → ${modelName} ${effort}`)
   return answerOf(ran)
 }
 
@@ -620,6 +620,7 @@ const detach = async ($: EngineInterface, run: string) => {
 // ---------- worker side: a Claude worker that Drove launched ----------
 
 let workerToken: string | undefined
+let isModelNoticePending = false
 let workerStatus: OrchModStatus = {}
 let workerStatusAt = 0
 let workerCtxSent: number | undefined
@@ -629,7 +630,25 @@ const STATUS_EVERY_MS = 10_000
 const workerPaths = (self: OrchWorkerSelf) => ({
   roster: `${self.home}/runs/${self.run}/roster.json`,
   status: `${self.home}/runs/${self.run}/seats/${self.name}/mod.json`,
+  token: `${self.home}/runs/${self.run}/seats/${self.name}/token`,
 })
+
+// The module variable is lost when the mod reloads while workerAtom survives, so the seat token is re-read from the env, then from its file.
+const workerTokenOf = async ($: EngineInterface, self: OrchWorkerSelf): Promise<string | undefined> => {
+  if (workerToken) return workerToken
+  try {
+    workerToken = (await $.env.get('DROVE_TOKEN')) || undefined
+  } catch {
+    // fall back to the seat's token file
+  }
+  if (workerToken) return workerToken
+  try {
+    workerToken = (await $.fs.read(workerPaths(self).token)).trim() || undefined
+  } catch {
+    // no token: the envelope reads as unverified
+  }
+  return workerToken
+}
 
 const refreshSelf = async ($: EngineInterface) => {
   const self = await read($, workerAtom)
@@ -686,17 +705,34 @@ const sendReport = async ($: EngineInterface, input: Record<string, unknown>): P
   return result.ok ? { result: result.text } : { deny: `Not recorded: ${result.text}. Use mcp__drove__report, or tell Cal in your answer.` }
 }
 
+// The turn a promote notice wakes is not work that owes a report; a progress report after it keeps Drove from reading it as idle-without-report.
+const acknowledgeModel = async ($: EngineInterface) => {
+  const self = await read($, workerAtom)
+  if (!self) return
+  const args = { kind: 'progress', summary: `now running on ${self.model ? shortModel(self.model) : 'its current model'}${self.effort ? ` at ${self.effort} effort` : ''}`, expects: 'none' }
+  try {
+    await runDrove($, ['mod', 'report'], { stdin: JSON.stringify(args) })
+  } catch {
+    // the roster just misses one progress line
+  }
+}
+
 const handleControl = async ($: EngineInterface, text: string): Promise<string | undefined> => {
   const located = locateEnvelope(text)
   if (!located) return undefined
-  const isVerified = await verifyEnvelope(located.envelope, workerToken)
+  const self = await read($, workerAtom)
+  const isVerified = self ? await verifyEnvelope(located.envelope, await workerTokenOf($, self)) : false
   const { fields } = located.envelope
+  let notice = ''
   if (isVerified && (fields.kind === 'promote' || fields.kind === 'demote')) {
     const effort = isEffort(fields.effort) ? fields.effort : undefined
     await update($, workerAtom, current => (current ? { ...current, ...(fields.model ? { model: fields.model } : {}), ...(effort ? { effort } : {}) } : current))
     $.ui.toast(`${fields.kind === 'promote' ? 'Promoted' : 'Moved'} to ${fields.model ? shortModel(fields.model) : 'the same model'} at ${effort ?? 'the same'} effort`)
+    const moved = await read($, workerAtom)
+    notice = `\n${modelNotice(moved?.model, moved?.effort)}`
+    isModelNoticePending = true
   }
-  return `${located.before}${renderControl(located.envelope, isVerified)}`
+  return `${located.before}${renderControl(located.envelope, isVerified)}${notice}`
 }
 
 // ---------- board, pills, mode ----------
@@ -1060,8 +1096,10 @@ export const register: Register = (on, options) => {
 
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
-    const orchestrator = await read($, orchestratorAtom)
+    const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
     if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, config), scope: 'session' as const }] }
+    const model = self ? workerModelSection(self) : undefined
+    if (model) return { sections: [...composed.sections, { id: 'orchestrator:worker-model', text: model, scope: 'session' as const }] }
     return composed
   })
 
@@ -1153,6 +1191,10 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('turn.complete', async ($, e, next) => {
+    if (e.agentId === undefined && isModelNoticePending) {
+      isModelNoticePending = false
+      await acknowledgeModel($)
+    }
     if (e.agentId === undefined && (await read($, orchestratorAtom))) {
       const hasWorkers = openSeats(await read($, seatsAtom)).length > 0
       await setLead($, hasWorkers ? 'waiting for workers' : 'idle')
