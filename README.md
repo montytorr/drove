@@ -1,6 +1,14 @@
 # drove
 
-Drove runs one planner and several worker agents side by side in [herdr](https://herdr.dev) panes. The planner (Claude Code or Codex) splits work into Cairn tasks, starts a worker for each, reviews their diffs and merges. The workers (Claude Code or Codex) write the code, each in its own pane and its own git worktree.
+Drove runs one planner and several worker agents side by side in [herdr](https://herdr.dev) panes. You choose the planner: Claude Code or Codex. It splits work into Cairn tasks, starts a worker for each, reviews their diffs and merges. The workers write the code, each in its own pane and its own git worktree, and they are Claude Code or Codex under either planner.
+
+Three ways to start a planner:
+
+| Planner | Start it with | What you get |
+|---|---|---|
+| Claude Code, with the mod | `/orchestrate <goal>` in a session with `mod/` loaded | A board inside Claude, model and effort switched on each request, in-app dialogs |
+| Claude Code, without the mod | `drove plan --kind claude` | Woken by a channel (a research preview in Claude Code) or by keystrokes |
+| Codex | `drove plan --kind codex` | Woken by `codex queue`; the sixth-pane budget is asked through MCP elicitation |
 
 There is no daemon. The planner's own MCP server (or, for a Claude planner with the mod, a child process of the mod) reads each worker's report file and wakes the planner. Run state is plain files under `~/.drove`.
 
@@ -24,15 +32,18 @@ Use `npm link`, not a global install: Node does not strip types from files under
 
 ## Quick start
 
-From a Claude Code session, with the mod:
+Pick the planner (the table above), then use one of these.
+
+**Claude Code with the mod.** From a Claude Code session:
 
 1. Start Claude in a herdr pane with `mod/` in `CLAUDE_CODE_PLUGIN_DIRS`.
 2. Type `/orchestrate <goal>`. The session becomes the planner and gets the tools `spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `close_worker` and `roster`. A board and a wake bridge run inside Claude. Typing `/orchestrate` again in the same session re-attaches to the run.
 
-From any herdr pane, without the mod:
+**Claude Code without the mod, or Codex.** From any herdr pane:
 
 ```sh
-drove plan --kind claude    # or --kind codex; add --goal "..." for a first instruction
+drove plan --kind claude    # Claude Code without the mod
+drove plan --kind codex     # Codex; add --goal "..." to either for a first instruction
 drove board                 # in a spare pane: live seats, states and what needs a human
 ```
 
