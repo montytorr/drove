@@ -51,6 +51,7 @@ export type RunMeta = {
   createdAt: string
   status: 'up' | 'down'
   goal?: string
+  cairn?: string
   tabId?: string
   budget: number
   planner: PlannerMeta

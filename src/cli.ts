@@ -69,9 +69,9 @@ const textArg = async (positionals: string[], from: number, io: Io): Promise<str
 
 export const COMMANDS: Record<string, Spec> = {
   plan: {
-    usage: 'drove plan [--kind claude|codex] [--model M] [--effort E] [--goal TEXT] [--run ID]',
-    why: 'start a planner in this pane',
-    options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, goal: { type: 'string' }, run: { type: 'string' } },
+    usage: 'drove plan [--kind claude|codex] [--model M] [--effort E] [--goal TEXT | --from-cairn REF | --next PROJECT] [--run ID]',
+    why: "start a planner in this pane; --from-cairn makes a Cairn task the run's goal, --next picks the top task of a Cairn project",
+    options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, goal: { type: 'string' }, run: { type: 'string' }, 'from-cairn': { type: 'string' }, next: { type: 'string' } },
     run: async (values, _positionals, io) =>
       printThenLaunch(
         await commands.plan(commands.defaultDeps(), {
@@ -81,6 +81,8 @@ export const COMMANDS: Record<string, Spec> = {
           effort: str(values, 'effort') as Effort | undefined,
           goal: str(values, 'goal'),
           run: str(values, 'run'),
+          cairn: str(values, 'from-cairn'),
+          next: str(values, 'next'),
         }),
         io,
       ),

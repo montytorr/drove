@@ -644,7 +644,7 @@ test('close releases the seat\'s Cairn claim with --force, best effort, and says
   const fake = new FakeHerdr()
   const base = fake.exec
   const released: string[][] = []
-  fake.exec = async (argv, options) => (argv[0] === 'cairn' ? (released.push([...argv]), { code: 0, stdout: '', stderr: '' }) : base(argv, options))
+  fake.exec = async (argv, options) => (argv[0] === 'cairn' ? (argv[1] === 'release' && released.push([...argv]), { code: 0, stdout: '', stderr: '' }) : base(argv, options))
   const { deps, identity } = await setup(fake)
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
   const closed = await commands.close(deps, identity, 'w-api', false)
