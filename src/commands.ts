@@ -617,6 +617,26 @@ const promoteBody = (request: PromoteRequest, config: DroveConfig, seat: Seat): 
   return `${direction} ${request.model || 'the default model'} at ${request.effort} effort${request.reason ? `: ${request.reason}` : ''}. Carry on.`
 }
 
+const markRestarting = async (deps: Deps, runId: string, name: string): Promise<Pick<Seat, 'state' | 'stateAt'> | undefined> => {
+  let before: Pick<Seat, 'state' | 'stateAt'> | undefined
+  const iso = deps.clock.now().toISOString()
+  await updateRoster(deps.home, runId, roster => {
+    const live = findSeat(roster, name)
+    if (!live) return roster
+    before = { state: live.state, stateAt: live.stateAt }
+    return upsertSeat(roster, { ...live, state: 'starting', stateAt: iso })
+  })
+  return before
+}
+
+const restoreState = async (deps: Deps, runId: string, name: string, before: Pick<Seat, 'state' | 'stateAt'> | undefined): Promise<void> => {
+  if (!before) return
+  await updateRoster(deps.home, runId, roster => {
+    const live = findSeat(roster, name)
+    return live ? upsertSeat(roster, { ...live, ...before }) : roster
+  })
+}
+
 export const promote = async (deps: Deps, identity: Identity, request: PromoteRequest): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
   if (denied) return denied
@@ -652,8 +672,12 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
 
   const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
   if (!token) return failed('no-token', `no token for ${seat.name}`)
+  const before = await markRestarting(deps, run.id, seat.name)
   const stop = await stopAgent(deps, seat, timing.exitWaitMs)
-  if (!stop.stopped) return failed('restart', `${seat.name} did not stop after ${seat.kind === 'claude' ? 'its pane was closed' : '/quit'}${stop.detail ? ` (${stop.detail})` : ''}. Check the pane.`)
+  if (!stop.stopped) {
+    await restoreState(deps, run.id, seat.name, before)
+    return failed('restart', `${seat.name} did not stop after ${seat.kind === 'claude' ? 'its pane was closed' : '/quit'}${stop.detail ? ` (${stop.detail})` : ''}. Check the pane.`)
+  }
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
 
   const updated: Seat = { ...seat, ...change, sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
@@ -837,8 +861,12 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
+  const before = await markRestarting(deps, run.id, seat.name)
   const placement = await placePane(deps, run, placed, seat.worktree, spec.env)
-  if (!isPlacement(placement)) return { error: placement.text }
+  if (!isPlacement(placement)) {
+    await restoreState(deps, run.id, seat.name, before)
+    return { error: placement.text }
+  }
   if (placement.createdTab) run.tabId = placement.createdTab
   const attempt = await startWithRetry(deps, run, {
     seat: seat.name, kind: seat.kind, argv: spec.argv, paneId: placement.paneId, ...(placement.createdTab ? { createdTab: placement.createdTab } : {}),
@@ -849,6 +877,7 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
   if (!started.ok && !adopted && started.code !== 'agent_not_ready') {
     await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
+    await restoreState(deps, run.id, seat.name, before)
     return { error: `herdr could not start ${seat.name}: ${clip(started.output)}.${captured ? hintText(captured) : ''}` }
   }
   const iso = deps.clock.now().toISOString()
