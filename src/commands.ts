@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { chmod, mkdir, readdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { applyDerived, deriveState, findDialog, matchDialog, shouldReadScreen } from './detect.ts'
+import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
@@ -24,7 +24,7 @@ export type ProcessPlan = { argv: string[]; env: Record<string, string>; cwd: st
 
 export const DROVE_ENTRY = fileURLToPath(new URL('./cli.ts', import.meta.url))
 export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
-export const timing = { pollMs: 500, exitWaitMs: 20_000, closeWaitMs: 3_000, lockWaitMs: 5_000, promptWaitMs: 4_000 }
+export const timing = { pollMs: 500, exitWaitMs: EXIT_WAIT_MS, closeWaitMs: 3_000, lockWaitMs: 5_000, promptWaitMs: 4_000 }
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
 const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
@@ -647,16 +647,27 @@ const markRestarting = async (deps: Deps, runId: string, name: string): Promise<
     const live = findSeat(roster, name)
     if (!live) return roster
     before = { state: live.state, stateAt: live.stateAt }
-    return upsertSeat(roster, { ...live, state: 'starting', stateAt: iso })
+    return upsertSeat(roster, { ...live, state: 'starting', stateAt: iso, restartingSince: iso })
   })
   return before
+}
+
+const clearRestarting = async (deps: Deps, runId: string, name: string): Promise<void> => {
+  await updateRoster(deps.home, runId, roster => {
+    const live = findSeat(roster, name)
+    if (!live?.restartingSince) return roster
+    const { restartingSince: _cleared, ...rest } = live
+    return upsertSeat(roster, rest)
+  })
 }
 
 const restoreState = async (deps: Deps, runId: string, name: string, before: Pick<Seat, 'state' | 'stateAt'> | undefined): Promise<void> => {
   if (!before) return
   await updateRoster(deps.home, runId, roster => {
     const live = findSeat(roster, name)
-    return live ? upsertSeat(roster, { ...live, ...before }) : roster
+    if (!live) return roster
+    const { restartingSince: _cleared, ...rest } = live
+    return upsertSeat(roster, { ...rest, ...before })
   })
 }
 
@@ -696,57 +707,61 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
   if (!token) return failed('no-token', `no token for ${seat.name}`)
   const before = await markRestarting(deps, run.id, seat.name)
-  const stop = await stopAgent(deps, seat, timing.exitWaitMs)
-  if (!stop.stopped) {
-    await restoreState(deps, run.id, seat.name, before)
-    return failed('restart', `${seat.name} did not stop after ${seat.kind === 'claude' ? 'its pane was closed' : '/quit'}${stop.detail ? ` (${stop.detail})` : ''}. Check the pane.`)
-  }
-  const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
-
-  const updated: Seat = { ...seat, ...change, sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
-  const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
-  const controlText = formatControl(control, token)
-  const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
-  const spec = specFor(
-    launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seat.kind === 'codex' ? '' : workerRole(updated, run, config), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await codexHomeOf(deps, seat)) }, config),
-  )
-  await writeLaunchFiles(spec)
-  await writeLaunchJson(deps, run.id, seat.name, spec)
-  let paneId = seat.paneId
-  if (seat.kind === 'claude') {
-    const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
-    const placement = await placePane(deps, run, others, seat.worktree, spec.env)
-    if (!isPlacement(placement)) {
-      await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, paneId: undefined, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `no pane for the promote restart (${clip(placement.text, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
-      return failed('restart', `${seat.name} exited but no new pane could be placed in its worktree: ${clip(placement.text)}. Relaunch it with \`drove up --seat ${seat.name}\`.`)
+  try {
+    const stop = await stopAgent(deps, seat, timing.exitWaitMs)
+    if (!stop.stopped) {
+      await restoreState(deps, run.id, seat.name, before)
+      return failed('restart', `${seat.name} did not stop after ${seat.kind === 'claude' ? 'its pane was closed' : '/quit'}${stop.detail ? ` (${stop.detail})` : ''}. Check the pane.`)
     }
-    paneId = placement.paneId
+    const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
+
+    const updated: Seat = { ...seat, ...change, sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
+    const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+    const controlText = formatControl(control, token)
+    const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
+    const spec = specFor(
+      launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seat.kind === 'codex' ? '' : workerRole(updated, run, config), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await codexHomeOf(deps, seat)) }, config),
+    )
+    await writeLaunchFiles(spec)
+    await writeLaunchJson(deps, run.id, seat.name, spec)
+    let paneId = seat.paneId
+    if (seat.kind === 'claude') {
+      const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
+      const placement = await placePane(deps, run, others, seat.worktree, spec.env)
+      if (!isPlacement(placement)) {
+        await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, paneId: undefined, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `no pane for the promote restart (${clip(placement.text, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
+        return failed('restart', `${seat.name} exited but no new pane could be placed in its worktree: ${clip(placement.text)}. Relaunch it with \`drove up --seat ${seat.name}\`.`)
+      }
+      paneId = placement.paneId
+      updated.paneId = paneId
+    }
+    const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
+    const attempt = await startWithRetry(deps, run, {
+      seat: seat.name, kind: seat.kind, argv: spec.argv, paneId,
+      place: () => placePane(deps, run, others, seat.worktree, spec.env),
+    })
+    const { started, adopted } = attempt
+    paneId = attempt.paneId
     updated.paneId = paneId
+    if (!started.ok && !adopted) {
+      const captured = await captureStartFailure(deps, run, seat.name, paneId, started)
+      await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
+      return failed('restart', `${seat.name} exited but did not come back: ${clip(started.output)}.${hintText(captured)} Relaunch it with \`drove up --seat ${seat.name}\`.`)
+    }
+    const typed = isInline ? undefined : await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, controlText), BUSY_RETRY_MS)
+    const via: Transport = isInline ? 'launch-arg' : 'herdr-prompt'
+    if (typed && !typed.ok && typed.code !== 'timeout') {
+      await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'idle', owes: 'none', hasNudged: false }))
+      return failed('delivery', `${seat.name} restarted on ${model || 'the default model'} at ${request.effort} effort, but herdr could not type the ${control.kind} notice into it: ${clip(typed.output)}`)
+    }
+    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'working', lastWorkingAt: deps.clock.now().toISOString(), owes: 'none', hasNudged: false }))
+    const isUnconfirmed = typed !== undefined && !typed.ok
+    await appendJsonl(join(seatDir(deps.home, run.id, seat.name), 'sent.jsonl'), { id: control.id, via, at: deps.clock.now().toISOString() })
+    await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via, model, effort: request.effort, ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(adopted && !started.ok ? { startTimeout: started.code === 'timeout' } : {}) } })
+    return ok(`${seat.name} restarted with resume on ${model || 'the default model'} at ${request.effort} effort.${adopted && !started.ok ? ` Note: herdr's agent start ${started.code === 'timeout' ? 'timed out' : `failed (${started.code})`} but the agent is up in the pane, so the seat was kept.` : ''}${isUnconfirmed ? ' The notice was typed; herdr did not confirm the agent took it.' : ''}${lockNote ? ` Note: ${lockNote}.` : ''}`)
+  } finally {
+    await clearRestarting(deps, run.id, seat.name)
   }
-  const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
-  const attempt = await startWithRetry(deps, run, {
-    seat: seat.name, kind: seat.kind, argv: spec.argv, paneId,
-    place: () => placePane(deps, run, others, seat.worktree, spec.env),
-  })
-  const { started, adopted } = attempt
-  paneId = attempt.paneId
-  updated.paneId = paneId
-  if (!started.ok && !adopted) {
-    const captured = await captureStartFailure(deps, run, seat.name, paneId, started)
-    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
-    return failed('restart', `${seat.name} exited but did not come back: ${clip(started.output)}.${hintText(captured)} Relaunch it with \`drove up --seat ${seat.name}\`.`)
-  }
-  const typed = isInline ? undefined : await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, controlText), BUSY_RETRY_MS)
-  const via: Transport = isInline ? 'launch-arg' : 'herdr-prompt'
-  if (typed && !typed.ok && typed.code !== 'timeout') {
-    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'idle', owes: 'none', hasNudged: false }))
-    return failed('delivery', `${seat.name} restarted on ${model || 'the default model'} at ${request.effort} effort, but herdr could not type the ${control.kind} notice into it: ${clip(typed.output)}`)
-  }
-  await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'working', lastWorkingAt: deps.clock.now().toISOString(), owes: 'none', hasNudged: false }))
-  const isUnconfirmed = typed !== undefined && !typed.ok
-  await appendJsonl(join(seatDir(deps.home, run.id, seat.name), 'sent.jsonl'), { id: control.id, via, at: deps.clock.now().toISOString() })
-  await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via, model, effort: request.effort, ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(adopted && !started.ok ? { startTimeout: started.code === 'timeout' } : {}) } })
-  return ok(`${seat.name} restarted with resume on ${model || 'the default model'} at ${request.effort} effort.${adopted && !started.ok ? ` Note: herdr's agent start ${started.code === 'timeout' ? 'timed out' : `failed (${started.code})`} but the agent is up in the pane, so the seat was kept.` : ''}${isUnconfirmed ? ' The notice was typed; herdr did not confirm the agent took it.' : ''}${lockNote ? ` Note: ${lockNote}.` : ''}`)
 }
 
 export const applyPendingPromotes = async (deps: Deps, run: RunMeta): Promise<CommandResult[]> => {
@@ -887,40 +902,44 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
   await writeLaunchJson(deps, run.id, seat.name, spec)
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
   const before = await markRestarting(deps, run.id, seat.name)
-  const placement = await placePane(deps, run, placed, seat.worktree, spec.env)
-  if (!isPlacement(placement)) {
-    await restoreState(deps, run.id, seat.name, before)
-    return { error: placement.text }
+  try {
+    const placement = await placePane(deps, run, placed, seat.worktree, spec.env)
+    if (!isPlacement(placement)) {
+      await restoreState(deps, run.id, seat.name, before)
+      return { error: placement.text }
+    }
+    if (placement.createdTab) run.tabId = placement.createdTab
+    const attempt = await startWithRetry(deps, run, {
+      seat: seat.name, kind: seat.kind, argv: spec.argv, paneId: placement.paneId, ...(placement.createdTab ? { createdTab: placement.createdTab } : {}),
+      place: () => placePane(deps, run, placed, seat.worktree, spec.env),
+    })
+    const { started, adopted, paneId } = attempt
+    if (attempt.createdTab) run.tabId = attempt.createdTab
+    const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
+    if (!started.ok && !adopted && started.code !== 'agent_not_ready') {
+      await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
+      await restoreState(deps, run.id, seat.name, before)
+      return { error: `herdr could not start ${seat.name}: ${clip(started.output)}.${captured ? hintText(captured) : ''}` }
+    }
+    const iso = deps.clock.now().toISOString()
+    const isUp = started.ok || adopted !== undefined
+    const typed = isUp && resumeText && !isInline ? await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, resumeText), BUSY_RETRY_MS) : undefined
+    const isUndelivered = typed !== undefined && !typed.ok && typed.code !== 'timeout'
+    const isResumed = Boolean(resumeText) && isUp && !isUndelivered
+    const next: Seat = {
+      ...seat, paneId, state: !isUp ? 'blocked' : isResumed ? 'working' : adopted?.state === 'working' ? 'working' : adopted?.state === 'starting' ? 'starting' : 'idle', stateAt: iso,
+      ...(isResumed ? { lastWorkingAt: iso } : {}),
+      attention: !isUp
+        ? [{ seat: seat.name, reason: 'dialog', detail: 'The resumed agent stopped on a startup dialog; answer it in the pane.', at: iso }]
+        : isUndelivered
+          ? [{ seat: seat.name, reason: 'pending-delivery', detail: `the resume notice was not delivered (${clip(typed.output, 120)}); tell ${seat.name} to carry on`, at: iso }]
+          : [],
+    }
+    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, next))
+    return { seat: next, ...(lockNote ? { note: lockNote } : {}) }
+  } finally {
+    await clearRestarting(deps, run.id, seat.name)
   }
-  if (placement.createdTab) run.tabId = placement.createdTab
-  const attempt = await startWithRetry(deps, run, {
-    seat: seat.name, kind: seat.kind, argv: spec.argv, paneId: placement.paneId, ...(placement.createdTab ? { createdTab: placement.createdTab } : {}),
-    place: () => placePane(deps, run, placed, seat.worktree, spec.env),
-  })
-  const { started, adopted, paneId } = attempt
-  if (attempt.createdTab) run.tabId = attempt.createdTab
-  const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
-  if (!started.ok && !adopted && started.code !== 'agent_not_ready') {
-    await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
-    await restoreState(deps, run.id, seat.name, before)
-    return { error: `herdr could not start ${seat.name}: ${clip(started.output)}.${captured ? hintText(captured) : ''}` }
-  }
-  const iso = deps.clock.now().toISOString()
-  const isUp = started.ok || adopted !== undefined
-  const typed = isUp && resumeText && !isInline ? await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, resumeText), BUSY_RETRY_MS) : undefined
-  const isUndelivered = typed !== undefined && !typed.ok && typed.code !== 'timeout'
-  const isResumed = Boolean(resumeText) && isUp && !isUndelivered
-  const next: Seat = {
-    ...seat, paneId, state: !isUp ? 'blocked' : isResumed ? 'working' : adopted?.state === 'working' ? 'working' : adopted?.state === 'starting' ? 'starting' : 'idle', stateAt: iso,
-    ...(isResumed ? { lastWorkingAt: iso } : {}),
-    attention: !isUp
-      ? [{ seat: seat.name, reason: 'dialog', detail: 'The resumed agent stopped on a startup dialog; answer it in the pane.', at: iso }]
-      : isUndelivered
-        ? [{ seat: seat.name, reason: 'pending-delivery', detail: `the resume notice was not delivered (${clip(typed.output, 120)}); tell ${seat.name} to carry on`, at: iso }]
-        : [],
-  }
-  await updateRoster(deps.home, run.id, roster => upsertSeat(roster, next))
-  return { seat: next, ...(lockNote ? { note: lockNote } : {}) }
 }
 
 const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, placed: readonly Seat[]): Promise<Relaunched> => {

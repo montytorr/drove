@@ -410,11 +410,16 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     if (derived.size === 0) return
     const at = now.toISOString()
     const transitions: { seat: string; from: Seat['state']; to: Seat['state'] }[] = []
+    const restarting = new Set<string>()
     const updated = await ports.updateRoster(deps.home, run.id, (latest) => ({
       ...latest,
       seats: latest.seats.map((seat) => {
         const result = derived.get(seat.name)
         if (!result || seat.state === 'closing' || roster.CLOSED_STATES.has(seat.state)) return seat
+        if (detect.isRestarting(seat, now)) {
+          restarting.add(seat.name)
+          return seat
+        }
         const changed = result.state !== seat.state
         if (changed) transitions.push({ seat: seat.name, from: seat.state, to: result.state })
         return {
@@ -431,7 +436,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     }))
     for (const move of transitions) await emit('seat.state', move.seat, undefined, { from: move.from, to: move.to })
     const live = new Set<string>()
-    for (const result of derived.values()) {
+    for (const [name, result] of derived) {
+      if (restarting.has(name)) continue
       for (const item of result.attention) {
         const key = `${item.seat}|${item.reason}`
         live.add(key)

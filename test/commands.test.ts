@@ -637,6 +637,99 @@ test('a codex promote marks the seat starting before the agent stops, so the res
   assert.deepEqual(seen, { state: 'starting', derived: 'starting', attention: 0, agents: 0 })
 })
 
+const probed = (deps: Deps) => {
+  const snapshots: { call: string[]; since: string | undefined }[] = []
+  const probe: Deps = {
+    ...deps,
+    exec: async (argv, options) => {
+      snapshots.push({ call: [...argv], since: (await loadRoster(deps.home, RUN)).seats[0]?.restartingSince })
+      return deps.exec(argv, options)
+    },
+  }
+  return { probe, snapshots }
+}
+
+const startsOf = (snapshots: { call: string[]; since: string | undefined }[]) => snapshots.filter(item => item.call[1] === 'agent' && item.call[2] === 'start')
+const quitsOf = (snapshots: { call: string[]; since: string | undefined }[]) => snapshots.filter(item => item.call[2] === 'prompt' && item.call[4] === '/quit')
+
+const idleCodex = async (fake: FakeHerdr) => {
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, lastReport: { id: 'r-1', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })) }))
+  return { deps, identity }
+}
+
+test('a codex promote holds restartingSince from before /quit to the end, and clears it on success', async () => {
+  const { deps, identity } = await idleCodex(new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' }))
+  const { probe, snapshots } = probed(deps)
+  const promoted = await commands.promote(probe, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.ok(quitsOf(snapshots)[0]?.since, 'set before /quit is typed')
+  assert.ok(startsOf(snapshots).at(-1)?.since, 'still set when the resumed agent starts')
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.restartingSince, undefined)
+  assert.equal(seat?.state, 'working')
+})
+
+test('a promote that cannot stop the agent clears restartingSince and restores the state', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await idleCodex(fake)
+  fake.agents.delete = () => false
+  const { probe, snapshots } = probed(deps)
+  const promoted = await commands.promote(probe, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' })
+  assert.equal(!promoted.ok && promoted.code, 'restart')
+  assert.ok(quitsOf(snapshots)[0]?.since, 'set before /quit is typed')
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.restartingSince, undefined)
+  assert.equal(seat?.state, 'idle')
+})
+
+test('a promote whose restart fails clears restartingSince and leaves the seat gone', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await idleCodex(fake)
+  const { probe, snapshots } = probed(deps)
+  fake.startFails = 'agent_start_failed'
+  const promoted = await commands.promote(probe, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' })
+  assert.equal(!promoted.ok && promoted.code, 'restart')
+  assert.ok(quitsOf(snapshots)[0]?.since, 'set before /quit is typed')
+  assert.ok(startsOf(snapshots).at(-1)?.since, 'still set when the resumed agent starts')
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.restartingSince, undefined)
+  assert.equal(seat?.state, 'gone')
+})
+
+test('a promote that throws midway still clears restartingSince', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await idleCodex(fake)
+  const { probe, snapshots } = probed(deps)
+  const failing: Deps = { ...probe, exec: async (argv, options) => (argv[1] === 'agent' && argv[2] === 'start' ? Promise.reject(new Error('boom')) : probe.exec(argv, options)) }
+  await assert.rejects(commands.promote(failing, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' }), /boom/)
+  assert.ok(quitsOf(snapshots)[0]?.since, 'set before /quit is typed')
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.restartingSince, undefined)
+})
+
+test('up --seat holds restartingSince while it relaunches and clears it on success and on failure', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await killedMidTurn(fake, deps)
+  const first = probed(deps)
+  const relaunched = await commands.up(first.probe, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  assert.ok(startsOf(first.snapshots).at(-1)?.since, 'set while the agent starts')
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.restartingSince, undefined)
+
+  await killedMidTurn(fake, deps)
+  fake.startFails = 'agent_start_failed'
+  const second = probed(deps)
+  const failed = await commands.up(second.probe, { run: RUN, repo: '/x' }, 'w-a')
+  assert.equal(!failed.ok && failed.code, 'relaunch')
+  assert.ok(startsOf(second.snapshots).at(-1)?.since, 'set while the agent starts')
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.restartingSince, undefined)
+  assert.equal(seat?.state, 'gone')
+})
+
 test('promote mid-turn is queued until the seat is idle, not restarted', async () => {
   const { fake, deps, identity } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
