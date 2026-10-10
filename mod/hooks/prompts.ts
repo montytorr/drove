@@ -4,9 +4,10 @@ import { shortModel } from './protocol'
 const modelLine = (model: string | undefined, effort: unknown): string =>
   `${model ? `${shortModel(model)} (${model})` : 'its current model'}${typeof effort === 'string' ? ` at ${effort} effort` : ''}`
 
-// A worker's system prompt is built at launch, so a promote cannot change the model it names; this section is composed on every request.
+// A worker's system prompt is built at launch, so a promote cannot change the model it names. This section is composed from the seat's current model,
+// but the engine may hold a rendered prompt (prompt.compose has no per-request scope, only shared and session), so it also defers to the latest notice.
 export const workerModelSection = (self: OrchWorkerSelf): string | undefined =>
-  self.model ? `# Your model, from Drove\n\nDrove runs you on ${modelLine(self.model, self.effort)}. Drove can change a worker's model or effort while it works. If the model named elsewhere in your system prompt differs, this section is current: say ${shortModel(self.model)} when asked which model you are.` : undefined
+  self.model ? `# Your model, from Drove\n\nDrove runs you on ${modelLine(self.model, self.effort)}. Drove can change a worker's model or effort while it works. If the model named elsewhere in your system prompt differs, this section is current, unless a later "you now run on" notice in this conversation names another model: that notice wins. Say the model that applies when asked which model you are.` : undefined
 
 // The line a verified promote or demote notice ends with. It owes no report: the mod records the acknowledgement itself.
 export const modelNotice = (model: string | undefined, effort: unknown): string =>
