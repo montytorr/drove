@@ -28,6 +28,17 @@ test('codexQueueArgv is the proven codex queue form', () => {
   assert.deepEqual(deliver.codexQueueArgv('t-1', 'hi'), ['codex', 'queue', '--thread', 't-1', '--message', 'hi'])
 })
 
+test('codex queue runs with the seat CODEX_HOME when Drove owns one, and with the inherited env otherwise', async () => {
+  for (const codexHome of ['/h/.drove/runs/r/codex-home', undefined]) {
+    const { deps, run } = await setup(makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1', ...(codexHome ? { codexHome } : {}) }))
+    const seen: (Record<string, string> | undefined)[] = []
+    const exec = deps.exec
+    const delivery = await deliver.deliverControl({ ...deps, exec: async (argv, options) => (argv[1] === 'queue' && seen.push(options?.env), exec(argv, options)) }, run, control('w-api'))
+    assert.deepEqual(delivery, { ok: true, via: 'codex-queue' })
+    assert.deepEqual(seen, [codexHome ? { CODEX_HOME: codexHome } : undefined])
+  }
+})
+
 test('a Codex seat with a thread gets codex queue, with the enveloped text', async () => {
   const { deps, run, fake } = await setup(makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1' }))
   const delivery = await deliver.deliverControl(deps, run, control('w-api'))

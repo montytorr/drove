@@ -55,7 +55,8 @@ export const codexQueueAdapter = (deps: Deps): DeliveryAdapter => ({
   canDeliver: seat => seat.kind === 'codex' && Boolean(seat.sessionId),
   deliver: async (seat, text) => {
     if (!seat.sessionId) return { ok: false, queued: false, reason: 'no codex thread id yet' }
-    const ran = await deps.exec(codexQueueArgv(seat.sessionId, text), { timeoutMs: 15_000 })
+    // The thread lives under the seat's own CODEX_HOME when Drove owns one (DROVE-34), not under ~/.codex.
+    const ran = await deps.exec(codexQueueArgv(seat.sessionId, text), { timeoutMs: 15_000, ...(seat.codexHome ? { env: { CODEX_HOME: seat.codexHome } } : {}) })
     if (ran.code === 0) return { ok: true, via: 'codex-queue' }
     return { ok: false, queued: false, reason: `codex queue failed: ${clip(ran.stderr || ran.stdout)}` }
   },

@@ -1172,3 +1172,68 @@ test('promote of a codex seat without a model keeps the seat model, and the resu
   assert.ok(argv.includes('model_reasoning_effort="high"'))
   assert.ok(!argv.some(arg => arg.startsWith('developer_instructions=')))
 })
+
+const startArgv = (fake: FakeHerdr): string[] => {
+  const call = fake.calls.filter(item => item[1] === 'agent' && item[2] === 'start').at(-1) ?? []
+  return call.slice(call.indexOf('--') + 1)
+}
+const placedEnv = (fake: FakeHerdr): string[] => {
+  const call = fake.calls.filter(item => (item[1] === 'pane' && item[2] === 'split') || (item[1] === 'tab' && item[2] === 'create')).at(-1) ?? []
+  return call.filter((_, index) => call[index - 1] === '--env')
+}
+const markIdle = (deps: Deps) =>
+  updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, lastReport: { id: 'r-1', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })) }))
+
+test('a codex worker gets a Drove-owned CODEX_HOME through the pane env, recorded on the seat, and a short launch line', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.equal(seat?.codexHome, join(deps.home, 'runs', RUN, 'codex-home'))
+  const home = await realpath(seat?.codexHome ?? '')
+  assert.ok(placedEnv(fake).includes(`CODEX_HOME=${home}`), placedEnv(fake).join(' '))
+  const argv = startArgv(fake)
+  assert.ok(!argv.some(arg => /^(hooks\.|mcp_servers|projects\.)/.test(arg)), argv.join(' '))
+  const config = await readFile(join(home, 'config.toml'), 'utf8')
+  assert.ok(config.includes(`[projects."${repo}"]`), config)
+  assert.match(config, /\[mcp_servers\.drove\]/)
+  assert.match(await readFile(join(home, 'hooks.json'), 'utf8'), /pre-tool-use/)
+})
+
+test('promote and up --seat resume a codex seat with the CODEX_HOME it started with', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  const recorded = join(deps.home, 'runs', RUN, 'codex-home')
+  await markIdle(deps)
+  const promoted = await commands.promote(deps, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' })
+  assert.equal(promoted.ok, true, promoted.text)
+  const resumed = startArgv(fake)
+  assert.deepEqual(resumed.slice(0, 2), ['resume', 'thread-xyz'])
+  assert.ok(!resumed.some(arg => arg.startsWith('mcp_servers') || arg.startsWith('hooks.')), resumed.join(' '))
+  const launchJson = JSON.parse(await readFile(join(seatDir(deps.home, RUN, 'w-cx'), 'launch.json'), 'utf8')) as { env: Record<string, string> }
+  assert.equal(launchJson.env.CODEX_HOME, await realpath(recorded))
+
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'gone' as const })) }))
+  fake.agents.clear()
+  const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-cx')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  assert.deepEqual(startArgv(fake).slice(0, 2), ['resume', 'thread-xyz'])
+  assert.ok(placedEnv(fake).includes(`CODEX_HOME=${await realpath(recorded)}`), placedEnv(fake).join(' '))
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.codexHome, recorded)
+})
+
+test('a codex seat with no recorded CODEX_HOME resumes the old way: inline overrides and no CODEX_HOME', async () => {
+  const fake = new FakeHerdr()
+  const { deps } = await setup(fake)
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: [makeSeat('w-old', { kind: 'codex', model: 'gpt-x', state: 'gone', sessionId: 'thread-old' })] }))
+  const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-old')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  const argv = startArgv(fake)
+  assert.deepEqual(argv.slice(0, 2), ['resume', 'thread-old'])
+  assert.ok(argv.some(arg => arg.startsWith('mcp_servers.drove=')))
+  assert.ok(argv.some(arg => arg.startsWith('hooks.PreToolUse=')))
+  assert.ok(!placedEnv(fake).some(entry => entry.startsWith('CODEX_HOME=')))
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.codexHome, undefined)
+  assert.ok(!existsSync(join(deps.home, 'runs', RUN, 'codex-home')))
+})

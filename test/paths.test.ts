@@ -51,3 +51,11 @@ test('identityFromEnv rejects incomplete or invalid env', () => {
   assert.equal(paths.identityFromEnv({ DROVE_RUN: 'r', DROVE_ROLE: 'worker', DROVE_SEAT: 'Bad Seat' }), undefined)
   assert.equal(paths.identityFromEnv({ DROVE_ROLE: 'worker', DROVE_SEAT: 'w' }), undefined)
 })
+
+test('the Drove CODEX_HOME is per run, and the user Codex home ignores a CODEX_HOME inherited from a Drove pane', () => {
+  assert.equal(paths.codexHomeDir('/h/.drove', 'r-1'), '/h/.drove/runs/r-1/codex-home')
+  assert.equal(paths.userCodexHome('/h/.drove', { CODEX_HOME: '/h/my-codex' }), '/h/my-codex')
+  assert.match(paths.userCodexHome('/h/.drove', { CODEX_HOME: '/h/.drove/runs/r-1/codex-home' }), /\/\.codex$/)
+  assert.match(paths.userCodexHome('/h/.drove', {}), /\/\.codex$/)
+  assert.equal(paths.userCodexHome('/h/.drove', { CODEX_HOME: '/h/.drove-other' }), '/h/.drove-other')
+})

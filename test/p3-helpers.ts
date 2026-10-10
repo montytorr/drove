@@ -245,10 +245,12 @@ export const seedRun = async (deps: Deps, repo: string, seats: Seat[] = [], over
   return run
 }
 
+// codexUserHome points at an empty folder, so no test reads the real ~/.codex.
 export const makeDeps = async (fake: FakeHerdr, prefix = 'deps'): Promise<Deps & { clock: ReturnType<typeof makeClock> }> => ({
   exec: fake.exec,
   clock: makeClock(),
   home: await tmp(prefix),
+  codexUserHome: await tmp(`${prefix}-codex-user`),
 })
 
 const GIT_ENV = {

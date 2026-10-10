@@ -78,6 +78,7 @@ export type Seat = {
   effort: Effort
   paneId?: string
   sessionId?: string
+  codexHome?: string
   worktree: string
   branch: string
   state: SeatState
@@ -207,6 +208,7 @@ export type Deps = {
   exec: Exec
   clock: Clock
   home: string
+  codexUserHome?: string
 }
 
 export type HerdrAgent = {
@@ -219,6 +221,8 @@ export type HerdrAgent = {
 
 export type LaunchFile = { path: string; content: string; mode: number }
 
+export type LaunchLink = { path: string; target: string }
+
 export type LaunchSpec = {
   kind: AgentKind
   role: Role
@@ -226,6 +230,7 @@ export type LaunchSpec = {
   env: Record<string, string>
   argv: string[]
   files: LaunchFile[]
+  links?: LaunchLink[]
 }
 
 export type LaunchRequest = {
