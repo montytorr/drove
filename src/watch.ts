@@ -166,11 +166,22 @@ const ackReports = async (deps: Deps, run: RunMeta, ports: WatchPorts, reports: 
   await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'ack', ids: reports.map((report) => report.id) } satisfies Ledger)
 }
 
+// Only a close the planner started makes a report stale. A seat that vanished ('gone') or went 'down' may
+// have filed its last done or blocked report just before, and the planner still needs it.
+const PLANNER_CLOSED: readonly Seat['state'][] = ['closing', 'closed']
+
+const splitClosed = async (deps: Deps, run: RunMeta, ports: WatchPorts, reports: readonly Report[]): Promise<{ kept: Report[]; dropped: Report[] }> => {
+  const current = await ports.loadRoster(deps.home, run.id)
+  const gone = new Set(current.seats.filter((seat) => PLANNER_CLOSED.includes(seat.state)).map((seat) => seat.name))
+  return { kept: reports.filter((report) => !gone.has(report.seat)), dropped: reports.filter((report) => gone.has(report.seat)) }
+}
+
 const withReports = (text: string, rendered: string, count: number): string =>
   `${text}\n\n— Drove: ${count} worker report${count === 1 ? '' : 's'} arrived while you were busy. Act on ${count === 1 ? 'it' : 'them'} now —\n${rendered}`
 
 export const piggyback = async (deps: Deps, run: RunMeta, text: string, ports: WatchPorts = defaultWatchPorts): Promise<string> => {
-  const reports = await unackedReports(deps, run, ports)
+  const { kept: reports, dropped } = await splitClosed(deps, run, ports, await unackedReports(deps, run, ports))
+  await ackReports(deps, run, ports, dropped)
   if (reports.length === 0) return text
   await ackReports(deps, run, ports, reports)
   const config = await ports.readJson<Partial<DroveConfig>>(join(deps.home, 'config.json'))
@@ -314,8 +325,15 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     ]
   }
 
+  const dropClosed = async (run: RunMeta, unacked: readonly Report[]): Promise<Report[]> => {
+    const { kept, dropped } = await splitClosed(deps, run, ports, unacked)
+    await ackReports(deps, run, ports, dropped)
+    for (const report of dropped) await emit('report.delivered', report.seat, report.id, { via: 'dropped-seat-closed' })
+    return kept
+  }
+
   const wake = async (run: RunMeta) => {
-    const reports = await unackedReports(deps, run, ports)
+    const reports = await dropClosed(run, await unackedReports(deps, run, ports))
     if (reports.length === 0) {
       batchStartedAt = undefined
       lastWakeFailAt = undefined
@@ -339,7 +357,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     }
     if (delivered?.ok) {
       await ackReports(deps, run, ports, reports)
-      const via = 'unconfirmed' in delivered && delivered.unconfirmed ? `${delivered.via}-unconfirmed` : delivered.via
+      // The mod only queues the text until the planner is idle, so a mod wake is a handoff, not a delivery.
+      const via = 'unconfirmed' in delivered && delivered.unconfirmed ? `${delivered.via}-unconfirmed` : delivered.via === 'mod' ? 'mod-handoff' : delivered.via
       for (const report of reports) await emit('report.delivered', report.seat, report.id, { via })
       batchStartedAt = undefined
       lastWakeFailAt = undefined
@@ -374,7 +393,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     else plannerStatus = undefined
     plannerAgentSession = planner?.sessionId ?? plannerAgentSession
     const current = await ports.loadRoster(deps.home, run.id)
-    const derived = new Map<string, { state: Seat['state']; attention: Attention[] }>()
+    const derived = new Map<string, { state: Seat['state']; attention: Attention[]; sessionId?: string }>()
     for (const seat of ports.openSeats(current).filter((open) => open.state !== 'closing')) {
       const agent = listed.value.find((candidate) => candidate.name === seat.name) ?? listed.value.find((candidate) => seat.paneId !== undefined && candidate.paneId === seat.paneId)
       const hooks = await hooksFor(run, seat.name)
@@ -384,7 +403,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         screen = read.code === 0 ? read.stdout : undefined
       }
       const result = ports.deriveState(seat, { herdr: agent, hooks, lastReport: seat.lastReport, screen }, now)
-      derived.set(seat.name, result)
+      const sessionId = seat.sessionId ? undefined : (hooks.findLast((record) => record.event === 'session-start' && record.sessionId) ?? hooks.findLast((record) => record.sessionId))?.sessionId
+      derived.set(seat.name, { ...result, ...(sessionId ? { sessionId } : {}) })
     }
     if (derived.size === 0) return
     const at = now.toISOString()
@@ -400,6 +420,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
           ...seat,
           state: result.state,
           stateAt: changed ? at : seat.stateAt,
+          ...(result.sessionId && !seat.sessionId ? { sessionId: result.sessionId } : {}),
           attention: [...seat.attention.filter((item) => KEPT_ATTENTION.includes(item.reason)), ...result.attention],
           ...(result.state === 'working' && !reportedThisEpisode(seat) ? { lastWorkingAt: at } : {}),
           ...(result.state === 'working' && seat.state !== 'working' ? { hasNudged: false } : {}),
@@ -461,7 +482,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     serial(async () => {
       const run = await currentRun()
       await guarded('ingest', () => ingest(run))
-      const reports = await unackedReports(deps, run, ports)
+      const reports = await dropClosed(run, await unackedReports(deps, run, ports))
       await ackReports(deps, run, ports, reports)
       for (const report of reports) await emit('report.delivered', report.seat, report.id, { via: 'piggyback' })
       if (reports.length > 0) batchStartedAt = undefined
