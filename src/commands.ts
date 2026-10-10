@@ -24,7 +24,7 @@ export type ProcessPlan = { argv: string[]; env: Record<string, string>; cwd: st
 
 export const DROVE_ENTRY = fileURLToPath(new URL('./cli.ts', import.meta.url))
 export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
-export const timing = { pollMs: 500, exitWaitMs: 20_000, closeWaitMs: 3_000 }
+export const timing = { pollMs: 500, exitWaitMs: 20_000, closeWaitMs: 3_000, lockWaitMs: 5_000 }
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
 const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
@@ -138,12 +138,34 @@ const isGone = (deps: Deps, target: string) => async (): Promise<boolean> => {
   return !live.ok && live.code !== 'unparseable'
 }
 
-const quitText = (kind: AgentKind): string => (kind === 'claude' ? '/exit' : '/quit')
+const isPaneMissing = (failure: { code: string; output: string }): boolean => /not.?found|no such|unknown/i.test(`${failure.code} ${failure.output}`)
 
-const quitAgent = async (deps: Deps, seat: Seat, waitMs: number): Promise<boolean> => {
+type Stopped = { stopped: boolean; paneClosed: boolean; detail?: string }
+
+// Claude's /exit in a worktree session opens a keep-or-remove dialog that Drove must never answer, so a Claude
+// seat is stopped by closing its pane: the transcript is written as it goes and resumes by session id.
+const stopAgent = async (deps: Deps, seat: Seat, waitMs: number): Promise<Stopped> => {
   const target = seat.paneId ?? seat.name
-  await herdr.run(deps.exec, herdr.agentTypeArgv(target, quitText(seat.kind)), 15_000)
-  return settle(isGone(deps, target), waitMs)
+  if (seat.kind === 'claude') {
+    if (!seat.paneId) return { stopped: true, paneClosed: false }
+    const closed = await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
+    if (!closed.ok && !isPaneMissing(closed)) return { stopped: false, paneClosed: false, detail: clip(closed.output) }
+    return { stopped: await settle(isGone(deps, target), waitMs), paneClosed: true }
+  }
+  await herdr.run(deps.exec, herdr.agentTypeArgv(target, '/quit'), 15_000)
+  return { stopped: await settle(isGone(deps, target), waitMs), paneClosed: false }
+}
+
+// Claude locks its worktree with its pid and a killed pane leaves that lock behind. Only a Claude-shaped lock
+// whose pid is dead is cleared; a live pid or a lock somebody else took stays.
+const releaseStaleLock = async (deps: Deps, run: RunMeta, seat: Seat): Promise<string | undefined> => {
+  const lock = await git.worktreeLock(deps.exec, run.repo, seat.worktree).catch(() => undefined)
+  const pid = lock?.claudePid
+  if (pid === undefined) return undefined
+  const isDead = await settle(async () => !git.isPidAlive(pid), timing.lockWaitMs)
+  if (!isDead) return `its worktree is locked by a running Claude (pid ${pid}), so the lock was left alone`
+  await git.unlockWorktree(deps.exec, run.repo, seat.worktree).catch(() => undefined)
+  return undefined
 }
 
 const launchRequest = (
@@ -579,8 +601,9 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
 
   const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
   if (!token) return failed('no-token', `no token for ${seat.name}`)
-  const quit = await quitAgent(deps, seat, timing.exitWaitMs)
-  if (!quit) return failed('restart', `${seat.name} did not exit after ${quitText(seat.kind)}; nothing was changed. Check the pane.`)
+  const stop = await stopAgent(deps, seat, timing.exitWaitMs)
+  if (!stop.stopped) return failed('restart', `${seat.name} did not stop after ${seat.kind === 'claude' ? 'its pane was closed' : '/quit'}${stop.detail ? ` (${stop.detail})` : ''}. Check the pane.`)
+  const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
 
   const updated: Seat = { ...seat, ...change, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
   const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
@@ -593,7 +616,6 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   await writeLaunchJson(deps, run.id, seat.name, spec)
   let paneId = seat.paneId
   if (seat.kind === 'claude') {
-    await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
     const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
     const placement = await placePane(deps, run, others, seat.worktree, spec.env)
     if (!isPlacement(placement)) {
@@ -620,7 +642,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   const isUnconfirmed = typed !== undefined && !typed.ok
   await appendJsonl(join(seatDir(deps.home, run.id, seat.name), 'sent.jsonl'), { id: control.id, via, at: deps.clock.now().toISOString() })
   await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via, model, effort: request.effort, ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(adopted && !started.ok ? { startTimeout: started.code === 'timeout' } : {}) } })
-  return ok(`${seat.name} restarted with resume on ${model || 'the default model'} at ${request.effort} effort.${adopted && !started.ok ? ` Note: herdr's agent start ${started.code === 'timeout' ? 'timed out' : `failed (${started.code})`} but the agent is up in the pane, so the seat was kept.` : ''}${isUnconfirmed ? ' The notice was typed; herdr did not confirm the agent took it.' : ''}`)
+  return ok(`${seat.name} restarted with resume on ${model || 'the default model'} at ${request.effort} effort.${adopted && !started.ok ? ` Note: herdr's agent start ${started.code === 'timeout' ? 'timed out' : `failed (${started.code})`} but the agent is up in the pane, so the seat was kept.` : ''}${isUnconfirmed ? ' The notice was typed; herdr did not confirm the agent took it.' : ''}${lockNote ? ` Note: ${lockNote}.` : ''}`)
 }
 
 export const applyPendingPromotes = async (deps: Deps, run: RunMeta): Promise<CommandResult[]> => {
@@ -670,9 +692,12 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
   if (!seat || seat.state === 'closed') return failed('no-seat', `no open seat named ${seatName}`)
   if (seat.paneId && seat.state !== 'gone' && seat.state !== 'down') {
     await updateRoster(deps.home, run.id, current => ({ ...current, seats: current.seats.map(entry => (entry.name === seat.name ? { ...entry, state: 'closing', attention: [] } : entry)) }))
-    await quitAgent(deps, seat, timing.closeWaitMs)
-    const closed = await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
-    if (!closed.ok && !/not.?found|no such|unknown/i.test(`${closed.code} ${closed.output}`)) return failed('herdr', `herdr could not close pane ${seat.paneId}: ${clip(closed.output)}`)
+    const stop = await stopAgent(deps, seat, timing.closeWaitMs)
+    if (stop.detail) return failed('herdr', `herdr could not close pane ${seat.paneId}: ${stop.detail}`)
+    if (!stop.paneClosed) {
+      const closed = await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
+      if (!closed.ok && !isPaneMissing(closed)) return failed('herdr', `herdr could not close pane ${seat.paneId}: ${clip(closed.output)}`)
+    }
   }
   const after = await updateRoster(deps.home, run.id, current => ({
     ...current,
@@ -722,8 +747,8 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
       if (live.ok) sessionId = sessionId ?? live.value.sessionId
       if (!sessionId) sessionId = (await hooksOf(deps, run.id, seat.name)).findLast(hook => hook.event === 'session-start' && hook.sessionId)?.sessionId
       if (live.ok) {
-        await quitAgent(deps, seat, timing.closeWaitMs)
-        if (seat.paneId) await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
+        const stop = await stopAgent(deps, seat, timing.closeWaitMs)
+        if (seat.paneId && !stop.paneClosed) await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
       }
     }
     ;(sessionId ? saved : unsaved).push(seat.name)
@@ -742,7 +767,7 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
 const resumePrompt = (seat: Seat): string | undefined =>
   seat.lastWorkingAt && (!seat.lastReport || Date.parse(seat.lastReport.at) < Date.parse(seat.lastWorkingAt)) ? resumedText() : undefined
 
-const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, placed: readonly Seat[]): Promise<{ seat: Seat } | { error: string }> => {
+const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, placed: readonly Seat[]): Promise<{ seat: Seat; note?: string } | { error: string }> => {
   if (!seat.sessionId) return { error: `${seat.name} has no saved session id, so it cannot be resumed; close it and spawn a new one` }
   const token = (await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))) ?? mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
@@ -752,6 +777,7 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: workerRole(seat, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}) }, config))
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
+  const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
   const placement = await placePane(deps, run, placed, seat.worktree, spec.env)
   if (!isPlacement(placement)) return { error: placement.text }
   if (placement.createdTab) run.tabId = placement.createdTab
@@ -777,7 +803,7 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
         : [],
   }
   await updateRoster(deps.home, run.id, roster => upsertSeat(roster, next))
-  return { seat: next }
+  return { seat: next, ...(lockNote ? { note: lockNote } : {}) }
 }
 
 export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<CommandResult> => {
@@ -792,7 +818,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
     if (seat.state !== 'gone' && seat.state !== 'down') return failed('not-dead', `${seatName} is ${seat.state}; only a gone or down seat is relaunched`)
     const placed = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
     const relaunched = await relaunchSeat(deps, run, config, seat, placed)
-    return 'error' in relaunched ? failed('relaunch', relaunched.error) : ok(`Relaunched ${seatName} in pane ${relaunched.seat.paneId} with resume.`, { paneId: relaunched.seat.paneId })
+    return 'error' in relaunched ? failed('relaunch', relaunched.error) : ok(`Relaunched ${seatName} in pane ${relaunched.seat.paneId} with resume.${relaunched.note ? ` Note: ${relaunched.note}.` : ''}`,{ paneId: relaunched.seat.paneId })
   }
 
   if (run.status !== 'down') return failed('not-down', `run ${run.id} is ${run.status}; nothing to resume`)

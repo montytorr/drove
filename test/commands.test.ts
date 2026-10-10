@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { readFile, realpath, stat, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
@@ -11,7 +12,7 @@ import type { Deps, Identity, RunMeta } from '../src/types.ts'
 import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun } from './p3-helpers.ts'
 
 beforeEach(() => {
-  Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20 })
+  Object.assign(commands.timing, { pollMs: 1, exitWaitMs: 50, closeWaitMs: 20, lockWaitMs: 20 })
   for (const key of ['DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_ROLE_IN_BRIEF', 'HERDR_PANE_ID']) delete process.env[key]
   process.env.DROVE_BRIEF_VIA = 'launch-arg'
 })
@@ -496,12 +497,13 @@ test('prompt types raw text but refuses a blocked pane', async () => {
   assert.equal(fake.prompts.length, 1)
 })
 
-test('close quits the agent, closes the pane and the empty tab, and keeps the worktree by default', async () => {
+test('close stops a Claude seat by closing its pane, never /exit, then closes the empty tab and keeps the worktree by default', async () => {
   const { fake, deps, identity, repo } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
   const closed = await commands.close(deps, identity, 'w-api', false)
   assert.equal(closed.ok, true, closed.text)
-  assert.equal(fake.prompts[0]?.text, '/exit')
+  assert.equal(fake.prompts.length, 0)
+  assert.equal(fake.calls.filter(call => call[1] === 'pane' && call[2] === 'close').length, 1)
   assert.ok(fake.herdrCalls().includes('pane close'))
   assert.ok(fake.herdrCalls().includes('tab close'))
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'closed')
@@ -509,7 +511,7 @@ test('close quits the agent, closes the pane and the empty tab, and keeps the wo
   assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
 })
 
-test('close marks the seat closing before /exit, so the worktree exit question raises nothing', async () => {
+test('close marks the seat closing before the pane goes, so nothing the closing pane shows raises attention', async () => {
   const { fake, deps, identity } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
   const seen: string[] = []
@@ -517,7 +519,7 @@ test('close marks the seat closing before /exit, so the worktree exit question r
   const watching: Deps = {
     ...deps,
     exec: async argv => {
-      if (argv.includes('/exit')) seen.push((await loadRoster(deps.home, RUN)).seats[0]?.state ?? 'missing')
+      if (argv[1] === 'pane' && argv[2] === 'close') seen.push((await loadRoster(deps.home, RUN)).seats[0]?.state ?? 'missing')
       return exec(argv)
     },
   }
@@ -579,7 +581,7 @@ test('promote on a settled Claude worker restarts it with --resume and the new m
   const sessionId = (await loadRoster(deps.home, RUN)).seats[0]?.sessionId
   const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high', reason: 'subtle bug' })
   assert.equal(promoted.ok, true, promoted.text)
-  assert.equal(fake.prompts[0]?.text, '/exit')
+  assert.ok(!fake.prompts.some(item => item.text === '/exit' || item.text === '/quit'))
   const starts = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')
   assert.equal(starts.length, 2)
   const restart = starts[1] ?? []
@@ -595,8 +597,8 @@ test('promote on a settled Claude worker restarts it with --resume and the new m
   const created = fake.calls.filter(call => call[1] === 'tab' && call[2] === 'create').at(-1) ?? []
   assert.equal(created[created.indexOf('--cwd') + 1], worktree)
   assert.equal(restart[restart.indexOf('--pane') + 1], 'w1:p2')
-  assert.equal(fake.prompts.length, 2)
-  assert.match(fake.prompts[1]?.text ?? '', /kind=promote model=claude-opus-5-5 effort=high/)
+  assert.equal(fake.prompts.length, 1)
+  assert.match(fake.prompts[0]?.text ?? '', /kind=promote model=claude-opus-5-5 effort=high/)
   const seat = (await loadRoster(deps.home, RUN)).seats[0]
   assert.deepEqual([seat?.model, seat?.effort, seat?.state, seat?.owes], ['claude-opus-5-5', 'high', 'working', 'none'])
   assert.equal(seat?.paneId, 'w1:p2')
@@ -714,6 +716,9 @@ test('down saves session ids and closes everything; up relaunches each seat with
   assert.equal(downed.ok, true, downed.text)
   assert.match(downed.text, /2 seat\(s\) saved/)
   assert.equal(fake.agents.size, 0)
+  assert.deepEqual(fake.prompts.map(item => item.text), ['/quit'])
+  assert.ok(fake.find('herdr', 'pane', 'close', 'w1:p1'))
+  assert.ok(fake.herdrCalls().includes('tab close'))
   assert.equal((await loadRun(deps.home, RUN))?.status, 'down')
   const seats = (await loadRoster(deps.home, RUN)).seats
   assert.deepEqual(seats.map(seat => seat.state), ['down', 'down'])
@@ -883,6 +888,80 @@ test('promote keeps the restarted seat when agent start timed out but the agent 
   const failed = await commands.promote(second.deps, second.identity, { seat: 'w-api', model: 'opus', effort: 'high' })
   assert.equal(!failed.ok && failed.code, 'restart')
   assert.equal((await loadRoster(second.deps.home, RUN)).seats[0]?.state, 'gone')
+})
+
+const deadPid = (): number => spawnSync(process.execPath, ['-e', '']).pid
+
+const lockWorktree = (repo: string, seat: string, reason: string): Promise<string> => git(repo, 'worktree', 'lock', '--reason', reason, join(repo, '.claude', 'worktrees', seat))
+
+const isLocked = async (repo: string, seat: string): Promise<boolean> => {
+  const listed = await git(repo, 'worktree', 'list', '--porcelain')
+  const block = listed.split('\n\n').find(entry => entry.includes(`/.claude/worktrees/${seat}\n`) || entry.endsWith(`/.claude/worktrees/${seat}`))
+  return /^locked\b/m.test(block ?? '')
+}
+
+test('relaunch clears a stale Claude lock before agent start, and leaves a live pid or a foreign lock alone', async () => {
+  const cases = [
+    { name: 'dead pid', reason: `claude session w-a (pid ${deadPid()} start Sat Oct 10 06:32:48 2026)`, unlocked: true },
+    { name: 'live pid', reason: `claude session w-a (pid ${process.pid})`, unlocked: false },
+    { name: 'foreign lock', reason: 'held by hand', unlocked: false },
+  ]
+  for (const { name, reason, unlocked } of cases) {
+    const fake = new FakeHerdr()
+    const { deps, identity, repo } = await setup(fake)
+    await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+    await killedMidTurn(fake, deps)
+    await lockWorktree(repo, 'w-a', reason)
+    assert.equal(await isLocked(repo, 'w-a'), true, name)
+    const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
+    assert.equal(relaunched.ok, true, `${name}: ${relaunched.text}`)
+    assert.equal(await isLocked(repo, 'w-a'), !unlocked, name)
+    const unlock = fake.calls.findIndex(call => call.includes('unlock'))
+    const start = fake.calls.findLastIndex(call => call[1] === 'agent' && call[2] === 'start')
+    assert.equal(unlock >= 0, unlocked, name)
+    if (unlocked) assert.ok(unlock < start, `${name}: unlock comes before agent start`)
+    assert.match(relaunched.text, name === 'live pid' ? /locked by a running Claude/ : /^Relaunched w-a in pane \S+ with resume\.$/, name)
+  }
+})
+
+test('promote clears a stale Claude lock between closing the pane and starting the resumed agent', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  await settleSeat(deps, fake, 'w-api')
+  await lockWorktree(repo, 'w-api', `claude session w-api (pid ${deadPid()})`)
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.equal(await isLocked(repo, 'w-api'), false)
+  const unlock = fake.calls.findIndex(call => call.includes('unlock'))
+  const close = fake.calls.findIndex(call => call[1] === 'pane' && call[2] === 'close')
+  const start = fake.calls.findLastIndex(call => call[1] === 'agent' && call[2] === 'start')
+  assert.ok(close < unlock && unlock < start)
+})
+
+test('promote leaves a lock held by a live Claude alone and says so', async () => {
+  const { fake, deps, identity, repo } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  await settleSeat(deps, fake, 'w-api')
+  await lockWorktree(repo, 'w-api', `claude session w-api (pid ${process.pid})`)
+  const promoted = await commands.promote(deps, identity, { seat: 'w-api', model: 'opus', effort: 'high' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.match(promoted.text, /locked by a running Claude \(pid \d+\), so the lock was left alone/)
+  assert.equal(await isLocked(repo, 'w-api'), true)
+})
+
+test('down closes each Claude pane without typing anything and saves the session ids it minted at launch', async () => {
+  const fake = new FakeHerdr()
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
+  await commands.spawn(deps, identity, { seat: 'w-b', kind: 'claude', brief })
+  const minted = (await loadRoster(deps.home, RUN)).seats.map(seat => seat.sessionId)
+  assert.ok(minted.every(Boolean))
+  const downed = await commands.down(deps, { run: RUN, repo: '/x' })
+  assert.equal(downed.ok, true, downed.text)
+  assert.equal(fake.prompts.length, 0)
+  assert.equal(fake.calls.filter(call => call[1] === 'pane' && call[2] === 'close').length, 2)
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats.map(seat => [seat.state, seat.sessionId]), [['down', minted[0]], ['down', minted[1]]])
+  assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
 })
 
 test('plan creates a run, writes the planner files and returns the exec plan', async () => {
