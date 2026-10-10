@@ -651,6 +651,26 @@ describe('worker session', () => {
     expect(world.submitted.at(-1)).toContain(UNVERIFIED)
   })
 
+  // herdr types a multi-line brief as a paste, so the terminal hands the mod CR (or CRLF) for each LF and drops trailing blanks.
+  // The mac is Drove's own (src/protocol.ts macOf over the canonical body), not one made by the mod's macOf.
+  const PASTED_MAC = 'bb1e04711c0222fa'
+  const BRIEF = ['Brief for the parser — start now   ', '', 'Step 1 → read the spec · then code', '', 'Done when tests pass']
+  const pasted = (bodyLines: string[], eol: string) =>
+    [`⟦drove v1 run=${RUN} from=planner to=w-auth id=c-7 kind=brief expects=review mac=${PASTED_MAC}⟧`, ...bodyLines, '↩ Reply with the drove report tool (server drove) when done, blocked, or when you need a decision.'].join(eol)
+
+  test('a multi-paragraph brief typed as a paste, with CR or CRLF line ends, still verifies', async ($, on) => {
+    const { world } = engine(on, WORKER_ENV)
+    await $.session.start(START)
+    for (const eol of ['\r', '\r\n', '\n']) {
+      await $.prompt.submit({ text: pasted(BRIEF, eol), origin: { kind: 'composer' } } as never)
+      const seen = world.submitted.at(-1) ?? ''
+      expect(seen).not.toContain(UNVERIFIED)
+      expect(seen).toContain('[planner · brief · expects review]\nBrief for the parser — start now\n\nStep 1 → read the spec · then code\n\nDone when tests pass')
+    }
+    await $.prompt.submit({ text: pasted([...BRIEF.slice(0, 4), 'Done when tests pass (edited)'], '\r'), origin: { kind: 'composer' } } as never)
+    expect(world.submitted.at(-1)).toContain(UNVERIFIED)
+  })
+
   test('with no token in the env or in the seat file a control stays unverified', async ($, on) => {
     const { world } = engine(on, { ...WORKER_ENV, DROVE_TOKEN: '' })
     await $.session.start(START)
