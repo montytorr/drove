@@ -210,7 +210,7 @@ const ORCHESTRATOR_TOOLS = [
   {
     name: 'spawn_worker',
     description:
-      'Orchestrator mode: start a worker through Drove in a new herdr pane, in its own git worktree, and give it a brief. kind claude (default, Sonnet unless you say otherwise) or codex. It reports back to you through Drove and can ask to be promoted. Up to the pane budget (5 open) without asking; beyond it Cal is asked in a dialog. Returns once the brief is delivered.',
+      'Orchestrator mode: start a worker through Drove in a new herdr pane, in its own git worktree, and give it a brief. kind claude (default, Sonnet unless you say otherwise) or codex. It reports back to you through Drove and can ask to be promoted. Up to the run’s pane budget without asking; beyond it Cal is asked in a dialog. Returns once the brief is delivered.',
     inputSchema: {
       type: 'object',
       properties: {
