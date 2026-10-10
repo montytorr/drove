@@ -88,6 +88,8 @@ describe('drove client', () => {
   test('argv for attach and spawn', () => {
     expect(attachArgs({ sessionId: 's', paneId: 'w1:p2', goal: 'g', model: 'm', effort: 'high', budget: 5 })).toEqual(['mod', 'attach', '--session', 's', '--pane', 'w1:p2', '--goal', 'g', '--model', 'm', '--effort', 'high', '--budget', '5'])
     expect(spawnArgs({ name: 'w-x', kind: 'codex', effort: 'low' })).toEqual(['spawn', 'w-x', '--kind', 'codex', '--brief', '-', '--effort', 'low'])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', mcp: ['mongodb', 'notion'] }).slice(-2)).toEqual(['--mcp', 'mongodb,notion'])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', mcp: [] }).slice(-2)).toEqual(['--mcp', ''])
   })
 
   test('failures, JSON results and guard verdicts are read from what the CLI prints', () => {

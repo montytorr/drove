@@ -1,16 +1,16 @@
 import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, readdir, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
-import { type CodexLaunchRequest, execArgv, isShellSafeArg, readCodexHome, redactSpec, specFor, writeLaunchFiles } from './launch.ts'
+import { type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readCodexHome, redactSpec, specFor, userClaudeConfig, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
-import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
+import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
@@ -28,6 +28,7 @@ export const timing = { pollMs: 500, exitWaitMs: EXIT_WAIT_MS, closeWaitMs: 3_00
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
 const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
+const MCP_NAME_RE = /^[^\s,]+$/
 
 export const DEFAULT_CONFIG: DroveConfig = {
   humanName: 'the human',
@@ -86,11 +87,18 @@ const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/
 const envOf = (value: unknown): Record<string, string> =>
   value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).filter(([name, text]) => ENV_NAME_RE.test(name) && typeof text === 'string')) : {}
 
+const namesOf = (value: unknown): string[] | undefined =>
+  Array.isArray(value) ? [...new Set(value.filter((name): name is string => typeof name === 'string').map(name => name.trim()).filter(Boolean))] : undefined
+
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const file = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const mcp = namesOf(workerMcp)
+  const skills = namesOf(workerSkills)
   return {
     ...DEFAULT_CONFIG,
     ...file,
+    ...(mcp ? { workerMcp: mcp } : {}),
+    ...(skills ? { workerSkills: skills } : {}),
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
     workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel },
     promotedModel: { ...DEFAULT_CONFIG.promotedModel, ...file.promotedModel },
@@ -201,6 +209,50 @@ const launchRequest = (
 // (DROVE-34). A seat with none recorded started before Drove owned one and keeps the inline launch line and ~/.codex.
 const codexHomeOf = async (deps: Deps, seat: Seat): Promise<Pick<CodexLaunchRequest, 'codexHome'>> =>
   seat.kind === 'codex' && seat.codexHome ? { codexHome: await readCodexHome(seat.codexHome, deps.codexUserHome ?? userCodexHome(deps.home)) } : {}
+
+// No allowlist anywhere keeps the user's whole MCP setup (DROVE-72); workerMcp or a seat's --mcp makes the seat lean:
+// Drove's server plus the union of both lists.
+const seatMcpAllow = (config: DroveConfig, seat: Pick<Seat, 'mcp'>): string[] | undefined =>
+  config.workerMcp === undefined && seat.mcp === undefined ? undefined : [...new Set([...(config.workerMcp ?? []), ...(seat.mcp ?? [])])]
+
+type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[] }
+
+const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
+  const mcpAllow = seatMcpAllow(config, seat)
+  if (seat.kind === 'claude') {
+    if (!mcpAllow) return { parts: {}, missing: [] }
+    const userMcp = await readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo)
+    return { parts: { mcpAllow, userMcp }, missing: mcpAllow.filter(name => name !== 'drove' && userMcp[name] === undefined) }
+  }
+  const { codexHome } = await codexHomeOf(deps, seat)
+  const known = codexHome ? codexMcpNames(codexHome.userConfig) : []
+  return {
+    parts: {
+      ...(codexHome ? { codexHome } : {}),
+      ...(mcpAllow ? { mcpAllow } : {}),
+      ...(config.workerMcp ? { homeMcpAllow: config.workerMcp } : {}),
+      ...(config.workerSkills ? { skillAllow: config.workerSkills } : {}),
+    },
+    missing: codexHome && mcpAllow ? mcpAllow.filter(name => name !== 'drove' && !known.includes(name)) : [],
+  }
+}
+
+const missingMcpNote = (seat: Seat, missing: readonly string[]): string[] =>
+  missing.length > 0 ? [`MCP server${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not in the user's ${seat.kind === 'claude' ? 'Claude' : 'Codex'} setup, so ${seat.name} runs without ${missing.length > 1 ? 'them' : 'it'}.`] : []
+
+// A Codex seat without a Drove-owned home got its role inside its brief, so a relaunch adds none.
+const seatRoleText = (run: RunMeta, config: DroveConfig, seat: Seat): string => (seat.kind === 'codex' && !seat.codexHome ? '' : workerRole(run, config))
+
+const LOCKFILES = ['yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock'] as const
+
+const repoVerifyCommands = async (repo: string): Promise<string[]> => {
+  const read = (name: string): Promise<string | undefined> => readFile(join(repo, name), 'utf8').catch(() => undefined)
+  return verifyCommands({
+    packageJson: await read('package.json'),
+    makefile: (await read('Makefile')) ?? (await read('makefile')),
+    lockfiles: LOCKFILES.filter(name => existsSync(join(repo, name))),
+  })
+}
 
 const writeLaunchJson = async (deps: Deps, run: string, seat: string, spec: Parameters<typeof redactSpec>[0]): Promise<void> => {
   await writeJsonAtomic(join(seatDir(deps.home, run, seat), 'launch.json'), redactSpec(spec))
@@ -549,6 +601,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (request.kind !== 'claude' && request.kind !== 'codex') return failed('usage', '--kind must be claude or codex')
   if (request.cairn && !CAIRN_RE.test(request.cairn)) return failed('usage', `--cairn must look like DROVE-5; got "${request.cairn}"`)
   if (request.effort && !EFFORTS.includes(request.effort)) return failed('usage', `--effort must be one of ${EFFORTS.join(', ')}`)
+  const badMcp = request.mcp?.find(name => !MCP_NAME_RE.test(name))
+  if (badMcp !== undefined) return failed('usage', `--mcp takes server names separated by commas; got "${badMcp}"`)
   const brief = request.brief.trim()
   if (!brief) return failed('usage', 'a worker needs a brief')
   const located = await locateFor(deps, identity, 'up')
@@ -570,7 +624,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const launchCwd = isClaude ? run.repo : worktree
   const sessionId = kind === 'claude' ? randomUUID() : undefined
   const seat: Seat = {
-    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), model, effort, worktree, branch,
+    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}), model, effort, worktree, branch,
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
     ...(isClaude ? {} : { codexHome: codexHomeDir(deps.home, run.id) }),
   }
@@ -632,15 +686,15 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
   const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const isBriefInline = isShellSafeArg(brief.trim())
-  const footer = isBriefInline ? `${brief.trim()} ${briefFooter(seat.name, request.cairn).trimStart()}` : `${brief}${briefFooter(seat.name, request.cairn)}`
-  const isRoleInBrief = kind === 'codex'
-  const roleText = workerRole(seat, run, config)
-  const briefText = isRoleInBrief ? `${roleText}\n\n${footer}` : footer
+  const footerText = briefFooter(seat.name, request.cairn, { branch, verify: await repoVerifyCommands(run.repo) })
+  const briefText = isBriefInline ? `${brief.trim()} ${footerText.trimStart()}` : `${brief}${footerText}`
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
   await saveBrief(deps, run.id, seat.name, briefText)
+  const extras = await launchExtrasOf(deps, run, config, seat)
+  baseNotes.push(...missingMcpNote(seat, extras.missing))
   const spec = specFor(
-    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}), ...(await codexHomeOf(deps, seat)) }, config),
+    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: workerRole(run, config), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -866,7 +920,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     const controlText = formatControl(control, token)
     const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
     const spec = specFor(
-      launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seat.kind === 'codex' ? '' : workerRole(updated, run, config), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await codexHomeOf(deps, seat)) }, config),
+      launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seatRoleText(run, config, seat), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config),
     )
     await writeLaunchFiles(spec)
     await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -1062,7 +1116,7 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
   const identity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const resumeText = resumePrompt(seat)
   const isInline = resolveBriefVia(config) === 'launch-arg'
-  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seat.kind === 'codex' ? '' : workerRole(seat, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}), ...(await codexHomeOf(deps, seat)) }, config))
+  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seatRoleText(run, config, seat), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config))
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined

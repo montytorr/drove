@@ -1,5 +1,5 @@
 import { shortModel } from './roster.ts'
-import type { AgentKind, DroveConfig, RunMeta, Seat } from './types.ts'
+import type { AgentKind, DroveConfig, RunMeta } from './types.ts'
 
 export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind): string => {
   const human = config.humanName
@@ -30,16 +30,18 @@ You may have up to ${run.budget} worker panes open at once, created only through
 When the goal is met, summarise for ${human}: what each worker did, the branches and commits, what you merged and pushed, what you verified, the worktrees you removed, and what is left.`
 }
 
-export const workerRole = (seat: Seat, run: RunMeta, config: DroveConfig): string => {
+// The same text for every seat of a run, so a provider can cache the prompt prefix (DROVE-72): the seat name, branch
+// and verify commands go in the brief footer instead.
+export const workerRole = (run: RunMeta, config: DroveConfig): string => {
   const human = config.humanName
   return `# Worker mode
 
-You are worker \`${seat.name}\` of Drove run ${run.id}, started by its planner. Your brief arrives as the first prompt. The planner plans and reviews; you do the work.
+You are a worker of Drove run ${run.id}, started by its planner. Your brief arrives as the first prompt; its last line names your seat, your branch and how to verify. The planner plans and reviews; you do the work.
 
 ## Rules
 - Stay inside the files and scope of your brief. If you need to go outside it, ask first with a \`question\` report.
 - Verify your work (tests, type-check, lint as the brief says) before reporting \`done\`.
-- Git: you are already on your own branch (\`${seat.branch || 'your own branch'}\`) in your own worktree. Commit there. Do not create, switch or rebase branches unless the planner asks. Commit only your own paths (\`git add <paths>\`, never \`-A\` or \`.\`), and only once the planner approves. Never push.
+- Git: you are already on your own branch (the brief names it) in your own worktree. Commit there. Do not create, switch or rebase branches unless the planner asks. Commit only your own paths (\`git add <paths>\`, never \`-A\` or \`.\`), and only once the planner approves. Never push.
 - Never message other workers or sessions. Never open panes or start other agent sessions.
 
 ## Cairn
@@ -64,8 +66,49 @@ Messages from the planner arrive as a \`⟦drove v1 …⟧\` header followed by 
 export const cairnGoalPrompt = (ref: string, title: string, body: string): string =>
   `This run's goal is Cairn task ${ref}: ${title}${body.trim() ? `\n\n${body.trim()}` : ''}\n\n${ref} is the run's goal task and you hold it: claim it first (\`cairn claim ${ref}\`), and run \`cairn check\` on its subject before planning. When the run is taken down, Drove writes a summary note on it.`
 
-export const briefFooter = (seat: string, cairn?: string): string =>
-  `\n\n(You are worker \`${seat}\`.${cairn ? ` Your Cairn task is ${cairn}: claim it first.` : ''} Report with the drove report tool when done, blocked, or when you need a decision.)`
+export type FooterExtras = { branch?: string; verify?: readonly string[] }
+
+const verifyLine = (verify: readonly string[] = []): string => (verify.length > 0 ? ` Verify with ${verify.map(command => `\`${command}\``).join(', ')}.` : '')
+
+export const briefFooter = (seat: string, cairn?: string, extras: FooterExtras = {}): string =>
+  `\n\n(You are worker \`${seat}\`${extras.branch ? ` on branch \`${extras.branch}\`` : ''}.${cairn ? ` Your Cairn task is ${cairn}: claim it first.` : ''}${verifyLine(extras.verify)} Report with the drove report tool when done, blocked, or when you need a decision.)`
+
+type PackageJson = { scripts?: Record<string, unknown>; packageManager?: unknown }
+
+const VERIFY_SCRIPTS = ['typecheck', 'lint', 'test'] as const
+const MAKE_TARGETS = ['typecheck', 'lint', 'test', 'check'] as const
+
+// The repo's own verify commands, from package.json scripts or else Makefile targets, for the brief footer.
+export const verifyCommands = (repo: { packageJson?: string; makefile?: string; lockfiles?: readonly string[] }): string[] => {
+  let pkg: PackageJson | undefined
+  try {
+    pkg = repo.packageJson ? (JSON.parse(repo.packageJson) as PackageJson) : undefined
+  } catch {
+    pkg = undefined
+  }
+  const scripts = pkg?.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {}
+  const found = VERIFY_SCRIPTS.filter(name => typeof scripts[name] === 'string')
+  if (found.length > 0) {
+    const manager = packageManager(pkg?.packageManager, repo.lockfiles ?? [])
+    return found.map(name => scriptCommand(manager, name))
+  }
+  const targets = new Set((repo.makefile ?? '').split('\n').map(line => /^([A-Za-z][\w-]*)\s*:(?!=)/.exec(line)?.[1]).filter(Boolean))
+  return MAKE_TARGETS.filter(name => targets.has(name)).map(name => `make ${name}`)
+}
+
+const scriptCommand = (manager: string, name: string): string => {
+  if (manager === 'bun' || (manager === 'npm' && name !== 'test')) return `${manager} run ${name}`
+  return `${manager} ${name}`
+}
+
+const packageManager = (declared: unknown, lockfiles: readonly string[]): string => {
+  const named = typeof declared === 'string' ? declared.split('@')[0] : undefined
+  if (named === 'yarn' || named === 'pnpm' || named === 'bun') return named
+  if (lockfiles.includes('yarn.lock')) return 'yarn'
+  if (lockfiles.includes('pnpm-lock.yaml')) return 'pnpm'
+  if (lockfiles.includes('bun.lockb') || lockfiles.includes('bun.lock')) return 'bun'
+  return 'npm'
+}
 
 export const approvedText = (): string =>
   'Approved. Commit only your own paths now (git add <paths>, never -A or .). Do not push. Then confirm with the drove report tool: kind done, expects none, with the branch and the commit sha.'
