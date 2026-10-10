@@ -575,17 +575,22 @@ test('a poll while the old agent is still alive does not overwrite a seat that i
 
 test('a restart that lands between the poll reading the roster and merging it is not overwritten', async () => {
   const ctx = await setup()
+  let restart: Promise<unknown> | undefined
   const { ports } = fakePorts({
     agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'done' }],
     deriveState: (seat, signals, now) => {
       const derived = detect.deriveState(seat, signals, now)
-      void markRestarting(ctx)
+      restart ??= markRestarting(ctx)
       return derived
+    },
+    updateRoster: async (home, run, change) => {
+      await restart
+      return updateRoster(home, run, change)
     },
   })
   const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
   await watcher.tick()
-  await new Promise((resolve) => setTimeout(resolve, 20))
+  assert.ok(restart, 'the restart started after the poll had read the roster')
   const seat = (await rosterOf(ctx)).seats[0]
   assert.equal(seat?.state, 'starting')
   assert.ok(seat?.restartingSince)
