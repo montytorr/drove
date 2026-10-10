@@ -103,6 +103,21 @@ export const isMerged = async (exec: Exec, repo: string, branch: string, into: s
 
 export const commonGitDir = async (exec: Exec, repo: string): Promise<string> => must(exec, repo, ['rev-parse', '--path-format=absolute', '--git-common-dir'])
 
+export type FreshestBase = { ref: string; note?: string }
+
+// A remote-tracking base such as origin/main goes stale as soon as the local branch is committed to and not pushed.
+// Use the local counterpart when it contains the remote one; fall back to the remote, with a note, when they diverged.
+export const freshestBase = async (exec: Exec, repo: string, base: string): Promise<FreshestBase> => {
+  const slash = base.indexOf('/')
+  if (slash <= 0 || !(await refExists(exec, repo, `refs/remotes/${base}`))) return { ref: base }
+  const localName = base.slice(slash + 1)
+  const local = `refs/heads/${localName}`
+  if (!(await refExists(exec, repo, local))) return { ref: base }
+  if ((await git(exec, repo, ['merge-base', '--is-ancestor', base, local])).code === 0) return { ref: localName }
+  if ((await git(exec, repo, ['merge-base', '--is-ancestor', local, base])).code === 0) return { ref: base }
+  return { ref: base, note: `local ${localName} and ${base} have diverged, so ${base} was used as the base; commits on local ${localName} are not in the worker's worktree.` }
+}
+
 export type FastForward =
   | { outcome: 'at-base'; head: string }
   | { outcome: 'fast-forwarded'; from: string; to: string }

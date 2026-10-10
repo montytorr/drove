@@ -12,7 +12,7 @@ import { deriveState } from '../src/detect.ts'
 import { approvedText } from '../src/prompts.ts'
 import { loadRoster, loadRun, updateRoster } from '../src/roster.ts'
 import type { Deps, Identity, RunMeta } from '../src/types.ts'
-import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun } from './p3-helpers.ts'
+import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun, tmp } from './p3-helpers.ts'
 
 beforeEach(() => {
   Object.assign(deliver.confirmTiming, { waitMs: 30, pollMs: 5 })
@@ -137,6 +137,77 @@ test('a claude worktree that diverged from main is left alone and the spawn resu
   assert.equal(spawned.ok, true, spawned.text)
   assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-api'), 'rev-parse', 'HEAD'), other)
   assert.match(spawned.text, /Note: Claude created worktree-w-api at [0-9a-f]+, which is not an ancestor of main, so it was left as is/)
+})
+
+const withRemote = async () => {
+  const fake = new FakeHerdr()
+  const repo = await makeRepo()
+  const bare = await tmp('origin')
+  await git(bare, 'init', '-q', '--bare', '-b', 'main')
+  await git(repo, 'remote', 'add', 'origin', bare)
+  await git(repo, 'push', '-q', 'origin', 'main')
+  await git(repo, 'fetch', '-q', 'origin')
+  const deps = await makeDeps(fake)
+  await seedRun(deps, repo, [], { base: 'origin/main' })
+  fake.claudeWorktreeFrom = 'origin/main'
+  return { fake, deps, repo, identity: planner(deps) }
+}
+
+test('with base origin/main and local main two commits ahead, codex and claude workers start at local main', async () => {
+  const { deps, identity, repo } = await withRemote()
+  await commitOn(repo, 'a.txt')
+  const tip = await commitOn(repo, 'b.txt')
+  const codex = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(codex.ok, true, codex.text)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cx'), 'rev-parse', 'HEAD'), tip)
+  assert.match(codex.text, /The base used was main, the local branch ahead of origin\/main/)
+  const claude = await commands.spawn(deps, identity, { seat: 'w-cl', kind: 'claude', brief })
+  assert.equal(claude.ok, true, claude.text)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cl'), 'rev-parse', 'HEAD'), tip)
+  assert.match(claude.text, /fast-forwarded to/)
+  assert.match(claude.text, /The base used was main, the local branch ahead of origin\/main/)
+  assert.equal((await loadRun(deps.home, RUN))?.base, 'origin/main')
+})
+
+test('with local main behind origin/main the workers start at origin/main', async () => {
+  const { deps, identity, repo } = await withRemote()
+  await commitOn(repo, 'a.txt')
+  const remoteTip = await commitOn(repo, 'b.txt')
+  await git(repo, 'push', '-q', 'origin', 'main')
+  await git(repo, 'fetch', '-q', 'origin')
+  await git(repo, 'reset', '-q', '--hard', 'HEAD~2')
+  const codex = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(codex.ok, true, codex.text)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cx'), 'rev-parse', 'HEAD'), remoteTip)
+  assert.doesNotMatch(codex.text, /Note:/)
+  const claude = await commands.spawn(deps, identity, { seat: 'w-cl', kind: 'claude', brief })
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cl'), 'rev-parse', 'HEAD'), remoteTip)
+  assert.doesNotMatch(claude.text, /Note:/)
+})
+
+test('with local main diverged from origin/main the workers start at origin/main and the result says so', async () => {
+  const { deps, identity, repo } = await withRemote()
+  const remoteTip = await commitOn(repo, 'a.txt')
+  await git(repo, 'push', '-q', 'origin', 'main')
+  await git(repo, 'fetch', '-q', 'origin')
+  await git(repo, 'reset', '-q', '--hard', 'HEAD~1')
+  await commitOn(repo, 'b.txt')
+  const codex = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(codex.ok, true, codex.text)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cx'), 'rev-parse', 'HEAD'), remoteTip)
+  assert.match(codex.text, /local main and origin\/main have diverged, so origin\/main was used/)
+  const claude = await commands.spawn(deps, identity, { seat: 'w-cl', kind: 'claude', brief })
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cl'), 'rev-parse', 'HEAD'), remoteTip)
+  assert.match(claude.text, /have diverged/)
+})
+
+test('without a remote a codex worktree starts at main with no base note', async () => {
+  const { deps, identity, repo } = await setup()
+  const tip = await commitOn(repo, 'a.txt')
+  const codex = await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(codex.ok, true, codex.text)
+  assert.equal(await git(join(repo, '.claude', 'worktrees', 'w-cx'), 'rev-parse', 'HEAD'), tip)
+  assert.doesNotMatch(codex.text, /Note:/)
 })
 
 test('a claude spawn at the base carries no base note', async () => {
