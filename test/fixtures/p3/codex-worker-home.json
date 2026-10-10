@@ -3,13 +3,13 @@
   "role": "worker",
   "cwd": "/work/repo/.claude/worktrees/w-api",
   "env": {
-    "DROVE_HOME": "/home/cal/.drove",
+    "DROVE_HOME": "/home/user/.drove",
     "DROVE_RUN": "drove-20261009-1042-a3f1",
     "DROVE_ROLE": "worker",
     "DROVE_SEAT": "w-api",
     "DROVE_TOKEN": "tok-0123456789abcdef",
     "DROVE_AGENT": "codex",
-    "CODEX_HOME": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home"
+    "CODEX_HOME": "/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home"
   },
   "argv": [
     "--dangerously-bypass-approvals-and-sandbox",
@@ -23,37 +23,37 @@
   ],
   "files": [
     {
-      "path": "/home/cal/.drove/g-d43caf1d",
+      "path": "/home/user/.drove/g-d43caf1d",
       "content": "#!/bin/sh\nexec node /opt/drove/src/cli.ts guard \"$@\"\n",
       "mode": 448
     },
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/config.toml",
-      "content": "# Written by Drove on every Codex worker launch in this run (DROVE-34). Edits here, Codex's included, are overwritten.\nmodel = \"gpt-6.1-sol\"\npersonality = 'pragmatic'\ncheck_for_update_on_startup = false\n\n[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n\n[mcp_servers.drove]\ncommand = \"node\"\nargs = [\"/opt/drove/src/cli.ts\", \"mcp\"]\nenv_vars = [\"DROVE_HOME\", \"DROVE_RUN\", \"DROVE_ROLE\", \"DROVE_SEAT\", \"DROVE_TOKEN\"]\ndefault_tools_approval_mode = \"approve\"\n\n[mcp_servers.docs]\ncommand = \"npx\"\nargs = [\n  \"docs-mcp\",\n]\n\n[mcp_servers.docs.env]\nTOKEN_FILE = \"/home/cal/.docs\"\n\n[hooks.state.\"/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:session_start:0:0\"]\ntrusted_hash = \"sha256:user-approved\"\n\n[hooks.state.\"/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:session_start:1:0\"]\ntrusted_hash = \"sha256:d1d3e61b445e7465d4d06771e322bcc085986fc2b06461bb2219aeee8057428d\"\n\n[hooks.state.\"/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:stop:0:0\"]\ntrusted_hash = \"sha256:user-stop\"\nenabled = false\n\n[hooks.state.\"/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:stop:1:0\"]\ntrusted_hash = \"sha256:85ad3daa42c60a33c45c52397fe8e9b42f717840674996a2b6d23bf2eb92ad49\"\n\n[hooks.state.\"/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"sha256:89e48e0cd1a1e32ff9deb4408b98dbdc2ea7c28172072a8d08cae0e2f709a5fd\"\n\n[hooks.state.\"/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:user_prompt_submit:0:0\"]\ntrusted_hash = \"sha256:8f78318f6f92ed45cd973d50f035269e9fea3f3a5b002e93d56c069708582366\"\n\n[hooks.state.\"/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:permission_request:0:0\"]\ntrusted_hash = \"sha256:033ba66bff1cef23cf1986d7e9883459f1365e83ea379609e20a7951de0042c5\"\n",
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/config.toml",
+      "content": "# Written by Drove on every Codex worker launch in this run (DROVE-34). Edits here, Codex's included, are overwritten.\nmodel = \"gpt-6.1-sol\"\npersonality = 'pragmatic'\ncheck_for_update_on_startup = false\n\n[projects.\"/work/repo\"]\ntrust_level = \"trusted\"\n\n[mcp_servers.drove]\ncommand = \"node\"\nargs = [\"/opt/drove/src/cli.ts\", \"mcp\"]\nenv_vars = [\"DROVE_HOME\", \"DROVE_RUN\", \"DROVE_ROLE\", \"DROVE_SEAT\", \"DROVE_TOKEN\"]\ndefault_tools_approval_mode = \"approve\"\n\n[mcp_servers.docs]\ncommand = \"npx\"\nargs = [\n  \"docs-mcp\",\n]\n\n[mcp_servers.docs.env]\nTOKEN_FILE = \"/home/user/.docs\"\n\n[hooks.state.\"/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:session_start:0:0\"]\ntrusted_hash = \"sha256:user-approved\"\n\n[hooks.state.\"/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:session_start:1:0\"]\ntrusted_hash = \"sha256:77b31650fecd054a869c999d7ab6f5c95067fe51ed35ebea507028bc9df0499f\"\n\n[hooks.state.\"/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:stop:0:0\"]\ntrusted_hash = \"sha256:user-stop\"\nenabled = false\n\n[hooks.state.\"/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:stop:1:0\"]\ntrusted_hash = \"sha256:5d4f918b7a8500e384197aebd937d6dcbc7312a8f5d4071f96939b6effc3e21c\"\n\n[hooks.state.\"/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:pre_tool_use:0:0\"]\ntrusted_hash = \"sha256:f45314be39e97dc125353d242fe29ef81d506b079f4fd9b4eade387ba136ad14\"\n\n[hooks.state.\"/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:user_prompt_submit:0:0\"]\ntrusted_hash = \"sha256:40fc2fd18287314a275d6753210cd453de66c9ce0ceb336ca3221bc3428e09ae\"\n\n[hooks.state.\"/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json:permission_request:0:0\"]\ntrusted_hash = \"sha256:5d188a476bda263f2a78af5bcd53b210247e67992f171729304fb1a2e51ad82b\"\n",
       "mode": 384
     },
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json",
-      "content": "{\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"bash '/home/cal/.codex/herdr-agent-state.sh' session\",\n            \"timeout\": 10\n          }\n        ]\n      },\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/cal/.drove/g-d43caf1d session-start\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"cairn-end\",\n            \"timeout\": 120,\n            \"async\": true\n          }\n        ]\n      },\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/cal/.drove/g-d43caf1d stop\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash|shell|exec_command|apply_patch\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/cal/.drove/g-d43caf1d pre-tool-use\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"UserPromptSubmit\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/cal/.drove/g-d43caf1d user-prompt-submit\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"PermissionRequest\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/cal/.drove/g-d43caf1d permission-request\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ]\n  }\n}\n",
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/hooks.json",
+      "content": "{\n  \"hooks\": {\n    \"SessionStart\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"bash '/home/user/.codex/herdr-agent-state.sh' session\",\n            \"timeout\": 10\n          }\n        ]\n      },\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/user/.drove/g-d43caf1d session-start\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"cairn-end\",\n            \"timeout\": 120,\n            \"async\": true\n          }\n        ]\n      },\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/user/.drove/g-d43caf1d stop\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash|shell|exec_command|apply_patch\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/user/.drove/g-d43caf1d pre-tool-use\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"UserPromptSubmit\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/user/.drove/g-d43caf1d user-prompt-submit\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"PermissionRequest\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"/home/user/.drove/g-d43caf1d permission-request\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ]\n  }\n}\n",
       "mode": 384
     }
   ],
   "links": [
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/auth.json",
-      "target": "/home/cal/.codex/auth.json"
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/auth.json",
+      "target": "/home/user/.codex/auth.json"
     },
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/AGENTS.md",
-      "target": "/home/cal/.codex/AGENTS.md"
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/AGENTS.md",
+      "target": "/home/user/.codex/AGENTS.md"
     },
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/skills/cairn",
-      "target": "/home/cal/.codex/skills/cairn"
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/skills/cairn",
+      "target": "/home/user/.codex/skills/cairn"
     },
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home/skills/croft",
-      "target": "/home/cal/.codex/skills/croft"
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home/skills/croft",
+      "target": "/home/user/.codex/skills/croft"
     }
   ]
 }

@@ -3,6 +3,21 @@
   "version": "0.0.0",
   "private": true,
   "description": "A small cross-agent orchestrator on herdr: one planner, Claude Code or Codex workers, one worktree each.",
+  "license": "MIT",
+  "author": "Callum Torr",
+  "homepage": "https://drove.montytorr.com",
+  "repository": "github:montytorr/drove",
+  "bugs": "https://github.com/montytorr/drove/issues",
+  "keywords": [
+    "herdr",
+    "orchestrator",
+    "agents",
+    "claude-code",
+    "codex",
+    "multi-agent",
+    "git-worktree",
+    "cli"
+  ],
   "type": "module",
   "bin": {
     "drove": "src/cli.ts"

@@ -19,7 +19,7 @@ test('defaultHome honours DROVE_HOME and falls back to ~/.drove', () => {
 })
 
 test('run ids follow <repo>-<yyyymmdd>-<hhmm>-<4 hex>', () => {
-  const id = paths.newRunId('/Users/cal/maestro-dev/Drove Repo', new Date(2026, 9, 9, 10, 42))
+  const id = paths.newRunId('/Users/test/src/Drove Repo', new Date(2026, 9, 9, 10, 42))
   assert.match(id, /^drove-repo-20261009-1042-[0-9a-f]{4}$/)
   assert.notEqual(id, paths.newRunId('/x/drove', new Date(2026, 9, 9, 10, 42)))
 })

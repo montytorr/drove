@@ -176,14 +176,14 @@ test('replyLine tells the receiver how to answer', () => {
 
 test('renderReport names the next step and the human', () => {
   const base = { v: 1 as const, id: 'r', run: 'r', seat: 'w-api', token: 't', summary: 'tests pass', at: '2026-10-09T10:20:53.000Z' }
-  const done = protocol.renderReport({ ...base, kind: 'done', expects: 'review', details: 'branch b' }, 'Cal')
+  const done = protocol.renderReport({ ...base, kind: 'done', expects: 'review', details: 'branch b' }, 'Sam')
   assert.match(done, /^\[worker w-api · done · expects review\]\ntests pass\nbranch b\n→ Review the work/)
-  const asked = protocol.renderReport({ ...base, kind: 'question', expects: 'answer', for: 'human' }, 'Cal')
-  assert.match(asked, /question for Cal · expects answer/)
-  assert.match(asked, /This decision is Cal's/)
-  const confirm = protocol.renderReport({ ...base, kind: 'done', expects: 'none' }, 'Cal')
+  const asked = protocol.renderReport({ ...base, kind: 'question', expects: 'answer', for: 'human' }, 'Sam')
+  assert.match(asked, /question for Sam · expects answer/)
+  assert.match(asked, /This decision is Sam's/)
+  const confirm = protocol.renderReport({ ...base, kind: 'done', expects: 'none' }, 'Sam')
   assert.match(confirm, /confirms work you already approved/)
-  assert.doesNotMatch(protocol.renderReport({ ...base, kind: 'progress', expects: 'none' }, 'Cal'), /→/)
+  assert.doesNotMatch(protocol.renderReport({ ...base, kind: 'progress', expects: 'none' }, 'Sam'), /→/)
 })
 
 test('renderReports joins several reports', () => {

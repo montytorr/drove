@@ -3,7 +3,7 @@
   "role": "planner",
   "cwd": "/work/repo/.claude/worktrees/w-api",
   "env": {
-    "DROVE_HOME": "/home/cal/.drove",
+    "DROVE_HOME": "/home/user/.drove",
     "DROVE_RUN": "drove-20261009-1042-a3f1",
     "DROVE_ROLE": "planner",
     "DROVE_SEAT": "planner",
@@ -20,26 +20,26 @@
     "--dangerously-load-development-channels",
     "server:drove",
     "--mcp-config",
-    "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/mcp.json",
+    "/home/user/.drove/runs/drove-20261009-1042-a3f1/planner/mcp.json",
     "--settings",
-    "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/settings.json",
+    "/home/user/.drove/runs/drove-20261009-1042-a3f1/planner/settings.json",
     "--append-system-prompt-file",
-    "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/role.md",
+    "/home/user/.drove/runs/drove-20261009-1042-a3f1/planner/role.md",
     "Ship it."
   ],
   "files": [
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/mcp.json",
-      "content": "{\n  \"mcpServers\": {\n    \"drove\": {\n      \"command\": \"node\",\n      \"args\": [\n        \"/opt/drove/src/cli.ts\",\n        \"mcp\"\n      ],\n      \"env\": {\n        \"DROVE_HOME\": \"/home/cal/.drove\",\n        \"DROVE_RUN\": \"drove-20261009-1042-a3f1\",\n        \"DROVE_ROLE\": \"planner\",\n        \"DROVE_SEAT\": \"planner\"\n      }\n    }\n  }\n}\n",
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/planner/mcp.json",
+      "content": "{\n  \"mcpServers\": {\n    \"drove\": {\n      \"command\": \"node\",\n      \"args\": [\n        \"/opt/drove/src/cli.ts\",\n        \"mcp\"\n      ],\n      \"env\": {\n        \"DROVE_HOME\": \"/home/user/.drove\",\n        \"DROVE_RUN\": \"drove-20261009-1042-a3f1\",\n        \"DROVE_ROLE\": \"planner\",\n        \"DROVE_SEAT\": \"planner\"\n      }\n    }\n  }\n}\n",
       "mode": 384
     },
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/settings.json",
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/planner/settings.json",
       "content": "{\n  \"hooks\": {\n    \"PreToolUse\": [\n      {\n        \"matcher\": \"Bash|Edit|Write|MultiEdit|NotebookEdit\",\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"node /opt/drove/src/cli.ts guard pre-tool-use\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"SessionStart\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"node /opt/drove/src/cli.ts guard session-start\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"UserPromptSubmit\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"node /opt/drove/src/cli.ts guard user-prompt-submit\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"Stop\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"node /opt/drove/src/cli.ts guard stop\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ],\n    \"Notification\": [\n      {\n        \"hooks\": [\n          {\n            \"type\": \"command\",\n            \"command\": \"node /opt/drove/src/cli.ts guard notification\",\n            \"timeout\": 10\n          }\n        ]\n      }\n    ]\n  }\n}\n",
       "mode": 384
     },
     {
-      "path": "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/role.md",
+      "path": "/home/user/.drove/runs/drove-20261009-1042-a3f1/planner/role.md",
       "content": "You are a worker.\nQuote: \"yes\" and \\ backslash with `ticks`\n",
       "mode": 384
     }

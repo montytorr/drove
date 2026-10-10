@@ -8,7 +8,7 @@ import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toast
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
 import { modelNotice, orchestratorSection, workerModelSection } from './prompts'
-import { CAIRN_RE, DROVE_OPEN, NAME_RE, isEffort, isExpects, locateEnvelope, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
+import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
 import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
 
 const STORE_PREFIX = 'drove:session:'
@@ -147,6 +147,16 @@ const droveHome = async ($: EngineInterface): Promise<string | undefined> => {
 
 const homeDir = async ($: EngineInterface): Promise<string> => (await droveHome($)) ?? `${(await $.env.get('HOME')) ?? ''}/.drove`
 
+// Drove's own humanName (~/.drove/config.json), so the mod names the human as Drove's prompts do.
+const humanNameOf = async ($: EngineInterface): Promise<string> => {
+  try {
+    const name = (JSON.parse(await $.fs.read(`${await homeDir($)}/config.json`)) as { humanName?: unknown }).humanName
+    return typeof name === 'string' && name.trim() ? name.trim() : DEFAULT_HUMAN_NAME
+  } catch {
+    return DEFAULT_HUMAN_NAME
+  }
+}
+
 const entryOf = ($: EngineInterface): string => drove.entryOf($.plugin.root, config.droveEntry)
 
 type RunInit = { env?: Record<string, string>; stdin?: string; timeoutMs?: number; cwd?: string }
@@ -210,7 +220,7 @@ const ORCHESTRATOR_TOOLS = [
   {
     name: 'spawn_worker',
     description:
-      'Orchestrator mode: start a worker through Drove in a new herdr pane, in its own git worktree, and give it a brief. kind claude (default, Sonnet unless you say otherwise) or codex. It reports back to you through Drove and can ask to be promoted. Up to the run’s pane budget without asking; beyond it Cal is asked in a dialog. Returns once the brief is delivered.',
+      'Orchestrator mode: start a worker through Drove in a new herdr pane, in its own git worktree, and give it a brief. kind claude (default, Sonnet unless you say otherwise) or codex. It reports back to you through Drove and can ask to be promoted. Up to the run’s pane budget without asking; beyond it the human is asked in a dialog. Returns once the brief is delivered.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -288,7 +298,7 @@ const ORCHESTRATOR_TOOLS = [
 const REPORT_TOOL = {
   name: 'report',
   description:
-    "Worker mode: report to your planner (the same as Drove's own report tool, mcp__drove__report). kind: done (finished and verified; expects review), question (you need a decision; for: cal when only Cal can decide), blocked, promote (you need a stronger model or more effort; say why), progress (optional, expects nothing). summary is one line; details carries the rest (branch, files, test output).",
+    "Worker mode: report to your planner (the same as Drove's own report tool, mcp__drove__report). kind: done (finished and verified; expects review), question (you need a decision; for: human when only the human can decide), blocked, promote (you need a stronger model or more effort; say why), progress (optional, expects nothing). summary is one line; details carries the rest (branch, files, test output).",
   inputSchema: {
     type: 'object',
     properties: {
@@ -296,7 +306,7 @@ const REPORT_TOOL = {
       summary: { type: 'string', description: 'one line' },
       details: { type: 'string' },
       expects: { type: 'string', enum: ['review', 'answer', 'none'], description: 'default: done → review, progress → none, others → answer' },
-      for: { type: 'string', enum: ['orchestrator', 'cal'], description: 'question only: who must decide' },
+      for: { type: 'string', enum: ['orchestrator', 'human', 'cal'], description: 'question only: who must decide (cal is an old alias of human)' },
     },
     required: ['kind', 'summary'],
   },
@@ -375,7 +385,7 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
     }
     if (answer !== 'Open it' || !orchestrator) {
       dropBody(`${name}:brief`)
-      return { deny: `Cal did not approve worker pane ${open + 1}. Reuse or close an open worker first.` }
+      return { deny: `${await humanNameOf($)} did not approve worker pane ${open + 1}. Reuse or close an open worker first.` }
     }
     const raised = await runDrove($, drove.budgetArgs(orchestrator.run, budget + 1), { cwd: orchestrator.repo, env: (await droveHome($)) ? { DROVE_HOME: (await droveHome($)) ?? '' } : {} })
     if (raised.exitCode !== 0) {
@@ -478,10 +488,10 @@ const onBridgeLine = async ($: EngineInterface, line: BridgeLine) => {
       if (is && !was) {
         nextAsks[seat.name] = now
         $.ui.toast(`${seat.name} is waiting for you in its pane: ${oneLine(is, 120)}`, { timeoutMs: 15_000 })
-        await record($, { at: now, from: seat.name, to: 'Cal', kind: 'asking', summary: is })
+        await record($, { at: now, from: seat.name, to: HUMAN, kind: 'asking', summary: is })
       } else if (!is && was) {
         delete nextAsks[seat.name]
-        await record($, { at: now, from: 'Cal', to: seat.name, kind: 'answered', summary: 'answered in its pane' })
+        await record($, { at: now, from: HUMAN, to: seat.name, kind: 'answered', summary: 'answered in its pane' })
       }
     }
     await update($, seatsAtom, () => line.roster.seats)
@@ -705,7 +715,7 @@ const sendReport = async ($: EngineInterface, input: Record<string, unknown>): P
   const forWho = input.for === 'cal' || input.for === 'human' ? { for: 'human' } : {}
   const args = { kind: input.kind, summary: input.summary, ...(input.details !== undefined ? { details: input.details } : {}), ...(input.expects !== undefined ? { expects: input.expects } : {}), ...forWho }
   const result = drove.jsonResultOf(await runDrove($, ['mod', 'report'], { stdin: JSON.stringify(args) }))
-  return result.ok ? { result: result.text } : { deny: `Not recorded: ${result.text}. Use mcp__drove__report, or tell Cal in your answer.` }
+  return result.ok ? { result: result.text } : { deny: `Not recorded: ${result.text}. Use mcp__drove__report, or tell ${await humanNameOf($)} in your answer.` }
 }
 
 // The turn a promote notice wakes is not work that owes a report; a progress report after it keeps Drove from reading it as idle-without-report.
@@ -879,7 +889,7 @@ const turnOn = async ($: EngineInterface, goal: string) => {
     ]
       .filter(Boolean)
       .join('\n'),
-    context: [`Cal switched this session into orchestrator mode${goal ? ` for: ${goal}` : ''}. Follow the "Orchestrator mode" section of your instructions from now on.`],
+    context: [`${await humanNameOf($)} switched this session into orchestrator mode${goal ? ` for: ${goal}` : ''}. Follow the "Orchestrator mode" section of your instructions from now on.`],
   }
 }
 
@@ -900,7 +910,7 @@ const turnOff = async ($: EngineInterface) => {
   const closing = down ? (down.exitCode === 0 ? ` ${down.stdout.trim()}` : ` drove down failed: ${drove.failureOf(down).text}`) : open.length > 0 ? ` ${open.length} worker(s) left running in run ${orchestrator.run}; \`/orchestrate\` in this session re-attaches it.` : ''
   return {
     text: `Orchestrator mode is off.${closing}`,
-    context: ['Cal turned orchestrator mode off: you may edit code again, and the orchestrator tools no longer work.'],
+    context: [`${await humanNameOf($)} turned orchestrator mode off: you may edit code again, and the orchestrator tools no longer work.`],
   }
 }
 
@@ -1101,7 +1111,7 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
-    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, config), scope: 'session' as const }] }
+    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, { ...config, humanName: await humanNameOf($) }), scope: 'session' as const }] }
     const model = self ? workerModelSection(self) : undefined
     if (model) return { sections: [...composed.sections, { id: 'orchestrator:worker-model', text: model, scope: 'session' as const }] }
     return composed

@@ -7,7 +7,7 @@ import * as launch from '../src/launch.ts'
 import type { Identity, LaunchRequest } from '../src/types.ts'
 import { assertGolden, tmp } from './p3-helpers.ts'
 
-const HOME = '/home/cal/.drove'
+const HOME = '/home/user/.drove'
 const RUN = 'drove-20261009-1042-a3f1'
 const TOKEN = 'tok-0123456789abcdef'
 const ENTRY = '/opt/drove/src/cli.ts'
@@ -30,17 +30,17 @@ const request = (overrides: Partial<launch.CodexLaunchRequest>): launch.CodexLau
 })
 
 test('claude worker spec matches the golden file', () => {
-  const spec = launch.claudeWorkerSpec(request({ cwd: '/work/repo', sessionId: '11111111-2222-3333-4444-555555555555' }))
+  const spec = launch.claudeWorkerSpec(request({ cwd: '/work/repo', sessionId: '11111111-2222-3333-4444-555555555555', workerEnv: { WORKER_FLAG: '1' } }))
   assertGolden('claude-worker', spec)
   assert.equal(spec.cwd, '/work/repo')
   assert.deepEqual(spec.argv.slice(spec.argv.indexOf('--worktree'), spec.argv.indexOf('--worktree') + 2), ['--worktree', 'w-api'])
-  assert.equal(spec.env._CC_ACCT_PINNED, '1')
+  assert.equal(spec.env.WORKER_FLAG, '1')
   assert.equal(spec.env.DROVE_AGENT, 'claude')
   assert.ok(spec.argv.includes('--dangerously-skip-permissions'))
 })
 
 test('claude worker resume replaces --session-id with --resume', () => {
-  const spec = launch.claudeWorkerSpec(request({ resumeId: 'abc', sessionId: 'ignored', initialPrompt: undefined }))
+  const spec = launch.claudeWorkerSpec(request({ resumeId: 'abc', sessionId: 'ignored', initialPrompt: undefined, workerEnv: { WORKER_FLAG: '1' } }))
   assertGolden('claude-worker-resume', spec)
   assert.ok(!spec.argv.includes('--session-id'))
   assert.ok(!spec.argv.includes('--worktree'))
@@ -60,7 +60,7 @@ test('a prompt that starts with a dash is passed after --', () => {
 test('codex worker spec matches the golden file', () => {
   const spec = launch.codexWorkerSpec(request({ kind: 'codex', model: 'gpt-x', effort: 'high' }))
   assertGolden('codex-worker', spec)
-  assert.equal(spec.env._CC_ACCT_PINNED, undefined)
+  assert.equal(spec.env.WORKER_FLAG, undefined)
   assert.equal(spec.env.DROVE_AGENT, 'codex')
   assert.ok(spec.argv.includes('--dangerously-bypass-approvals-and-sandbox'))
   for (const gone of ['-s', '--add-dir', 'sandbox_workspace_write.network_access=true']) assert.ok(!spec.argv.includes(gone), gone)
@@ -68,6 +68,17 @@ test('codex worker spec matches the golden file', () => {
 })
 
 const shimOf = (spec: { files: readonly { path: string }[] }): string => spec.files[0]?.path ?? ''
+
+test('workerEnv reaches Claude and Codex workers, never planners, and never overrides Drove\'s own variables', () => {
+  const workerEnv = { WORKER_FLAG: '1', DROVE_TOKEN: 'forged', DROVE_AGENT: 'other' }
+  for (const kind of ['claude', 'codex'] as const) {
+    const spec = launch.specFor(request({ kind, workerEnv }))
+    assert.equal(spec.env.WORKER_FLAG, '1', kind)
+    assert.equal(spec.env.DROVE_TOKEN, TOKEN, kind)
+    assert.equal(spec.env.DROVE_AGENT, kind, kind)
+    assert.equal(launch.specFor(request({ kind, identity: planner, workerEnv })).env.WORKER_FLAG, undefined, kind)
+  }
+})
 
 test('codex worker keeps the old sandbox when bypassSandbox is false', () => {
   const spec = launch.codexWorkerSpec(request({ kind: 'codex', bypassSandbox: false }))
@@ -110,10 +121,10 @@ test('codex worker with the default model omits -m, and resume leads with the su
 })
 
 test('claude planner spec matches the golden file and has no permission bypass', () => {
-  const spec = launch.claudePlannerSpec(request({ identity: planner, model: 'claude-opus-5-5', effort: 'high', sessionId: 'planner-uuid', channel: true, initialPrompt: 'Ship it.' }))
+  const spec = launch.claudePlannerSpec(request({ identity: planner, model: 'claude-opus-5-5', effort: 'high', sessionId: 'planner-uuid', channel: true, initialPrompt: 'Ship it.', workerEnv: { WORKER_FLAG: '1' } }))
   assertGolden('claude-planner', spec)
   assert.ok(!spec.argv.includes('--dangerously-skip-permissions'))
-  assert.equal(spec.env._CC_ACCT_PINNED, undefined)
+  assert.equal(spec.env.WORKER_FLAG, undefined)
   assert.equal(spec.env.DROVE_CHANNEL, '1')
   assert.equal(spec.env.DROVE_TOKEN, undefined)
   assert.ok(spec.argv.includes('server:drove'))
@@ -311,14 +322,14 @@ test('execArgv puts the agent binary first', () => {
 
 // ---------- Drove-owned CODEX_HOME (DROVE-34) ----------
 
-const CODEX_DIR = '/home/cal/.drove/runs/drove-20261009-1042-a3f1/codex-home'
-const USER_CODEX = '/home/cal/.codex'
+const CODEX_DIR = '/home/user/.drove/runs/drove-20261009-1042-a3f1/codex-home'
+const USER_CODEX = '/home/user/.codex'
 const USER_CONFIG = [
   'model = "gpt-6.1-sol"',
   "personality = 'pragmatic'",
   'model_reasoning_effort = "high"',
   '',
-  '[projects."/home/cal/elsewhere"]',
+  '[projects."/home/user/elsewhere"]',
   'trust_level = "trusted"',
   '',
   '[mcp_servers.docs]',
@@ -328,7 +339,7 @@ const USER_CONFIG = [
   ']',
   '',
   '[mcp_servers.docs.env]',
-  'TOKEN_FILE = "/home/cal/.docs"',
+  'TOKEN_FILE = "/home/user/.docs"',
   '',
   '[mcp_servers.drove]',
   'command = "stale"',
@@ -336,10 +347,10 @@ const USER_CONFIG = [
   '[tui]',
   'screen_reader_detection_done = true',
   '',
-  '[hooks.state."/home/cal/.codex/hooks.json:session_start:0:0"]',
+  '[hooks.state."/home/user/.codex/hooks.json:session_start:0:0"]',
   'trusted_hash = "sha256:user-approved"',
   '',
-  '[hooks.state."/home/cal/.codex/hooks.json:stop:0:0"]',
+  '[hooks.state."/home/user/.codex/hooks.json:stop:0:0"]',
   'trusted_hash = "sha256:user-stop"',
   'enabled = false',
   '',
@@ -347,7 +358,7 @@ const USER_CONFIG = [
   'trusted_hash = "sha256:old-inline"',
 ].join('\n')
 const USER_HOOKS = {
-  SessionStart: [{ hooks: [{ type: 'command', command: "bash '/home/cal/.codex/herdr-agent-state.sh' session", timeout: 10 }] }],
+  SessionStart: [{ hooks: [{ type: 'command', command: "bash '/home/user/.codex/herdr-agent-state.sh' session", timeout: 10 }] }],
   Stop: [{ hooks: [{ type: 'command', command: 'cairn-end', timeout: 120, async: true }] }],
 }
 const codexHome = (overrides: Partial<launch.CodexHome> = {}): launch.CodexHome => ({
@@ -357,18 +368,18 @@ const homeRequest = (overrides: Partial<launch.CodexLaunchRequest> = {}) =>
   request({ kind: 'codex', model: 'gpt-x', effort: 'high', roleText: '', initialPrompt: undefined, codexHome: codexHome(), ...overrides })
 const fileOf = (spec: { files: readonly { path: string; content: string }[] }, name: string): string => spec.files.find(file => file.path.endsWith(`/${name}`))?.content ?? ''
 
-test('codexHookHash reproduces the trusted_hash values Codex itself wrote (codex-cli 0.162.0)', () => {
-  const shim = '/Users/cal/.drove/g-ff7841bf'
+test('codexHookHash reproduces Codex\'s trusted_hash (checked against values codex-cli 0.162.0 wrote; the paths here are generic)', () => {
+  const shim = '/Users/test/.drove/g-ff7841bf'
   const command = (event: string) => ({ type: 'command', command: `${shim} ${event}`, timeout: 10 })
-  assert.equal(launch.codexHookHash('PreToolUse', { matcher: launch.CODEX_GUARDED_TOOLS }, command('pre-tool-use')), 'sha256:164080a958b75aedbbaf804fddc99ac5a7dfac9779587c0bab11e1f72abe34c5')
-  assert.equal(launch.codexHookHash('PermissionRequest', {}, command('permission-request')), 'sha256:12473e07e15a5d300591c818a3e98e32656cea5ad30d810b2912e6831d1aa383')
-  assert.equal(launch.codexHookHash('SessionStart', {}, command('session-start')), 'sha256:b1f47b3c43ad06c6726a135cf0ca33355c01a434ac05b0e7dbf1c152f2f77643')
-  assert.equal(launch.codexHookHash('UserPromptSubmit', {}, command('user-prompt-submit')), 'sha256:2879930912548ff1529c26e88918af63a70979b68430a967f9aaa492887f61bf')
-  assert.equal(launch.codexHookHash('Stop', {}, command('stop')), 'sha256:6a7dff9277070641a6b1a1d35637089498f5c614c577472eac9d576486b8a07c')
-  assert.equal(launch.codexHookHash('SessionStart', {}, { type: 'command', command: "bash '/Users/cal/.codex/herdr-agent-state.sh' session", timeout: 10 }), 'sha256:caebd0a1922d55ac29a2de20f125aa461e0a11777d499c99f22c11597ed42a4c')
+  assert.equal(launch.codexHookHash('PreToolUse', { matcher: launch.CODEX_GUARDED_TOOLS }, command('pre-tool-use')), 'sha256:dfa64f7118e75fd73a50104576f96f9fc501b2c5e86f530fd3100aac181af9c0')
+  assert.equal(launch.codexHookHash('PermissionRequest', {}, command('permission-request')), 'sha256:a6016bc0883262103342f9ac1a9371d9d95191b70677a302de3cba183fb4d49f')
+  assert.equal(launch.codexHookHash('SessionStart', {}, command('session-start')), 'sha256:019e6bbeec07517012c1e2a13dfc8beb86aab8309dd426cf259e752c7d313af7')
+  assert.equal(launch.codexHookHash('UserPromptSubmit', {}, command('user-prompt-submit')), 'sha256:2752a8ae3ab05fe52f032af2cfcea9a25fe4ba7030055bc280b1bc99649682ff')
+  assert.equal(launch.codexHookHash('Stop', {}, command('stop')), 'sha256:83029344a1ca77b33a655740d445ebb9a0301153f19127dd3c4db4ce047f9adc')
+  assert.equal(launch.codexHookHash('SessionStart', {}, { type: 'command', command: "bash '/Users/test/.codex/herdr-agent-state.sh' session", timeout: 10 }), 'sha256:3cda037cde67292f957909fdd42d2e84de391f2d5f80c362caacb8c5019d8a89')
   assert.equal(
-    launch.codexHookHash('Stop', {}, { type: 'command', command: 'CAIRN_AGENT=codex CAIRN_PLATFORM=codex node /Users/cal/.cairn/hooks/cairn-session-end.mjs --ongoing', timeout: 120, async: true }),
-    'sha256:9e08c97c86da93f549b778314a7f9917369cde4da6b4559520c5b2eb3b100315',
+    launch.codexHookHash('Stop', {}, { type: 'command', command: 'CAIRN_AGENT=codex CAIRN_PLATFORM=codex node /Users/test/.cairn/hooks/cairn-session-end.mjs --ongoing', timeout: 120, async: true }),
+    'sha256:31e94fd79c322783727d88db4996280f3d3f08b819f4b1b2be6863a8a2a9392f',
   )
 })
 
@@ -385,9 +396,9 @@ test('the Drove config.toml holds the repo trust, the drove MCP server, the user
   assert.ok(config.includes('model = "gpt-6.1-sol"\npersonality = \'pragmatic\'\ncheck_for_update_on_startup = false\n'), config)
   assert.ok(!config.includes('model_reasoning_effort'), 'effort stays per seat on the launch line')
   assert.ok(config.includes('[projects."/work/repo"]\ntrust_level = "trusted"\n'))
-  assert.ok(!config.includes('/home/cal/elsewhere'))
+  assert.ok(!config.includes('/home/user/elsewhere'))
   assert.ok(config.includes('[mcp_servers.drove]\ncommand = "node"\nargs = ["/opt/drove/src/cli.ts", "mcp"]\nenv_vars = ["DROVE_HOME", "DROVE_RUN", "DROVE_ROLE", "DROVE_SEAT", "DROVE_TOKEN"]\ndefault_tools_approval_mode = "approve"\n'))
-  assert.ok(config.includes('[mcp_servers.docs]\ncommand = "npx"\nargs = [\n  "docs-mcp",\n]\n\n[mcp_servers.docs.env]\nTOKEN_FILE = "/home/cal/.docs"\n'))
+  assert.ok(config.includes('[mcp_servers.docs]\ncommand = "npx"\nargs = [\n  "docs-mcp",\n]\n\n[mcp_servers.docs.env]\nTOKEN_FILE = "/home/user/.docs"\n'))
   assert.ok(!config.includes('stale'), 'a user mcp_servers.drove never shadows Drove\'s')
   assert.ok(!config.includes('[tui]') && !config.includes('session-flags'))
   assert.ok(config.includes(`[hooks.state."${CODEX_DIR}/hooks.json:session_start:0:0"]\ntrusted_hash = "sha256:user-approved"\n`))
@@ -401,7 +412,7 @@ test('the Drove config.toml holds the repo trust, the drove MCP server, the user
 
 test('the Drove hooks.json keeps the user groups first, at the indices their trust is keyed by, then Drove groups', () => {
   const hooks = (JSON.parse(fileOf(launch.codexWorkerSpec(homeRequest()), 'hooks.json')) as { hooks: Record<string, { matcher?: string; hooks: { command: string }[] }[]> }).hooks
-  assert.deepEqual(hooks.SessionStart?.map(group => group.hooks[0]?.command), ["bash '/home/cal/.codex/herdr-agent-state.sh' session", `${HOME}/g-d43caf1d session-start`])
+  assert.deepEqual(hooks.SessionStart?.map(group => group.hooks[0]?.command), ["bash '/home/user/.codex/herdr-agent-state.sh' session", `${HOME}/g-d43caf1d session-start`])
   assert.deepEqual(hooks.Stop?.map(group => group.hooks[0]?.command), ['cairn-end', `${HOME}/g-d43caf1d stop`])
   assert.equal(hooks.PreToolUse?.[0]?.matcher, launch.CODEX_GUARDED_TOOLS)
   assert.deepEqual(Object.keys(hooks).sort(), ['PermissionRequest', 'PreToolUse', 'SessionStart', 'Stop', 'UserPromptSubmit'])

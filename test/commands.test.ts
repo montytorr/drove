@@ -34,6 +34,7 @@ const brief = 'Build the widget.'
 
 test('spawn opens the tab at the repo root, then starts the agent, which creates its own worktree', async () => {
   const { fake, deps, identity, repo } = await setup()
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerEnv: { WORKER_FLAG: '1' } }))
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
   assert.equal(spawned.ok, true, spawned.text)
   const order = fake.calls.map(call => (call[0] === 'git' ? 'git' : call.slice(1, 3).join(' ')))
@@ -55,7 +56,7 @@ test('spawn opens the tab at the repo root, then starts the agent, which creates
   assert.equal(fake.prompts.length, 0)
   const tab = fake.find('herdr', 'tab', 'create') ?? []
   assert.equal(tab[tab.indexOf('--cwd') + 1], repo)
-  assert.ok(tab.includes('_CC_ACCT_PINNED=1'))
+  assert.ok(tab.includes('WORKER_FLAG=1'))
   assert.ok(tab.some(arg => arg.startsWith('DROVE_TOKEN=')))
   assert.equal(tab[tab.indexOf('--workspace') + 1], 'w1')
 
@@ -654,9 +655,9 @@ test('close releases the seat\'s Cairn claim with --force, best effort, and says
 
 test('close adds no note when cairn has nothing to release, and keeps one for a real failure', async () => {
   const cases = [
-    { stderr: 'cairn: dispofi could not be checked (stale project cache); routing DROVE to personal on its own record\nClaim ownership changed; nothing was released.', note: false },
+    { stderr: 'cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record\nClaim ownership changed; nothing was released.', note: false },
     { stderr: 'Cannot release DROVE-5: it is already done.', note: false },
-    { stderr: 'cairn: dispofi could not be checked (stale project cache); routing DROVE to personal on its own record\ndatabase locked', note: true },
+    { stderr: 'cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record\ndatabase locked', note: true },
   ]
   for (const { stderr, note } of cases) {
     const fake = new FakeHerdr()
@@ -1338,9 +1339,13 @@ test('plan for codex has an initial prompt and no session id yet; it needs a her
 test('loadConfig merges ~/.drove/config.json over the defaults', async () => {
   const deps = await makeDeps(new FakeHerdr())
   assert.deepEqual(await commands.loadConfig(deps.home), commands.DEFAULT_CONFIG)
-  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ humanName: 'Cal', workerModel: { codex: 'gpt-x' }, claudeChannel: true }))
+  await writeFile(
+    join(deps.home, 'config.json'),
+    JSON.stringify({ humanName: 'Sam', workerModel: { codex: 'gpt-x' }, claudeChannel: true, workerEnv: { WORKER_FLAG: '1', NOT_TEXT: 2, 'BAD NAME': 'x' } }),
+  )
   const config = await commands.loadConfig(deps.home)
-  assert.equal(config.humanName, 'Cal')
+  assert.equal(config.humanName, 'Sam')
+  assert.deepEqual(config.workerEnv, { WORKER_FLAG: '1' })
   assert.deepEqual(config.workerModel, { claude: 'claude-sonnet-5-5', codex: 'gpt-x' })
   assert.equal(config.claudeChannel, true)
   assert.equal(config.budget, 5)
@@ -1367,7 +1372,7 @@ const withPromptAfter = (fake: FakeHerdr, reads: number): { paneReads: () => num
   fake.exec = async argv => {
     if (argv[1] === 'pane' && argv[2] === 'read') {
       paneReads += 1
-      fake.screen = paneReads >= reads ? 'cal@mac drove % ' : 'Last login: Sat Oct 10'
+      fake.screen = paneReads >= reads ? 'user@host drove % ' : 'Last login: Sat Oct 10'
     }
     return inner(argv)
   }

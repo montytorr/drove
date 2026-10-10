@@ -1,5 +1,5 @@
 import type { Effort, OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus, OrchOrchestrator, Seat, SeatState } from '../types'
-import { shortModel } from './protocol'
+import { HUMAN, shortModel } from './protocol'
 import { isAsking, openSeats, spawnedMs, statusGlyph } from './roster'
 
 export const BOARD_ID = 'orchestra'
@@ -102,7 +102,7 @@ export const needsAnimation = (lead: OrchLead | null, seats: readonly Seat[], as
   openSeats(seats).some(({ name, state }) => state === 'working' || state === 'starting' || (asksAt[name] !== undefined && now - (asksAt[name] ?? 0) < PULSE_MS))
 
 const personOf = (name: string): { text: string; tone: Tone } =>
-  name === '⌘' ? { text: '⌘', tone: 'lead' } : name === 'Cal' ? { text: 'you', tone: 'you' } : { text: name, tone: 'working' }
+  name === '⌘' ? { text: '⌘', tone: 'lead' } : name === HUMAN ? { text: 'you', tone: 'you' } : { text: name, tone: 'working' }
 
 export const clip = (text: string, width: number): string => (width <= 0 ? '' : text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`)
 
