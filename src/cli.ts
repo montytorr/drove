@@ -131,14 +131,14 @@ export const COMMANDS: Record<string, Spec> = {
       print(await commands.prompt(commands.defaultDeps(), commands.identityOrPlanner(), need(positionals[0], '<seat>'), await textArg(positionals, 1, io)), io),
   },
   promote: {
-    usage: 'drove promote <seat> --model M --effort E [--reason TEXT]',
+    usage: 'drove promote <seat> [--model M] --effort E [--reason TEXT]',
     why: "change a worker's model or effort (may restart it with resume)",
     options: { model: { type: 'string' }, effort: { type: 'string' }, reason: { type: 'string' } },
     run: async (values, positionals, io) =>
       print(
         await commands.promote(commands.defaultDeps(), commands.identityOrPlanner(), {
           seat: need(positionals[0], '<seat>'),
-          model: need(str(values, 'model'), '--model'),
+          model: str(values, 'model') ?? '',
           effort: need(str(values, 'effort'), '--effort') as Effort,
           reason: str(values, 'reason'),
         }),

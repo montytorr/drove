@@ -24,7 +24,7 @@ export type ProcessPlan = { argv: string[]; env: Record<string, string>; cwd: st
 
 export const DROVE_ENTRY = fileURLToPath(new URL('./cli.ts', import.meta.url))
 export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
-export const timing = { pollMs: 500, exitWaitMs: 20_000, closeWaitMs: 3_000, lockWaitMs: 5_000 }
+export const timing = { pollMs: 500, exitWaitMs: 20_000, closeWaitMs: 3_000, lockWaitMs: 5_000, promptWaitMs: 4_000 }
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
 const CAIRN_RE = /^[A-Z][A-Z0-9]*-\d+$/
@@ -124,6 +124,9 @@ const workspaceOf = (run: RunMeta): string | undefined => run.planner.paneId?.sp
 
 const hooksOf = async (deps: Deps, run: string, seat: string): Promise<HookRecord[]> =>
   (await readJsonlFrom<HookRecord>(join(seatDir(deps.home, run, seat), 'hooks.jsonl'), { offset: 0 })).items.slice(-60)
+
+const hookSessionId = async (deps: Deps, run: string, seat: string): Promise<string | undefined> =>
+  (await hooksOf(deps, run, seat)).findLast(hook => hook.event === 'session-start' && hook.sessionId)?.sessionId
 
 const settle = async (condition: () => Promise<boolean>, totalMs: number): Promise<boolean> => {
   for (let waited = 0; waited <= totalMs; waited += timing.pollMs) {
@@ -318,7 +321,13 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
 
 type Placement = { paneId: string; createdTab?: string }
 
-const placePane = async (deps: Deps, run: RunMeta, placed: readonly Seat[], cwd: string, env: Record<string, string>): Promise<Placement | CommandResult> => {
+// DROVE-23: powerlevel10k's instant prompt draws a finished-looking prompt while .zshrc is still loading and the tty
+// is canonical, which is exactly when a long typed launch line gets cut at 1024 bytes. With it off, the prompt only
+// appears once init is done and zle owns the tty, so the readiness gate can trust what it sees.
+const PANE_ENV = { POWERLEVEL9K_INSTANT_PROMPT: 'off' }
+
+const placePane = async (deps: Deps, run: RunMeta, placed: readonly Seat[], cwd: string, agentEnv: Record<string, string>): Promise<Placement | CommandResult> => {
+  const env = { ...agentEnv, ...PANE_ENV }
   const slot = gridSlot(placed)
   const isTabAlive = run.tabId ? (await herdr.run(deps.exec, herdr.tabGetArgv(run.tabId), 10_000)).ok : false
   if (slot && isTabAlive) {
@@ -343,6 +352,47 @@ const closeEmptyTab = async (deps: Deps, run: RunMeta, roster: { seats: readonly
   if (stillPlaced || !run.tabId) return
   await herdr.run(deps.exec, herdr.tabCloseArgv(run.tabId))
   await saveRun(deps.home, { ...run, tabId: undefined })
+}
+
+// herdr types the launch line into the pane's shell. Until zle owns the tty the kernel is in canonical mode and cuts
+// the line at 1024 bytes (DROVE-23), so wait for a prompt that has stopped changing before typing.
+const SHELL_PROMPT_END = /[%$#>❯➜»]$/
+
+const awaitShellPrompt = async (deps: Deps, paneId: string): Promise<boolean> => {
+  let previous: string | undefined
+  for (let waited = 0; waited <= timing.promptWaitMs; waited += timing.pollMs) {
+    const screen = await herdr.readPane(deps.exec, paneId, 5, 'visible')
+    const text = screen.ok ? screen.value.trimEnd() : ''
+    if (text && text === previous && SHELL_PROMPT_END.test(text)) return true
+    previous = text
+    await sleep(timing.pollMs)
+  }
+  return false
+}
+
+type StartAttempt = { started: herdr.HerdrResult<string>; adopted: Adopted | undefined; paneId: string; createdTab: string | undefined }
+
+// Waits for the shell, starts the agent and, when it never shows up, resets the pane once and tries again.
+const startWithRetry = async (
+  deps: Deps,
+  run: RunMeta,
+  start: { seat: string; kind: AgentKind; argv: readonly string[]; paneId: string; createdTab?: string; place: () => Promise<Placement | CommandResult> },
+): Promise<StartAttempt> => {
+  const attempt = async (paneId: string): Promise<Pick<StartAttempt, 'started' | 'adopted'>> => {
+    await awaitShellPrompt(deps, paneId)
+    const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(start.seat, start.kind, paneId, start.argv), BUSY_RETRY_MS)
+    const adopted = !started.ok && started.code !== 'agent_not_ready' ? await adoptFailedStart(deps, start.seat, start.kind, paneId) : undefined
+    return { started, adopted }
+  }
+  const first = await attempt(start.paneId)
+  const isLost = !first.started.ok && !first.adopted && first.started.code !== 'agent_not_ready'
+  const result: StartAttempt = { ...first, paneId: start.paneId, createdTab: start.createdTab }
+  if (!isLost) return result
+  await recordEvent(deps, run.id, { type: 'seat.state', seat: start.seat, data: { startRetry: true, code: first.started.ok ? '' : first.started.code, pane: start.paneId } })
+  await herdr.run(deps.exec, start.createdTab ? herdr.tabCloseArgv(start.createdTab) : herdr.paneCloseArgv(start.paneId))
+  const placed = await start.place()
+  if (!isPlacement(placed)) return result
+  return { ...(await attempt(placed.paneId)), paneId: placed.paneId, createdTab: placed.createdTab }
 }
 
 class OverBudget extends Error {}
@@ -430,7 +480,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const isBriefInline = isShellSafeArg(brief.trim())
   const footer = isBriefInline ? `${brief.trim()} ${briefFooter(seat.name, request.cairn).trimStart()}` : `${brief}${briefFooter(seat.name, request.cairn)}`
-  const isRoleInBrief = kind === 'codex' && process.env.DROVE_ROLE_IN_BRIEF === '1'
+  const isRoleInBrief = kind === 'codex'
   const roleText = workerRole(seat, run, config)
   const briefText = isRoleInBrief ? `${roleText}\n\n${footer}` : footer
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
@@ -448,11 +498,11 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     await rollback(undefined, undefined)
     return placement
   }
-  const { paneId, createdTab } = placement
-
-  const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(seat.name, kind, paneId, spec.argv), BUSY_RETRY_MS)
+  const { started, adopted, paneId, createdTab } = await startWithRetry(deps, run, {
+    seat: seat.name, kind, argv: spec.argv, paneId: placement.paneId, createdTab: placement.createdTab,
+    place: () => placePane(deps, run, placed, launchCwd, spec.env),
+  })
   const live = started.ok ? await herdr.getAgent(deps.exec, seat.name) : undefined
-  const adopted = !started.ok && started.code !== 'agent_not_ready' ? await adoptFailedStart(deps, seat.name, kind, paneId) : undefined
   const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
 
   if (!started.ok && started.code === 'agent_not_ready') {
@@ -577,7 +627,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   const config = await loadConfig(deps.home)
   const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
   if (!seat || ['closed', 'gone', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
-  const model = resolveModel(seat.kind, request.model, config)
+  const model = !request.model?.trim() && seat.kind === 'codex' ? seat.model : resolveModel(seat.kind, request.model, config)
   const change = { model, effort: request.effort }
   const control: Control = {
     v: 1, id: newControlId(deps.clock.now()), run: run.id, from: 'planner', to: seat.name, kind: model === config.workerModel[seat.kind] && request.effort === config.workerEffort ? 'demote' : 'promote',
@@ -596,7 +646,8 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...seat, pendingPromote: { ...change, ...(request.reason ? { reason: request.reason } : {}) } }))
     return ok(`Queued until ${seat.name} is idle: a restart is refused mid-turn or while it owes a report.`, { queued: true })
   }
-  if (!seat.sessionId) return failed('no-session', `${seat.name} has no saved session id yet, so it cannot be resumed`)
+  const sessionId = seat.sessionId ?? (await hookSessionId(deps, run.id, seat.name))
+  if (!sessionId) return failed('no-session', `${seat.name} has no saved session id yet, so it cannot be resumed`)
   if (!seat.paneId) return failed('no-pane', `${seat.name} has no pane`)
 
   const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
@@ -605,12 +656,12 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   if (!stop.stopped) return failed('restart', `${seat.name} did not stop after ${seat.kind === 'claude' ? 'its pane was closed' : '/quit'}${stop.detail ? ` (${stop.detail})` : ''}. Check the pane.`)
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
 
-  const updated: Seat = { ...seat, ...change, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
+  const updated: Seat = { ...seat, ...change, sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
   const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const controlText = formatControl(control, token)
   const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
   const spec = specFor(
-    launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: workerRole(updated, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: controlText } : {}) }, config),
+    launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seat.kind === 'codex' ? '' : workerRole(updated, run, config), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}) }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -625,8 +676,14 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     paneId = placement.paneId
     updated.paneId = paneId
   }
-  const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(seat.name, seat.kind, paneId, spec.argv), BUSY_RETRY_MS)
-  const adopted = !started.ok && started.code !== 'agent_not_ready' ? await adoptFailedStart(deps, seat.name, seat.kind, paneId) : undefined
+  const others = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
+  const attempt = await startWithRetry(deps, run, {
+    seat: seat.name, kind: seat.kind, argv: spec.argv, paneId,
+    place: () => placePane(deps, run, others, seat.worktree, spec.env),
+  })
+  const { started, adopted } = attempt
+  paneId = attempt.paneId
+  updated.paneId = paneId
   if (!started.ok && !adopted) {
     const captured = await captureStartFailure(deps, run, seat.name, paneId, started)
     await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
@@ -699,6 +756,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
       if (!closed.ok && !isPaneMissing(closed)) return failed('herdr', `herdr could not close pane ${seat.paneId}: ${clip(closed.output)}`)
     }
   }
+  const lockNote = seat.kind === 'claude' && seat.paneId ? await releaseStaleLock(deps, run, seat) : undefined
   const after = await updateRoster(deps.home, run.id, current => ({
     ...current,
     seats: current.seats.map(entry => (entry.name === seat.name ? { ...entry, state: 'closed', stateAt: deps.clock.now().toISOString(), attention: [] } : entry)),
@@ -707,6 +765,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
   await closeEmptyTab(deps, run, after)
 
   const notes = [`Closed ${seat.name}${seat.paneId ? ` (pane ${seat.paneId})` : ''}.`]
+  if (lockNote) notes.push(`Note: ${lockNote}.`)
   if (!removeWorktree) notes.push(`Its worktree ${seat.worktree} and branch ${seat.branch} are kept.`)
   else {
     const targets = [run.base, run.base.replace(/^origin\//, '')]
@@ -745,7 +804,7 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
     if (seat.state !== 'gone' && seat.state !== 'down') {
       const live = await herdr.getAgent(deps.exec, target)
       if (live.ok) sessionId = sessionId ?? live.value.sessionId
-      if (!sessionId) sessionId = (await hooksOf(deps, run.id, seat.name)).findLast(hook => hook.event === 'session-start' && hook.sessionId)?.sessionId
+      if (!sessionId) sessionId = await hookSessionId(deps, run.id, seat.name)
       if (live.ok) {
         const stop = await stopAgent(deps, seat, timing.closeWaitMs)
         if (seat.paneId && !stop.paneClosed) await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
@@ -774,27 +833,31 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   const identity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
   const resumeText = resumePrompt(seat)
   const isInline = resolveBriefVia(config) === 'launch-arg'
-  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: workerRole(seat, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}) }, config))
+  const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seat.kind === 'codex' ? '' : workerRole(seat, run, config), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}) }, config))
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
   const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
   const placement = await placePane(deps, run, placed, seat.worktree, spec.env)
   if (!isPlacement(placement)) return { error: placement.text }
   if (placement.createdTab) run.tabId = placement.createdTab
-  const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(seat.name, seat.kind, placement.paneId, spec.argv), BUSY_RETRY_MS)
-  const adopted = !started.ok && started.code !== 'agent_not_ready' ? await adoptFailedStart(deps, seat.name, seat.kind, placement.paneId) : undefined
-  const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, placement.paneId, started)
+  const attempt = await startWithRetry(deps, run, {
+    seat: seat.name, kind: seat.kind, argv: spec.argv, paneId: placement.paneId, ...(placement.createdTab ? { createdTab: placement.createdTab } : {}),
+    place: () => placePane(deps, run, placed, seat.worktree, spec.env),
+  })
+  const { started, adopted, paneId } = attempt
+  if (attempt.createdTab) run.tabId = attempt.createdTab
+  const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
   if (!started.ok && !adopted && started.code !== 'agent_not_ready') {
-    await herdr.run(deps.exec, herdr.paneCloseArgv(placement.paneId))
+    await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
     return { error: `herdr could not start ${seat.name}: ${clip(started.output)}.${captured ? hintText(captured) : ''}` }
   }
   const iso = deps.clock.now().toISOString()
   const isUp = started.ok || adopted !== undefined
-  const typed = isUp && resumeText && !isInline ? await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(placement.paneId, resumeText), BUSY_RETRY_MS) : undefined
+  const typed = isUp && resumeText && !isInline ? await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, resumeText), BUSY_RETRY_MS) : undefined
   const isUndelivered = typed !== undefined && !typed.ok && typed.code !== 'timeout'
   const isResumed = Boolean(resumeText) && isUp && !isUndelivered
   const next: Seat = {
-    ...seat, paneId: placement.paneId, state: !isUp ? 'blocked' : isResumed ? 'working' : adopted?.state === 'working' ? 'working' : adopted?.state === 'starting' ? 'starting' : 'idle', stateAt: iso,
+    ...seat, paneId, state: !isUp ? 'blocked' : isResumed ? 'working' : adopted?.state === 'working' ? 'working' : adopted?.state === 'starting' ? 'starting' : 'idle', stateAt: iso,
     ...(isResumed ? { lastWorkingAt: iso } : {}),
     attention: !isUp
       ? [{ seat: seat.name, reason: 'dialog', detail: 'The resumed agent stopped on a startup dialog; answer it in the pane.', at: iso }]

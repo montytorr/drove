@@ -44,6 +44,13 @@ test('cli reports usage errors with 2', async () => {
   }
 })
 
+test('promote accepts a missing --model, so a Codex seat keeps its current one', async () => {
+  const { err, io } = capture()
+  assert.equal(await main(['promote', 'w-api', '--effort', 'high'], io), 1)
+  assert.doesNotMatch(err.join('\n'), /missing --model/)
+  assert.match(err.join('\n'), /^no-|forbidden|no-run/)
+})
+
 test('a command that fails prints code: text on stderr and exits 1', async () => {
   const { err, io } = capture()
   assert.equal(await main(['roster', '--run', 'no-such-run'], io), 1)
