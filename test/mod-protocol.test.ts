@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { main } from '../src/cli.ts'
 import { runHook } from '../src/hooks.ts'
-import { formatControl, macOf } from '../src/protocol.ts'
+import { formatControl, MAC_FIELDS, macInput, macOf } from '../src/protocol.ts'
 import type { Control } from '../src/types.ts'
 import { setup } from './p4-helpers.ts'
 
@@ -16,7 +16,9 @@ import { setup } from './p4-helpers.ts'
 
 type Ran = { exitCode: number; stdout: string; stderr: string }
 type ModProtocol = {
-  macOf: (token: string, id: string, body: string) => Promise<string>
+  macOf: (token: string, fields: Record<string, string | undefined>, body: string) => Promise<string>
+  macInput: (fields: Record<string, string | undefined>, body: string) => string
+  MAC_FIELDS: readonly string[]
   parseEnvelope: (text: string) => { fields: Record<string, string>; body: string; reply?: string } | undefined
   verifyEnvelope: (envelope: { fields: Record<string, string>; body: string }, token: string | undefined) => Promise<boolean>
   locateEnvelope: (text: string) => { envelope: { fields: Record<string, string>; body: string; reply?: string; after?: string }; before: string } | undefined
@@ -41,19 +43,37 @@ const capture = async (argv: string[], stdin = ''): Promise<Ran> => {
 
 test("the mod's HMAC on crypto.subtle.digest matches Drove's mac for every control", async () => {
   const mod = await load<ModProtocol>('protocol.ts')
-  const cases = [
-    ['tok', 'c-1', 'Approved.\n\nShip it'],
-    ['a'.repeat(64), 'c-kq3-9f0a', 'x'],
-    ['b'.repeat(65), 'c-2', 'ünïcødé ⟦ ⟧ and\nnew lines'],
-    ['3f'.repeat(32), 'c-3', ''],
-  ] as const
-  for (const [token, id, body] of cases) assert.equal(await mod.macOf(token, id, body), macOf(token, id, body), `mac for ${id}`)
+  const full = { run: 'r-1', from: 'planner', to: 'w-api', kind: 'promote', model: 'claude-opus-5-5', effort: 'high', expects: 'none' }
+  const cases: [string, Record<string, string | undefined>, string][] = [
+    ['tok', { id: 'c-1', ...full }, 'Approved.\n\nShip it'],
+    ['a'.repeat(64), { id: 'c-kq3-9f0a', kind: 'verdict', verdict: 'approve', expects: 'none' }, 'x'],
+    ['b'.repeat(65), { id: 'c-2', ...full, to: 'w ünï⟧x' }, 'ünïcødé ⟦ ⟧ and\nnew lines'],
+    ['3f'.repeat(32), { id: 'c-3' }, ''],
+  ]
+  assert.deepEqual([...mod.MAC_FIELDS], [...MAC_FIELDS])
+  for (const [token, fields, body] of cases) {
+    assert.equal(mod.macInput(fields, body), macInput(fields, body), `mac input for ${fields.id}`)
+    assert.equal(await mod.macOf(token, fields, body), macOf(token, fields, body), `mac for ${fields.id}`)
+  }
   const control: Control = { v: 1, id: 'c-9', run: 'r-1', from: 'planner', to: 'w-api', kind: 'promote', expects: 'none', model: 'claude-opus-5-5', effort: 'high', body: 'Promoted.\n\nCarry on.', at: 'x' }
   const parsed = mod.parseEnvelope(formatControl(control, 'seat-token'))
   assert.equal(parsed?.body, 'Promoted.\n\nCarry on.')
   assert.equal(parsed?.fields.model, 'claude-opus-5-5')
   assert.equal(await mod.verifyEnvelope(parsed!, 'seat-token'), true)
   assert.equal(await mod.verifyEnvelope(parsed!, 'other-token'), false)
+})
+
+test("editing a header field of a genuine envelope fails the mod's mac, as it fails Drove's", async () => {
+  const mod = await load<ModProtocol>('protocol.ts')
+  const control: Control = { v: 1, id: 'c-13', run: 'r-1', from: 'planner', to: 'w-api', kind: 'promote', expects: 'none', model: 'claude-sonnet-5-5', effort: 'high', body: 'Promoted.\n\nCarry on.', at: 'x' }
+  const parsed = mod.parseEnvelope(formatControl(control, 'seat-token'))!
+  assert.equal(await mod.verifyEnvelope(parsed, 'seat-token'), true)
+  const edits: Record<string, string> = { model: 'claude-fable-5-1', effort: 'max', kind: 'demote', expects: 'review', to: 'w-other', run: 'r-2', from: 'human', verdict: 'approve' }
+  for (const [key, value] of Object.entries(edits)) {
+    assert.equal(await mod.verifyEnvelope({ ...parsed, fields: { ...parsed.fields, [key]: value } }, 'seat-token'), false, `edited ${key}`)
+  }
+  const { model: _model, ...withoutModel } = parsed.fields
+  assert.equal(await mod.verifyEnvelope({ ...parsed, fields: withoutModel }, 'seat-token'), false, 'dropped model')
 })
 
 test('a multi-paragraph control pasted into a terminal (LF turned into CR or CRLF, trailing blanks dropped) still verifies in the mod', async () => {
@@ -77,7 +97,8 @@ test('a multi-paragraph control pasted into a terminal (LF turned into CR or CRL
     const tampered = mod.parseEnvelope(transform(sent).replace('Third: ok', 'Third: not ok'))
     assert.equal(await mod.verifyEnvelope(tampered!, 'seat-token'), false, `tampered body after ${name}`)
   }
-  assert.equal(await mod.macOf('seat-token', 'c-11', body.replace(/\n/g, '\r')), macOf('seat-token', 'c-11', body))
+  const signed = { id: 'c-11', run: 'r-1', from: 'planner', to: 'w-api', kind: 'brief', expects: 'review' }
+  assert.equal(await mod.macOf('seat-token', signed, body.replace(/\n/g, '\r')), macOf('seat-token', signed, body))
 })
 
 test('a control wrapped in pasted_content tags, as Claude Code hands a pasted prompt to a hook, verifies and renders without them', async () => {
