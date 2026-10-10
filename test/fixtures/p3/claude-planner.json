@@ -17,14 +17,14 @@
     "high",
     "--session-id",
     "planner-uuid",
+    "--dangerously-load-development-channels",
+    "server:drove",
     "--mcp-config",
     "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/mcp.json",
     "--settings",
     "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/settings.json",
     "--append-system-prompt-file",
     "/home/cal/.drove/runs/drove-20261009-1042-a3f1/planner/role.md",
-    "--dangerously-load-development-channels",
-    "server:drove",
     "Ship it."
   ],
   "files": [

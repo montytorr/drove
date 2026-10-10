@@ -87,10 +87,10 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     ...(isWorker ? ['-n', identity.seat] : []),
     ...(isWorker && !request.resumeId ? ['--worktree', identity.seat] : []),
     ...(request.resumeId ? ['--resume', request.resumeId] : request.sessionId ? ['--session-id', request.sessionId] : []),
+    ...(!isWorker && request.channel ? [CHANNEL_FLAG, 'server:drove'] : []),
     '--mcp-config', mcpPath,
     '--settings', settingsPath,
     ...(request.roleText ? ['--append-system-prompt-file', rolePath] : []),
-    ...(!isWorker && request.channel ? [CHANNEL_FLAG, 'server:drove'] : []),
     ...(prompt ? (prompt.startsWith('-') ? ['--', prompt] : [prompt]) : []),
   ]
   assertShellSafeArgs(isWorker || !prompt ? argv : argv.slice(0, -1))
