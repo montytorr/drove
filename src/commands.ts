@@ -1100,7 +1100,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
       ...(kind === 'codex' ? { codexHome: codexHomeDir(deps.home, run.id) } : {}),
       migratedFrom: { kind: seat.kind, ...(oldSession ? { sessionId: oldSession } : {}), model: seat.model, at: iso, ...(request.reason ? { reason: request.reason } : {}) },
     }
-    const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token }
+    const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
     const extras = await launchExtrasOf(deps, run, config, migrated)
     notes.push(...missingMcpNote(migrated, extras.missing))
     const spec = specFor(

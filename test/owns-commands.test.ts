@@ -86,6 +86,16 @@ test('owns survives up --seat: a relaunched seat gets the same DROVE_OWNS', asyn
   assert.deepEqual(JSON.parse(placedEnv(fake).DROVE_OWNS ?? 'null'), OWNS)
 })
 
+test('owns and the budgets survive a migrate to the other provider', async () => {
+  const { fake, deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief, owns: OWNS, maxTurns: 9 })
+  const migrated = await commands.migrate(deps, identity, { seat: 'w-api', kind: 'codex', reason: 'Claude usage limit' })
+  assert.equal(migrated.ok, true, migrated.text)
+  const seat = (await loadRoster(deps.home, RUN)).seats[0]
+  assert.deepEqual([seat?.kind, seat?.owns, seat?.maxTurns], ['codex', OWNS, 9])
+  assert.deepEqual(JSON.parse(placedEnv(fake).DROVE_OWNS ?? 'null'), OWNS)
+})
+
 test('maxTurns and maxTokens are saved per seat; the config maxTurns is the default and a spawn option wins', async () => {
   const { deps, identity } = await setup()
   await writeFile(join(deps.home, 'config.json'), JSON.stringify({ maxTurns: 40 }))
