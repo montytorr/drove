@@ -25,10 +25,12 @@ There is no daemon. The planner's own MCP server (or, for a Claude planner with 
 
 ```sh
 npm install      # dev dependencies only: typescript, @types/node
-npm link         # puts `drove` on PATH, pointing at src/cli.ts
+ln -sf ~/maestro-dev/drove/src/cli.ts ~/.local/bin/drove   # any directory on PATH
 ```
 
-Use `npm link`, not a global install: Node does not strip types from files under `node_modules`.
+Recommended: the symlink survives `nvm use`. `src/cli.ts` is executable and runs under whichever `node` is on PATH, which must be Node 22.18+.
+
+Alternative: `npm link` from the repo. Under nvm a link exists for one Node version only, so `drove` disappears after switching versions. Use a link, not a global install: Node does not strip types from files under `node_modules`.
 
 ## Quick start
 
