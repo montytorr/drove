@@ -119,6 +119,24 @@ test('claude planner spec matches the golden file and has no permission bypass',
   assert.ok(spec.argv.includes('server:drove'))
 })
 
+test('a variadic claude flag is never followed by the prompt or any extra non-flag token', () => {
+  const variadic = ['--mcp-config', '--dangerously-load-development-channels']
+  const specs = [true, false].flatMap(channel => [undefined, 'Ship it.', 'Build the thing.'].flatMap(initialPrompt => [
+    launch.claudePlannerSpec(request({ identity: planner, channel, initialPrompt })),
+    launch.claudeWorkerSpec(request({ channel, initialPrompt, roleText: undefined })),
+    launch.claudeWorkerSpec(request({ channel, initialPrompt })),
+  ]))
+  for (const { argv } of specs) {
+    argv.forEach((arg, i) => {
+      if (!variadic.includes(arg)) return
+      const value = argv[i + 1]
+      assert.ok(value !== undefined && !value.startsWith('-'), `${arg} has a value`)
+      const next = argv[i + 2]
+      assert.ok(next === undefined ? false : next.startsWith('-'), `${arg} <value> is followed by ${next}, not a flag`)
+    })
+  }
+})
+
 test('claude planner without the channel does not set DROVE_CHANNEL', () => {
   const spec = launch.claudePlannerSpec(request({ identity: planner, initialPrompt: undefined }))
   assert.equal(spec.env.DROVE_CHANNEL, undefined)
