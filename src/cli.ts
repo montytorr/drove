@@ -167,7 +167,7 @@ export const COMMANDS: Record<string, Spec> = {
   },
   board: {
     usage: 'drove board [--once] [--run ID]',
-    why: 'live plain-text board for a herdr pane',
+    why: 'live board for a herdr pane (plain when piped or NO_COLOR)',
     options: { once: { type: 'boolean' }, run: { type: 'string' } },
     run: async (values, _positionals, io) => {
       const deps = commands.defaultDeps()
