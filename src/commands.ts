@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { chmod, mkdir, readdir, writeFile } from 'node:fs/promises'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, matchDialog, shouldReadScreen } from './detect.ts'
+import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
@@ -1007,6 +1007,40 @@ const relaunchSeat = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   return relaunched
 }
 
+type PaneLiveness = { state: 'alive' | 'gone' } | { state: 'unverified'; detail: string }
+
+const paneLiveness = async (deps: Deps, target: string): Promise<PaneLiveness> => {
+  const live = await herdr.getAgent(deps.exec, target)
+  if (live.ok) return { state: 'alive' }
+  return isPaneMissing(live) ? { state: 'gone' } : { state: 'unverified', detail: clip(live.output || live.code, 160) }
+}
+
+const adoptAsDown = async (deps: Deps, run: RunMeta, seat: Seat): Promise<Seat> => {
+  const sessionId = seat.sessionId ?? (await hookSessionId(deps, run.id, seat.name))
+  const { restartingSince: _cleared, ...rest } = seat
+  const adopted: Seat = { ...rest, ...(sessionId ? { sessionId } : {}), state: 'down', stateAt: deps.clock.now().toISOString(), attention: [] }
+  await updateRoster(deps.home, run.id, roster => upsertSeat(roster, adopted))
+  return adopted
+}
+
+// An `up` run whose planner and seat panes are all gone is a crash: nothing ran `down`, and the watcher died too.
+const probeCrashedRun = async (deps: Deps, run: RunMeta): Promise<{ seats: Seat[] } | { error: CommandResult }> => {
+  const now = deps.clock.now()
+  const seats = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state !== 'closed')
+  const probes = [
+    ...(run.planner.paneId ? [{ label: `the planner pane ${run.planner.paneId}`, target: run.planner.paneId }] : []),
+    ...seats.filter(seat => seat.state !== 'gone' && seat.state !== 'down').map(seat => ({ label: `${seat.name} (pane ${seat.paneId ?? herdr.agentTarget(run.id, seat)})`, target: herdr.agentTarget(run.id, seat) })),
+  ]
+  const results = await Promise.all(probes.map(async probe => ({ ...probe, liveness: await paneLiveness(deps, probe.target) })))
+  const alive = results.filter(result => result.liveness.state === 'alive').map(result => result.label)
+  if (alive.length) return { error: failed('not-down', `run ${run.id} is up and still has live panes: ${alive.join(', ')}; nothing to recover`) }
+  const unverified = results.find(result => result.liveness.state === 'unverified')
+  if (unverified && unverified.liveness.state === 'unverified') return { error: failed('herdr', `herdr could not say whether ${unverified.label} is alive: ${unverified.liveness.detail}`) }
+  const restarting = seats.filter(seat => isRestarting(seat, now)).map(seat => seat.name)
+  if (restarting.length) return { error: failed('not-down', `run ${run.id} has a restart in flight for ${restarting.join(', ')}; try again shortly`) }
+  return { seats }
+}
+
 export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<CommandResult> => {
   const located = seatName ? await locateRun(deps, ref, 'up') : await locateRun(deps, ref, 'down')
   if ('error' in located) return located.error
@@ -1014,17 +1048,31 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
   const config = await loadConfig(deps.home)
 
   if (seatName) {
-    const seat = findSeat(await loadRoster(deps.home, run.id), seatName)
+    let seat = findSeat(await loadRoster(deps.home, run.id), seatName)
     if (!seat || seat.state === 'closed') return failed('no-seat', `no seat named ${seatName} to relaunch`)
-    if (seat.state !== 'gone' && seat.state !== 'down') return failed('not-dead', `${seatName} is ${seat.state}; only a gone or down seat is relaunched`)
+    if (seat.state !== 'gone' && seat.state !== 'down') {
+      if (isRestarting(seat, deps.clock.now())) return failed('not-dead', `${seatName} is ${seat.state} and is being restarted; try again shortly`)
+      const probed = await paneLiveness(deps, herdr.agentTarget(run.id, seat))
+      if (probed.state === 'alive') return failed('not-dead', `${seatName} is ${seat.state}; only a gone or down seat is relaunched`)
+      if (probed.state === 'unverified') return failed('herdr', `herdr could not say whether ${seatName}'s pane ${seat.paneId ?? '?'} is alive: ${probed.detail}`)
+      seat = await adoptAsDown(deps, run, seat)
+    }
     const placed = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
     const relaunched = await relaunchSeat(deps, run, config, seat, placed)
     return 'error' in relaunched ? failed('relaunch', relaunched.error) : ok(`Relaunched ${seatName} in pane ${relaunched.seat.paneId} with resume.${relaunched.note ? ` Note: ${relaunched.note}.` : ''}`,{ paneId: relaunched.seat.paneId })
   }
 
-  if (run.status !== 'down') return failed('not-down', `run ${run.id} is ${run.status}; nothing to resume`)
   const paneId = process.env.HERDR_PANE_ID
   if (!paneId) return failed('not-in-herdr', 'drove up must run inside a herdr pane (HERDR_PANE_ID is unset); the planner resumes in this pane')
+  let recovered: Seat[] | undefined
+  if (run.status === 'up') {
+    const crashed = await probeCrashedRun(deps, run)
+    if ('error' in crashed) return crashed.error
+    recovered = await Promise.all(crashed.seats.map(seat => adoptAsDown(deps, run, seat)))
+    const plannerId = run.planner.sessionId ?? (await plannerSessionId(deps, run))
+    run = { ...run, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } }
+    await recordEvent(deps, run.id, { type: 'run.recovered', data: { seats: recovered.map(seat => seat.name), unsaved: recovered.filter(seat => !seat.sessionId).map(seat => seat.name), plannerPane: run.planner.paneId, pane: paneId } })
+  }
   run = { ...run, status: 'up', tabId: undefined, planner: { ...run.planner, paneId } }
   await saveRun(deps.home, run)
   const seats = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state === 'down').sort(SPAWNED_ORDER)
@@ -1051,7 +1099,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
     launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: plannerRole(run, config, planner.kind), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
   )
   await writeLaunchFiles(spec)
-  const summary = `Run ${run.id} is up: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}`
+  const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}`
   return ok(summary, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
 }
 
