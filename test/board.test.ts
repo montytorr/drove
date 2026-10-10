@@ -269,3 +269,85 @@ test('live mode enters the alternate screen, hides the cursor, redraws on resize
   assert.ok(stripAnsi(written[2] ?? '').split('\r\n').every(line => board.widthOf(line) <= 60))
   assert.equal(resize, undefined)
 })
+
+const fakeInput = () => {
+  const calls: string[] = []
+  let listener: ((chunk: Buffer | string) => void) | undefined
+  return {
+    calls,
+    send: (chunk: string) => listener?.(chunk),
+    input: {
+      setRawMode: (raw: boolean) => void calls.push(`raw:${raw}`),
+      resume: () => void calls.push('resume'),
+      pause: () => void calls.push('pause'),
+      onData: (next: (chunk: Buffer | string) => void) => {
+        listener = next
+        calls.push('listen')
+        return () => {
+          listener = undefined
+          calls.push('unlisten')
+        }
+      },
+    },
+  }
+}
+
+const liveIo = (written: string[], input?: board.BoardInput): board.BoardIo => ({
+  write: text => void written.push(text),
+  columns: () => 80,
+  rows: () => 24,
+  isTTY: true,
+  depth: 24,
+  offsetMinutes: 0,
+  frameMs: 5,
+  pollMs: 5,
+  input,
+})
+
+const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+
+test('live mode puts input in raw mode, ignores wheel, arrows and letters, and stops on q', async () => {
+  const { deps } = await makeHome()
+  const written: string[] = []
+  const fake = fakeInput()
+  const done = board.runBoard(deps, RUN.id, false, liveIo(written, fake.input))
+  await pause(30)
+  assert.deepEqual(fake.calls.slice(0, 3), ['raw:true', 'resume', 'listen'])
+  const before = written.length
+  const typed = ['\x1b[A', '\x1b[<64;10;5M', 'x', 'j']
+  for (const chunk of typed) fake.send(chunk)
+  await pause(30)
+  assert.ok(!written.slice(before).includes(board.LEAVE))
+  assert.ok(!fake.calls.includes('raw:false'))
+  fake.send('q')
+  await done
+  assert.ok(fake.calls.includes('raw:false'))
+  assert.ok(fake.calls.includes('pause'))
+  assert.equal(written.at(-1), board.LEAVE)
+})
+
+test('live mode restores raw mode on Ctrl-C and on SIGINT', async () => {
+  const { deps } = await makeHome()
+  const ctrlC = fakeInput()
+  const first = board.runBoard(deps, RUN.id, false, liveIo([], ctrlC.input))
+  await pause(20)
+  ctrlC.send('\x03')
+  await first
+  assert.ok(ctrlC.calls.includes('raw:false'))
+  assert.equal(ctrlC.calls.at(-1), 'pause')
+
+  const sig = fakeInput()
+  const second = board.runBoard(deps, RUN.id, false, liveIo([], sig.input))
+  await pause(20)
+  process.emit('SIGINT')
+  await second
+  assert.ok(sig.calls.includes('raw:false'))
+  assert.ok(sig.calls.includes('unlisten'))
+})
+
+test('--once never touches input', async () => {
+  const { deps } = await makeHome()
+  const fake = fakeInput()
+  await board.runBoard(deps, RUN.id, true, liveIo([], fake.input))
+  assert.deepEqual(fake.calls, [])
+})

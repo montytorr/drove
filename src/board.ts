@@ -300,6 +300,13 @@ export const boardSource = (deps: Deps, run: string): (() => Promise<BoardData>)
 
 // ---------- drawing ----------
 
+export type BoardInput = {
+  setRawMode: (raw: boolean) => void
+  resume: () => void
+  pause: () => void
+  onData: (listener: (chunk: Buffer | string) => void) => () => void
+}
+
 export type BoardIo = {
   write: (text: string) => void
   columns: () => number | undefined
@@ -311,7 +318,23 @@ export type BoardIo = {
   onResize?: (listener: () => void) => () => void
   pollMs?: number
   frameMs?: number
+  input?: BoardInput
 }
+
+const stdinInput = (): BoardInput | undefined =>
+  process.stdin.isTTY === true
+    ? {
+        setRawMode: raw => void process.stdin.setRawMode(raw),
+        resume: () => void process.stdin.resume(),
+        pause: () => void process.stdin.pause(),
+        onData: listener => {
+          process.stdin.on('data', listener)
+          return () => void process.stdin.off('data', listener)
+        },
+      }
+    : undefined
+
+const QUIT_KEYS = new Set(['q', 'Q', '\x03'])
 
 const stdoutIo = (): BoardIo => ({
   write: text => void process.stdout.write(text),
@@ -323,6 +346,7 @@ const stdoutIo = (): BoardIo => ({
     process.stdout.on('resize', listener)
     return () => void process.stdout.off('resize', listener)
   },
+  input: stdinInput(),
 })
 
 export const ENTER = '\x1b[?1049h\x1b[?25l'
@@ -355,13 +379,30 @@ export const runBoard = async (deps: Deps, run: string, once: boolean, io: Board
     last = ''
     wake?.()
   }
-  const restore = () => io.write(LEAVE)
+  let rawOn = false
+  const restore = () => {
+    if (rawOn) {
+      rawOn = false
+      io.input?.setRawMode(false)
+      io.input?.pause()
+    }
+    io.write(LEAVE)
+  }
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
   process.once('exit', restore)
   const offResize = io.onResize?.(resized)
   io.write(ENTER)
+  let offInput: (() => void) | undefined
   try {
+    if (io.input) {
+      io.input.setRawMode(true)
+      rawOn = true
+      io.input.resume()
+      offInput = io.input.onData(chunk => {
+        if (QUIT_KEYS.has(chunk.toString())) stop()
+      })
+    }
     let data = await load()
     let loadedAt = deps.clock.now().getTime()
     let frame = 0
@@ -393,6 +434,7 @@ export const runBoard = async (deps: Deps, run: string, once: boolean, io: Board
     }
   } finally {
     offResize?.()
+    offInput?.()
     process.off('SIGINT', stop)
     process.off('SIGTERM', stop)
     process.off('exit', restore)

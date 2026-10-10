@@ -17,7 +17,7 @@ beforeEach(() => {
 
 type Task = { title: string; status: string; description?: string }
 
-const NOISE = 'cairn: dispofi could not be checked (stale project cache); routing DROVE to personal on its own record\n'
+const NOISE = 'cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record\n'
 
 // A stand-in for the cairn CLI behind the fake herdr's exec: show, next and note, with the stale-cache preamble on stderr.
 const stubCairn = (fake: FakeHerdr, tasks: Record<string, Task>, next: string[] = []) => {
@@ -245,7 +245,7 @@ test('a real cairn executable on PATH is read as JSON, so the goal comes from it
   await writeFile(
     script,
     `#!/bin/sh
-echo "cairn: dispofi could not be checked (stale project cache); routing DROVE to personal on its own record" >&2
+echo "cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record" >&2
 case "$1 $2" in
   "show DROVE-9") printf '%s' '{"ref":"DROVE-9","title":"From PATH","status":"todo","description":"Real body"}' ;;
   *) echo "No task $2." >&2; exit 1 ;;
