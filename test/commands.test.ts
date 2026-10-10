@@ -652,6 +652,25 @@ test('close releases the seat\'s Cairn claim with --force, best effort, and says
   assert.match(closed.text, /Released the Cairn claim on DROVE-5/)
 })
 
+test('close adds no note when cairn has nothing to release, and keeps one for a real failure', async () => {
+  const cases = [
+    { stderr: 'cairn: dispofi could not be checked (stale project cache); routing DROVE to personal on its own record\nClaim ownership changed; nothing was released.', note: false },
+    { stderr: 'Cannot release DROVE-5: it is already done.', note: false },
+    { stderr: 'cairn: dispofi could not be checked (stale project cache); routing DROVE to personal on its own record\ndatabase locked', note: true },
+  ]
+  for (const { stderr, note } of cases) {
+    const fake = new FakeHerdr()
+    const base = fake.exec
+    fake.exec = async (argv, options) => (argv[0] === 'cairn' ? { code: 1, stdout: '', stderr } : base(argv, options))
+    const { deps, identity } = await setup(fake)
+    await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
+    const closed = await commands.close(deps, identity, 'w-api', false)
+    assert.equal(closed.ok, true, closed.text)
+    assert.equal(/Cairn claim on DROVE-5 was not released/.test(closed.text), note, closed.text)
+    if (note) assert.doesNotMatch(closed.text, /could not be checked/)
+  }
+})
+
 test('close still closes when cairn is not on PATH, with a note, and skips release for a seat without a ref', async () => {
   for (const missing of ['exit', 'throw'] as const) {
     const fake = new FakeHerdr()

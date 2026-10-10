@@ -832,10 +832,16 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
 
 // ---------- close ----------
 
-const releaseCairnClaim = async (deps: Deps, ref: string): Promise<string> => {
+const BENIGN_RELEASE = /nothing was released|claim ownership changed|already (done|released)|is done\b/i
+const cairnPreamble = /cairn: [^\n]*could not be checked[^\n]*\n?/gi
+
+const releaseCairnClaim = async (deps: Deps, ref: string): Promise<string | undefined> => {
   try {
     const ran = await deps.exec(['cairn', 'release', ref, '--force'], { timeoutMs: 15_000 })
-    return ran.code === 0 ? `Released the Cairn claim on ${ref}.` : `Note: the Cairn claim on ${ref} was not released (cairn exited ${ran.code}: ${clip(ran.stderr || ran.stdout)}); release it by hand.`
+    if (ran.code === 0) return `Released the Cairn claim on ${ref}.`
+    const output = `${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, '')
+    if (BENIGN_RELEASE.test(output)) return undefined
+    return `Note: the Cairn claim on ${ref} was not released (cairn exited ${ran.code}: ${clip(output)}); release it by hand.`
   } catch (error) {
     return `Note: the Cairn claim on ${ref} was not released (${messageOf(error)}); release it by hand.`
   }
@@ -868,7 +874,8 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 
   const notes = [`Closed ${seat.name}${seat.paneId ? ` (pane ${seat.paneId})` : ''}.`]
   if (lockNote) notes.push(`Note: ${lockNote}.`)
-  if (seat.cairn) notes.push(await releaseCairnClaim(deps, seat.cairn))
+  const releaseNote = seat.cairn ? await releaseCairnClaim(deps, seat.cairn) : undefined
+  if (releaseNote) notes.push(releaseNote)
   if (!removeWorktree) notes.push(`Its worktree ${seat.worktree} and branch ${seat.branch} are kept.`)
   else {
     const targets = [run.base, run.base.replace(/^origin\//, '')]
