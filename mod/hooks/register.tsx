@@ -656,7 +656,10 @@ const refreshSelf = async ($: EngineInterface) => {
   try {
     const roster = JSON.parse(await $.fs.read(workerPaths(self).roster)) as { seats?: Seat[] }
     const seat = roster.seats?.find(({ name }) => name === self.name)
-    if (seat && (seat.model !== self.model || seat.effort !== self.effort)) await update($, workerAtom, current => (current ? { ...current, model: seat.model || undefined, effort: seat.effort } : current))
+    if (seat && (seat.model !== self.model || seat.effort !== self.effort)) {
+      await update($, workerAtom, current => (current ? { ...current, model: seat.model || undefined, effort: seat.effort } : current))
+      $.ui.invalidate('prompt.section')
+    }
   } catch {
     // keep the last known model and effort
   }
@@ -728,6 +731,7 @@ const handleControl = async ($: EngineInterface, text: string): Promise<string |
     const effort = isEffort(fields.effort) ? fields.effort : undefined
     await update($, workerAtom, current => (current ? { ...current, ...(fields.model ? { model: fields.model } : {}), ...(effort ? { effort } : {}) } : current))
     $.ui.toast(`${fields.kind === 'promote' ? 'Promoted' : 'Moved'} to ${fields.model ? shortModel(fields.model) : 'the same model'} at ${effort ?? 'the same'} effort`)
+    $.ui.invalidate('prompt.section')
     const moved = await read($, workerAtom)
     notice = `\n${modelNotice(moved?.model, moved?.effort)}`
     isModelNoticePending = true
