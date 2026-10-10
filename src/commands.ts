@@ -245,6 +245,13 @@ const adoptFailedStart = async (deps: Deps, seatName: string, kind: AgentKind, p
   return screen.ok && !findDialog(screen.value) && AGENT_SCREEN[kind].test(screen.value) ? { state: 'starting' } : undefined
 }
 
+const saveBrief = async (deps: Deps, run: string, seat: string, text: string): Promise<void> => {
+  const file = join(seatDir(deps.home, run, seat), 'brief.md')
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  await writeFile(file, `${text}\n`, { mode: 0o600 })
+  await chmod(file, 0o600)
+}
+
 const resolveBriefVia = (config: DroveConfig, env: NodeJS.ProcessEnv = process.env): DroveConfig['briefVia'] => {
   const override = env.DROVE_BRIEF_VIA
   if (override === 'launch-arg') return 'launch-arg'
@@ -263,7 +270,7 @@ export const refreshRoster = async (deps: Deps, run: RunMeta): Promise<void> => 
     seats.map(async seat => {
       const live = listed.value.find(agent => (seat.paneId ? agent.paneId === seat.paneId : agent.name === herdr.agentName(run.id, seat.name)))
       const hooks = await hooksOf(deps, run.id, seat.name)
-      const screen = shouldReadScreen(live, hooks) ? await herdr.readScreen(deps.exec, herdr.agentTarget(run.id, seat), 40, 'visible') : undefined
+      const screen = shouldReadScreen(live, hooks, seat) ? await herdr.readScreen(deps.exec, herdr.agentTarget(run.id, seat), 40, 'visible') : undefined
       const sessionId = live?.sessionId ?? [...hooks].reverse().find(hook => hook.event === 'session-start' && hook.sessionId)?.sessionId
       return { seat, sessionId, derived: deriveState(seat, { herdr: live, hooks, ...(seat.lastReport ? { lastReport: seat.lastReport } : {}), ...(screen?.ok ? { screen: screen.value } : {}) }, now) }
     }),
@@ -531,6 +538,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const briefText = isRoleInBrief ? `${roleText}\n\n${footer}` : footer
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
+  await saveBrief(deps, run.id, seat.name, briefText)
   const spec = specFor(
     launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: isRoleInBrief ? '' : roleText, initialPrompt, ...(sessionId ? { sessionId } : {}), ...(await codexHomeOf(deps, seat)) }, config),
   )

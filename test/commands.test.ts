@@ -87,6 +87,21 @@ test('a codex worker still gets a Drove git worktree on drove/<seat> and launche
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.branch, 'drove/w-cx')
 })
 
+test('spawn saves the full brief to seats/<seat>/brief.md, mode 600, for both kinds', async () => {
+  const { deps, identity } = await setup()
+  for (const [seat, kind] of [['w-cl', 'claude'], ['w-cx', 'codex']] as const) {
+    const spawned = await commands.spawn(deps, identity, { seat, kind, cairn: 'DROVE-5', brief })
+    assert.equal(spawned.ok, true, spawned.text)
+    const file = join(seatDir(deps.home, RUN, seat), 'brief.md')
+    const saved = await readFile(file, 'utf8')
+    assert.match(saved, /Build the widget\. \(You are worker `/)
+    assert.match(saved, new RegExp(`You are worker \`${seat}\``))
+    assert.match(saved, /Your Cairn task is DROVE-5/)
+    assert.equal(saved.startsWith('# Worker mode') || saved.startsWith('Build the widget.'), true, 'Codex carries its role in the brief, Claude does not')
+    assert.equal((await stat(file)).mode & 0o777, 0o600)
+  }
+})
+
 const commitOn = async (repo: string, file: string): Promise<string> => {
   await writeFile(join(repo, file), 'x\n')
   await git(repo, 'add', file)
