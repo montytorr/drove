@@ -4,7 +4,7 @@ import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 import type { AgentKind, Effort, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat } from '../types'
 import { BOARD_ID, EXPAND_INDENT, buildBoard, needsAnimation, timelineRoom } from './board'
 import type { BoardRow, Cell, Tone } from './board'
-import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf } from './bridge'
+import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeContext, wakeHeadlines } from './bridge'
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
 import { modelNotice, orchestratorSection, workerModelSection } from './prompts'
@@ -533,8 +533,26 @@ const onBridgeLine = async ($: EngineInterface, line: BridgeLine) => {
     $.ui.toast(toastOf(blocks))
     if (config.effortRouting && blocks.some(({ kind }) => kind !== 'done')) pendingRouting = true
   }
-  const text = line.text
-  soon($, 0, () => $.prompt.submit({ text }))
+  const wake = line.text
+  const text = blocks.length > 0 ? wakeHeadlines(blocks) : wake
+  if (text !== wake) hiddenWakes.set(text, [...(hiddenWakes.get(text) ?? []), wake])
+  soon($, 0, async () => {
+    const submitted = await $.prompt.submit({ text })
+    if (submitted.drop !== undefined) takeHiddenWake(text)
+  })
+}
+
+// A wake is submitted as its headlines, which is all the person sees. A plugin's own prompt skips its prompt.submit hooks, so the turn it starts
+// gets the full reports instead: turn.start appends them as a user row the person does not see (isMeta), keyed by the headlines.
+const hiddenWakes = new Map<string, string[]>()
+
+const takeHiddenWake = (text: string): string | undefined => {
+  const key = hiddenWakes.has(text) ? text : [...hiddenWakes.keys()].find(headlines => text.includes(headlines))
+  if (key === undefined) return undefined
+  const [wake, ...rest] = hiddenWakes.get(key) ?? []
+  if (rest.length > 0) hiddenWakes.set(key, rest)
+  else hiddenWakes.delete(key)
+  return wake
 }
 
 const superviseBridge = async ($: EngineInterface, run: string, epoch: number) => {
@@ -1136,6 +1154,14 @@ export const register: Register = (on, options) => {
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
 
   on('turn.start', async ($, e, next) => {
+    const wake = takeHiddenWake(e.text)
+    if (wake) {
+      try {
+        await $.session.append({ message: { type: 'user', content: [{ type: 'text', text: wakeContext(wake) }] } })
+      } catch (error) {
+        $.ui.log(`orchestrator: the full reports did not reach the planner: ${messageOf(error)}`, { to: 'debug' })
+      }
+    }
     if (await read($, orchestratorAtom)) await setLead($, 'thinking')
     if (await read($, workerAtom)) await refreshSelf($)
     if (pendingRouting) {

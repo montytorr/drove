@@ -33,7 +33,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
-| `drove board [--once]` | human | A live plain-text board for a herdr pane: seats, states, attention list and recent events. `--once` prints a single frame. |
+| `drove board [--once]` | human | A live coloured board for a herdr pane, drawn from the orchestrator mod's board model (`mod/hooks/board.ts`) on the terminal's own background: the lead and what it owes, seats with state stripes, gauges and a spinner, and the timeline. It uses the alternate screen, redraws in place only while something moves, and fits the pane. `--once` or a non-TTY stdout prints a single frame; it has no colour escapes when piped or under `NO_COLOR`. |
 | `drove down [--run ID]` | human, planner | Saves every session id, quits the agents, closes the panes and marks the run `down`. |
 | `drove up [--run ID] [--seat SEAT]` | human | Reopens the worker tab and resumes each worker by session id, then `exec`s the planner with its resume argument in the current pane. With `--seat`, it relaunches only that one `gone` or `down` seat. Each relaunch records a `seat.relaunch` event (§9). |
 | `drove budget <n>` | human only | Raises the pane budget for the current run. The guard denies it to every agent, so it is the human's OK for a 6th pane when the client cannot show a dialog (§3). |
@@ -72,6 +72,7 @@ $DROVE_HOME (default ~/.drove), mode 700
       mcp.json          # Claude worker --mcp-config
       role.md           # Claude worker --append-system-prompt-file (Codex: the role rides in the brief)
       mod.json          # status a Claude worker's mod writes for the board (§10)
+      brief.md          # the full brief as the seat received it, mode 600 (a migration hands it to the next agent)
       start-failure.txt # pane output saved when an agent start failed (§7)
       launch.json       # the LaunchSpec used (token redacted), for relaunch and debugging
   worktrees: <repo>/.claude/worktrees/<seat>   (Codex: made by Drove on drove/<seat>; Claude: made by Claude on worktree-<seat>; see Open question 1)
@@ -332,6 +333,7 @@ Signals, by freshness:
 - a Claude folder-trust prompt;
 - a channel confirmation;
 - **the Codex "Background server has incompatible feature settings" dialog**;
+- a usage limit (`usage-limit`, "w-x hit its usage limit (resets 2pm)"; the seat is never nudged);
 - a stalled prompt;
 - idle without a report;
 - a gone pane;
@@ -341,6 +343,8 @@ Signals, by freshness:
 
 | Pattern | Attention reason |
 |---|---|
+| `/^You've hit your usage limit/m` (Codex; "… or try again at 2:00 PM.") | `usage-limit` |
+| `/^You've (hit\|reached) your …/m`, `You're out of usage`, `Your org is out of usage` (Claude; "You've hit your session limit · resets 2pm"; "fast limit" is excluded, it is a status-line cooldown) | `usage-limit` |
 | `/Background server has incompatible feature settings/` | `codex-version-mismatch` |
 | `/trust (this\|the files in this) folder\|project you created or one you trust/i` | `trust` (Claude: "Do you trust the files in this folder?") |
 | `/hooks? needs? review\|hooks? (is\|are) new or changed/i` | `hook-trust` (Codex: "1 hook needs review before it can run"; hint: approve Drove's hooks once in the pane, Codex remembers them) |
@@ -348,6 +352,8 @@ Signals, by freshness:
 | `/trust the contents of this directory/i` (added to the folder-trust row) | `trust` (older Codex folder trust) |
 | `/Update available\|Update now \(runs/` | `dialog` (Codex update prompt; choose Skip) |
 | `/Codex just got an upgrade\|Try new model/` | `dialog` (Codex model migration) |
+
+**Usage limit.** A seat that stopped after working with no report since its last working time also has its visible screen read, not only a blocked or hook-less one, so a limit screen that herdr shows as `idle` is seen. The match is anchored at a line start so a diff or a transcript quoting the text does not trip it. The detail carries the reset time the screen shows ("hit its usage limit (resets 2pm)"); the seat reads `blocked` and `needsNudge` never fires for it. The strings come from Claude Code 2.1.296 and Codex's native binary. Claude Code also has a `StopFailure` hook event (`error: rate_limit | billing_error | …`, `error_details`, `last_assistant_message`) that Drove does not use yet.
 
 **Start failures.** Whenever `herdr agent start` fails or times out (in `spawn`, `promote` and `up`), Drove first runs the adoption check of §5 (a live agent of the expected kind in the pane and no dialog keeps the seat; `promote` and `up` keep it and send the control, `seat` is marked gone or the pane closed only when it is absent or a dialog matched). Before any rollback closes the pane, Drove reads the pane twice, `herdr agent read <seat> --source visible --lines 60` and `--source recent-unwrapped --lines 60` (each falling back to `herdr pane read <pane>`), and saves both to `seats/<seat>/start-failure.txt` (mode 600) under `== visible screen ==` and `== recent output ==` headings, appends a `seat.start_failed` event with the herdr error code and the first matching dialog reason from this table, and puts a one-line hint in the error ("Claude is asking to trust the folder") with the file path.
 

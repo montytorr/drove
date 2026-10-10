@@ -1,5 +1,5 @@
-import type { DroveEvent, OrchFeedEntry, OrchModStatus, Roster, RunMeta } from '../types'
-import { HUMAN, oneLine } from './protocol'
+import type { DroveEvent, OrchFeedEntry, OrchModStatus, Roster, RunMeta } from '../types/index.d.ts'
+import { HUMAN, oneLine } from './protocol.ts'
 
 // What `drove mod bridge` writes, one JSON object per line (src/modhost.ts BridgeLine).
 export type BridgeLine =
@@ -94,3 +94,10 @@ export const splitWake = (wake: string): WakeBlock[] =>
     .filter((block): block is WakeBlock => block !== undefined)
 
 export const toastOf = (blocks: readonly WakeBlock[]): string => oneLine(blocks.map(({ seat, kind }) => `${seat}: ${kind}`).join(', '), 80)
+
+// What the person sees of a wake: each block's head, `w-auth · done · expects review`, one line per report. The rest goes to the model as hidden context.
+export const wakeHeadlines = (blocks: readonly WakeBlock[]): string =>
+  blocks.map(({ text }) => (text.split('\n')[0] ?? '').replace(/^\[worker /, '').replace(/\]$/, '')).join('\n')
+
+export const wakeContext = (wake: string): string =>
+  `The full worker reports behind this wake's one-line headlines, in Drove's words. The person sees only the headlines, so tell them what matters.\n\n${wake}`

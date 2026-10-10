@@ -10,7 +10,7 @@ import * as git from './git.ts'
 import * as herdr from './herdr.ts'
 import { type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readCodexHome, redactSpec, specFor, userClaudeConfig, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
-import { approvedText, briefFooter, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
+import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
@@ -18,7 +18,7 @@ import type {
   AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, PromoteRequest, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
-export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string }
+export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string }
 export type RunRef = { run?: string; repo: string }
 export type ProcessPlan = { argv: string[]; env: Record<string, string>; cwd: string }
 
@@ -297,6 +297,13 @@ const adoptFailedStart = async (deps: Deps, seatName: string, kind: AgentKind, p
   return screen.ok && !findDialog(screen.value) && AGENT_SCREEN[kind].test(screen.value) ? { state: 'starting' } : undefined
 }
 
+const saveBrief = async (deps: Deps, run: string, seat: string, text: string): Promise<void> => {
+  const file = join(seatDir(deps.home, run, seat), 'brief.md')
+  await mkdir(dirname(file), { recursive: true, mode: 0o700 })
+  await writeFile(file, `${text}\n`, { mode: 0o600 })
+  await chmod(file, 0o600)
+}
+
 const resolveBriefVia = (config: DroveConfig, env: NodeJS.ProcessEnv = process.env): DroveConfig['briefVia'] => {
   const override = env.DROVE_BRIEF_VIA
   if (override === 'launch-arg') return 'launch-arg'
@@ -315,7 +322,7 @@ export const refreshRoster = async (deps: Deps, run: RunMeta): Promise<void> => 
     seats.map(async seat => {
       const live = listed.value.find(agent => (seat.paneId ? agent.paneId === seat.paneId : agent.name === herdr.agentName(run.id, seat.name)))
       const hooks = await hooksOf(deps, run.id, seat.name)
-      const screen = shouldReadScreen(live, hooks) ? await herdr.readScreen(deps.exec, herdr.agentTarget(run.id, seat), 40, 'visible') : undefined
+      const screen = shouldReadScreen(live, hooks, seat) ? await herdr.readScreen(deps.exec, herdr.agentTarget(run.id, seat), 40, 'visible') : undefined
       const sessionId = live?.sessionId ?? [...hooks].reverse().find(hook => hook.event === 'session-start' && hook.sessionId)?.sessionId
       return { seat, sessionId, derived: deriveState(seat, { herdr: live, hooks, ...(seat.lastReport ? { lastReport: seat.lastReport } : {}), ...(screen?.ok ? { screen: screen.value } : {}) }, now) }
     }),
@@ -329,6 +336,100 @@ export const refreshRoster = async (deps: Deps, run: RunMeta): Promise<void> => 
       return hit.sessionId && !next.sessionId ? { ...next, sessionId: hit.sessionId } : next
     }),
   }))
+}
+
+// ---------- cairn goal and ref checks ----------
+
+type CairnTask = { ref: string; title: string; status: string; body: string }
+type CairnRead = { task: CairnTask } | { missing: string } | { skipped: string }
+
+const CAIRN_CLOSED = ['done', 'cancelled']
+const PROJECT_RE = /^[A-Z][A-Z0-9]*$/
+
+const cairnJson = async (deps: Deps, argv: string[]): Promise<{ value: Record<string, unknown> } | { missing: string } | { skipped: string }> => {
+  try {
+    const ran = await deps.exec(['cairn', ...argv], { timeoutMs: 15_000 })
+    const output = `${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, '')
+    const gone = /^No (task|project) /m.exec(output)
+    if (gone) return { missing: clip(output) }
+    if (ran.code !== 0) return { skipped: `cairn exited ${ran.code}: ${clip(output)}` }
+    const value: unknown = JSON.parse(ran.stdout)
+    return value && typeof value === 'object' ? { value: value as Record<string, unknown> } : { skipped: 'cairn printed no JSON object' }
+  } catch (error) {
+    return { skipped: `cairn could not be run: ${messageOf(error)}` }
+  }
+}
+
+const textOf = (value: unknown): string => (typeof value === 'string' ? value : '')
+
+const readCairnTask = async (deps: Deps, ref: string): Promise<CairnRead> => {
+  const read = await cairnJson(deps, ['show', ref, '--full', '--json'])
+  if ('value' in read) return { task: { ref: textOf(read.value.ref) || ref, title: textOf(read.value.title), status: textOf(read.value.status), body: textOf(read.value.description) } }
+  return read
+}
+
+const checkSpawnCairn = async (deps: Deps, ref: string): Promise<{ error: CommandResult } | { note?: string }> => {
+  const read = await readCairnTask(deps, ref)
+  if ('missing' in read) return { error: failed('no-task', `Cairn task ${ref} does not exist (${read.missing}); pass an open task's ref`) }
+  if ('skipped' in read) return { note: `the Cairn task ${ref} was not checked (${read.skipped}).` }
+  if (CAIRN_CLOSED.includes(read.task.status)) return { error: failed('task-closed', `Cairn task ${ref} is ${read.task.status}; a worker needs an open task, so file one or reopen it`) }
+  return {}
+}
+
+type GoalTask = { ref: string; goal: string; prompt: string }
+
+const pickNextTask = async (deps: Deps, project: string): Promise<{ ref: string } | { error: CommandResult }> => {
+  if (!PROJECT_RE.test(project)) return { error: failed('usage', `--next takes a Cairn project key like DROVE; got "${project}"`) }
+  const read = await cairnJson(deps, ['next', '--project', project, '--json'])
+  if ('missing' in read) return { error: failed('no-task', `Cairn has no project ${project}`) }
+  if ('skipped' in read) return { error: failed('cairn', `could not ask Cairn for the next task in ${project}: ${read.skipped}`) }
+  const pick = read.value.pick
+  const ref = pick && typeof pick === 'object' ? textOf((pick as Record<string, unknown>).ref) : ''
+  return ref ? { ref } : { error: failed('no-task', `Cairn has no task to pick up in ${project}`) }
+}
+
+const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next'>): Promise<GoalTask | { error: CommandResult } | undefined> => {
+  if (request.cairn === undefined && request.next === undefined) return undefined
+  if (request.cairn !== undefined && request.next !== undefined) return { error: failed('usage', '--from-cairn and --next are exclusive') }
+  if (request.goal) return { error: failed('usage', '--goal cannot be combined with --from-cairn or --next: the goal is the task') }
+  let ref = request.cairn
+  if (request.next !== undefined) {
+    const picked = await pickNextTask(deps, request.next)
+    if ('error' in picked) return picked
+    ref = picked.ref
+  }
+  if (!ref || !CAIRN_RE.test(ref)) return { error: failed('usage', `--from-cairn must look like DROVE-5; got "${request.cairn ?? ''}"`) }
+  const read = await readCairnTask(deps, ref)
+  if ('missing' in read) return { error: failed('no-task', `Cairn task ${ref} does not exist (${read.missing})`) }
+  if ('skipped' in read) return { error: failed('cairn', `could not read Cairn task ${ref}: ${read.skipped}`) }
+  const { task } = read
+  if (CAIRN_CLOSED.includes(task.status)) return { error: failed('task-closed', `Cairn task ${ref} is ${task.status}; pick an open task`) }
+  if (!task.title) return { error: failed('cairn', `Cairn task ${ref} has no title to use as a goal`) }
+  return { ref, goal: `${ref}: ${task.title}`, prompt: cairnGoalPrompt(ref, task.title, task.body) }
+}
+
+const seatLine = (seat: Seat): string => {
+  const open = seat.state !== 'closed'
+  return `- ${seat.name} (${seat.kind}${seat.cairn ? `, ${seat.cairn}` : ''}): ${open ? `still open, ${seat.state}${seat.sessionId ? ', resumable' : ''}` : 'closed'}; branch ${seat.branch || 'none'}`
+}
+
+// DROVE-70: best effort; a run that comes down must never be held up by Cairn.
+const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[], at: string): Promise<string | undefined> => {
+  if (!run.cairn) return undefined
+  const open = seats.filter(seat => seat.state !== 'closed')
+  const lines = [
+    `Drove run ${run.id} was taken down at ${at}.`,
+    seats.length ? `Seats (${seats.length - open.length} closed, ${open.length} open):` : 'No seats were spawned.',
+    ...seats.map(seatLine),
+    open.length ? `Still open: ${open.map(seat => seat.cairn ?? seat.name).join(', ')}. Resume with \`drove up --run ${run.id}\`.` : 'Nothing is left open.',
+  ]
+  try {
+    const ran = await deps.exec(['cairn', 'note', run.cairn, lines.join('\n')], { timeoutMs: 15_000 })
+    if (ran.code === 0) return `Wrote a summary note on the goal task ${run.cairn}.`
+    return `Note: the summary note on ${run.cairn} was not written (cairn exited ${ran.code}: ${clip(`${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, ''))}).`
+  } catch (error) {
+    return `Note: the summary note on ${run.cairn} was not written (${messageOf(error)}).`
+  }
 }
 
 // ---------- plan ----------
@@ -346,12 +447,15 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const model = request.model ?? config.plannerModel[kind]
   const effort = request.effort ?? config.plannerEffort
   const sessionId = kind === 'claude' ? randomUUID() : undefined
+  const goalTask = await resolveGoalTask(deps, request)
+  if (goalTask && 'error' in goalTask) return goalTask.error
+  const goal = goalTask?.goal ?? request.goal
 
   let run: RunMeta
   if (request.run) {
     const existing = await loadRun(deps.home, request.run)
     if (!existing) return failed('no-run', `no run named ${request.run}`)
-    run = { ...existing, goal: request.goal ?? existing.goal, planner: { ...existing.planner, kind, paneId, model, effort, ...(sessionId ? { sessionId } : { sessionId: undefined }) } }
+    run = { ...existing, goal: goal ?? existing.goal, cairn: goalTask?.ref ?? existing.cairn, planner: { ...existing.planner, kind, paneId, model, effort, ...(sessionId ? { sessionId } : { sessionId: undefined }) } }
   } else {
     const base = await git.baseRef(deps.exec, repo).catch(() => undefined)
     if (!base) return failed('no-base', `no main or master branch found in ${repo}`)
@@ -363,7 +467,8 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
       hasRemote: await git.hasRemote(deps.exec, repo),
       createdAt: now.toISOString(),
       status: 'up',
-      ...(request.goal ? { goal: request.goal } : {}),
+      ...(goal ? { goal } : {}),
+      ...(goalTask ? { cairn: goalTask.ref } : {}),
       budget: config.budget,
       planner: { kind, paneId, model, effort, viaMod: false, ...(sessionId ? { sessionId } : {}) },
     }
@@ -378,7 +483,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     {
       identity, kind, repo, cwd: repo, model, effort,
       roleText: plannerRole(run, config, kind),
-      initialPrompt: request.goal ?? (kind === 'codex' ? SESSIONLESS_PROMPT : undefined),
+      initialPrompt: goalTask?.prompt ?? request.goal ?? (kind === 'codex' ? SESSIONLESS_PROMPT : undefined),
       channel: kind === 'claude' && config.claudeChannel,
       ...(sessionId ? { sessionId } : {}),
     },
@@ -386,7 +491,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   )
   const spec = specFor(launch)
   await writeLaunchFiles(spec)
-  return ok(`Run ${run.id} is up; starting the ${kind} planner.`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
+  return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on Cairn task ${goalTask.ref}` : ''}.`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
 }
 
 // ---------- spawn ----------
@@ -504,6 +609,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if ('error' in located) return located.error
   const { run } = located
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
+  const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn) : {}
+  if ('error' in cairnCheck) return cairnCheck.error
 
   const config = await loadConfig(deps.home)
   const now = deps.clock.now()
@@ -551,7 +658,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     }
   }
 
-  const baseNotes: string[] = []
+  const baseNotes: string[] = cairnCheck.note ? [cairnCheck.note] : []
   let claudeBase: string | undefined
   try {
     if (isClaude) {
@@ -583,6 +690,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const briefText = isBriefInline ? `${brief.trim()} ${footerText.trimStart()}` : `${brief}${footerText}`
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
+  await saveBrief(deps, run.id, seat.name, briefText)
   const extras = await launchExtrasOf(deps, run, config, seat)
   baseNotes.push(...missingMcpNote(seat, extras.missing))
   const spec = specFor(
@@ -989,8 +1097,9 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
   const plannerId = run.planner.sessionId ?? (await plannerSessionId(deps, run)) ?? (run.planner.paneId ? (await herdr.getAgent(deps.exec, run.planner.paneId).then(result => (result.ok ? result.value.sessionId : undefined))) : undefined)
   await saveRun(deps.home, { ...run, status: 'down', tabId: undefined, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } })
   await recordEvent(deps, run.id, { type: 'run.down', data: { saved, unsaved } })
+  const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString())
   return ok(
-    [`Run ${run.id} is down: ${saved.length} seat(s) saved for resume${saved.length ? ` (${saved.join(', ')})` : ''}.`, ...(unsaved.length ? [`No session id for ${unsaved.join(', ')}: they cannot be resumed.`] : []), `Resume with \`drove up --run ${run.id}\`.`].join(' '),
+    [`Run ${run.id} is down: ${saved.length} seat(s) saved for resume${saved.length ? ` (${saved.join(', ')})` : ''}.`, ...(unsaved.length ? [`No session id for ${unsaved.join(', ')}: they cannot be resumed.`] : []), `Resume with \`drove up --run ${run.id}\`.`, ...(cairnNote ? [cairnNote] : [])].join(' '),
     { saved, unsaved },
   )
 }

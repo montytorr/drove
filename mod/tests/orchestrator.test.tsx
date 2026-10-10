@@ -4,7 +4,7 @@ import type { Engine } from 'claude-code/testing'
 
 import type { RunMeta, Seat } from '../types'
 import { buildBoard, fixedRows, gauge, needsAnimation, progressOf } from '../hooks/board'
-import { backoffMs, feedOf, parseLine, splitLines, splitWake } from '../hooks/bridge'
+import { backoffMs, feedOf, parseLine, splitLines, splitWake, wakeHeadlines } from '../hooks/bridge'
 import { attachArgs, failureOf, guardStdin, guardVerdictOf, jsonResultOf, spawnArgs } from '../hooks/drove'
 import { UNVERIFIED, hmacSha256, locateEnvelope, macOf, parseEnvelope, raiseEffort, renderControl, shortModel, verifyEnvelope } from '../hooks/protocol'
 
@@ -132,6 +132,7 @@ describe('bridge stream', () => {
   test('a wake splits into one block per report', () => {
     const blocks = splitWake('[worker w-a · done · expects review]\nAll green\n→ Review it\n\n[worker w-b · question for the human · expects answer]\nWhich table?')
     expect(blocks.map(({ seat, kind }) => [seat, kind])).toEqual([['w-a', 'done'], ['w-b', 'question']])
+    expect(wakeHeadlines(blocks)).toBe('w-a · done · expects review\nw-b · question for the human · expects answer')
   })
 })
 
@@ -503,16 +504,34 @@ describe('orchestrator session', () => {
     expect(String((await callTool($, 'roster', {})).result)).toContain('w-auth working')
   })
 
-  test('a wake from the bridge becomes a prompt of its own; the roster feeds the pills', async ($, on) => {
+  test('a wake from the bridge becomes a prompt of its own: the person sees one line per report, the model also reads the reports in a hidden row; the roster feeds the pills', async ($, on) => {
     const { world, clock } = engine(on)
+    const session = mock.session(on)
     await $.session.start(START)
     await runCommand($, '')
     await settle(clock)
     await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
     world.submitted.length = 0
-    await emit(world, clock, { t: 'wake', text: '[worker w-auth · done · expects review]\nRate limiter added\n→ Review the work' })
-    expect(world.submitted).toEqual(['[worker w-auth · done · expects review]\nRate limiter added\n→ Review the work'])
-    expect(world.toasts).toContain('w-auth: done')
+    const wake = "[worker w-auth · done · expects review]\nRate limiter added\n→ Review the work\n\n[worker w-api · question for Cal · expects answer]\nWhich port?\n→ This decision is Cal's"
+    await emit(world, clock, { t: 'wake', text: wake })
+    const headlines = 'w-auth · done · expects review\nw-api · question for Cal · expects answer'
+    expect(world.submitted).toEqual([headlines])
+    expect(session.appended()).toHaveLength(0)
+    await $.turn.start({ text: `The orchestrator plugin sent a message: ${headlines}`, turnId: 't-wake' })
+    const rows = session.appended()
+    expect(rows).toHaveLength(1)
+    expect(rows[0]?.message.type).toBe('user')
+    expect(rows[0]?.door).toBe('note')
+    const hidden = JSON.stringify(rows[0]?.message.content)
+    expect(hidden).toContain(JSON.stringify(wake).slice(1, -1))
+    expect(hidden).toContain('The person sees only the headlines')
+    await $.turn.start({ text: headlines, turnId: 't-again' })
+    expect(session.appended()).toHaveLength(1)
+    await emit(world, clock, { t: 'wake', text: 'not a report block' })
+    expect(world.submitted.at(-1)).toBe('not a report block')
+    await $.turn.start({ text: 'not a report block', turnId: 't-plain' })
+    expect(session.appended()).toHaveLength(1)
+    expect(world.toasts).toContain('w-auth: done, w-api: question')
     const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'AbovePrompt', props: BAND_PROPS })
     expect((await ui.find({ type: 'Text', text: /orchestrator · 1\/5/ }))?.text).toContain('⌘')
     expect((await ui.find({ type: 'Text', text: /w-auth S·m/ }))?.text).toContain('⚙')

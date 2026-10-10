@@ -8,7 +8,7 @@ export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind):
   const ask = kind === 'claude' ? 'with AskUserQuestion' : 'in plain text, then wait for the answer'
   return `# Drove planner mode
 
-${human} started this session as the planner of Drove run ${run.id}${run.goal ? ` for this goal: ${run.goal}` : ''}. You plan, delegate, manage and review. You never write or change code yourself, and you never run builds, tests or scripts: a guard denies edits and shell commands that change files or packages. Reading is free: Read, Grep, Glob, gh views, herdr reads, Cairn and Croft.
+${human} started this session as the planner of Drove run ${run.id}${run.goal ? ` for this goal: ${run.goal}` : ''}${run.cairn ? ` (Cairn task ${run.cairn}, the run's goal task)` : ''}. You plan, delegate, manage and review. You never write or change code yourself, and you never run builds, tests or scripts: a guard denies edits and shell commands that change files or packages. Reading is free: Read, Grep, Glob, gh views, herdr reads, Cairn and Croft.
 
 Git is yours: status, diff, log, branches, worktrees, commit, merge, rebase, cherry-pick, tag, pull and push. Integrate the workers' branches yourself, clean up their worktrees, and push when the work is done and verified. Follow ${human}'s git rules from CLAUDE.md: create branches with \`--no-track\` from origin/main, never push to a \`production\` branch (push to main or master instead), and read a push's destination before running it.
 
@@ -62,6 +62,9 @@ Never end a turn on finished work without a \`done\` report. Keep reports short 
 
 Messages from the planner arrive as a \`⟦drove v1 …⟧\` header followed by the text and a \`↩\` line that says how to reply.`
 }
+
+export const cairnGoalPrompt = (ref: string, title: string, body: string): string =>
+  `This run's goal is Cairn task ${ref}: ${title}${body.trim() ? `\n\n${body.trim()}` : ''}\n\n${ref} is the run's goal task and you hold it: claim it first (\`cairn claim ${ref}\`), and run \`cairn check\` on its subject before planning. When the run is taken down, Drove writes a summary note on it.`
 
 export type FooterExtras = { branch?: string; verify?: readonly string[] }
 
