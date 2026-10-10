@@ -117,6 +117,12 @@ test('a seat missing from the herdr list is gone, with the one-step fix', () => 
   assert.match(derived.attention[0]?.detail ?? '', /drove up --seat w-api/)
 })
 
+test('an idle seat with no herdr agent is gone', () => {
+  const derived = detect.deriveState(seatOf({ state: 'idle' }), { hooks: [] }, NOW)
+  assert.equal(derived.state, 'gone')
+  assert.equal(derived.attention[0]?.reason, 'gone')
+})
+
 test('a starting seat that herdr does not list yet stays starting', () => {
   assert.equal(detect.deriveState(seatOf({ state: 'starting' }), { hooks: [] }, NOW).state, 'starting')
 })

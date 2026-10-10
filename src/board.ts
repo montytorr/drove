@@ -87,6 +87,7 @@ const reportOf = (seat: Seat): string => (seat.lastReport === undefined ? '-' : 
 
 const eventDetail = (event: DroveEvent): string => {
   const data = event.data ?? {}
+  if (event.type === 'seat.relaunch') return data.ok === false ? `relaunch failed: ${String(data.error ?? '')}` : `relaunched${data.resumed ? ' (resumed)' : ''}`
   const pick = ['summary', 'reason', 'state', 'kind', 'to'].map((key) => data[key]).find((value) => typeof value === 'string')
   return typeof pick === 'string' ? pick : ''
 }

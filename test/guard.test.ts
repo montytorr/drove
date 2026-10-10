@@ -156,6 +156,17 @@ test('planner may codex queue only to an open seat (by name or thread id)', () =
   assert.match(planner('codex') ?? '', /another codex session/)
 })
 
+test('worker may run claude plugin test; everything else claude stays denied', () => {
+  for (const command of ['claude plugin test mod', 'claude plugin test', '~/.local/bin/claude plugin test mod', '/Users/x/.local/bin/claude plugin test mod', 'cd x && claude plugin test mod']) {
+    assert.equal(worker(command), undefined, command)
+  }
+  for (const command of ['claude', 'claude -p hi', 'claude --resume x', 'claude plugin install foo', 'claude plugin', 'claude plugin test mod extra', 'claude plugin test --dangerously-skip-permissions', 'codex plugin test mod', '~/.local/bin/claude -p hi']) {
+    assert.ok(worker(command), command)
+  }
+  assert.match(planner('claude plugin test mod') ?? '', /another claude session/)
+  assert.match(planner('~/.local/bin/claude plugin test mod') ?? '', /another claude session|executes a script/)
+})
+
 test('claude and codex allow --help and --version for everyone', () => {
   for (const command of ['claude --help', 'claude --version', 'claude -v', 'codex --help', 'codex -V', 'codex queue --help', 'claude mcp add --help']) {
     assert.deepEqual([command, planner(command)], [command, undefined])

@@ -199,8 +199,12 @@ const herdrReason = (words: readonly string[], scope: Scope): string | undefined
   return `herdr ${group} ${action} changes panes or agents: use the drove tools, which keep the roster and the pane budget`
 }
 
+const isPluginTest = (words: readonly string[]): boolean =>
+  words[1] === 'plugin' && words[2] === 'test' && words.length <= 4 && !(words[3] ?? '').startsWith('-')
+
 const sessionReason = (head: 'claude' | 'codex', words: readonly string[], scope: Scope): string | undefined => {
   if (isHelpOrVersion(words)) return undefined
+  if (head === 'claude' && scope.role === 'worker' && isPluginTest(words)) return undefined
   if (head === 'codex' && scope.role === 'planner' && words[1] === 'queue') {
     const thread = optionValue(words, '--thread')
     return thread !== undefined && scope.seats.includes(thread) ? undefined : `codex queue to ${thread ?? '<no thread>'}: that is not an open seat of this run`

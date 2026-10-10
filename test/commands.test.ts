@@ -7,6 +7,7 @@ import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
 import { agentName } from '../src/herdr.ts'
 import { seatDir } from '../src/paths.ts'
+import { deriveState } from '../src/detect.ts'
 import { approvedText } from '../src/prompts.ts'
 import { loadRoster, loadRun, updateRoster } from '../src/roster.ts'
 import type { Deps, Identity, RunMeta } from '../src/types.ts'
@@ -620,6 +621,22 @@ test('promote on a codex worker quits with /quit and resumes the thread', async 
   assert.ok(argv.includes('model_reasoning_effort="xhigh"'))
 })
 
+test('a codex promote marks the seat starting before the agent stops, so the restart window never reads gone', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-cx', kind: 'codex', brief })
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, lastReport: { id: 'r-1', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })) }))
+  let seen: { state?: string; derived?: string; attention?: number; agents?: number } = {}
+  fake.onStart = async () => {
+    const seat = (await loadRoster(deps.home, RUN)).seats[0]
+    const derived = seat ? deriveState(seat, { hooks: [] }, deps.clock.now()) : undefined
+    seen = { state: seat?.state, derived: derived?.state, attention: derived?.attention.length, agents: fake.agents.size }
+  }
+  const promoted = await commands.promote(deps, identity, { seat: 'w-cx', model: 'gpt-big', effort: 'xhigh' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.deepEqual(seen, { state: 'starting', derived: 'starting', attention: 0, agents: 0 })
+})
+
 test('promote mid-turn is queued until the seat is idle, not restarted', async () => {
   const { fake, deps, identity } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
@@ -766,6 +783,15 @@ test('up --seat relaunches only a dead seat, and refuses a live one or one with 
   const none = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-x')
   assert.equal(!none.ok && none.code, 'relaunch')
   assert.match(none.text, /no saved session id/)
+  const events = (await readEvents(deps)).filter(item => item.type === 'seat.relaunch')
+  assert.equal(events.length, 2)
+  assert.equal(events[0]?.seat, 'w-a')
+  assert.equal(events[0]?.data?.ok, true)
+  assert.equal(events[0]?.data?.resumed, true)
+  assert.ok(events[0]?.data?.pane)
+  assert.equal(events[1]?.seat, 'w-x')
+  assert.equal(events[1]?.data?.ok, false)
+  assert.match(String(events[1]?.data?.error), /no saved session id/)
 })
 
 const settleSeat = async (deps: Deps, fake: FakeHerdr, name: string) => {
