@@ -183,7 +183,7 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
     await appendJsonl(sentFile(deps, run, seat.name), { id: control.id, via: delivery.via, at: sentAt } satisfies Sent)
     if (control.expects !== 'none' || isReplyToOpenAsk(seat, control)) await updateRoster(deps.home, run, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? { ...entry, lastSentAt: sentAt } : entry)) }))
     const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
-    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
+    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
     attempts.delete(control.id)
   }
   return delivery
