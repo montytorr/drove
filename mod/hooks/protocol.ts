@@ -44,6 +44,19 @@ export const goalFromPrompt = (text: string): string | undefined => {
   return oneLine(first, GOAL_MAX)
 }
 
+// `/orchestrate --repo <dir> [goal]`: the repo to attach to, then the goal. The dir may be quoted; `--repo=<dir>` also works.
+export type RepoFlag = { repo: string; goal: string } | { error: string }
+
+export const repoFlagOf = (args: string): RepoFlag | undefined => {
+  const match = /^--repo(?:=|\s+|$)([\s\S]*)$/.exec(args)
+  if (!match) return undefined
+  const rest = (match[1] ?? '').trim()
+  const quoted = /^(?:"([^"]+)"|'([^']+)')\s*([\s\S]*)$/.exec(rest)
+  const repo = quoted ? (quoted[1] ?? quoted[2] ?? '') : (/^(\S+)/.exec(rest)?.[1] ?? '')
+  if (!repo) return { error: '`/orchestrate --repo <dir> [goal]` needs the repository directory.' }
+  return { repo, goal: (quoted ? (quoted[3] ?? '') : rest.slice(repo.length)).trim() }
+}
+
 // ---------- Drove control envelopes (src/protocol.ts formatControl), as a Claude worker receives them ----------
 
 export const DROVE_OPEN = '⟦drove v1'

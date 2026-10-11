@@ -6,7 +6,7 @@ import type { RunMeta, Seat } from '../types'
 import { buildBoard, fixedRows, gauge, needsAnimation, progressOf } from '../hooks/board'
 import { HEADLINE_SUMMARY_MAX, backoffMs, feedOf, parseLine, splitLines, splitWake, wakeHeadlines } from '../hooks/bridge'
 import { attachArgs, failureOf, guardStdin, guardVerdictOf, jsonResultOf, spawnArgs } from '../hooks/drove'
-import { UNVERIFIED, hmacSha256, locateEnvelope, macOf, parseEnvelope, raiseEffort, renderControl, shortModel, verifyEnvelope } from '../hooks/protocol'
+import { UNVERIFIED, hmacSha256, locateEnvelope, macOf, parseEnvelope, raiseEffort, renderControl, repoFlagOf, shortModel, verifyEnvelope } from '../hooks/protocol'
 
 const NOW = Date.parse('2026-10-06T10:00:00Z')
 const ISO = new Date(NOW).toISOString()
@@ -235,6 +235,11 @@ type World = {
   bridge: { push: (text: string | null) => void }
   bridgeCode: number
   store: Map<string, unknown>
+  cwd: string
+  root: string
+  repoRoot: string | null
+  submitFailures: number
+  submitFailure: 'throw' | 'drop'
 }
 
 const channel = () => {
@@ -274,7 +279,10 @@ const fakeDrove = (world: World, call: Call) => {
   if (command === 'mod' && action === 'attach') {
     const at = call.args.indexOf('--goal')
     const budget = call.args.indexOf('--budget')
-    return ok(JSON.stringify({ ok: true, text: `Run ${RUN} is up`, data: { run: runMeta({ ...(at > 0 ? { goal: call.args[at + 1] } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}) }) } }))
+    const repo = call.cwd ?? '/work/repo'
+    if (repo.startsWith('/work/plain')) return ok(JSON.stringify({ ok: false, code: 'not-a-repo', text: `${repo} is not inside a git repository` }), 1)
+    const id = repo === '/work/repo' || call.args.includes('--run') ? RUN : `${repo.split('/').at(-1)}-20261006-1000-abcd`
+    return ok(JSON.stringify({ ok: true, text: `Run ${id} is up`, data: { run: runMeta({ id, ...(call.args.includes('--run') ? {} : { repo }), ...(at > 0 ? { goal: call.args[at + 1] } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}) }) } }))
   }
   if (command === 'mod' && action === 'report') return ok(JSON.stringify({ ok: true, text: 'report r-1 recorded (done, expects review).' }))
   if (command === 'guard') {
@@ -303,6 +311,7 @@ const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HER
   const world: World = {
     registeredTools: [], toolSchemas: {}, commands: [], calls: [], spawned: [], submitted: [], asked: [], toasts: [], stepped: [], files: {},
     answer: 'Open it', isOverBudget: false, isGuardBroken: false, bridge, bridgeCode: 0, store: new Map(Object.entries(stored)),
+    cwd: '/work/repo', root: '/work/repo', repoRoot: '/work/repo', submitFailures: 0, submitFailure: 'drop',
   }
   const clock = mock.clock(on, { now: NOW })
   mock.env(on, env)
@@ -313,11 +322,21 @@ const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HER
   const panes = new Set<string>()
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: env.DROVE_ROLE === 'worker' ? 's-auth' : SELF }))
-  on('session.cwd', () => ({ value: '/work/repo' }))
+  on('session.cwd', () => ({ value: world.cwd }))
+  on('session.root', () => ({ value: world.root }))
+  on('session.repo', () => ({ value: world.repoRoot ? { root: world.repoRoot, remote: null, internal: false, name: null } : null }) as never)
   on('tool.register', ($, e) => (world.registeredTools.push(e.name), (world.toolSchemas[e.name] = e), { value: { tool: `mcp__orchestrator__${e.name}` } }))
   on('command.register', ($, e) => (world.commands.push(e.name), { value: { command: e.name } }))
   on('ui.toast', ($, e) => (world.toasts.push(e.text), { value: undefined }))
-  on('prompt.submit', ($, e) => (world.submitted.push(e.text), { text: e.text, context: e.context ?? [] }))
+  on('prompt.submit', ($, e) => {
+    if (world.submitFailures > 0 && e.origin.kind === 'plugin') {
+      world.submitFailures -= 1
+      if (world.submitFailure === 'throw') throw new Error('the engine refused the prompt')
+      return { drop: 'another hook refused it' }
+    }
+    world.submitted.push(e.text)
+    return { text: e.text, context: e.context ?? [] }
+  })
   on('turn.start', ($, e) => ({ turnId: e.turnId }))
   on('turn.step', async function* ($, e) {
     world.stepped.push({ model: e.model, effort: e.effort })
@@ -447,7 +466,9 @@ describe('orchestrator session', () => {
     const sections = (await compose()).sections
     expect(sections.map(({ id }) => id)).toEqual(['intro', 'orchestrator:role'])
     expect(sections[1]?.text).toContain('Ship it')
-    expect(sections[1]?.text).toContain(RUN)
+    expect(sections[1]?.text).toContain(`Drove run ${RUN} on /work/repo`)
+    expect(sections[1]?.text).toContain('`drove init <dir>`')
+    expect(sections[1]?.text).toContain('`/orchestrate --repo <dir>`')
     expect(sections[1]?.text).toContain('kind: codex')
     expect(sections[1]?.text).toContain('the human switched this session into orchestrator mode')
     expect(sections[1]?.text).toContain('A wake shows one line per worker report')
@@ -617,6 +638,68 @@ describe('orchestrator session', () => {
     await ui.unmount()
   })
 
+  test('a wake the engine refuses is retried once, then toasted and sent ahead of the next prompt you type; a wake that fails once just lands', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 })
+    world.submitted.length = 0
+
+    world.submitFailures = 1
+    world.submitFailure = 'throw'
+    await emit(world, clock, { t: 'wake', text: 'first report' })
+    await clock.advance(2_000)
+    await settle(clock)
+    expect(world.submitted).toEqual(['first report'])
+    expect(world.toasts.filter(text => text.includes('could not be delivered'))).toHaveLength(0)
+
+    world.submitted.length = 0
+    world.submitFailures = 4
+    world.submitFailure = 'drop'
+    await emit(world, clock, { t: 'wake', text: 'second report' })
+    await emit(world, clock, { t: 'wake', text: 'third report' })
+    await clock.advance(2_000)
+    await settle(clock)
+    expect(world.submitted).toEqual([])
+    expect(world.toasts.filter(text => text.includes('could not be delivered'))).toEqual(['Drove: a worker report could not be delivered to the planner (another hook refused it). Press Enter to receive it.'])
+    await $.prompt.submit({ text: 'what is the state?', wait: false, origin: { kind: 'composer' } } as never)
+    await $.prompt.submit({ text: 'and now?', wait: false, origin: { kind: 'composer' } } as never)
+    expect(world.submitted).toEqual(['second report\n\nthird report\n\nwhat is the state?', 'and now?'])
+    expect(world.store.get(`drove:session:${SELF}`)).not.toHaveProperty('pendingWakes')
+  })
+
+  test('a goal or report left pending by a reload or a restart is toasted on restore and goes with the next prompt', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    expect(world.store.get(`drove:session:${SELF}`)).toMatchObject({ pendingGoal: 'Ship it' })
+    // A hot reload cancels the timer that would have sent the goal and runs session.start again; the atom outlives it.
+    await $.session.start(START)
+    expect(world.toasts).toContain('Drove: the goal was not sent to the planner. Press Enter (or type anything) to start.')
+    await $.prompt.submit({ text: 'go on', wait: false, origin: { kind: 'composer' } } as never)
+    expect(world.submitted).toEqual(['Ship it\n\ngo on'])
+    await clock.advance(5_000)
+    await settle(clock)
+    expect(world.submitted).toEqual(['Ship it\n\ngo on'])
+    expect(world.store.get(`drove:session:${SELF}`)).not.toHaveProperty('pendingGoal')
+  })
+
+  test('a pending goal and reports saved in the store are restored by a restarted session', async ($, on) => {
+    const { world } = engine(on, undefined, {
+      [`drove:session:${SELF}`]: { run: RUN, goal: 'Ship it', startedAt: NOW, savedAt: NOW, pendingGoal: 'Ship it', pendingWakes: ['w-auth · done · expects review — Rate limiter added'] },
+    })
+    await $.session.start(START)
+    expect(world.toasts).toEqual(expect.arrayContaining([
+      'Drove: the goal was not sent to the planner. Press Enter (or type anything) to start.',
+      'Drove: a worker report could not be delivered to the planner. Press Enter to receive it.',
+    ]))
+    await $.prompt.submit({ text: '', wait: false, origin: { kind: 'composer' } } as never)
+    expect(world.submitted).toEqual(['Ship it\n\nw-auth · done · expects review — Rate limiter added'])
+    expect(world.store.get(`drove:session:${SELF}`)).not.toHaveProperty('pendingGoal')
+    expect(world.store.get(`drove:session:${SELF}`)).not.toHaveProperty('pendingWakes')
+  })
+
   test('without a goal, the first prompt you type becomes the goal', async ($, on) => {
     engine(on)
     await $.session.start(START)
@@ -675,6 +758,174 @@ describe('orchestrator session', () => {
     expect(world.spawned).toHaveLength(1)
     expect(world.toasts.some(text => text.includes('old orchestrator mod') && text.includes('1 open worker'))).toBe(true)
     expect(world.store.has(`session:${SELF}`)).toBe(false)
+  })
+
+  test('a goal the engine refuses is retried once, then toasted and sent with the next prompt you type', async ($, on) => {
+    const { world, clock } = engine(on)
+    world.submitFailures = 2
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await settle(clock)
+    expect(world.toasts.filter(text => text.includes('the goal was not sent'))).toHaveLength(0)
+    await clock.advance(2_000)
+    await settle(clock)
+    expect(world.submitted).toEqual([])
+    expect(world.toasts).toContain('Drove: the goal was not sent to the planner (another hook refused it). Press Enter (or type anything) to start.')
+    await $.prompt.submit({ text: '/orchestrate status', wait: false, origin: { kind: 'composer' } } as never)
+    expect(world.submitted).toEqual(['/orchestrate status'])
+    await $.prompt.submit({ text: 'and keep it simple', wait: false, origin: { kind: 'composer' } } as never)
+    await $.prompt.submit({ text: 'one more thing', wait: false, origin: { kind: 'composer' } } as never)
+    expect(world.submitted).toEqual(['/orchestrate status', 'Ship it\n\nand keep it simple', 'one more thing'])
+  })
+
+  test('a goal that fails once is sent by the retry, with no toast; an empty Enter sends one that failed twice', async ($, on) => {
+    const { world, clock } = engine(on)
+    world.submitFailures = 1
+    world.submitFailure = 'throw'
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await settle(clock)
+    await clock.advance(2_000)
+    await settle(clock)
+    expect(world.submitted).toEqual(['Ship it'])
+    expect(world.toasts.filter(text => text.includes('the goal was not sent'))).toHaveLength(0)
+
+    world.submitFailures = 2
+    await runCommand($, 'Ship it again')
+    await settle(clock)
+    await clock.advance(2_000)
+    await settle(clock)
+    expect(world.toasts.filter(text => text.startsWith('Drove: the goal was not sent to the planner (') && text.endsWith('). Press Enter (or type anything) to start.'))).toHaveLength(1)
+    await $.prompt.submit({ text: '  ', wait: false, origin: { kind: 'composer' } } as never)
+    expect(world.submitted).toEqual(['Ship it', 'Ship it again'])
+  })
+
+  test('the on-message and the planner context name the repo', async ($, on) => {
+    engine(on)
+    await $.session.start(START)
+    const ran = (await runCommand($, 'Ship it')) as { text: string; context: string[] }
+    expect(ran.text).toContain(`Orchestrator mode is on: Drove run ${RUN} on \`/work/repo\`,`)
+    expect(ran.context[0]).toContain('on `/work/repo`')
+    expect(((await runCommand($, 'status')) as { text: string }).text).toContain(`Drove run ${RUN} on /work/repo`)
+  })
+
+  test('a cwd that left where the session started asks before attaching: attach goes ahead, cancel turns nothing on', async ($, on) => {
+    const { world } = engine(on)
+    world.root = '/home/cal'
+    await $.session.start(START)
+    world.answer = 'Cancel'
+    const cancelled = (await runCommand($, 'Ship it')) as { text: string }
+    expect(world.asked).toEqual(['Attach to `/work/repo`? This session started in `/home/cal`.'])
+    expect(cancelled.text).toContain('was not turned on')
+    expect(cancelled.text).toContain('`/home/cal`')
+    expect(cancelled.text).toContain('`/orchestrate --repo <dir> <goal>`')
+    expect(droveCalls(world, 'mod')).toHaveLength(0)
+    expect(world.registeredTools).toEqual([])
+
+    world.answer = 'Attach'
+    const attached = (await runCommand($, 'Ship it')) as { text: string }
+    expect(world.asked).toHaveLength(2)
+    expect(attached.text).toContain(`Drove run ${RUN} on \`/work/repo\``)
+    expect(droveCalls(world, 'mod')[0]?.cwd).toBe('/work/repo')
+  })
+
+  test('no ask when the session started inside the repo its cwd resolves to, or when the cwd is in no repo', async ($, on) => {
+    const { world } = engine(on)
+    world.cwd = '/work/repo/src'
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    expect(world.asked).toEqual([])
+    expect(droveCalls(world, 'mod')[0]?.cwd).toBe('/work/repo/src')
+    await runCommand($, 'off')
+
+    world.root = '/home/cal'
+    world.cwd = '/work/plain'
+    world.repoRoot = null
+    const ran = (await runCommand($, 'Ship it')) as { text: string }
+    expect(world.asked).toEqual([])
+    expect(ran.text).toContain('could not start')
+    expect(ran.text).toContain('not-a-repo')
+    expect(ran.text).toContain('`/orchestrate --repo <dir> <goal>`')
+  })
+
+  test('/orchestrate --repo <dir> attaches there without asking, resolving a relative dir against where the session started', async ($, on) => {
+    const { world, clock } = engine(on)
+    world.root = '/home/cal'
+    await $.session.start(START)
+    const ran = (await runCommand($, '--repo /work/other Ship it')) as { text: string; context: string[] }
+    expect(world.asked).toEqual([])
+    const [attach] = droveCalls(world, 'mod')
+    expect(attach?.cwd).toBe('/work/other')
+    expect(attach?.args).toEqual(expect.arrayContaining(['--goal', 'Ship it']))
+    expect(ran.text).toContain('Drove run other-20261006-1000-abcd on `/work/other`')
+    expect(ran.context[0]).toContain('on `/work/other`')
+    await settle(clock)
+    expect(world.submitted).toEqual(['Ship it'])
+    await runCommand($, 'off')
+
+    await runCommand($, '--repo="~/proj"')
+    await runCommand($, 'off')
+    await runCommand($, "--repo 'my repo'")
+    await runCommand($, 'off')
+    await runCommand($, '--repo rel/dir')
+    expect(droveCalls(world, 'mod').map(({ cwd }) => cwd)).toEqual(['/work/other', '/Users/test/proj', '/home/cal/my repo', '/home/cal/rel/dir'])
+  })
+
+  test('--repo with the mode on switches to the other repo when no worker is open, and keeps the budget', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await settle(clock)
+    expect(world.spawned).toHaveLength(1)
+    const ran = (await runCommand($, '--repo /work/other')) as { text: string }
+    expect(ran.text).toContain('Drove run other-20261006-1000-abcd on `/work/other`')
+    expect(ran.text).toContain(`Switched from run ${RUN} on \`/work/repo\``)
+    expect(ran.text).toContain('Give it a goal in your next prompt.')
+    const attach = droveCalls(world, 'mod').at(-1)
+    expect(attach?.cwd).toBe('/work/other')
+    expect(attach?.args).toEqual(expect.arrayContaining(['--budget', '5']))
+    await settle(clock)
+    expect(world.spawned.map(argv => argv[argv.indexOf('--run') + 1])).toEqual([RUN, 'other-20261006-1000-abcd'])
+    expect(((await runCommand($, 'status')) as { text: string }).text).toContain('Drove run other-20261006-1000-abcd on /work/other')
+    expect(world.store.get(`drove:session:${SELF}`)).toMatchObject({ run: 'other-20261006-1000-abcd' })
+    expect(((await runCommand($, '--repo /work/repo')) as { text: string }).text).toContain(`Drove run ${RUN} on \`/work/repo\``)
+  })
+
+  test('--repo with the mode on refuses while a worker is open; the same repo is only a re-attach; a non-repo changes nothing', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await settle(clock)
+    await emit(world, clock, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    const calls = droveCalls(world, 'mod').length
+    const refused = (await runCommand($, '--repo /work/other')) as { text: string }
+    expect(refused.text).toContain('1 open worker(s) (w-auth)')
+    expect(refused.text).toContain('will not switch to /work/other')
+    expect(droveCalls(world, 'mod')).toHaveLength(calls)
+    expect(world.spawned).toHaveLength(1)
+
+    await emit(world, clock, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat({ state: 'closed' })], updatedAt: ISO }, status: {} })
+    expect(((await runCommand($, '--repo /work/repo')) as { text: string }).text).toContain(`already on (Drove run ${RUN} on \`/work/repo\`)`)
+    const failed = (await runCommand($, '--repo /work/plain/new')) as { text: string }
+    expect(failed.text).toContain('could not switch')
+    expect(failed.text).toContain('not-a-repo')
+    expect(((await runCommand($, 'status')) as { text: string }).text).toContain(`Drove run ${RUN} on /work/repo`)
+    expect(world.spawned).toHaveLength(1)
+  })
+
+  test('--repo with no dir, and help, list the forms', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    const bare = (await runCommand($, '--repo')) as { text: string }
+    expect(bare.text).toContain('needs the repository directory')
+    expect(bare.text).toContain('/orchestrate --repo <dir> [goal]')
+    expect(((await runCommand($, 'help')) as { text: string }).text).toContain('`/orchestrate --repo <dir> [goal]`')
+    expect(droveCalls(world, 'mod')).toHaveLength(0)
+    expect(repoFlagOf('--repo /a/b  fix the thing')).toEqual({ repo: '/a/b', goal: 'fix the thing' })
+    expect(repoFlagOf('--repo=/a/b')).toEqual({ repo: '/a/b', goal: '' })
+    expect(repoFlagOf('--repo "/a b/c" go')).toEqual({ repo: '/a b/c', goal: 'go' })
+    expect(repoFlagOf('--repository x')).toBeUndefined()
+    expect(repoFlagOf('fix --repo x')).toBeUndefined()
   })
 
   test('off asks, stops the workers with drove down on yes, and forgets the run', async ($, on) => {

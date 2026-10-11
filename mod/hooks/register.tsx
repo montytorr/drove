@@ -8,7 +8,7 @@ import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toast
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
 import { type LeanSpawnTrims, modelNotice, orchestratorSection, workerModelSection } from './prompts'
-import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, goalFromPrompt, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
+import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, goalFromPrompt, oneLine, raiseEffort, renderControl, repoFlagOf, shortModel, verifyEnvelope } from './protocol'
 import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
 
 const STORE_PREFIX = 'drove:session:'
@@ -39,7 +39,11 @@ const frameAtom = atom({ plugin: 'orchestrator', key: 'frame' } as const, 0)
 const boardBgAtom = atom({ plugin: 'orchestrator', key: 'boardBg' } as const, true)
 const scrollAtom = atom({ plugin: 'orchestrator', key: 'scrollBack' } as const, 0)
 const expandedAtom = atom({ plugin: 'orchestrator', key: 'expanded' } as const, null)
+const pendingGoalAtom = atom({ plugin: 'orchestrator', key: 'pendingGoal' } as const, null)
+const pendingWakesAtom = atom({ plugin: 'orchestrator', key: 'pendingWakes' } as const, [] as string[])
 let feedCount = 0
+const RETRY_MS = 2_000
+const PENDING_WAKES_MAX = 20
 const FULL_MAX = 4000
 const BOARD_BG = '#1e1e2e'
 const FRAME_MS = 250
@@ -244,9 +248,18 @@ const dropBody = (key: string) => bodies.set(key, (bodies.get(key) ?? []).slice(
 
 const persist = async ($: EngineInterface) => {
   try {
-    const [orchestrator, sessionId, now] = await Promise.all([read($, orchestratorAtom), $.session.id(), $.clock.now()])
+    const [orchestrator, pendingGoal, pendingWakes, sessionId, now] = await Promise.all([read($, orchestratorAtom), read($, pendingGoalAtom), read($, pendingWakesAtom), $.session.id(), $.clock.now()])
     const key = `${STORE_PREFIX}${sessionId}`
-    if (orchestrator) await $.store.set(key, { run: orchestrator.run, goal: orchestrator.goal, startedAt: orchestrator.startedAt, savedAt: now })
+    if (orchestrator) {
+      await $.store.set(key, {
+        run: orchestrator.run,
+        goal: orchestrator.goal,
+        startedAt: orchestrator.startedAt,
+        savedAt: now,
+        ...(pendingGoal ? { pendingGoal } : {}),
+        ...(pendingWakes.length > 0 ? { pendingWakes } : {}),
+      })
+    }
     else await $.store.delete(key)
   } catch {
     // persistence is best effort: the run itself lives in Drove's state
@@ -636,9 +649,7 @@ const onBridgeLine = async ($: EngineInterface, line: BridgeLine) => {
   // A wake is submitted as one line per report, all the person sees and all the model gets: a row appended at turn.start lands after the
   // turn's request is built, so the planner reads the full reports with read_reports.
   const text = blocks.length > 0 ? wakeHeadlines(blocks) : wake
-  soon($, 0, async () => {
-    await $.prompt.submit({ text })
-  })
+  await sendWake($, text)
 }
 
 const superviseBridge = async ($: EngineInterface, run: string, epoch: number) => {
@@ -724,6 +735,8 @@ const clearOrchestration = async ($: EngineInterface) => {
   await update($, scrollAtom, () => 0)
   await update($, expandedAtom, () => null)
   await update($, leadAtom, () => null)
+  await update($, pendingGoalAtom, () => null)
+  await update($, pendingWakesAtom, () => [])
   await persist($)
 }
 
@@ -900,8 +913,9 @@ const closeBoard = async ($: EngineInterface) => {
 
 type Attached = { ok: true; run: RunMeta } | { ok: false; text: string }
 
-const attachRun = async ($: EngineInterface, input: { goal?: string; run?: string; budget?: number }): Promise<Attached> => {
-  const [sessionId, paneId, cwd, home] = await Promise.all([$.session.id(), herdrPane($), $.session.cwd(), droveHome($)])
+const attachRun = async ($: EngineInterface, input: { goal?: string; run?: string; budget?: number; cwd?: string }): Promise<Attached> => {
+  const [sessionId, paneId, sessionCwd, home] = await Promise.all([$.session.id(), herdrPane($), $.session.cwd(), droveHome($)])
+  const cwd = input.cwd ?? sessionCwd
   const ran = await runDrove(
     $,
     drove.attachArgs({ sessionId, paneId, goal: input.goal, model: config.orchestratorModel, effort: config.orchestratorEffort, budget: input.budget, run: input.run }),
@@ -921,7 +935,7 @@ const restore = async ($: EngineInterface) => {
       $.ui.toast(`An orchestration from the old orchestrator mod was found for this session; its ${open} open worker(s) were not adopted (they use the retired protocol). Close their panes by hand.`, { timeoutMs: 20_000 })
       await $.store.delete(`${LEGACY_PREFIX}${sessionId}`)
     }
-    const saved = (await $.store.get(`${STORE_PREFIX}${sessionId}`)) as { run?: string; goal?: string; startedAt?: number } | undefined
+    const saved = (await $.store.get(`${STORE_PREFIX}${sessionId}`)) as { run?: string; goal?: string; startedAt?: number; pendingGoal?: string; pendingWakes?: string[] } | undefined
     if (!saved?.run) return
     const attached = await attachRun($, { run: saved.run })
     if (!attached.ok) {
@@ -942,6 +956,18 @@ const restore = async ($: EngineInterface) => {
     await registerOrchestratorTools($)
     await openBoard($)
     startBridge($, attached.run.id)
+    // A prompt set pending before this load never finished (the process ended, or a hot reload cancelled its timer): the person's next prompt carries it.
+    const pendingGoal = (await read($, pendingGoalAtom)) ?? (typeof saved.pendingGoal === 'string' ? saved.pendingGoal : null)
+    const atomWakes = await read($, pendingWakesAtom)
+    const pendingWakes = atomWakes.length > 0 ? atomWakes : stringsOf(saved.pendingWakes) ?? []
+    if (pendingGoal) {
+      await update($, pendingGoalAtom, () => pendingGoal)
+      $.ui.toast(`Drove: the goal was not sent to the planner. Press Enter (or type anything) to start.`, { timeoutMs: 15_000 })
+    }
+    if (pendingWakes.length > 0) {
+      await update($, pendingWakesAtom, () => pendingWakes)
+      $.ui.toast(`Drove: a worker report could not be delivered to the planner. Press Enter to receive it.`, { timeoutMs: 15_000 })
+    }
   } catch {
     // nothing saved
   }
@@ -952,42 +978,190 @@ const statusText = async ($: EngineInterface): Promise<string> => {
   if (!orchestrator) return 'Orchestrator mode is off. `/orchestrate <goal>` turns it on.'
   const roster = await plannerRun($, drove.rosterArgs(orchestrator.run))
   return [
-    `Orchestrator mode is on · Drove run ${orchestrator.run}${orchestrator.goal ? ` · goal: ${orchestrator.goal}` : ''} · bridge ${bridge?.state ?? 'not started'}${bridge?.detail ? ` (${bridge.detail})` : ''}.`,
+    `Orchestrator mode is on · Drove run ${orchestrator.run} on ${orchestrator.repo}${orchestrator.goal ? ` · goal: ${orchestrator.goal}` : ''} · bridge ${bridge?.state ?? 'not started'}${bridge?.detail ? ` (${bridge.detail})` : ''}.`,
     roster.exitCode === 0 ? roster.stdout.trim() : `roster unavailable: ${drove.failureOf(roster).text}`,
   ].join('\n')
 }
 
-const turnOn = async ($: EngineInterface, goal: string) => {
-  const current = await read($, orchestratorAtom)
-  if (current) {
-    if (goal) {
-      await update($, orchestratorAtom, state => (state ? { ...state, goal } : state))
-      await persist($)
-      soon($, 0, () => $.prompt.submit({ text: goal, asUser: true }))
-    }
-    return { text: `Orchestrator mode is already on (Drove run ${current.run}).` }
+// $.prompt.submit rejects when the engine refuses the call and resolves { drop } when a hook (another plugin's, or a settings hook) refuses
+// the prompt. Either way the prompt never reached the planner, and nothing else records it.
+const submitPrompt = async ($: EngineInterface, input: { text: string; asUser?: true }): Promise<{ isSent: boolean; reason?: string }> => {
+  try {
+    const result = await $.prompt.submit(input)
+    return result.drop === undefined ? { isSent: true } : { isSent: false, reason: result.drop }
+  } catch (error) {
+    return { isSent: false, reason: messageOf(error) }
   }
-  if (!(await herdrPane($))) return { text: 'This session is not in a herdr pane (HERDR_PANE_ID is unset), so it cannot orchestrate workers. Start Claude in a herdr pane first.' }
-  const attached = await attachRun($, { goal: goal || undefined, budget: config.maxWorkers })
-  if (!attached.ok) return { text: `Orchestrator mode could not start: Drove said ${attached.text}` }
+}
+
+// Submit once the session is idle, retry once, then hand the failure over. isWanted is asked before each attempt: a person's own prompt may
+// have carried the text by then.
+const deliverPrompt = (
+  $: EngineInterface,
+  input: { text: string; asUser?: true },
+  handlers: { isWanted: () => Promise<boolean>; onSent: () => Promise<void>; onFailed: (reason?: string) => Promise<void> },
+) => {
+  const attempt = async (isLast: boolean) => {
+    if (!(await handlers.isWanted())) return
+    const sent = await submitPrompt($, input)
+    if (sent.isSent) await handlers.onSent()
+    else if (isLast) await handlers.onFailed(sent.reason)
+    else soon($, RETRY_MS, () => attempt(true))
+  }
+  soon($, 0, () => attempt(false))
+}
+
+const reasonOf = (reason?: string): string => (reason ? ` (${oneLine(reason, 100)})` : '')
+
+// The goal is pending from the first attempt until a submit lands, in the atom (it outlives a hot reload, which cancels the timers) and in
+// the store (it outlives the process); `restore` toasts one that was never cleared. Drove has no command that writes an event to a run, so
+// a goal.unsent event is not recorded: the toast and the pending goal are.
+const sendGoal = async ($: EngineInterface, goal: string) => {
+  await update($, pendingGoalAtom, () => goal)
+  await persist($)
+  deliverPrompt($, { text: goal, asUser: true }, {
+    isWanted: async () => (await read($, pendingGoalAtom)) === goal,
+    onSent: async () => {
+      await update($, pendingGoalAtom, current => (current === goal ? null : current))
+      await persist($)
+    },
+    onFailed: async reason => {
+      $.ui.toast(`Drove: the goal was not sent to the planner${reasonOf(reason)}. Press Enter (or type anything) to start.`, { timeoutMs: 15_000 })
+    },
+  })
+}
+
+// Drove counts a wake as delivered once the bridge line is written and never redelivers it, so a wake is pending here until a submit lands,
+// and goes ahead of the person's next prompt, like a pending goal.
+let lastWakeToastAt = 0
+
+const sendWake = async ($: EngineInterface, text: string) => {
+  await update($, pendingWakesAtom, list => [...list, text].slice(-PENDING_WAKES_MAX))
+  await persist($)
+  deliverPrompt($, { text }, {
+    isWanted: async () => (await read($, pendingWakesAtom)).includes(text),
+    onSent: async () => {
+      await update($, pendingWakesAtom, list => {
+        const at = list.indexOf(text)
+        return at < 0 ? list : [...list.slice(0, at), ...list.slice(at + 1)]
+      })
+      await persist($)
+    },
+    onFailed: async reason => {
+      const now = await $.clock.now()
+      if (now - lastWakeToastAt < 10_000) return
+      lastWakeToastAt = now
+      $.ui.toast(`Drove: a worker report could not be delivered to the planner${reasonOf(reason)}. Press Enter to receive it.`, { timeoutMs: 15_000 })
+    },
+  })
+}
+
+// Where the session started ($.session.root: it follows /cd but not a shell cd), against the repository its cwd resolves to now.
+// A planner's own `cd` moves the cwd, so a drifted session would otherwise bind a run to a repository nobody chose.
+const launchDrift = async ($: EngineInterface): Promise<{ cwd: string; root: string; repo: string } | undefined> => {
+  try {
+    const [cwd, root, repo] = await Promise.all([$.session.cwd(), $.session.root(), $.session.repo()])
+    if (!repo) return undefined
+    const top = repo.root.replace(/\/+$/, '')
+    return root === top || root.startsWith(`${top}/`) ? undefined : { cwd, root, repo: top }
+  } catch {
+    return undefined
+  }
+}
+
+const launchDirOf = async ($: EngineInterface): Promise<string> => {
+  try {
+    return await $.session.root()
+  } catch {
+    return $.session.cwd()
+  }
+}
+
+// `~` and a relative dir resolve against the home and the session's launch directory, never the drifted cwd.
+const dirOf = async ($: EngineInterface, dir: string): Promise<string> => {
+  if (dir.startsWith('/')) return dir.replace(/\/+$/, '') || '/'
+  if (dir === '~' || dir.startsWith('~/')) return `${(await $.env.get('HOME')) ?? ''}${dir.slice(1)}`.replace(/\/+$/, '')
+  return `${(await launchDirOf($)).replace(/\/+$/, '')}/${dir.replace(/^\.\//, '')}`
+}
+
+const REPO_FORM = '`/orchestrate --repo <dir> <goal>` attaches to the repository at <dir>.'
+
+const helpText = (): string =>
+  [
+    'Orchestrator mode turns this session into a Drove planner.',
+    '`/orchestrate <goal>`: on, in the repository this session is in; the planner starts on the goal.',
+    '`/orchestrate --repo <dir> [goal]`: on, in the repository at <dir>. When it is already on, it switches only if the current run has no open workers.',
+    '`/orchestrate status`, `/orchestrate board`, `/orchestrate board bg`, `/orchestrate off`.',
+  ].join('\n')
+
+// A fresh run, a switched one or a re-attached one: bind this session to it and tell the planner where it is.
+const startRun = async ($: EngineInterface, run: RunMeta, goal: string, previous: OrchOrchestrator | null) => {
   const now = await $.clock.now()
-  await update($, orchestratorAtom, () => ({ run: attached.run.id, repo: attached.run.repo, goal: goal || attached.run.goal, startedAt: now, budget: attached.run.budget }) satisfies OrchOrchestrator)
-  lastRun = attached.run
+  await update($, orchestratorAtom, () => ({ run: run.id, repo: run.repo, goal: goal || run.goal, startedAt: now, budget: run.budget }) satisfies OrchOrchestrator)
+  lastRun = run
   await registerOrchestratorTools($)
   await persist($)
   await setLead($, goal ? 'planning' : 'waiting for a goal')
   await openBoard($)
-  startBridge($, attached.run.id)
-  if (goal) soon($, 0, () => $.prompt.submit({ text: goal, asUser: true }))
+  startBridge($, run.id)
+  if (goal) await sendGoal($, goal)
   return {
     text: [
-      `Orchestrator mode is on: Drove run ${attached.run.id}, ${shortModel(config.orchestratorModel)} at ${config.orchestratorEffort} effort or more, no code edits, up to ${attached.run.budget} worker panes before a dialog.`,
+      `Orchestrator mode is on: Drove run ${run.id} on \`${run.repo}\`, ${shortModel(config.orchestratorModel)} at ${config.orchestratorEffort} effort or more, no code edits, up to ${run.budget} worker panes before a dialog.`,
+      previous ? `Switched from run ${previous.run} on \`${previous.repo}\`; it had no open workers and stays up in Drove.` : '',
       goal ? '' : 'Give it a goal in your next prompt.',
     ]
       .filter(Boolean)
       .join('\n'),
-    context: [`${await humanNameOf($)} switched this session into orchestrator mode${goal ? ` for: ${goal}` : ''}. Follow the "Orchestrator mode" section of your instructions from now on.`],
+    context: [`${await humanNameOf($)} switched this session into orchestrator mode on \`${run.repo}\`${goal ? ` for: ${goal}` : ''}. Follow the "Orchestrator mode" section of your instructions from now on.`],
   }
+}
+
+const turnOn = async ($: EngineInterface, goal: string, options: { repo?: string } = {}) => {
+  const current = await read($, orchestratorAtom)
+  if (current && !options.repo) {
+    if (goal) {
+      await update($, orchestratorAtom, state => (state ? { ...state, goal } : state))
+      await persist($)
+      await sendGoal($, goal)
+    }
+    return { text: `Orchestrator mode is already on (Drove run ${current.run} on \`${current.repo}\`).` }
+  }
+  if (!(await herdrPane($))) return { text: 'This session is not in a herdr pane (HERDR_PANE_ID is unset), so it cannot orchestrate workers. Start Claude in a herdr pane first.' }
+  if (current) {
+    const open = openSeats(await read($, seatsAtom))
+    if (open.length > 0) {
+      return { text: `Orchestrator mode is on in Drove run ${current.run} on \`${current.repo}\` with ${open.length} open worker(s) (${open.map(({ name }) => name).join(', ')}), so it will not switch to ${options.repo}. Close them, or \`/orchestrate off\`, then run this again.` }
+    }
+  }
+  let cwd: string | undefined
+  if (options.repo) cwd = await dirOf($, options.repo)
+  else {
+    const drift = await launchDrift($)
+    if (drift) {
+      let answer = ''
+      try {
+        answer = await $.ui.ask(`Attach to \`${drift.repo}\`? This session started in \`${drift.root}\`.`, { header: 'Drove repo', options: ['Attach', 'Cancel'] })
+      } catch {
+        answer = ''
+      }
+      if (answer !== 'Attach') {
+        return { text: `Orchestrator mode was not turned on: this session started in \`${drift.root}\` and is now in \`${drift.cwd}\`, in \`${drift.repo}\`. ${REPO_FORM}` }
+      }
+    }
+  }
+  const attached = await attachRun($, { goal: goal || undefined, budget: current?.budget ?? config.maxWorkers, ...(cwd ? { cwd } : {}) })
+  if (!attached.ok) return { text: `Orchestrator mode could not ${current ? 'switch' : 'start'}: Drove said ${attached.text}${options.repo || !attached.text.includes('not-a-repo') ? '' : ` ${REPO_FORM}`}` }
+  if (current && attached.run.id === current.run) {
+    if (goal) {
+      await update($, orchestratorAtom, state => (state ? { ...state, goal } : state))
+      await persist($)
+      await sendGoal($, goal)
+    }
+    return { text: `Orchestrator mode is already on (Drove run ${current.run} on \`${current.repo}\`).` }
+  }
+  if (current) await clearOrchestration($)
+  return startRun($, attached.run, goal, current)
 }
 
 const turnOff = async ($: EngineInterface) => {
@@ -1073,6 +1247,7 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     const started = await next(e)
     leanTrims = undefined
+    lastWakeToastAt = 0
     if (!e.isInteractive || (await isSummariser($))) return started
     const role = await $.env.get('DROVE_ROLE')
     if (role === 'worker') {
@@ -1083,7 +1258,7 @@ export const register: Register = (on, options) => {
     await $.command.register({
       name: 'orchestrate',
       description: 'Turn this session into a Drove planner: Opus plans, delegates to Claude or Codex workers in herdr panes, and reviews; it never edits code',
-      argumentHint: '[goal] | status | board | board bg | off',
+      argumentHint: '[goal] | --repo <dir> [goal] | status | board | board bg | off | help',
     })
     if (isDrovePlanner) return started
     await restore($)
@@ -1129,6 +1304,9 @@ export const register: Register = (on, options) => {
       await openBoard($)
       return { text: 'Board shown.' }
     }
+    if (args === 'help') return { text: helpText() }
+    const flag = repoFlagOf(args)
+    if (flag) return 'error' in flag ? { text: `${flag.error}\n${helpText()}` } : turnOn($, flag.goal, { repo: flag.repo })
     return turnOn($, args)
   })
 
@@ -1231,7 +1409,17 @@ export const register: Register = (on, options) => {
       await update($, orchestratorAtom, current => (current && !current.goal ? { ...current, goal } : current))
       await persist($)
       await setLead($, 'planning')
-      await attachRun($, { run: orchestrator.run, goal })
+      await attachRun($, { run: orchestrator.run, goal, cwd: orchestrator.repo })
+    }
+    // A goal or a worker report that never reached the planner rides on the person's next prompt (or is that prompt, when it is empty).
+    const [pendingGoal, pendingWakes] = orchestrator && isPerson ? await Promise.all([read($, pendingGoalAtom), read($, pendingWakesAtom)]) : [null, []]
+    const isBlank = e.text.trim() === ''
+    if ((pendingGoal || pendingWakes.length > 0) && (isBlank || goalFromPrompt(e.text) !== undefined)) {
+      await update($, pendingGoalAtom, () => null)
+      await update($, pendingWakesAtom, () => [])
+      await persist($)
+      const parts = [...(pendingGoal && !e.text.includes(pendingGoal) ? [pendingGoal] : []), ...pendingWakes, ...(isBlank ? [] : [e.text])]
+      return next(parts.length === 1 && !isBlank ? e : { ...e, text: parts.join('\n\n') })
     }
     return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))

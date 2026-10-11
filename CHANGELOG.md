@@ -9,6 +9,9 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - The guard lets the planner write inside its Claude Code session scratchpad (`/tmp/claude-*/…/scratchpad`): `mkdir`, `touch`, `tee`, `cp`, `mv`, `rm` and redirects, when every target is inside one. Writes anywhere else, interpreters and unresolved variables stay denied; worker rules are unchanged.
 - The planner's role text mentions `drove init <dir>` and attaching the run there.
 
+### The mod's /orchestrate
+- `/orchestrate <goal>` checks that the goal (and each worker report) reached the planner: it retries once, then toasts and sends it with your next prompt, also after a reload or restart; it names the repo it attached to, asks before attaching when a shell `cd` moved the session out of where it started, and takes `/orchestrate --repo <dir> [goal]` to attach to (or, with no open workers, switch to) another repo.
+
 ### Lean spawns
 - A lean Claude worker (`workerMcp` or `--mcp` set) starts with `--no-chrome`, so Claude in Chrome's 22 tools are not loaded. Name `claude-in-chrome` in the list to keep it.
 - A Claude worker no longer gets a second report tool from the mod: `mcp__drove__report` is the one.
