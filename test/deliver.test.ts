@@ -7,10 +7,12 @@ import { deriveState } from '../src/detect.ts'
 import { seatDir } from '../src/paths.ts'
 import { loadRoster } from '../src/roster.ts'
 import type { Control, DeliveryAdapter, Report, RunMeta, Seat } from '../src/types.ts'
-import { FakeHerdr, herdrFail, makeDeps, makeSeat, seedRun } from './p3-helpers.ts'
+import { FakeHerdr, herdrFail, makeDeps, makeSeat, result, seedRun } from './p3-helpers.ts'
 
 deliver.confirmTiming.waitMs = 60
 deliver.confirmTiming.pollMs = 10
+deliver.workingWait.maxMs = 60
+deliver.workingWait.pollMs = 10
 
 afterEach(() => deliver.unregisterAdapters())
 
@@ -357,4 +359,63 @@ test('a question answered with expects none is a reply that owes a report: a sil
   const later = new Date(deps.clock.now().getTime() + 60_000)
   const derived = deriveState({ ...seat, lastWorkingAt: deps.clock.now().toISOString(), stateAt: deps.clock.now().toISOString() }, { herdr: { paneId: 'w1:p1', status: 'idle' }, hooks: [], lastReport: asked }, later)
   assert.deepEqual(derived.attention.map(item => item.reason), ['idle-without-report'])
+})
+
+test('a bare herdr exit 1 while the seat is working waits for idle, then delivers', async () => {
+  const fake = new FakeHerdr()
+  const base = fake.exec
+  let gets = 0
+  fake.exec = async argv => {
+    if (argv[2] === 'prompt' && fake.agents.get('w-ui')?.status === 'working') return result('', 1, '')
+    if (argv[2] === 'get' && ++gets === 3) fake.setStatus('w-ui', 'idle')
+    return base(argv)
+  }
+  const { deps, run } = await setup(makeSeat('w-ui'), 'working', fake)
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
+  assert.equal(fake.prompts.length, 1)
+})
+
+test('a seat that stays working queues the control with a readable reason', async () => {
+  const fake = new FakeHerdr()
+  const base = fake.exec
+  fake.exec = async argv => (argv[2] === 'prompt' ? result('', 1, '') : base(argv))
+  const { deps, run } = await setup(makeSeat('w-ui'), 'working', fake)
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+  assert.equal(!delivery.ok && delivery.queued, true)
+  assert.match(!delivery.ok ? delivery.reason : '', /^w-ui is working; herdr would not take the text/)
+  assert.doesNotMatch(!delivery.ok ? delivery.reason : '', /exit_1/)
+  assert.equal((await lines(join(seatDir(deps.home, run.id, 'w-ui'), 'pending.jsonl'))).length, 1)
+})
+
+test('delivery failures carry a readable reason, never a bare exit code', async () => {
+  const cases: [string, ReturnType<typeof result>, RegExp][] = [
+    ['empty exit 1 on an idle seat', result('', 1, ''), /refused to type into w-ui \(agent prompt exited 1 with no message\)/],
+    ['exit with text', result('', 2, 'pane exploded'), /exited 2 with "pane exploded"/],
+    ['exec timeout', result('', 124, 'timed out after 90000ms'), /did not answer in time/],
+    ['pane gone', herdrFail('pane_not_found'), /pane is gone or unknown to herdr/],
+  ]
+  for (const [label, outcome, expected] of cases) {
+    const fake = new FakeHerdr()
+    const base = fake.exec
+    fake.exec = async argv => (argv[2] === 'prompt' ? outcome : base(argv))
+    const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+    const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+    assert.equal(delivery.ok, false, label)
+    assert.match(!delivery.ok ? delivery.reason : '', expected, label)
+  }
+})
+
+test('a pane that vanished between the prompt and the status check is reported as gone', async () => {
+  const fake = new FakeHerdr()
+  const base = fake.exec
+  fake.exec = async argv => {
+    if (argv[2] === 'prompt') {
+      fake.agents.delete('w-ui')
+      return result('', 1, '')
+    }
+    return base(argv)
+  }
+  const { deps, run } = await setup(makeSeat('w-ui'), 'working', fake)
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+  assert.match(!delivery.ok ? delivery.reason : '', /pane is gone or unknown to herdr/)
 })

@@ -12,6 +12,7 @@ export const BUSY_RETRY_MS = 45_000
 export const PLANNER_QUIET_MS = 5_000
 export const MAX_ATTEMPTS = 5
 export const confirmTiming = { waitMs: 4_000, pollMs: 250 }
+export const workingWait = { maxMs: 45_000, pollMs: 1_000 }
 
 const RANK: Partial<Record<Transport, number>> = { mod: 0, 'codex-queue': 1, 'herdr-prompt': 2 }
 const BLOCKING_STATES: ReadonlySet<Seat['state']> = new Set(['blocked', 'needs-input'])
@@ -34,22 +35,56 @@ export const recordEvent = async (deps: Deps, run: string, event: Omit<DroveEven
   await appendJsonl(join(runDir(deps.home, run), 'events.jsonl'), { at: deps.clock.now().toISOString(), ...event })
 }
 
+const describeFailure = (seat: Seat, code: string, output: string): string => {
+  const detail = clip(output, 160)
+  const suffix = detail ? ` (${detail})` : ''
+  if (code === 'timeout') return `herdr did not answer in time while typing into ${seat.name}${suffix}`
+  if (code === 'exit_124') return `herdr did not answer in time while typing into ${seat.name}; check the pane before sending again${suffix}`
+  if (code === 'agent_not_found' || code === 'pane_not_found') return `${seat.name}'s pane is gone or unknown to herdr (${code})`
+  if (code === 'agent_pane_busy') return `${seat.name}'s pane is busy and herdr would not take the text${suffix}`
+  if (code === 'agent_blocked') return `${seat.name} is waiting at a dialog, so herdr cannot type into it`
+  if (/^exit_\d+$/.test(code)) return `herdr refused to type into ${seat.name} (agent prompt exited ${code.slice(5)} with ${detail ? `"${detail}"` : 'no message'})`
+  return `herdr could not type into ${seat.name}: ${code}${suffix}`
+}
+
+const waitForIdle = async (deps: Deps, target: string): Promise<'idle' | 'working' | 'gone'> => {
+  for (let waited = 0; ; waited += workingWait.pollMs) {
+    const live = await getAgent(deps.exec, target)
+    if (!live.ok) return live.code === 'agent_not_found' || live.code === 'pane_not_found' ? 'gone' : 'working'
+    if (live.value.status === 'idle' || live.value.status === 'done') return 'idle'
+    if (waited >= workingWait.maxMs) return 'working'
+    await sleep(workingWait.pollMs)
+  }
+}
+
 export const herdrPromptAdapter = (deps: Deps): DeliveryAdapter => ({
   transport: 'herdr-prompt',
   canDeliver: seat => Boolean(seat.paneId),
   deliver: async (seat, text): Promise<Delivery | UnconfirmedDelivery> => {
     const target = targetOf(seat)
-    const ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
+    let ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
     if (ran.ok) return { ok: true, via: 'herdr-prompt' }
     if (ran.code === 'timeout') return { ok: true, via: 'herdr-prompt', unconfirmed: true }
     if (ran.code === 'agent_blocked') return { ok: false, queued: true, reason: 'agent_blocked: the pane is waiting at a dialog' }
-    if (ran.code === 'agent_not_found' || ran.code === 'agent_pane_busy') return { ok: false, queued: true, reason: `${ran.code}: ${clip(ran.output)}` }
     if (ran.code === 'agent_prompt_stalled') {
       const live = await getAgent(deps.exec, target)
       if (live.ok && (live.value.status === 'working' || live.value.status === 'blocked')) return { ok: true, via: 'herdr-prompt' }
       return { ok: false, queued: false, reason: 'agent_prompt_stalled: herdr typed the text but saw no activity; it may still have landed, so check the pane before sending it again' }
     }
-    return { ok: false, queued: false, reason: `${ran.code}: ${clip(ran.output)}` }
+    // herdr can refuse a prompt while the agent is mid-turn, sometimes with no message at all (`exit_1:`).
+    // Ask what the agent is doing instead of passing the bare exit code on.
+    const live = await getAgent(deps.exec, target)
+    if (!live.ok && (live.code === 'agent_not_found' || live.code === 'pane_not_found')) return { ok: false, queued: true, reason: describeFailure(seat, live.code, '') }
+    if (live.ok && live.value.status === 'working') {
+      const settled = await waitForIdle(deps, target)
+      if (settled === 'gone') return { ok: false, queued: true, reason: describeFailure(seat, 'agent_not_found', '') }
+      if (settled === 'working') return { ok: false, queued: true, reason: `${seat.name} is working; herdr would not take the text. It will be sent when the seat is idle` }
+      ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
+      if (ran.ok) return { ok: true, via: 'herdr-prompt' }
+      if (ran.code === 'timeout') return { ok: true, via: 'herdr-prompt', unconfirmed: true }
+      if (ran.code === 'agent_blocked') return { ok: false, queued: true, reason: 'agent_blocked: the pane is waiting at a dialog' }
+    }
+    return { ok: false, queued: ran.code === 'agent_not_found' || ran.code === 'agent_pane_busy', reason: describeFailure(seat, ran.code, ran.output) }
   },
 })
 
@@ -86,7 +121,7 @@ export const isDeliverable = async (deps: Deps, seat: Seat): Promise<{ ok: true 
   if (seat.state === 'needs-input') return { ok: false, reason: `${seat.name} is waiting for an approval` }
   if (!seat.paneId) return { ok: false, reason: `${seat.name} has no pane yet` }
   const live = await getAgent(deps.exec, targetOf(seat))
-  if (!live.ok) return { ok: false, reason: live.code === 'unparseable' ? `${seat.name}: herdr gave no state` : `${seat.name}: ${live.code}` }
+  if (!live.ok) return { ok: false, reason: live.code === 'unparseable' ? `${seat.name}: herdr gave no state` : describeFailure(seat, live.code, '') }
   if (live.value.status === 'blocked') return { ok: false, reason: `${seat.name} is blocked at a dialog` }
   return { ok: true }
 }
