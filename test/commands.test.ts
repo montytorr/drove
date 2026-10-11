@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { appendFile, mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
 import * as deliver from '../src/deliver.ts'
@@ -559,6 +559,93 @@ test('with no workerMcp and no --mcp a claude seat keeps the user MCP setup and 
   assert.ok(!(fake.find('herdr', 'agent', 'start') ?? []).includes('--strict-mcp-config'))
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.mcp, undefined)
   assert.equal((await commands.spawn(deps, identity, { seat: 'w-bad', kind: 'claude', brief, mcp: ['a b'] })).ok, false)
+})
+
+test('a lean claude seat runs --no-chrome, and naming claude-in-chrome in the allowlist is not reported missing and keeps Chrome', async () => {
+  const { fake, deps, identity } = await setup()
+  const claudeUserConfig = join(deps.home, 'claude.json')
+  await writeFile(claudeUserConfig, JSON.stringify({ mcpServers: { notion: { command: 'notion-mcp' } } }))
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerMcp: ['notion'] }))
+  const lean = await commands.spawn({ ...deps, claudeUserConfig }, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(lean.ok, true, lean.text)
+  assert.ok((fake.find('herdr', 'agent', 'start') ?? []).includes('--no-chrome'))
+
+  const withChrome = await commands.spawn({ ...deps, claudeUserConfig }, identity, { seat: 'w-web', kind: 'claude', brief, mcp: ['claude-in-chrome'] })
+  assert.equal(withChrome.ok, true, withChrome.text)
+  assert.doesNotMatch(withChrome.text, /claude-in-chrome/)
+  const starts = fake.calls.filter(call => call[0] === 'herdr' && call[1] === 'agent' && call[2] === 'start')
+  assert.ok(!(starts.at(-1) ?? []).includes('--no-chrome'))
+  const mcp = JSON.parse(await readFile(join(seatDir(deps.home, RUN, 'w-web'), 'mcp.json'), 'utf8')) as { mcpServers: object }
+  assert.deepEqual(Object.keys(mcp.mcpServers), ['notion', 'drove'], 'Chrome is not an MCP server of the user; the flag alone leaves it on')
+})
+
+test('with no allowlist a claude seat keeps Chrome', async () => {
+  const { fake, deps, identity } = await setup()
+  assert.equal((await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })).ok, true)
+  assert.ok(!(fake.find('herdr', 'agent', 'start') ?? []).includes('--no-chrome'))
+})
+
+test('workerPlugins and workerUserMemory false shape a claude seat\'s settings.json from the user Claude settings and folders', async () => {
+  const { deps, identity, repo } = await setup()
+  const claudeUserDir = join(deps.home, 'claude-dir')
+  await mkdir(join(claudeUserDir, 'mods', 'ci-watch'), { recursive: true })
+  await mkdir(join(claudeUserDir, 'mods', 'orch', '.claude-plugin'), { recursive: true })
+  await writeFile(join(claudeUserDir, 'mods', 'orch', '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'orchestrator' }))
+  const dirs = [join(claudeUserDir, 'mods', 'ci-watch'), join(claudeUserDir, 'mods', 'orch')]
+  await writeFile(join(claudeUserDir, 'settings.json'), JSON.stringify({
+    enabledPlugins: { 'context7@claude-plugins-official': true, 'ccc-skills@ccc': true, 'old@x': false },
+    env: { CLAUDE_CODE_PLUGIN_DIRS: dirs.join(':') },
+  }))
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerPlugins: ['context7'], workerUserMemory: false }))
+  const spawned = await commands.spawn({ ...deps, claudeUserDir }, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const settings = JSON.parse(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'settings.json'), 'utf8')) as Record<string, unknown>
+  assert.deepEqual(settings.enabledPlugins, { 'ccc-skills@ccc': false })
+  assert.deepEqual(settings.env, { CLAUDE_CODE_PLUGIN_DIRS: dirs[1] })
+  const excludes = settings.claudeMdExcludes as string[]
+  assert.equal(excludes[0], join(claudeUserDir, 'CLAUDE.md'))
+  assert.ok(excludes.includes(join(dirname(repo), 'CLAUDE.md')), 'the folder above the repo')
+  assert.ok(!excludes.includes(join(repo, 'CLAUDE.md')), "the repo's own file stays")
+})
+
+test('with neither switch set a claude seat\'s settings.json is hooks only, and the user settings are never read', async () => {
+  const { deps, identity } = await setup()
+  const spawned = await commands.spawn({ ...deps, claudeUserDir: join(deps.home, 'absent-dir') }, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  const settings = JSON.parse(await readFile(join(seatDir(deps.home, RUN, 'w-api'), 'settings.json'), 'utf8')) as Record<string, unknown>
+  assert.deepEqual(Object.keys(settings), ['hooks'])
+})
+
+test('workerUserMemory false keeps AGENTS.md out of a codex worker CODEX_HOME and unlinks an earlier link; on, it stays linked', async () => {
+  const { deps, identity } = await setup()
+  const codexUserHome = join(deps.home, 'user-codex')
+  await mkdir(codexUserHome, { recursive: true })
+  await writeFile(join(codexUserHome, 'AGENTS.md'), 'user rules')
+  await writeFile(join(codexUserHome, 'auth.json'), '{}')
+  const first = await commands.spawn({ ...deps, codexUserHome }, identity, { seat: 'w-cx', kind: 'codex', brief })
+  assert.equal(first.ok, true, first.text)
+  const home = join(deps.home, 'runs', RUN, 'codex-home')
+  assert.ok(existsSync(join(home, 'AGENTS.md')), 'linked by default')
+
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerUserMemory: false }))
+  const second = await commands.spawn({ ...deps, codexUserHome }, identity, { seat: 'w-cx2', kind: 'codex', brief })
+  assert.equal(second.ok, true, second.text)
+  assert.ok(!existsSync(join(home, 'AGENTS.md')), 'unlinked')
+  assert.ok(existsSync(join(home, 'auth.json')), 'the login stays')
+})
+
+test('loadConfig reads workerPlugins as names and workerUserMemory as a boolean, and ignores other values', async () => {
+  const deps = await makeDeps(new FakeHerdr())
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerPlugins: [' context7 ', 'ccc-skills@ccc', 3, '', 'context7'], workerUserMemory: false }))
+  const config = await commands.loadConfig(deps.home)
+  assert.deepEqual(config.workerPlugins, ['context7', 'ccc-skills@ccc'])
+  assert.equal(config.workerUserMemory, false)
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerPlugins: 'context7', workerUserMemory: 'no' }))
+  const bad = await commands.loadConfig(deps.home)
+  assert.equal(bad.workerPlugins, undefined)
+  assert.equal(bad.workerUserMemory, undefined)
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerPlugins: [] }))
+  assert.deepEqual((await commands.loadConfig(deps.home)).workerPlugins, [], 'an empty list is the lean setting: the user plugins off')
 })
 
 test('a single-line brief stays a launch argument; the role text is a file, not an argument', async () => {

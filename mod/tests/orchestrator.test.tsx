@@ -901,18 +901,12 @@ describe('worker session', () => {
     expect(droveCalls(world, 'mod')).toHaveLength(0)
   })
 
-  test('a Drove worker registers the report alias, which records through drove mod report', async ($, on) => {
+  test("a Drove worker registers no report tool of its own: Drove's server is its one report tool", async ($, on) => {
     const { world } = engine(on, WORKER_ENV)
     await $.session.start(START)
     expect(world.commands).toEqual([])
-    expect(world.registeredTools).toEqual(['report'])
-    const reported = await $.tool.call({ tool: 'mcp__orchestrator__report', kind: 'question', summary: 'Drop the table?', for: 'cal' } as never)
-    expect(String((reported as { result?: unknown }).result)).toContain('recorded')
-    const [call] = droveCalls(world, 'mod')
-    expect(call?.args).toEqual(['mod', 'report'])
-    expect(JSON.parse(call?.stdin ?? '{}')).toEqual({ kind: 'question', summary: 'Drop the table?', for: 'human' })
-    await $.tool.call({ tool: 'mcp__orchestrator__report', kind: 'question', summary: 'Drop the column?', for: 'human' } as never)
-    expect(JSON.parse(droveCalls(world, 'mod')[1]?.stdin ?? '{}')).toEqual({ kind: 'question', summary: 'Drop the column?', for: 'human' })
+    expect(world.registeredTools).toEqual([])
+    expect(droveCalls(world, 'mod')).toHaveLength(0)
   })
 
   test('the worker follows its seat model from the roster, and a verified promote moves it at once; a forged one does not', async ($, on) => {

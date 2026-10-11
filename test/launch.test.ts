@@ -520,7 +520,8 @@ test('a claude worker without an allowlist loads the user MCP setup as before; w
   const lean = launch.claudeWorkerSpec(request({ mcpAllow: ['mongodb', 'drove', 'missing'], userMcp: USER_MCP }))
   const strict = lean.argv.indexOf('--strict-mcp-config')
   assert.ok(strict >= 0)
-  assert.equal(lean.argv[strict + 1], '--mcp-config')
+  assert.equal(lean.argv[strict + 1], '--no-chrome')
+  assert.equal(lean.argv[strict + 2], '--mcp-config')
   const servers = mcpServersOf(lean)
   assert.deepEqual(Object.keys(servers), ['mongodb', 'drove'])
   assert.deepEqual(servers.drove?.args, [ENTRY, 'mcp'], 'a user server named drove never shadows Drove\'s')
@@ -595,4 +596,119 @@ test('writeLaunchFiles removes an unlinked skill symlink but never a real folder
   await launch.writeLaunchFiles({ kind: 'codex', role: 'worker', cwd: root, env: {}, argv: [], files: [], unlinks: [join(root, 'skills', 'linked'), join(root, 'skills', 'real'), join(root, 'skills', 'none')] })
   await assert.rejects(lstat(join(root, 'skills', 'linked')))
   assert.ok((await lstat(join(root, 'skills', 'real'))).isDirectory())
+})
+
+// ---------- lean workers drop Chrome, unlisted plugins and (opt-in) user memory (DROVE-88) ----------
+
+const settingsOf = (spec: { files: readonly { path: string; content: string }[] }): Record<string, unknown> => JSON.parse(fileOf(spec, 'settings.json')) as Record<string, unknown>
+
+const USER_PLUGINS = {
+  enabled: ['context7@claude-plugins-official', 'ralph-loop@claude-plugins-official', 'ccc-skills@ccc'],
+  dirs: [
+    { entry: '~/.claude/mods/ci-watch', name: 'ci-watch' },
+    { entry: '~/.claude/mods/secret-guard', name: 'secret-guard' },
+    { entry: '~/maestro-dev/drove/mod', name: 'orchestrator' },
+  ],
+}
+
+test('a lean claude worker runs --no-chrome unless its allowlist names claude-in-chrome; an open worker and a planner keep Chrome', () => {
+  const lean = launch.claudeWorkerSpec(request({ mcpAllow: ['mongodb'] }))
+  assert.ok(lean.argv.includes('--no-chrome'))
+  assert.ok(launch.claudeWorkerSpec(request({ mcpAllow: [] })).argv.includes('--no-chrome'), "Drove's server alone is lean too")
+  assert.ok(!launch.claudeWorkerSpec(request({ mcpAllow: ['mongodb', 'claude-in-chrome'] })).argv.includes('--no-chrome'))
+  assert.ok(!launch.claudeWorkerSpec(request({})).argv.includes('--no-chrome'), "no allowlist keeps today's setup")
+  assert.ok(!launch.claudePlannerSpec(request({ identity: planner, mcpAllow: [] })).argv.includes('--no-chrome'))
+})
+
+test("workerPlugins turns off every other user plugin by enabledPlugins and cuts CLAUDE_CODE_PLUGIN_DIRS, always keeping Drove's mod", () => {
+  const open = settingsOf(launch.claudeWorkerSpec(request({})))
+  assert.deepEqual(Object.keys(open), ['hooks'], 'nothing set, nothing changed')
+
+  const bare = settingsOf(launch.claudeWorkerSpec(request({ pluginAllow: [], userPlugins: USER_PLUGINS })))
+  assert.deepEqual(bare.enabledPlugins, { 'context7@claude-plugins-official': false, 'ralph-loop@claude-plugins-official': false, 'ccc-skills@ccc': false })
+  assert.deepEqual(bare.env, { CLAUDE_CODE_PLUGIN_DIRS: '~/maestro-dev/drove/mod' })
+
+  const some = settingsOf(launch.claudeWorkerSpec(request({ pluginAllow: ['context7', 'ccc-skills@ccc', 'secret-guard', 'ci-watch@inline'], userPlugins: USER_PLUGINS })))
+  assert.deepEqual(some.enabledPlugins, { 'ralph-loop@claude-plugins-official': false })
+  assert.deepEqual(some.env, { CLAUDE_CODE_PLUGIN_DIRS: '~/.claude/mods/ci-watch:~/.claude/mods/secret-guard:~/maestro-dev/drove/mod' })
+
+  const wrongMarket = settingsOf(launch.claudeWorkerSpec(request({ pluginAllow: ['context7@elsewhere'], userPlugins: USER_PLUGINS })))
+  assert.deepEqual(Object.keys(wrongMarket.enabledPlugins as object), USER_PLUGINS.enabled, 'a marketplace that does not match allows nothing')
+
+  const noDirs = settingsOf(launch.claudeWorkerSpec(request({ pluginAllow: [], userPlugins: { enabled: [] } })))
+  assert.deepEqual(Object.keys(noDirs), ['hooks'], 'no user dir list, no env override; nothing enabled, nothing to disable')
+
+  assert.deepEqual(Object.keys(settingsOf(launch.claudePlannerSpec(request({ identity: planner, pluginAllow: [], userPlugins: USER_PLUGINS })))), ['hooks'], 'the planner is never trimmed')
+})
+
+test("readClaudePlugins reads the enabled plugins and each mod dir's name, best effort and read only", async () => {
+  const { mkdir, writeFile: write, readdir } = await import('node:fs/promises')
+  const root = await tmp('claude-plugins')
+  await mkdir(join(root, 'mods', 'named', '.claude-plugin'), { recursive: true })
+  await mkdir(join(root, 'mods', 'plain'), { recursive: true })
+  await write(join(root, 'mods', 'named', '.claude-plugin', 'plugin.json'), JSON.stringify({ name: 'real-name' }))
+  const settings = join(root, 'settings.json')
+  await write(settings, JSON.stringify({
+    enabledPlugins: { 'a@m': true, 'b@m': false, c: true },
+    env: { CLAUDE_CODE_PLUGIN_DIRS: `${join(root, 'mods', 'named')}:${join(root, 'mods', 'plain')}::${join(root, 'mods', 'missing')}` },
+  }))
+  assert.deepEqual(await launch.readClaudePlugins(settings), {
+    enabled: ['a@m', 'c'],
+    dirs: [
+      { entry: join(root, 'mods', 'named'), name: 'real-name' },
+      { entry: join(root, 'mods', 'plain'), name: 'plain' },
+      { entry: join(root, 'mods', 'missing'), name: 'missing' },
+    ],
+  })
+  assert.deepEqual(await launch.readClaudePlugins(join(root, 'absent.json')), { enabled: [] })
+  await write(join(root, 'bad.json'), '{ nope')
+  assert.deepEqual(await launch.readClaudePlugins(join(root, 'bad.json')), { enabled: [] })
+  assert.deepEqual((await readdir(root)).sort(), ['bad.json', 'mods', 'settings.json'])
+  assert.equal(launch.userClaudeDir({ CLAUDE_CONFIG_DIR: '/cfg' }), '/cfg')
+  assert.match(launch.userClaudeDir({}), /\.claude$/)
+})
+
+test("workerUserMemory false adds claudeMdExcludes for the user's CLAUDE.md and every file above the repo, never the repo's own", () => {
+  assert.ok(!('claudeMdExcludes' in settingsOf(launch.claudeWorkerSpec(request({})))), 'on by default')
+  assert.ok(!('claudeMdExcludes' in settingsOf(launch.claudeWorkerSpec(request({ userMemory: true })))))
+
+  const off = settingsOf(launch.claudeWorkerSpec(request({ userMemory: false, claudeDir: '/home/user/.claude', repo: '/home/user/code/app', cwd: '/home/user/code/app/.claude/worktrees/w-api' })))
+  const excludes = off.claudeMdExcludes as string[]
+  assert.equal(excludes[0], '/home/user/.claude/CLAUDE.md')
+  for (const dir of ['/home/user/code', '/home/user', '/home', '']) {
+    for (const name of ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md']) assert.ok(excludes.includes(`${dir}/${name}`), `${dir}/${name}`)
+  }
+  assert.ok(!excludes.some(path => path.startsWith('/home/user/code/app')), "the repo's own files and its worktree stay")
+  assert.equal(new Set(excludes).size, excludes.length)
+
+  assert.deepEqual(launch.claudeMdExcludes('/cfg', '/srv/repo', '/srv/repo').slice(0, 2), ['/cfg/CLAUDE.md', '/srv/CLAUDE.md'], 'CLAUDE_CONFIG_DIR replaces ~/.claude')
+  const elsewhere = launch.claudeMdExcludes('/cfg', '/srv/repo', '/srv/trees/w-api')
+  assert.ok(elsewhere.includes('/srv/trees/CLAUDE.md'), 'a worktree outside the repo has its own ancestors')
+  assert.ok(!elsewhere.includes('/srv/trees/w-api/CLAUDE.md'), "the worktree's own file is the repo's")
+  assert.ok(!launch.claudeMdExcludes('/cfg', '/srv/repo', '/srv/repo').includes('/srv/repo/CLAUDE.md'))
+  assert.ok(!('claudeMdExcludes' in settingsOf(launch.claudePlannerSpec(request({ identity: planner, userMemory: false })))), 'the planner keeps its memory')
+})
+
+test('workerUserMemory false leaves AGENTS.md and AGENTS.override.md out of the codex home and unlinks them; auth.json stays', () => {
+  const home = codexHome({ links: ['auth.json', 'AGENTS.md', 'AGENTS.override.md'] })
+  const on = launch.codexWorkerSpec(homeRequest({ codexHome: home }))
+  assert.deepEqual(on.links?.filter(link => !link.path.includes('/skills/')).map(link => link.path), [`${CODEX_DIR}/auth.json`, `${CODEX_DIR}/AGENTS.md`, `${CODEX_DIR}/AGENTS.override.md`])
+  assert.equal(on.unlinks, undefined)
+
+  const off = launch.codexWorkerSpec(homeRequest({ codexHome: home, userMemory: false }))
+  assert.deepEqual(off.links?.filter(link => !link.path.includes('/skills/')).map(link => link.path), [`${CODEX_DIR}/auth.json`])
+  assert.deepEqual(off.unlinks, [`${CODEX_DIR}/AGENTS.md`, `${CODEX_DIR}/AGENTS.override.md`], 'a link an earlier spawn made goes')
+})
+
+test('writeLaunchFiles applies the memory unlinks to a symlink an earlier spawn made and keeps a real AGENTS file', async () => {
+  const { mkdir, symlink, lstat, writeFile: write } = await import('node:fs/promises')
+  const root = await tmp('memory-unlink')
+  const home = join(root, 'codex-home')
+  await mkdir(home)
+  await symlink(join(root, 'user', 'AGENTS.md'), join(home, 'AGENTS.md'))
+  await write(join(home, 'AGENTS.override.md'), 'made by hand')
+  const spec = launch.codexWorkerSpec(homeRequest({ codexHome: codexHome({ dir: home, user: join(root, 'user'), links: ['AGENTS.md'] }), userMemory: false }))
+  await launch.writeLaunchFiles({ ...spec, files: [] })
+  await assert.rejects(lstat(join(home, 'AGENTS.md')))
+  assert.equal(await readFile(join(home, 'AGENTS.override.md'), 'utf8'), 'made by hand')
 })

@@ -2,6 +2,14 @@
 
 All notable changes to Drove are listed here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Lean spawns
+- A lean Claude worker (`workerMcp` or `--mcp` set) starts with `--no-chrome`, so Claude in Chrome's 22 tools are not loaded. Name `claude-in-chrome` in the list to keep it.
+- A Claude worker no longer gets a second report tool from the mod: `mcp__drove__report` is the one.
+- New `workerPlugins` config key: a Claude worker loads only the plugins and mods you list, plus Drove's own mod.
+- New `workerUserMemory: false` config key: a worker skips your `~/.claude/CLAUDE.md` and the `CLAUDE.md` files above the repo (Claude), and your `AGENTS.md` and `AGENTS.override.md` (Codex). It stays on by default.
+
 ## [0.2.0] - 2026-10-11
 
 The first public release. Drove runs one planner and several worker agents side by side in [herdr](https://herdr.dev) panes, each worker in its own git worktree, tracked on Cairn tasks.

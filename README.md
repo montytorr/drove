@@ -116,6 +116,12 @@ A worker that hits its usage limit gets a `usage-limit` attention item and is ne
 
 State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia`, `maxTurns` (a default turn budget for every worker; unset by default) and `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`). Defaults are in `src/commands.ts`.
 
+A worker loads your whole Claude setup unless you trim it. These keys, and `--mcp` on a spawn, make a worker lean:
+- `workerMcp` (a list of MCP server names) and `--mcp`: a Claude worker runs `--strict-mcp-config` with Drove's server plus the servers named. A lean Claude worker also runs `--no-chrome`, so Claude in Chrome's 22 tools are not loaded, unless the list names `claude-in-chrome`. Drove's own report tool, `mcp__drove__report`, is the worker's one report tool.
+- `workerSkills` (a list of skill names): a Codex worker links only these skills into its `CODEX_HOME`.
+- `workerPlugins` (a list of plugin names, with or without `@marketplace`, such as `["context7", "ci-watch"]`): a Claude worker loads only these plugins and mods from your `settings.json`, plus Drove's own mod. `[]` keeps Drove's mod alone. Unset, nothing changes.
+- `workerUserMemory` (`false` to opt in; default `true`): a worker does not load your own memory files, which are your `~/.claude/CLAUDE.md` and any `CLAUDE.md` in the folders above the repo for Claude, and your `AGENTS.md` and `AGENTS.override.md` for Codex. The repo's own files stay.
+
 Codex workers run with approvals and the sandbox bypassed, like Claude workers with `--dangerously-skip-permissions`. Drove's guard hook still denies pushes. Set `codexWorkerSandbox` to `"workspace-write"` to turn that off.
 
 ## Known limits
