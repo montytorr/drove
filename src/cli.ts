@@ -233,6 +233,13 @@ export const COMMANDS: Record<string, Spec> = {
     run: async (values, positionals, io) =>
       print(await commands.reports(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { seat: positionals[0], all: values.all === true, asJson: values.json === true }), io),
   },
+  report: {
+    usage: 'drove report [<run>] [--json] [--run ID]',
+    why: 'tokens, cost, time and rework of a run, per seat and in total (read only)',
+    options: { json: { type: 'boolean' }, run: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(await commands.runReport(commands.defaultDeps(), { run: positionals[0] ?? str(values, 'run'), repo: process.cwd() }, values.json === true), io),
+  },
   capture: {
     usage: 'drove capture <seat> [--lines N] [--run ID]',
     why: "read a seat's recent output",

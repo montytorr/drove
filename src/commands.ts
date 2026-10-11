@@ -15,6 +15,7 @@ import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShel
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, LAB_RE, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
+import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
@@ -579,12 +580,14 @@ const seatLine = (seat: Seat): string => {
 // DROVE-70: best effort; a run that comes down must never be held up by Cairn.
 const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[], at: string, labInstance: string): Promise<string | undefined> => {
   if (!run.cairn) return undefined
+  const costs: RunReport | undefined = await buildReport(deps, run.id, deps.claudeUserDir ?? userClaudeDir()).catch(() => undefined)
   const open = seats.filter(seat => seat.state !== 'closed')
   const lines = [
     `Drove run ${run.id} was taken down at ${at}.`,
     seats.length ? `Seats (${seats.length - open.length} closed, ${open.length} open):` : 'No seats were spawned.',
     ...seats.map(seatLine),
     open.length ? `Still open: ${open.map(seat => seat.cairn ?? seat.name).join(', ')}. Resume with \`drove up --run ${run.id}\`.` : 'Nothing is left open.',
+    ...(costs ? noteLines(costs) : []),
   ]
   const lab = LAB_RE.test(run.cairn)
   try {
@@ -1954,6 +1957,17 @@ const mergePr = async (
   const gated = isChecked ? gateText(plan.commands, plan.source) : 'GitHub checks green'
   await settle('merge.passed', `${request.squash ? 'squash-merged' : 'merged'} ${pr.url}${sha ? `, local ${base} at ${sha}` : ''}; ${gated}`, { ...at, ...(sha ? { sha } : {}), squash: request.squash === true, checks: isChecked ? plan.commands : [] })
   return ok([`Merged ${pr.url} (${request.squash ? 'squash' : 'merge commit'}); ${gated}.`, ...notes, `Close ${seat.name} with drove close ${seat.name} --remove-worktree.`].join(' '), { status: 'merged', mode: 'pr', ...at, ...(sha ? { sha } : {}) })
+}
+
+// ---------- report ----------
+
+// DROVE-106: tokens, cost, time and rework of a run, per seat; read only, any status.
+export const runReport = async (deps: Deps, ref: RunRef, asJson: boolean): Promise<CommandResult> => {
+  const located = await locateRun(deps, ref)
+  if ('error' in located) return located.error
+  const built = await buildReport(deps, located.run.id, deps.claudeUserDir ?? userClaudeDir())
+  if (!built) return failed('no-run', `no run named ${located.run.id}`)
+  return ok(asJson ? JSON.stringify(built, null, 2) : renderReport(built), built)
 }
 
 // ---------- down / up ----------

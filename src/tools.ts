@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'set_goal', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'set_goal', 'run_report', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'runReport'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -297,6 +297,13 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       },
       ['goal'],
       async (args) => asResult(await cmd.setGoal(deps, await ref(), { goal: text(args, 'goal') as string, cairn: text(args, 'cairn', false) })),
+    ),
+    defineTool(
+      'run_report',
+      'Tokens, cost, wall time, time spent waiting on the human and rework (change rounds, promotions, migrations, restarts) of this run, per seat and in total, read from the agents\' transcripts and the run\'s events. Read only.',
+      { json: { type: 'boolean', description: 'Return JSON instead of a table.' } },
+      [],
+      async (args) => asResult(await cmd.runReport(deps, await ref(), flag(args, 'json'))),
     ),
     defineTool(
       'down',
