@@ -43,7 +43,7 @@ Pick the planner (the table above), then use one of these.
 **Claude Code with the mod.** From a Claude Code session:
 
 1. Start Claude in a herdr pane with `mod/` in `CLAUDE_CODE_PLUGIN_DIRS`.
-2. Type `/orchestrate <goal>`. The session becomes the planner and gets the tools `spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `migrate_worker`, `close_worker` and `roster`. A board and a wake bridge run inside Claude. Typing `/orchestrate` again in the same session re-attaches to the run.
+2. Type `/orchestrate <goal>`. The session becomes the planner and gets the tools `spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `migrate_worker`, `close_worker` and `roster`. A board and a wake bridge run inside Claude. Typing `/orchestrate` again in the same session re-attaches to the run. With no goal, the first prompt you type becomes the run's goal (its first line, clipped to 120 characters) and is saved on the run; a Drove wake, a slash command or an empty prompt never is, and an existing goal is never replaced.
 
 **Claude Code without the mod, or Codex.** From any herdr pane:
 
@@ -57,6 +57,8 @@ drove board --web           # the same board in a browser, read-only
 ```
 
 `drove plan` creates a run, records the pane as the planner pane and replaces itself with `claude` or `codex`, with Drove's MCP server, guard hooks and role text attached.
+
+A run started without `--goal` takes the first prompt you type to the planner as its goal, the same way, in the mod and in the planner's `user-prompt-submit` hook.
 
 `--from-cairn REF` and `--next PROJECT` start a run from a Cairn task. The planner's first prompt carries the task's title and body and says it is the run's goal task, which the planner holds; Drove stores the ref as the run's `cairn`. The task must exist and be open (a done or cancelled one is refused), and `--goal` cannot be combined with either flag. `drove down` then writes a summary note on that task: the seats, which are closed, their branches and what is still open (best effort: a failure to write it never holds the run up).
 

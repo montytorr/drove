@@ -31,6 +31,19 @@ export const oneLine = (text: string, max = 120): string => {
   return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat
 }
 
+export const GOAL_MAX = 120
+const WAKE_LINE_RE = /^\[worker \S+ · /
+
+// The first prompt a person types becomes a run's goal when it has none: its first non-empty line, clipped. A slash command,
+// a Drove envelope or an empty prompt is not a goal.
+export const goalFromPrompt = (text: string): string | undefined => {
+  if (text.includes('⟦drove v1')) return undefined
+  const lines = text.replace(/<\/?pasted_content(?:\s[^>]*)?>/g, '').split('\n').map(line => line.trim())
+  const first = lines.find(line => line !== '')
+  if (!first || first.startsWith('/') || WAKE_LINE_RE.test(first)) return undefined
+  return oneLine(first, GOAL_MAX)
+}
+
 // ---------- Drove control envelopes (src/protocol.ts formatControl), as a Claude worker receives them ----------
 
 export const DROVE_OPEN = '⟦drove v1'

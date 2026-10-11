@@ -8,7 +8,7 @@ import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toast
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
 import { modelNotice, orchestratorSection, workerModelSection } from './prompts'
-import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
+import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, goalFromPrompt, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
 import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
 
 const STORE_PREFIX = 'drove:session:'
@@ -1200,10 +1200,12 @@ export const register: Register = (on, options) => {
     }
     const orchestrator = await read($, orchestratorAtom)
     const isPerson = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
-    if (orchestrator && !orchestrator.goal && isPerson && !e.text.trimStart().startsWith('/') && e.text.trim()) {
-      await update($, orchestratorAtom, current => (current ? { ...current, goal: oneLine(e.text, 100) } : current))
+    const goal = orchestrator && !orchestrator.goal && isPerson ? goalFromPrompt(e.text) : undefined
+    if (orchestrator && goal) {
+      await update($, orchestratorAtom, current => (current && !current.goal ? { ...current, goal } : current))
       await persist($)
       await setLead($, 'planning')
+      await attachRun($, { run: orchestrator.run, goal })
     }
     return next(e)
   }).catch(($, e, next) => (next.called ? undefined : next(e)))
