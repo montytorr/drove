@@ -5,19 +5,27 @@ import type { AddressInfo } from 'node:net'
 import type { BoardModel } from '../mod/hooks/board.ts'
 import { boardSource, isAnimated, modelOf, POLL_MS } from './board.ts'
 import type { BoardData, FrameInput } from './board.ts'
-import type { Deps } from './types.ts'
+import { capture } from './commands.ts'
+import { loadRoster, openSeats } from './roster.ts'
+import type { Deps, Seat } from './types.ts'
 import { pageOf } from './web/page.ts'
 
 // A read-only copy of the live board for a browser: the same boardSource and modelOf the terminal board uses,
 // served as JSON and pushed over Server-Sent Events. Only 127.0.0.1, only GET and HEAD, and every request needs the per-start token.
+// A request that names a foreign Origin is refused. The pane tail of an open seat is read with the same call as `drove capture`.
 
 export const WEB_HOST = '127.0.0.1'
 // Wide and tall enough that buildBoard clips and drops nothing; the page wraps long cells itself.
 export const WEB_COLUMNS = 400
 export const WEB_ROWS = 1000
 const KEEPALIVE_MS = 15_000
+const TAIL_LINES = 40
+const TAIL_PATH = /^\/api\/seat\/([^/]+)\/tail$/
 
-export type WebPayload = { run: string; status: string; model: BoardModel }
+// What the seat panel shows, from the roster the board already loads.
+export type WebSeat = Pick<Seat, 'name' | 'kind' | 'model' | 'effort' | 'state' | 'stateAt' | 'branch' | 'worktree' | 'cairn' | 'sessionId' | 'owes'>
+
+export type WebPayload = { run: string; status: string; model: BoardModel; seats: WebSeat[] }
 
 export type WebServer = {
   url: string
@@ -44,7 +52,8 @@ const sameToken = (given: string | null, token: string): boolean => {
 export const payloadOf = (data: BoardData, now: number, offsetMinutes: number): WebPayload => {
   const input: FrameInput = { ...data, now, frame: 0, columns: WEB_COLUMNS, rows: WEB_ROWS, offsetMinutes }
   const frame = isAnimated(input) ? Math.floor(now / POLL_MS) % 1000 : 0
-  return { run: data.run.id, status: data.run.status, model: modelOf({ ...input, frame }) }
+  const seats = openSeats(data.roster).map(({ name, kind, model, effort, state, stateAt, branch, worktree, cairn, sessionId, owes }) => ({ name, kind, model, effort, state, stateAt, branch, worktree, cairn, sessionId, owes }))
+  return { run: data.run.id, status: data.run.status, model: modelOf({ ...input, frame }), seats }
 }
 
 export const startWeb = async (deps: Deps, run: string, options: WebOptions = {}): Promise<WebServer> => {
@@ -73,13 +82,34 @@ export const startWeb = async (deps: Deps, run: string, options: WebOptions = {}
 
   const allowedHost = (host: string | undefined): boolean => host !== undefined && [`${WEB_HOST}:${port}`, `localhost:${port}`].includes(host.toLowerCase())
 
+  const allowedOrigin = (origin: string | undefined): boolean => origin === undefined || [`http://${WEB_HOST}:${port}`, `http://localhost:${port}`].includes(origin.toLowerCase())
+
   const reply = (res: ServerResponse, code: number, type: string, body: string, extra: Record<string, string> = {}) => {
     res.writeHead(code, { 'content-type': `${type}; charset=utf-8`, ...SECURITY_HEADERS, ...extra })
     res.end(body)
   }
 
+  const tail = async (res: ServerResponse, rawName: string, isHead: boolean) => {
+    let name = ''
+    try {
+      name = decodeURIComponent(rawName)
+    } catch {
+      return reply(res, 404, 'text/plain', 'no such seat\n')
+    }
+    try {
+      const seat = openSeats(await loadRoster(deps.home, run)).find(item => item.name === name)
+      if (!seat) return reply(res, 404, 'text/plain', 'no such seat\n')
+      const screen = await capture(deps, { run, repo: '' }, seat.name, TAIL_LINES)
+      if (!screen.ok) return reply(res, 502, 'text/plain', `${screen.text}\n`)
+      return reply(res, 200, 'text/plain', isHead ? '' : `${screen.text}\n`)
+    } catch {
+      return reply(res, 502, 'text/plain', 'could not read the pane\n')
+    }
+  }
+
   const handle = (req: IncomingMessage, res: ServerResponse) => {
     if (!allowedHost(req.headers.host)) return reply(res, 403, 'text/plain', 'forbidden host\n')
+    if (!allowedOrigin(req.headers.origin)) return reply(res, 403, 'text/plain', 'forbidden origin\n')
     if (req.method !== 'GET' && req.method !== 'HEAD') return reply(res, 405, 'text/plain', 'read only\n', { allow: 'GET, HEAD' })
     const url = new URL(req.url ?? '/', `http://${WEB_HOST}:${port}`)
     if (!sameToken(url.searchParams.get('t'), token)) return reply(res, 403, 'text/plain', 'missing or wrong token\n')
@@ -93,6 +123,8 @@ export const startWeb = async (deps: Deps, run: string, options: WebOptions = {}
       res.on('close', () => clients.delete(res))
       return
     }
+    const tailed = TAIL_PATH.exec(url.pathname)
+    if (tailed?.[1] !== undefined) return void tail(res, tailed[1], req.method === 'HEAD')
     return reply(res, 404, 'text/plain', 'not found\n')
   }
 
