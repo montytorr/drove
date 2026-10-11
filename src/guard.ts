@@ -98,7 +98,7 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'attention', 'capture', 'close', 'down'])
+const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'attention', 'capture', 'close', 'down'])
 const WORKER_DROVE = new Set(['roster', 'capture'])
 
 const WORKER_PUSH = 'workers never push; report done and let the planner and the human decide'
@@ -444,7 +444,7 @@ const ghReason = (words: readonly string[]): string | undefined => {
     return 'gh api with a method or fields writes to GitHub: ask the human to run it'
   }
   if (!GH_PLANNER_WRITES[group]?.has(action)) return undefined
-  if (group === 'pr' && action === 'merge' && words.includes('--admin')) return 'gh pr merge --admin bypasses branch protection: ask the human'
+  if (group === 'pr' && action === 'merge') return 'gh pr merge skips the merge gate: use drove merge <seat> --pr, which gates the merge on the checks; ask the human to merge other PRs'
   if (namesProduction(words)) return `gh ${group} ${action} names the production branch: nobody pushes to the production branch, use main (or master) instead`
   if (group === 'repo' && action === 'create' && (words.includes('--public') || !words.some(word => word === '--private' || word === '--internal'))) {
     return 'gh repo create without --private or --internal would publish a repo: ask the human to run it'
