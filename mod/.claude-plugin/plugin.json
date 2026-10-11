@@ -1,6 +1,6 @@
 {
   "name": "orchestrator",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "/orchestrate turns this session into a Drove planner: Opus plans, delegates to Claude or Codex workers in herdr panes (each in its own worktree), and reviews, but never edits code. A thin layer over Drove (../src): run state, delivery, guard and wakes are Drove's.",
   "author": {
     "name": "Callum Torr",

@@ -4,10 +4,9 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
-### New repos and the planner scratchpad
-- New `drove init <dir> [--json]`: makes a repo on `main` with one empty commit in an empty or missing directory, so a planner can start a goal that needs a new repo. It refuses a non-empty directory, an existing repo and a directory inside a repo. The guard allows it for the planner.
-- The guard lets the planner write inside its Claude Code session scratchpad (`/tmp/claude-*/…/scratchpad`): `mkdir`, `touch`, `tee`, `cp`, `mv`, `rm` and redirects, when every target is inside one. Writes anywhere else, interpreters and unresolved variables stay denied; worker rules are unchanged.
-- The planner's role text mentions `drove init <dir>` and attaching the run there.
+## [0.3.0] - 2026-10-11
+
+Leaner workers the planner trims per spawn, a more reliable `/orchestrate`, and `drove init` for starting a goal in a new repo.
 
 ### The mod's /orchestrate
 - `/orchestrate <goal>` checks that the goal (and each worker report) reached the planner: it retries once, then toasts and sends it with your next prompt, also after a reload or restart; it names the repo it attached to, asks before attaching when a shell `cd` moved the session out of where it started, and takes `/orchestrate --repo <dir> [goal]` to attach to (or, with no open workers, switch to) another repo.
@@ -21,6 +20,11 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - The planner's role text has a "Lean spawns" paragraph: what a worker loads under your config, when to pass `mcp`, `plugins` and `userMemory`, and the MCP server and plugin names it can choose from (read from your Claude and Codex files, names only).
 - A spawn reports a `plugins` name that matches no plugin you have enabled, as it already does for MCP servers.
 - The README has a "Lean workers" section with a table of each switch, its default and what it saves.
+
+### New repos and the planner scratchpad
+- New `drove init <dir> [--json]`: makes a repo on `main` with one empty commit in an empty or missing directory, so a planner can start a goal that needs a new repo. It refuses a non-empty directory, an existing repo and a directory inside a repo. The guard allows it for the planner.
+- The guard lets the planner write inside its Claude Code session scratchpad (`/tmp/claude-*/…/scratchpad`): `mkdir`, `touch`, `tee`, `cp`, `mv`, `rm` and redirects, when every target is inside one. Writes anywhere else, interpreters and unresolved variables stay denied; worker rules are unchanged.
+- The planner's role text mentions `drove init <dir>` and attaching the run there.
 
 ## [0.2.0] - 2026-10-11
 
@@ -65,4 +69,5 @@ See [Known limits](README.md#known-limits) in the README.
 
 Full history: see the commit log.
 
+[0.3.0]: https://github.com/montytorr/drove/releases/tag/v0.3.0
 [0.2.0]: https://github.com/montytorr/drove/releases/tag/v0.2.0
