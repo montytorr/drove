@@ -289,6 +289,7 @@ test('drove subcommands are allowed or denied per role', () => {
   assert.match(planner('drove budget 6') ?? '', /ask the human/)
   assert.equal(worker('drove roster'), undefined)
   assert.equal(worker('drove capture w-api --lines 5'), undefined)
+  assert.equal(worker('drove doctor --json'), undefined)
   for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once', 'merge w-x', 'attention']) assert.ok(worker(`drove ${sub}`), sub)
 })
 

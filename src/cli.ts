@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
 import { attentionLine } from './attention.ts'
 import { runBoard } from './board.ts'
+import { formatReport, nodeDoctorDeps, runDoctor } from './doctor.ts'
 import { runWeb } from './web.ts'
 import * as commands from './commands.ts'
 import { HOOK_EVENTS, runHook } from './hooks.ts'
@@ -346,6 +347,17 @@ export const COMMANDS: Record<string, Spec> = {
       const ref = { run: named ? first : str(values, 'run') ?? process.env[ENV.run], repo: process.cwd() }
       const goal = await textArg(positionals, named ? 1 : 0, io)
       return print(await commands.setGoal(commands.defaultDeps(), ref, { goal, cairn: str(values, 'cairn') }), io)
+    },
+  },
+  doctor: {
+    usage: 'drove doctor [--json]',
+    why: 'check what this machine needs to run Drove (read-only): Node, git, herdr and its server, claude or codex, gh, cairn, DROVE_HOME; exits 1 when a check fails',
+    options: { json: { type: 'boolean' } },
+    run: async (values, _positionals, io) => {
+      const deps = commands.defaultDeps()
+      const report = await runDoctor(nodeDoctorDeps(deps.exec, deps.home))
+      io.out(values.json === true ? JSON.stringify(report, null, 2) : formatReport(report))
+      return report.ok ? 0 : 1
     },
   },
   budget: {

@@ -98,8 +98,8 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'attention', 'capture', 'close', 'down'])
-const WORKER_DROVE = new Set(['roster', 'capture'])
+const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'attention', 'capture', 'close', 'down', 'doctor'])
+const WORKER_DROVE = new Set(['roster', 'capture', 'doctor'])
 
 const WORKER_PUSH = 'workers never push; report done and let the planner and the human decide'
 

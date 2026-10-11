@@ -14,6 +14,10 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - The summary note `drove down` writes on the run's goal task now carries the totals and one line per seat.
 - The `control.sent` event of a verdict now records the verdict (`approve` or `changes`); older events are read from the report that followed.
 
+### Running Drove on another machine (DROVE-97)
+- New `drove doctor [--json]`: checks Node 22.18+, git and the repo's remote, herdr and its server (listed, never started), `claude` (at least 2.1.296) and `codex`, `gh` and its sign-in, `cairn` and one read, `DROVE_HOME`, and the mod's `nodePath`. Each check is `ok`, `warn` or `fail` with a one-line fix; the exit status is 1 when one fails. The planner and workers may run it.
+- README: "Running Drove on another machine" (install, Cairn sign-in, herdr on a headless host, unattended starts, how reports come back, and a client-project checklist).
+
 ### Planner
 - The run's goal is the planner's to keep: new `drove goal [--run ID] [--cairn REF] <text>|-` and a `set_goal` tool (`mcp__orchestrator__set_goal` in the mod) set `run.goal` (and optionally `run.cairn`), record a `goal.set` event the timeline shows, and update the mod's goal. The planner role text says when: the goal is missing or vague, or the human's ask moved on. On restore the mod writes a goal only it holds to the run, and an empty mod goal takes the run's; the bridge now follows a changed run goal (DROVE-107).
 - The planner handles GitHub itself through `gh`: PRs (all), issues, releases (`create`, `edit`, `upload`), workflow runs, labels, and `repo create --private|--internal`, `clone`, `fork`, `sync`. Deletions, transfers, secrets and variables, repo `edit`/`rename`/`archive`, public repo creation and `gh api` writes stay with the human, and any `gh` write naming a `production` branch (`--base`, `-B`, `--target`, `--ref`, or the head of `pr create`) is denied. Worker rules are unchanged (DROVE-104).

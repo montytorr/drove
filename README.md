@@ -142,6 +142,7 @@ Review and testing can be seats of their own. They are optional: the planner rea
 | `drove board [--once] [--web [--port N]] [--run ID]` | live coloured board, the orchestrator mod's layout on your terminal's own background; one frame with `--once` or when piped; no colour when piped or with `NO_COLOR`; `--web` serves the same board read-only in a browser (see below); this repo's latest run unless `--run` or `DROVE_RUN` |
 | `drove down [--run ID]` / `drove up [--run ID] [--seat SEAT] [--detached [--json]]` | stop and resume a run; the run may also be given as a bare argument, and `--detached` resumes it in a workspace of its own |
 | `drove goal [--run ID] [--cairn REF] <text>\|-` | set the run's goal, one plain line of what it is doing now (the planner or the human; a worker is denied); `--cairn` also sets the run's goal task |
+| `drove doctor [--json]` | check what this machine needs (Node, git, herdr and its server, `claude`/`codex`, `gh`, `cairn`, `DROVE_HOME`, the mod's `nodePath`); each check is `ok`, `warn` or `fail` with a one-line fix, and the exit status is 1 when one fails. Read-only; never starts a server. The planner and workers may run it |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only; agents are denied) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
 
@@ -241,6 +242,32 @@ A snapshot is `{"v":1,"at":"…","runs":["…"],"items":[…]}`; each item:
 **Failure.** With `--json`, a failure is one JSON object on stderr, `{"ok":false,"code":"herdr-down","error":"…"}`, and the exit status is 1; bad usage exits 2. Codes a job should expect: `herdr-down` (no server), `herdr` (herdr refused a step), `no-run`, `no-task` and `task-closed` (Cairn), `not-a-repo`, `not-down` (the run still has a live pane), `usage`. A start that cannot finish closes the workspace it opened and marks a new run `down`, so `drove up --run ID --detached` can try it again.
 
 **Not proven.** A real herdr server opening a workspace without a client attached; a planner started by `agent start` in a workspace nobody is looking at; the wake reaching it there; and the shapes above under a real poller. Until then treat a stuck start as a bug to report, not a state to build on.
+
+## Running Drove on another machine
+
+Drove runs where the code lives: a client's laptop, a dev box, a CI host. Nothing in it talks to a Drove service; a run is `~/.drove` plus the repo's worktrees plus a herdr server.
+
+**Install.** Node 22.18+, `git`, herdr 0.9+, `claude` and/or `codex` (signed in), `gh` (signed in, only for `drove merge --pr`) and the Cairn CLI. Clone Drove and symlink `src/cli.ts` as in "Install". Then run `drove doctor` from the repo: it lists what is missing with a fix for each, and exits 1 on a failure, so a setup script can gate on it (`drove doctor --json` for a script).
+
+**Cairn sign-in.** Every worker claims a Cairn task, so the machine needs a signed-in `cairn`. `cairn setup --url <instance>` pairs keys in the browser and installs the CLI, hooks and skill; it is safe to re-run. On a host with no browser, pair on a machine that has one and set `CAIRN_BASE_URL` and `CAIRN_API_KEY` in the environment Drove runs under. A machine with several instances names each (`cairn instance add <name> --url <url>`) and routes a repo to one (`cairn route add <instance> --folder`), so a client's tasks stay on the client's instance. `drove doctor` proves the sign-in with one read (`cairn projects`).
+
+**herdr on a headless host.** Drove never starts herdr. Start the server yourself in a persistent session (tmux, screen, or a service such as a systemd user unit or a launchd agent running `herdr`), and give Drove's commands the same `HERDR_SOCKET_PATH` if the socket is not the default. `drove doctor` fails with the reason when no server answers.
+
+**Start a run unattended.** From cron, a webhook or a chat command: `drove plan --from-cairn REF --detached --json` opens a workspace of its own and returns at once; `drove attention --all --json [--follow]` says what waits on a person; `drove up --run ID --detached` resumes. The details, JSON shapes and failure codes are in "Unattended runs". Trust the repo and approve Drove's hooks once, by hand, before leaving a job alone: Drove never answers a dialog.
+
+**How reports come back.**
+
+- The worker's `done`, `question` and `blocked` reports reach the planner in its pane; `drove reports --json` reads them and `drove roster --json` shows who owes one.
+- Every worker also leaves its findings and status on its Cairn task (notes, then `in-review`), which outlives the run and is readable from any machine on the instance.
+- What needs a person is `drove attention`; Bothy forwards those items as alerts (BOTHY-20, in progress: until it lands, poll `drove attention --all --json --follow` yourself).
+
+**Client-project checklist.**
+
+- Keep the client's code on the client's machine. Run Drove there, not on a machine of yours with the code mounted or copied; prompts and diffs go to the agent's provider either way, so confirm the client allows that.
+- Use a separate `DROVE_HOME` per client (`export DROVE_HOME=~/.drove-acme`), so run state, session ids and `config.json` never mix, and set it in every command and job that touches the run.
+- Keep secrets out of `workerEnv`: its values are in `~/.drove/config.json` and in every worker's environment, so any worker (and its logs) can read them. Put a client secret in the repo's ignored `.env` and copy it with `workerCopy` (the worktree copy never leaves the machine), or let the agent's own sign-in carry it.
+- Use the client's Cairn instance (or a project on yours that they cannot read) for their tasks; a worker's notes quote their code.
+- Review before you merge: `drove merge --pr` pushes the branch, so check the remote is the client's.
 
 ## Rules Drove enforces
 
