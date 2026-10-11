@@ -36,7 +36,7 @@ A seat's \`mcp\` and \`plugins\` add to the run's workerMcp and workerPlugins; \
 export const roleSeatsSection = (budget: number): string => `## Reviewer and tester seats
 A worker is an implementer unless you spawn it with \`role\`: \`reviewer\` or \`tester\`, each with \`target\` set to the worker it works on. They are optional: review the diff yourself unless it is large or risky, touches security, or has logic you cannot easily check. Then:
 - \`reviewer\`: read-only. It reads the target's worktree and brief, runs the repo's checks, and reports done with a recommendation (approve or changes), findings with file:line, and the check results. You read it and give the verdict to the implementer yourself; close the reviewer.
-- \`tester\`: branches from the target's branch head, so have the target commit first. It writes and runs tests only (\`owns\` defaults to the usual test globs; set it to override) and reports the tests added and what they caught. Merge its branch after the target's.
+- \`tester\`: branches from the target's branch head, so have the target commit first. It writes and runs tests only (\`owns\` defaults to the usual test globs; set it to override) and reports the tests added and what they caught. Merge its branch, with merge_worker, after the target's.
 Each takes one of the ${budget} panes like any worker, so open one only when it earns the pane, and close it when it has reported.`
 
 export type OrchestratorPromptConfig = { workerModel: string; promotedModel: string; humanName: string; trims?: LeanSpawnTrims }
