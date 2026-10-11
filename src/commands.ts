@@ -2,7 +2,7 @@ import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, dirname, join } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
@@ -1209,6 +1209,31 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
   } finally {
     await clearRestarting(deps, run.id, seat.name)
   }
+}
+
+// ---------- init ----------
+
+export const INITIAL_COMMIT = 'chore: initial empty commit'
+
+export const initRepo = async (deps: Deps, dir: string, cwd: string, asJson: boolean): Promise<CommandResult> => {
+  const target = resolve(cwd, dir)
+  const entries = await readdir(target).catch((error: NodeJS.ErrnoException) => (error.code === 'ENOENT' ? undefined : error))
+  if (entries instanceof Error) return failed('INIT_NOT_A_DIRECTORY', `${target} is not a directory`)
+  if (entries !== undefined && entries.length > 0) {
+    return failed('INIT_NOT_EMPTY', `${target} is ${entries.includes('.git') ? 'already a git repository' : 'not empty'}: drove init only makes a new repo in an empty or missing directory`)
+  }
+  let probe = entries === undefined ? dirname(target) : target
+  while (!existsSync(probe) && dirname(probe) !== probe) probe = dirname(probe)
+  const enclosing = await git.toplevel(deps.exec, probe)
+  if (enclosing) return failed('INIT_INSIDE_REPO', `${target} is inside the git repository ${enclosing}: pick a directory outside it`)
+  await mkdir(target, { recursive: true })
+  const made = await deps.exec(['git', '-C', target, 'init', '-b', 'main'], { timeoutMs: 30_000 })
+  if (made.code !== 0) return failed('INIT_GIT_FAILED', `git init failed: ${(made.stderr || made.stdout).trim().slice(0, 300)}`)
+  const committed = await deps.exec(['git', '-C', target, 'commit', '--allow-empty', '-m', INITIAL_COMMIT], { timeoutMs: 30_000 })
+  if (committed.code !== 0) return failed('INIT_COMMIT_FAILED', `git commit failed in ${target}: ${(committed.stderr || committed.stdout).trim().slice(0, 300)}`)
+  const sha = (await deps.exec(['git', '-C', target, 'rev-parse', '--short', 'HEAD'], { timeoutMs: 10_000 })).stdout.trim()
+  const data = { path: target, branch: 'main', commit: sha }
+  return ok(asJson ? JSON.stringify(data, null, 2) : `Created ${target} on main with one empty commit (${sha}). Attach the run there: /orchestrate --repo ${target}, or drove plan from that directory.`, data)
 }
 
 // ---------- roster / capture ----------

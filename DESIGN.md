@@ -31,6 +31,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove prompt <seat> TEXT` | planner, human | Raw `herdr agent prompt` into a seat the run owns, with no envelope. This is the escape hatch for a re-brief after a restart, or when `codex queue` is unavailable. It still refuses a `blocked` pane. |
 | `drove promote <seat> [--model M] --effort E [--reason TEXT]` | planner | Changes a worker's model or effort (§8). `--model` is optional: a Codex seat is promoted by effort alone and keeps its model (or Codex's default when none is recorded). It is a separate command because it can restart the agent; demote is the same command with a lower setting. |
 | `drove migrate <seat> --kind claude\|codex [--model M] [--effort E] [--reason TEXT]` | planner | Moves a worker to the other agent kind in the same worktree, with a handoff brief and no resume (§8, Migrate). Also the `migrate` MCP tool and the mod's `migrate_worker`. |
+| `drove init <dir> [--json]` | planner, human | Makes a new git repo (`main`, one empty commit) in an empty or missing directory; see §6. |
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
@@ -296,20 +297,24 @@ The mod's `bashReason` regex-scans the whole raw command for `$(…)` and backti
 | | Planner | Worker |
 |---|---|---|
 | Edit/Write/MultiEdit/NotebookEdit/apply_patch | deny, except in `/tmp`, `/private/tmp`, `~/.claude/plans`, `$DROVE_HOME/runs/<run>/scratch` | allow |
-| Bash: file writers, in-place sed/perl, runtimes, `./script`, redirects to files | deny (mod rules) | allow |
+| Bash: file writers, in-place sed/perl, runtimes, `./script`, redirects to files | deny (mod rules), **except** `mkdir`, `touch`, `tee`, `cp`, `mv`, `rm`, `rmdir` and redirects whose every write target is inside a Claude Code session scratchpad (below) | allow |
 | Package tools | read-only subcommands only (mod table) | allow |
 | `gh` writes, `curl`/`wget` writes | deny | allow |
 | `git` | allow, except a push to `production` | allow, except any `push` |
 | `herdr` writes | deny, **except** `herdr agent prompt\|wait <seat>` where `<seat>` is an open seat of this run, given as its name, namespaced agent name, pane id or session id (CCS-50, DROVE-43) | deny |
 | `herdr` reads (`list`, `get`, `read`, `explain`, `wait`) | allow | allow |
 | `claude`, `codex` | deny, except `--help`, `--version` and `codex queue` to an open seat of this run | deny, except `--help`, `--version` and `claude plugin test [dir]` (DROVE-39) |
-| `drove` | allow `spawn`, `send`, `prompt`, `promote`, `roster`, `capture`, `close`, `board --once`, `down`; deny `budget`, `plan`, `up`, `guard`, `mcp` | allow `roster`, `capture`; deny the rest |
+| `drove` | allow `init`, `spawn`, `send`, `prompt`, `promote`, `roster`, `capture`, `close`, `board --once`, `down`; deny `budget`, `plan`, `up`, `guard`, `mcp` | allow `roster`, `capture`; deny the rest |
 
 The `--help` and `--version` exception fixes a real annoyance: the mod denied `claude --help` to this worker while it wrote this design.
 
 **`claude plugin test`** (DROVE-39). It runs a mod's test file and starts no session, so a worker may run exactly `claude plugin test` with at most one directory argument and no flags, including through the real binary's path (`~/.local/bin/claude plugin test mod`). Every other `claude` or `codex` command is still denied to it (`claude`, `claude -p`, `claude --resume`), and the planner gets no exception. A user's zsh `claude` function injects `--dangerously-skip-permissions` before `plugin`, which breaks the subcommand in Claude itself, so the worker must call the real binary [proven: a worker ran `~/.local/bin/claude plugin test mod` itself, 38/38].
 
 The writable roots (`isInside`) are resolved after `realpath`, so `/tmp/../repo` does not count as `/tmp`.
+
+**Planner scratchpad** (DROVE-101). A planner in a Claude Code session may write in that session's scratchpad: a path under `/tmp`, `/private/tmp` or `tmpdir()` shaped `claude-<uid>/<project>/<session>/…/scratchpad`, checked after `realpath` so `..` and symlinks do not count. Every write target of the command must be inside one; a glob or variable before the `scratchpad` segment, a plain `/tmp` path and a mix of targets are denied. Interpreters, `chmod` and the rest of the file writers stay denied, and the worker rules are unchanged.
+
+**`drove init <dir>`** (DROVE-101) makes a new repo for a goal that needs one: it creates `<dir>` (with parents) if missing or empty, runs `git init -b main` and makes one empty commit, `chore: initial empty commit`. It refuses a non-empty directory, an existing repo and a directory inside a repo. `--json` prints `{path, branch, commit}`. The planner then attaches the run there (`/orchestrate --repo <dir>` in the mod, `drove plan` from the directory otherwise), because a run is bound to the repo of the session's cwd.
 
 Stricter planner denials added in P2:
 

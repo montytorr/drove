@@ -235,6 +235,49 @@ test('drove subcommands are allowed or denied per role', () => {
   for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once']) assert.ok(worker(`drove ${sub}`), sub)
 })
 
+test('planner may write inside a Claude session scratchpad and nowhere else', () => {
+  const pad = '/private/tmp/claude-501/-Users-cal-proj/abc-123/scratchpad'
+  const strict = (command: string) => guard.bashReason(command, 'planner', { writableRoots: [], openSeats: [] })
+  for (const command of [
+    `mkdir -p ${pad}/x`,
+    `cat > ${pad}/f <<EOF\nhi\nEOF`,
+    `echo hi >> ${pad}/f`,
+    `tee ${pad}/f`,
+    `touch ${pad}/a ${pad}/b`,
+    `cp /Users/test/plan.md ${pad}/plan.md`,
+    `mv ${pad}/a ${pad}/b`,
+    `rm -rf ${pad}/x`,
+    'mkdir -p /tmp/claude-501/p/s/scratchpad/y',
+  ]) {
+    assert.equal(strict(command), undefined, command)
+  }
+  for (const command of [
+    'mkdir /Users/x/foo',
+    'mkdir /tmp/other',
+    'mkdir -p /tmp/claude-501/p/s/notpad',
+    `mkdir ${pad}/../../other`,
+    `mkdir ${pad}/x /tmp/other`,
+    `mv ${pad}/a /Users/x/a`,
+    'rm -rf /tmp/claude-*/p/s/scratchpad/x',
+    'rm -rf $TMPDIR/claude-501/p/s/scratchpad/x',
+    'cat > /Users/x/f <<EOF\nhi\nEOF',
+    'cat > /tmp/other',
+    'node -e "1"',
+    `chmod +x ${pad}/a`,
+  ]) {
+    assert.ok(strict(command), command)
+  }
+})
+
+test('worker rules are unchanged by the planner scratchpad rule', () => {
+  assert.equal(worker('mkdir -p /Users/x/foo && rm -rf dist && git init'), undefined)
+})
+
+test('drove init is for the planner only', () => {
+  assert.equal(planner('drove init /Users/test/new-repo'), undefined)
+  assert.ok(worker('drove init /Users/test/new-repo'))
+})
+
 test('isInside compares real paths (ported from the mod)', () => {
   assert.equal(guard.isInside('/tmp/claude-501/x/scratchpad/plan.md', ROOTS), true)
   assert.equal(guard.isInside('/Users/test/.claude/plans/p.md', ROOTS), true)

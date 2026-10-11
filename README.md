@@ -100,6 +100,7 @@ A worker that hits its usage limit gets a `usage-limit` attention item and is ne
 | `drove prompt <seat> TEXT\|-` | raw prompt into a seat of this run (guarded) |
 | `drove promote <seat> [--model M] --effort E [--reason TEXT]` | change a worker's model or effort |
 | `drove migrate <seat> --kind claude\|codex [--model M] [--effort E] [--reason TEXT]` | move a worker to the other kind in the same worktree, with a handoff brief |
+| `drove init <dir> [--json]` | make a new git repo (branch `main`, one empty commit) in an empty or missing directory, then attach the run there; refuses a non-empty directory or an existing repo |
 | `drove roster [--json] [--run ID]` | one line per seat |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
@@ -114,7 +115,7 @@ A worker that hits its usage limit gets a `usage-limit` attention item and is ne
 
 ## Rules Drove enforces
 
-- The planner does not edit code or run builds; a guard hook denies it. Workers never push, and nobody pushes to `production`. A worker may run `claude plugin test`, and no other `claude` command.
+- The planner does not edit code or run builds; a guard hook denies it. It may still write inside its Claude Code session scratchpad (`/tmp/claude-*/…/scratchpad`), with `mkdir`, `touch`, `tee`, `cp`, `mv`, `rm` or a redirect, and nowhere else. Workers never push, and nobody pushes to `production`. A worker may run `claude plugin test`, and no other `claude` command.
 - A worker spawned with `--owns` (the spawn tool's `owns`) may change only files matching those globs, relative to its worktree: `*` stays in one directory, `**` crosses directories, `{a,b}` alternates, and a glob that names a directory owns what is under it (`docs` owns `docs/a/b.md`). The guard hook denies the worker's `Edit`, `Write`, `MultiEdit`, `NotebookEdit` and `apply_patch` outside them, and shell redirects and the file writers it can read (`rm`, `mv`, `cp`, `tee`, `touch`, `mkdir`, `sed -i`, `chmod`, `dd of=` and the like), with "this file is outside the paths your brief gives you (…); ask the planner with the drove report tool". The globs live on the seat, so `promote`, a restart and `up` keep them; a seat with none is unchanged. It is a seatbelt against mistakes, not a sandbox: a script or an interpreter that writes elsewhere is not parsed, a target with a variable in it is not checked, and the temp directories and Claude's per-project memory stay writable.
 - A worker spawned with `--max-turns N` (or the `maxTurns` setting, for every worker) is flagged at its Nth turn, counted as one Stop hook each, so a long autonomous turn counts once. `--max-tokens N` bounds the tokens the model processed (input, cached input and output), read from the agent's own transcript: the path Claude's hooks report, or the rollout Codex writes under the run's `codex-home/`. At the limit the board shows a `budget` attention and the worker is sent one notice asking it to report `progress` or `promote` and stop. Drove does not kill it; the planner decides.
 - At most 5 worker panes. A 6th needs the human's yes (`drove budget 6`, or a dialog in the mod).

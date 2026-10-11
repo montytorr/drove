@@ -4,6 +4,11 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+### New repos and the planner scratchpad
+- New `drove init <dir> [--json]`: makes a repo on `main` with one empty commit in an empty or missing directory, so a planner can start a goal that needs a new repo. It refuses a non-empty directory, an existing repo and a directory inside a repo. The guard allows it for the planner.
+- The guard lets the planner write inside its Claude Code session scratchpad (`/tmp/claude-*/…/scratchpad`): `mkdir`, `touch`, `tee`, `cp`, `mv`, `rm` and redirects, when every target is inside one. Writes anywhere else, interpreters and unresolved variables stay denied; worker rules are unchanged.
+- The planner's role text mentions `drove init <dir>` and attaching the run there.
+
 ### Lean spawns
 - A lean Claude worker (`workerMcp` or `--mcp` set) starts with `--no-chrome`, so Claude in Chrome's 22 tools are not loaded. Name `claude-in-chrome` in the list to keep it.
 - A Claude worker no longer gets a second report tool from the mod: `mcp__drove__report` is the one.
