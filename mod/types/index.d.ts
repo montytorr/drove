@@ -63,9 +63,12 @@ export type Seat = {
   codexHome?: string
   mcp?: string[]
   plugins?: string[]
+  skills?: string[]
+  agents?: string[]
   userMemory?: boolean
   role?: SeatRole
   target?: string
+  userHooks?: boolean
   owns?: string[]
   maxTurns?: number
   maxTokens?: number

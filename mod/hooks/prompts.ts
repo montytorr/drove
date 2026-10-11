@@ -13,23 +13,34 @@ export const workerModelSection = (self: OrchWorkerSelf): string | undefined =>
 export const modelNotice = (model: string | undefined, effort: unknown): string =>
   `Applied from your next request: you now run on ${modelLine(model, effort)}. The "powered by" line in your system prompt is from launch and is out of date. This notice needs no reply and no report: carry on with what you were doing, or stop if you were waiting.`
 
-// What a worker loads by default (Drove's workerMcp, workerPlugins and workerUserMemory settings) and the names the
-// orchestrator can pass as mcp and plugins, read best effort and names only. A copy of leanSpawns in src/prompts.ts.
-export type LeanSpawnTrims = { workerMcp?: string[]; workerPlugins?: string[]; workerUserMemory?: boolean; mcp?: string[]; codexMcp?: string[]; plugins?: string[] }
+// What a worker loads by default (Drove's workerMcp, workerPlugins, workerSkills, workerAgents, workerUserMemory and
+// workerUserHooks settings) and the names the orchestrator can pass as mcp, plugins, skills and agents, read best effort
+// and names only. A copy of leanSpawns in src/prompts.ts.
+export type LeanSpawnTrims = {
+  workerMcp?: string[]; workerPlugins?: string[]; workerSkills?: string[]; workerAgents?: string[]; workerUserMemory?: boolean; workerUserHooks?: boolean
+  mcp?: string[]; codexMcp?: string[]; plugins?: string[]; skills?: string[]; agents?: string[]
+}
 
 const listOf = (names: readonly string[] | undefined, none: string): string => (names && names.length > 0 ? names.join(', ') : none)
 
 export const leanSpawnsSection = (human: string, trims: LeanSpawnTrims = {}): string => {
   const mcpNow = trims.workerMcp ? `only ${listOf(trims.workerMcp, "Drove's own server")} of ${human}'s MCP servers, and no Claude in Chrome unless it is listed` : `all of ${human}'s MCP servers and Claude in Chrome`
   const pluginsNow = trims.workerPlugins ? `only ${listOf(trims.workerPlugins, "Drove's own mod")}` : 'every enabled plugin'
+  const onlyOf = (names: readonly string[] | undefined, what: string): string => (names ? (names.length > 0 ? `only ${names.join(', ')} of ${what}` : `none of ${what}`) : `all of ${what}`)
+  const skillsNow = onlyOf(trims.workerSkills, `${human}'s skills`)
+  const agentsNow = onlyOf(trims.workerAgents, `${human}'s agent types`)
   const memoryNow = trims.workerUserMemory === false ? 'none of' : 'all of'
+  const hooksNow = trims.workerUserHooks === false ? 'none of' : 'all of'
   const seen = (label: string, names: readonly string[] | undefined): string => (names ? ` ${label}: ${listOf(names, 'none found')}.` : '')
   return `## Lean spawns
-A Claude worker loads, by default: ${mcpNow}; ${pluginsNow}; ${memoryNow} ${human}'s own CLAUDE.md files. Each costs context on every turn, so trim per worker with spawn_worker options:
+A Claude worker loads, by default: ${mcpNow}; ${pluginsNow}; ${skillsNow}; ${agentsNow}; ${memoryNow} ${human}'s own CLAUDE.md files; ${hooksNow} ${human}'s own settings hooks. Each costs context on every turn, so trim per worker with spawn_worker options:
 - \`mcp\`: the MCP servers it needs, by name; [] for Drove's alone, which also drops Claude in Chrome.${seen('Claude servers', trims.mcp)}${seen('Codex servers', trims.codexMcp)}
 - \`plugins\`: the plugins it needs, by name; [] for Drove's mod alone.${seen('Plugins', trims.plugins)}
+- \`skills\`: the skills it needs, by name; [] for none at all. Plugin skills follow \`plugins\`.${seen('Skills', trims.skills)}
+- \`agents\`: the agent types it may use, by name; [] hides ${human}'s own, and the built-in ones stay.${seen('Agent types', trims.agents)}
 - \`userMemory\`: true to load ${human}'s CLAUDE.md files, false to leave them out.
-A seat's \`mcp\` and \`plugins\` add to the run's workerMcp and workerPlugins; \`userMemory\` overrides workerUserMemory. A browser task needs \`mcp: ["claude-in-chrome"]\`; a worker that must follow ${human}'s own coding rules needs \`userMemory: true\`; a mechanical edit can be fully lean (\`mcp: []\`, \`plugins: []\`, \`userMemory: false\`). A Codex worker takes \`mcp\` and follows workerUserMemory only.`
+- \`userHooks\`: false to leave out the hooks in ${human}'s settings.json (prompt reminders, session-start blocks); Drove's stay. Claude reads ${human}'s own skills, agents and commands from the same source, so false drops those too.
+A seat's \`mcp\`, \`plugins\`, \`skills\` and \`agents\` add to the run's workerMcp, workerPlugins, workerSkills and workerAgents; \`userMemory\` and \`userHooks\` override workerUserMemory and workerUserHooks. A browser task needs \`mcp: ["claude-in-chrome"]\`; a worker that must follow ${human}'s own coding rules needs \`userMemory: true\`; a mechanical edit can be fully lean (\`mcp: []\`, \`plugins: []\`, \`skills: []\`, \`agents: []\`, \`userMemory: false\`, \`userHooks: false\`). A Codex worker takes \`mcp\` and follows workerUserMemory and workerUserHooks only.`
 }
 
 // A copy of roleSeats in src/prompts.ts, worded for spawn_worker (DROVE-91).

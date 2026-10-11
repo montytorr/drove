@@ -204,6 +204,23 @@ test('the merge tool is drove merge: local by default, pr and squash on request,
   assert.equal(fake.calls.length, 2)
 })
 
+test('the spawn tool passes skills, agents and userHooks through, and says what they do and default to', async () => {
+  const { fake, tool } = await plannerWith()
+  await tool('spawn').call({ seat: 'w-ui', kind: 'claude', brief: 'x', skills: ['cairn', ' '], agents: [], userHooks: false })
+  assert.deepEqual(fake.calls, [
+    { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, skills: ['cairn'], agents: [], userHooks: false }] },
+  ])
+  const schema = tool('spawn').inputSchema as { properties: Record<string, { type: string; description: string }> }
+  assert.deepEqual([schema.properties.skills?.type, schema.properties.agents?.type, schema.properties.userHooks?.type], ['array', 'array', 'boolean'])
+  assert.match(schema.properties.skills?.description ?? '', /Claude workers only.*Left out.*workerSkills/)
+  assert.match(schema.properties.agents?.description ?? '', /Claude workers only.*Left out.*workerAgents/)
+  assert.match(schema.properties.userHooks?.description ?? '', /Claude workers only.*skills, agents and commands.*Left out.*workerUserHooks/)
+  for (const args of [{ skills: 'cairn' }, { agents: [1] }, { userHooks: 'false' }]) {
+    assert.equal((await tool('spawn').call({ seat: 'w-x', kind: 'claude', brief: 'x', ...args })).isError, true, JSON.stringify(args))
+  }
+  assert.equal(fake.calls.length, 1)
+})
+
 test('planner tools reject bad arguments before calling a command', async () => {
   const { fake, tool } = await plannerWith()
   const bad: [string, Record<string, unknown>][] = [

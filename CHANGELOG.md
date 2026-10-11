@@ -43,6 +43,13 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - `drove send` takes `--run ID`, for an answer sent from outside the run's folder. With `--json`, a failure of `plan --detached`, `up --detached` or `attention` is one JSON object on stderr.
 - The README has an "Unattended runs" section and DESIGN a §14 on the interface and what it needs on the host.
 
+### Leaner workers: skills, agents and your settings hooks
+- `workerSkills` now trims Claude workers too (it was Codex-only): a worker loads only the skills you list of your own `~/.claude/skills`, `~/.claude/commands` and claude.ai skills, and `[]` starts it with `--disable-slash-commands`. Plugin skills follow `workerPlugins`. If you already set `workerSkills` for Codex, Claude workers now follow it too.
+- New `workerAgents` config key: your own agent types (`~/.claude/agents`) the list leaves out are hidden from a Claude worker's Agent tool; the built-in agents stay.
+- New `workerUserHooks: false` config key: a Claude worker starts without the `user` setting source (`--setting-sources project,local`), so the hooks in your `settings.json` do not run in it, and neither do your own skills, agents and commands, which Claude reads from the same place. Your settings (env, permissions, plugins) and user-scope MCP servers are handed over by Drove, and Drove's own hooks stay. A Codex worker leaves your `hooks.json` out of the run's `CODEX_HOME`.
+- A spawn can set each one for one worker: `skills` (`--skills a,b`) and `agents` (`--agents a,b`) add to the run's lists and make that worker lean even when the key is unset, and `userHooks` (`--user-hooks on|off`) overrides `workerUserHooks`. They work in `drove spawn`, the spawn tool and the mod's `spawn_worker`, and a promote, restart, `up` or migrate keeps them. They are Claude-only per seat: a Codex seat follows `workerUserHooks`, and the spawn result says so.
+- The planner's "Lean spawns" text names the new options and lists your skill and agent names (read from your Claude folders, names only).
+
 ## [0.3.0] - 2026-10-11
 
 Leaner workers the planner trims per spawn, a more reliable `/orchestrate`, and `drove init` for starting a goal in a new repo.

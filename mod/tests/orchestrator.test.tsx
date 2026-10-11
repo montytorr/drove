@@ -92,6 +92,8 @@ describe('drove client', () => {
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', mcp: [] }).slice(-2)).toEqual(['--mcp', ''])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', plugins: ['context7', 'ccc-skills'], userMemory: false }).slice(-4)).toEqual(['--plugins', 'context7,ccc-skills', '--user-memory', 'off'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', plugins: [], userMemory: true }).slice(-4)).toEqual(['--plugins', '', '--user-memory', 'on'])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', skills: ['cairn'], agents: [], userHooks: false }).slice(-6)).toEqual(['--skills', 'cairn', '--agents', '', '--user-hooks', 'off'])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', skills: [], userHooks: true }).slice(-4)).toEqual(['--skills', '', '--user-hooks', 'on'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: ['src/a.ts', 'test/**'], maxTurns: 25, maxTokens: 1000000 }).slice(-6)).toEqual(['--owns', 'src/a.ts,test/**', '--max-turns', '25', '--max-tokens', '1000000'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: [] })).toEqual(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low' }))
     expect(spawnArgs({ name: 'r-x', kind: 'claude', effort: 'low', role: 'reviewer', target: 'w-x' }).slice(-4)).toEqual(['--role', 'reviewer', '--target', 'w-x'])
@@ -367,6 +369,13 @@ const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HER
     return { value: text } as never
   })
   on('fs.write', ($, e) => ((world.files[e.path] = e.text), { value: undefined }) as never)
+  on('fs.list', ($, e) => {
+    const prefix = `${e.path}/`
+    const names = [...new Set(Object.keys(world.files).filter(path => path.startsWith(prefix)).map(path => path.slice(prefix.length).split('/')[0] ?? ''))]
+    if (names.length === 0) throw new Error(`ENOENT: ${e.path}`)
+    return { value: names } as never
+  })
+  on('fs.exists', ($, e) => ({ value: world.files[e.path] !== undefined }) as never)
   on('process.run', ($, e) => {
     const [, , ...args] = e.argv
     const init = e.init ?? {}
@@ -598,19 +607,44 @@ describe('orchestrator session', () => {
     expect(inputSchema.properties.userMemory?.description).toContain('workerUserMemory')
   })
 
+  test('spawn_worker passes skills, agents and userHooks to drove spawn, and its schema says what they default to', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await callTool($, 'spawn_worker', { name: 'w-lean', brief: 'Edit it', skills: ['cairn', 4], agents: [], userHooks: false })
+    expect(droveCalls(world, 'spawn')[0]?.args.slice(-6)).toEqual(['--skills', 'cairn', '--agents', '', '--user-hooks', 'off'])
+    await callTool($, 'spawn_worker', { name: 'w-hooks', brief: 'Follow the rules', userHooks: 'no' })
+    expect(droveCalls(world, 'spawn')[1]?.args).not.toContain('--user-hooks')
+    const { inputSchema } = world.toolSchemas.spawn_worker as { inputSchema: { properties: Record<string, { type: string; description: string }> } }
+    expect([inputSchema.properties.skills?.type, inputSchema.properties.agents?.type, inputSchema.properties.userHooks?.type]).toEqual(['array', 'array', 'boolean'])
+    expect(inputSchema.properties.skills?.description).toContain('workerSkills')
+    expect(inputSchema.properties.agents?.description).toContain('workerAgents')
+    expect(inputSchema.properties.userHooks?.description).toContain('workerUserHooks')
+  })
+
   test("the orchestrator section has Lean spawns: what a worker loads under Drove's config and the names it can pick", async ($, on) => {
     const { world } = engine(on)
-    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ workerMcp: ['notion'], workerUserMemory: false })
+    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ workerMcp: ['notion'], workerUserMemory: false, workerSkills: ['cairn'], workerAgents: [], workerUserHooks: false })
     world.files['/Users/test/.claude.json'] = JSON.stringify({ mcpServers: { notion: {}, mongodb: {}, drove: {} } })
     world.files['/Users/test/.claude/settings.json'] = JSON.stringify({ enabledPlugins: { 'context7@claude-plugins-official': true, 'old@x': false } })
+    world.files['/Users/test/.claude/skills/cairn/SKILL.md'] = '---\nname: cairn\n---'
+    world.files['/Users/test/.claude/skills/notes/SKILL.md'] = '---\nname: notes\n---'
+    world.files['/Users/test/.claude/skills/lib/helper.sh'] = 'x'
+    world.files['/Users/test/.claude/skills/synced/acct/docx/SKILL.md'] = '---\nname: docx\n---'
+    world.files['/Users/test/.claude/commands/audit.md'] = 'x'
+    world.files['/Users/test/.claude/agents/design/ui-ux-designer.md'] = 'x'
+    world.files['/Users/test/.claude/agents/debugger.md'] = 'x'
     on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
     await $.session.start(START)
     await runCommand($, 'Ship it')
     const text = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections[1]?.text ?? ''
     expect(text).toContain('## Lean spawns')
-    expect(text).toContain("by default: only notion of the human's MCP servers, and no Claude in Chrome unless it is listed; every enabled plugin; none of the human's own CLAUDE.md files.")
+    expect(text).toContain("by default: only notion of the human's MCP servers, and no Claude in Chrome unless it is listed; every enabled plugin; only cairn of the human's skills; none of the human's agent types; none of the human's own CLAUDE.md files; none of the human's own settings hooks.")
     expect(text).toContain('Claude servers: notion, mongodb.')
     expect(text).toContain('Plugins: context7.')
+    expect(text).toContain('Skills: cairn, notes, anthropic-skills:docx, audit.')
+    expect(text).toContain('Agent types: ui-ux-designer, debugger.')
+    expect(text).toContain('`userHooks: false`')
     expect(text).toContain('`mcp: ["claude-in-chrome"]`')
   })
 

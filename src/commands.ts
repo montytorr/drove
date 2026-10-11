@@ -11,7 +11,7 @@ import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isD
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
 import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './isolation.ts'
-import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readClaudePlugins, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
+import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeAgents, readClaudeMcp, readClaudePlugins, readClaudeSettings, readClaudeSkills, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, LAB_RE, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
@@ -105,11 +105,12 @@ const portsOf = (value: unknown): DroveConfig['workerPorts'] => {
 }
 
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const { workerMcp, workerSkills, workerPlugins, workerUserMemory, maxTurns, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const ports = portsOf(workerPorts)
   const copy = namesOf(workerCopy)
   const mcp = namesOf(workerMcp)
   const skills = namesOf(workerSkills)
+  const agents = namesOf(workerAgents)
   const plugins = namesOf(workerPlugins)
   return {
     ...DEFAULT_CONFIG,
@@ -118,8 +119,10 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
     ...(copy && copy.length > 0 ? { workerCopy: copy } : {}),
     ...(mcp ? { workerMcp: mcp } : {}),
     ...(skills ? { workerSkills: skills } : {}),
+    ...(agents ? { workerAgents: agents } : {}),
     ...(plugins ? { workerPlugins: plugins } : {}),
     ...(typeof workerUserMemory === 'boolean' ? { workerUserMemory } : {}),
+    ...(typeof workerUserHooks === 'boolean' ? { workerUserHooks } : {}),
     ...(isWhole(maxTurns) ? { maxTurns } : {}),
     ...(typeof labInstance === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(labInstance.trim()) ? { labInstance: labInstance.trim() } : {}),
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
@@ -249,27 +252,50 @@ const seatMcpAllow = (config: DroveConfig, seat: Pick<Seat, 'mcp'>): string[] | 
 const seatPluginAllow = (config: DroveConfig, seat: Pick<Seat, 'plugins'>): string[] | undefined =>
   config.workerPlugins === undefined && seat.plugins === undefined ? undefined : [...new Set([...(config.workerPlugins ?? []), ...(seat.plugins ?? [])])]
 
+// The same rule for skills and agents (DROVE-98): the run's list plus the seat's, a list on the seat alone makes it lean.
+const seatSkillAllow = (config: DroveConfig, seat: Pick<Seat, 'skills'>): string[] | undefined =>
+  config.workerSkills === undefined && seat.skills === undefined ? undefined : [...new Set([...(config.workerSkills ?? []), ...(seat.skills ?? [])])]
+
+const seatAgentAllow = (config: DroveConfig, seat: Pick<Seat, 'agents'>): string[] | undefined =>
+  config.workerAgents === undefined && seat.agents === undefined ? undefined : [...new Set([...(config.workerAgents ?? []), ...(seat.agents ?? [])])]
+
 // A seat's own userMemory wins over workerUserMemory; a Codex seat cannot use it (see below).
 const isSeatMemoryOff = (config: DroveConfig, seat: Pick<Seat, 'userMemory'>): boolean => (seat.userMemory ?? config.workerUserMemory) === false
+
+// A seat's own userHooks wins over workerUserHooks the same way.
+const isSeatHooksOff = (config: DroveConfig, seat: Pick<Seat, 'userHooks'>): boolean => (seat.userHooks ?? config.workerUserHooks) === false
 
 type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[]; unknownPlugins: string[] }
 
 // Codex's CODEX_HOME is shared by every seat of a run and Codex reads the user's AGENTS.md from it with no per-launch
 // way to skip it (probed in rust-v0.162.0: project_doc_* only gates the repo's own AGENTS.md). So a Codex seat follows
-// workerUserMemory alone, and a seat's plugins and userMemory options are Claude-only.
+// workerUserMemory alone, and a seat's plugins and userMemory options are Claude-only. The same goes for workerUserHooks:
+// the shared home's hooks.json is one file, so a Codex seat follows the run's setting (DROVE-98).
 const trimExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
   const mcpAllow = seatMcpAllow(config, seat)
   if (seat.kind === 'claude') {
     // The user's MCP servers, plugins and memory are read only when a switch asks for them (DROVE-72, DROVE-88).
     const claudeDir = deps.claudeUserDir ?? userClaudeDir()
     const pluginAllow = seatPluginAllow(config, seat)
-    const userMcp = mcpAllow ? await readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo) : undefined
+    const isHooksOff = isSeatHooksOff(config, seat)
+    const skillAllow = seatSkillAllow(config, seat)
+    const agentAllow = seatAgentAllow(config, seat)
+    const userMcp = mcpAllow || isHooksOff ? await readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo) : undefined
     const userPlugins = pluginAllow ? await readClaudePlugins(join(claudeDir, 'settings.json')) : undefined
+    // Without the user setting source Claude loads no user skills, agents or commands, so there is nothing to switch off.
+    const userSkills = skillAllow && skillAllow.length > 0 && !isHooksOff ? await readClaudeSkills(claudeDir) : undefined
+    const userAgents = agentAllow && !isHooksOff ? await readClaudeAgents(claudeDir) : undefined
+    const userSettings = isHooksOff ? await readClaudeSettings(join(claudeDir, 'settings.json')) : undefined
     return {
       parts: {
-        ...(mcpAllow && userMcp ? { mcpAllow, userMcp } : {}),
+        ...(mcpAllow && userMcp ? { mcpAllow } : {}),
+        ...(userMcp ? { userMcp } : {}),
         ...(pluginAllow && userPlugins ? { pluginAllow, userPlugins } : {}),
+        ...(skillAllow ? { skillAllow } : {}),
+        ...(userSkills ? { userSkills } : {}),
+        ...(agentAllow && userAgents ? { agentAllow, userAgents } : {}),
         ...(isSeatMemoryOff(config, seat) ? { userMemory: false, claudeDir } : {}),
+        ...(userSettings ? { userHooks: false, userSettings } : {}),
       },
       missing: mcpAllow && userMcp ? mcpAllow.filter(name => name !== 'drove' && name !== CHROME_SERVER && userMcp[name] === undefined) : [],
       unknownPlugins: pluginAllow && userPlugins ? unknownPlugins(pluginAllow, userPlugins) : [],
@@ -284,6 +310,7 @@ const trimExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
       ...(config.workerMcp ? { homeMcpAllow: config.workerMcp } : {}),
       ...(config.workerSkills ? { skillAllow: config.workerSkills } : {}),
       ...(config.workerUserMemory === false ? { userMemory: false } : {}),
+      ...(config.workerUserHooks === false ? { userHooks: false } : {}),
     },
     missing: codexHome && mcpAllow ? mcpAllow.filter(name => name !== 'drove' && !known.includes(name)) : [],
     unknownPlugins: [],
@@ -310,15 +337,19 @@ const slotsOfOtherRuns = async (deps: Deps, runId: string): Promise<number[]> =>
 // Names only, read best effort and never written: what the planner can pass as mcp and plugins (DROVE-89).
 const availableTrimsOf = async (deps: Deps, run: RunMeta): Promise<AvailableTrims> => {
   const claudeDir = deps.claudeUserDir ?? userClaudeDir()
-  const [claudeMcp, plugins, codexConfig] = await Promise.all([
+  const [claudeMcp, plugins, skills, agents, codexConfig] = await Promise.all([
     readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo).catch(() => undefined),
     readClaudePlugins(join(claudeDir, 'settings.json')).catch(() => undefined),
+    readClaudeSkills(claudeDir).catch(() => undefined),
+    readClaudeAgents(claudeDir).catch(() => undefined),
     readFile(join(deps.codexUserHome ?? userCodexHome(deps.home), 'config.toml'), 'utf8').catch(() => undefined),
   ])
   return {
     ...(claudeMcp ? { mcp: Object.keys(claudeMcp).filter(name => name !== 'drove') } : {}),
     ...(codexConfig !== undefined ? { codexMcp: codexMcpNames(codexConfig) } : {}),
     ...(plugins ? { plugins: [...new Set([...plugins.enabled.map(key => key.split('@')[0] ?? key), ...(plugins.dirs ?? []).map(dir => dir.name)])].filter(name => name !== 'orchestrator') } : {}),
+    ...(skills && skills.length > 0 ? { skills } : {}),
+    ...(agents && agents.length > 0 ? { agents } : {}),
   }
 }
 
@@ -328,10 +359,21 @@ const missingMcpNote = (seat: Seat, missing: readonly string[]): string[] =>
 const unknownPluginsNote = (seat: Seat, unknown: readonly string[]): string[] =>
   unknown.length > 0 ? [`Plugin${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')} ${unknown.length > 1 ? 'are' : 'is'} not enabled in the user's Claude settings, so ${seat.name} runs without ${unknown.length > 1 ? 'them' : 'it'}.`] : []
 
-// plugins and userMemory shape a Claude seat's settings only; saying so beats a silent no-op.
-const claudeOnlyNote = (seat: Seat): string[] =>
-  seat.kind === 'codex' && (seat.plugins !== undefined || seat.userMemory !== undefined)
-    ? [`${seat.name} is a Codex seat: ${[seat.plugins !== undefined ? 'plugins' : '', seat.userMemory !== undefined ? 'userMemory' : ''].filter(Boolean).join(' and ')} apply to Claude seats only. A Codex seat follows the workerUserMemory config key, since its CODEX_HOME is shared by the run.`]
+// plugins, skills, agents, userMemory and userHooks shape a Claude seat's settings only; saying so beats a silent no-op.
+const claudeOnlyNote = (seat: Seat): string[] => {
+  const given = [
+    seat.plugins !== undefined ? 'plugins' : '', seat.skills !== undefined ? 'skills' : '', seat.agents !== undefined ? 'agents' : '',
+    seat.userMemory !== undefined ? 'userMemory' : '', seat.userHooks !== undefined ? 'userHooks' : '',
+  ].filter(Boolean)
+  if (seat.kind !== 'codex' || given.length === 0) return []
+  const listed = given.length > 1 ? `${given.slice(0, -1).join(', ')} and ${given.at(-1)}` : given.join('')
+  return [`${seat.name} is a Codex seat: ${listed} apply to Claude seats only. A Codex seat follows the workerUserMemory and workerUserHooks config keys, since its CODEX_HOME is shared by the run.`]
+}
+
+// Claude reads the user's hooks, skills, agents and commands from one setting source, so dropping it drops all four.
+const userHooksNote = (config: DroveConfig, seat: Seat): string[] =>
+  seat.kind === 'claude' && isSeatHooksOff(config, seat)
+    ? [`${seat.name} runs without the user's own settings hooks, and so without the user's own skills, agents and commands (Claude reads them from the same source); plugin skills, bundled skills and the MCP servers stay.`]
     : []
 
 // A Codex seat without a Drove-owned home got its role inside its brief, so a relaunch adds none.
@@ -826,7 +868,12 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (badMcp !== undefined) return failed('usage', `--mcp takes server names separated by commas; got "${badMcp}"`)
   const badPlugin = request.plugins?.find(name => !MCP_NAME_RE.test(name))
   if (badPlugin !== undefined) return failed('usage', `--plugins takes plugin names separated by commas; got "${badPlugin}"`)
+  const badSkill = request.skills?.find(name => !MCP_NAME_RE.test(name))
+  if (badSkill !== undefined) return failed('usage', `--skills takes skill names separated by commas; got "${badSkill}"`)
+  const badAgent = request.agents?.find(name => !MCP_NAME_RE.test(name))
+  if (badAgent !== undefined) return failed('usage', `--agents takes agent names separated by commas; got "${badAgent}"`)
   if (request.userMemory !== undefined && typeof request.userMemory !== 'boolean') return failed('usage', '--user-memory must be on or off')
+  if (request.userHooks !== undefined && typeof request.userHooks !== 'boolean') return failed('usage', '--user-hooks must be on or off')
   const role = request.role ?? 'implementer'
   if (!SEAT_ROLES.includes(role)) return failed('usage', `--role must be one of ${SEAT_ROLES.join(', ')}; got "${String(role)}"`)
   const isReview = role !== 'implementer'
@@ -867,6 +914,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}),
     ...(request.plugins ? { plugins: [...new Set(request.plugins)] } : {}), ...(request.userMemory !== undefined ? { userMemory: request.userMemory } : {}),
     ...(isReview && request.target ? { role, target: request.target } : {}),
+    ...(request.skills ? { skills: [...new Set(request.skills)] } : {}), ...(request.agents ? { agents: [...new Set(request.agents)] } : {}),
+    ...(request.userHooks !== undefined ? { userHooks: request.userHooks } : {}),
     ...(owns ? { owns } : {}), model, effort, worktree, branch,
     ...(request.maxTurns ?? config.maxTurns ? { maxTurns: request.maxTurns ?? config.maxTurns } : {}), ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
@@ -971,7 +1020,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   await saveBrief(deps, run.id, seat.name, briefText)
   const extras = await launchExtrasOf(deps, run, config, seat)
   if (extras.unknownPlaceholders.length > 0) baseNotes.push(`workerEnv has placeholders Drove does not know, left as written: ${extras.unknownPlaceholders.join(', ')}. Known: {seat}, {run}, {slot}${config.workerPorts ? ', {port}' : ' and {port} (set workerPorts)'}.`)
-  baseNotes.push(...missingMcpNote(seat, extras.missing), ...unknownPluginsNote(seat, extras.unknownPlugins), ...claudeOnlyNote(seat))
+  baseNotes.push(...missingMcpNote(seat, extras.missing), ...unknownPluginsNote(seat, extras.unknownPlugins), ...claudeOnlyNote(seat), ...userHooksNote(config, seat))
   const spec = specFor(
     launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: seatRoleText(run, config, seat), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
   )

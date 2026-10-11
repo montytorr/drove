@@ -648,6 +648,19 @@ test('loadConfig reads workerPlugins as names and workerUserMemory as a boolean,
   assert.deepEqual((await commands.loadConfig(deps.home)).workerPlugins, [], 'an empty list is the lean setting: the user plugins off')
 })
 
+test('loadConfig reads workerAgents as names and workerUserHooks as a boolean, and ignores other values', async () => {
+  const deps = await makeDeps(new FakeHerdr())
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerSkills: ['cairn'], workerAgents: [' debugger ', 7, 'debugger'], workerUserHooks: false }))
+  const config = await commands.loadConfig(deps.home)
+  assert.deepEqual([config.workerSkills, config.workerAgents, config.workerUserHooks], [['cairn'], ['debugger'], false])
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerAgents: 'debugger', workerUserHooks: 'no' }))
+  const bad = await commands.loadConfig(deps.home)
+  assert.deepEqual([bad.workerAgents, bad.workerUserHooks], [undefined, undefined])
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerAgents: [], workerSkills: [] }))
+  const empty = await commands.loadConfig(deps.home)
+  assert.deepEqual([empty.workerAgents, empty.workerSkills], [[], []], 'an empty list is the lean setting: none of the user ones')
+})
+
 test('a single-line brief stays a launch argument; the role text is a file, not an argument', async () => {
   const { fake, deps, identity } = await setup()
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief: '  Build the widget.  ' })

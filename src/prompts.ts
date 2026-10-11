@@ -1,23 +1,31 @@
 import { shortModel } from './roster.ts'
 import type { AgentKind, DroveConfig, RunMeta, SeatRole } from './types.ts'
 
-// Names the planner can pass as mcp and plugins, read best effort from the user's own setup; names only (DROVE-89).
-export type AvailableTrims = { mcp?: string[]; codexMcp?: string[]; plugins?: string[] }
+// Names the planner can pass as mcp, plugins, skills and agents, read best effort from the user's own setup; names only
+// (DROVE-89, DROVE-98).
+export type AvailableTrims = { mcp?: string[]; codexMcp?: string[]; plugins?: string[]; skills?: string[]; agents?: string[] }
 
 const listOf = (names: readonly string[] | undefined, none: string): string => (names && names.length > 0 ? names.join(', ') : none)
 
 // The planner's own text only: the worker role stays identical across seats so it caches (DROVE-72).
-export const leanSpawns = (human: string, config: Pick<DroveConfig, 'workerMcp' | 'workerPlugins' | 'workerUserMemory'>, available: AvailableTrims = {}): string => {
+export const leanSpawns = (human: string, config: Pick<DroveConfig, 'workerMcp' | 'workerPlugins' | 'workerSkills' | 'workerAgents' | 'workerUserMemory' | 'workerUserHooks'>, available: AvailableTrims = {}): string => {
   const mcpNow = config.workerMcp ? `only ${listOf(config.workerMcp, "Drove's own server")} of ${human}'s MCP servers, and no Claude in Chrome unless it is listed` : `all of ${human}'s MCP servers and Claude in Chrome`
   const pluginsNow = config.workerPlugins ? `only ${listOf(config.workerPlugins, "Drove's own mod")}` : 'every enabled plugin'
+  const onlyOf = (names: readonly string[] | undefined, what: string): string => (names ? (names.length > 0 ? `only ${names.join(', ')} of ${what}` : `none of ${what}`) : `all of ${what}`)
+  const skillsNow = onlyOf(config.workerSkills, `${human}'s skills`)
+  const agentsNow = onlyOf(config.workerAgents, `${human}'s agent types`)
   const memoryNow = config.workerUserMemory === false ? 'none of' : 'all of'
+  const hooksNow = config.workerUserHooks === false ? 'none of' : 'all of'
   const seen = (label: string, names: readonly string[] | undefined): string => (names ? ` ${label}: ${listOf(names, 'none found')}.` : '')
   return `## Lean spawns
-A Claude worker loads, by default: ${mcpNow}; ${pluginsNow}; ${memoryNow} ${human}'s own CLAUDE.md files. Each costs context on every turn, so trim per worker with spawn options:
+A Claude worker loads, by default: ${mcpNow}; ${pluginsNow}; ${skillsNow}; ${agentsNow}; ${memoryNow} ${human}'s own CLAUDE.md files; ${hooksNow} ${human}'s own settings hooks. Each costs context on every turn, so trim per worker with spawn options:
 - \`mcp\`: the MCP servers it needs, by name; [] for Drove's alone, which also drops Claude in Chrome.${seen('Claude servers', available.mcp)}${seen('Codex servers', available.codexMcp)}
 - \`plugins\`: the plugins it needs, by name; [] for Drove's mod alone.${seen('Plugins', available.plugins)}
+- \`skills\`: the skills it needs, by name; [] for none at all. Plugin skills follow \`plugins\`.${seen('Skills', available.skills)}
+- \`agents\`: the agent types it may use, by name; [] hides ${human}'s own, and the built-in ones stay.${seen('Agent types', available.agents)}
 - \`userMemory\`: true to load ${human}'s CLAUDE.md files, false to leave them out.
-A seat's \`mcp\` and \`plugins\` add to the run's workerMcp and workerPlugins; \`userMemory\` overrides workerUserMemory. A browser task needs \`mcp: ["claude-in-chrome"]\`; a worker that must follow ${human}'s own coding rules needs \`userMemory: true\`; a mechanical edit can be fully lean (\`mcp: []\`, \`plugins: []\`, \`userMemory: false\`). A Codex worker takes \`mcp\` and follows workerUserMemory only.`
+- \`userHooks\`: false to leave out the hooks in ${human}'s settings.json (prompt reminders, session-start blocks); Drove's stay. Claude reads ${human}'s own skills, agents and commands from the same source, so false drops those too.
+A seat's \`mcp\`, \`plugins\`, \`skills\` and \`agents\` add to the run's workerMcp, workerPlugins, workerSkills and workerAgents; \`userMemory\` and \`userHooks\` override workerUserMemory and workerUserHooks. A browser task needs \`mcp: ["claude-in-chrome"]\`; a worker that must follow ${human}'s own coding rules needs \`userMemory: true\`; a mechanical edit can be fully lean (\`mcp: []\`, \`plugins: []\`, \`skills: []\`, \`agents: []\`, \`userMemory: false\`, \`userHooks: false\`). A Codex worker takes \`mcp\` and follows workerUserMemory and workerUserHooks only.`
 }
 
 // Reviewer and tester seats are the planner's to use, never required (DROVE-91). The text is the planner's own: the worker roles stay identical per role.
