@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict'
 import { realpath } from 'node:fs/promises'
 import { beforeEach, test } from 'node:test'
-import { COMMANDS, main, splitGlobs } from '../src/cli.ts'
+import { parseArgs } from 'node:util'
+import { COMMANDS, main, spawnRequestOf, splitGlobs } from '../src/cli.ts'
 import type { ProcessPlan } from '../src/commands.ts'
 import { saveRun } from '../src/roster.ts'
 import { makeRepo, makeRun, RUN, tmp } from './p3-helpers.ts'
@@ -39,6 +40,32 @@ test('--owns splits on commas outside braces, and spawn reads --owns, --max-turn
     assert.equal(await main([...base, ...extra], io), 1)
     assert.match(err.join('\n'), message)
   }
+})
+
+test('spawn reads --plugins and --user-memory, and checks their shape', async () => {
+  assert.match(COMMANDS.spawn?.usage ?? '', /--plugins NAME,NAME.*--user-memory on\|off/)
+  const base = ['spawn', 'w-api', '--kind', 'claude', '--brief', 'x']
+  for (const [extra, code, message] of [
+    [['--plugins', 'context7,a b'], 1, /--plugins takes plugin names separated by commas; got "a b"/],
+    [['--user-memory', 'maybe'], 2, /--user-memory must be on or off; got "maybe"/],
+  ] as const) {
+    const { err, io } = capture()
+    assert.equal(await main([...base, ...extra], io), code)
+    assert.match(err.join('\n'), message)
+  }
+})
+
+test("an empty --mcp or --plugins is the empty list, not a dropped option, and a missing one is undefined", () => {
+  const requestOf = (...args: string[]) => {
+    const { values, positionals } = parseArgs({ args: ['w-api', '--kind', 'claude', '--brief', 'x', ...args], options: COMMANDS.spawn?.options ?? {}, allowPositionals: true, strict: true })
+    return spawnRequestOf(values as Parameters<typeof spawnRequestOf>[0], positionals, 'x')
+  }
+  const lean = requestOf('--mcp', '', '--plugins', '', '--user-memory', 'off')
+  assert.deepEqual([lean.mcp, lean.plugins, lean.userMemory], [[], [], false])
+  const named = requestOf('--mcp', 'notion, mongodb', '--plugins', 'context7', '--user-memory', 'on')
+  assert.deepEqual([named.mcp, named.plugins, named.userMemory], [['notion', 'mongodb'], ['context7'], true])
+  const open = requestOf()
+  assert.deepEqual([open.mcp, open.plugins, open.userMemory], [undefined, undefined, undefined])
 })
 
 test('cli --help prints usage and exits 0', async () => {

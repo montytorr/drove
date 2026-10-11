@@ -65,6 +65,10 @@ const pluginNameOf = (key: string): string => key.split('@')[0] ?? key
 const isPluginAllowed = (allow: readonly string[], key: string): boolean =>
   pluginNameOf(key) === DROVE_PLUGIN || allow.some(item => item === key || item === pluginNameOf(key))
 
+// Allowlist entries that match nothing the user enabled, so the seat runs without them (a typo, or a plugin not installed).
+export const unknownPlugins = (allow: readonly string[], user: UserPlugins): string[] =>
+  allow.filter(item => item !== DROVE_PLUGIN && ![...user.enabled, ...(user.dirs ?? []).map(dir => `${dir.name}@${INLINE_MARKETPLACE}`)].some(key => key === item || pluginNameOf(key) === item))
+
 // Turns off what the user enabled and the list leaves out, for this session only: enabledPlugins false for marketplace
 // plugins, and CLAUDE_CODE_PLUGIN_DIRS cut to the allowed mod dirs. Probed on Claude Code 2.1.296: both override the
 // user's settings.json when they come from --settings.
