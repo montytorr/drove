@@ -7,6 +7,13 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 ### Planner
 - The planner handles GitHub itself through `gh`: PRs (all), issues, releases (`create`, `edit`, `upload`), workflow runs, labels, and `repo create --private|--internal`, `clone`, `fork`, `sync`. Deletions, transfers, secrets and variables, repo `edit`/`rename`/`archive`, public repo creation and `gh api` writes stay with the human, and any `gh` write naming a `production` branch (`--base`, `-B`, `--target`, `--ref`, or the head of `pr create`) is denied. Worker rules are unchanged (DROVE-104).
 
+### Isolation beyond a worktree (DROVE-93)
+- New `workerPorts: { base, stride }` config key: each open seat takes the lowest free slot and launches with `PORT` (= base + slot × stride), `DROVE_PORT_BASE` and `DROVE_PORT_COUNT` (= stride). A closed seat's slot is reused, and the slot is kept through restart, promote, `up` and migrate.
+- `workerEnv` values may use `{seat}`, `{run}`, `{slot}` and `{port}`, filled per seat at launch; an unknown placeholder is left as written and the spawn result says so.
+- New `workerCopy` config key: globs of files git ignores (such as `.env`) that are copied from the main checkout into a worker's worktree at spawn. It never overwrites a file and refuses a file git does not ignore, with a note.
+- The brief footer gives a worker its ports and the files copied for it, only when set.
+- DESIGN has an "Isolation" section: what a worktree isolates, what these keys add, and when a container or VM per seat is worth it (not built).
+
 ## [0.3.0] - 2026-10-11
 
 Leaner workers the planner trims per spawn, a more reliable `/orchestrate`, and `drove init` for starting a goal in a new repo.

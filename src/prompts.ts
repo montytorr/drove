@@ -87,12 +87,25 @@ Messages from the planner arrive as a \`⟦drove v1 …⟧\` header followed by 
 export const cairnGoalPrompt = (ref: string, title: string, body: string): string =>
   `This run's goal is Cairn task ${ref}: ${title}${body.trim() ? `\n\n${body.trim()}` : ''}\n\n${ref} is the run's goal task and you hold it: claim it first (\`cairn claim ${ref}\`), and run \`cairn check\` on its subject before planning. When the run is taken down, Drove writes a summary note on it.`
 
-export type FooterExtras = { branch?: string; verify?: readonly string[] }
+export type FooterExtras = { branch?: string; verify?: readonly string[]; ports?: { port: number; count: number }; copied?: readonly string[] }
+
+const MAX_COPIED_SHOWN = 6
+
+// One line, and only for what is set: the seat's own ports and the untracked files copied into its worktree (DROVE-93).
+const isolationLine = (extras: FooterExtras): string => {
+  const parts = [
+    extras.ports ? `Your ports are ${extras.ports.port}-${extras.ports.port + extras.ports.count - 1} (PORT=${extras.ports.port}); use only those.` : '',
+    extras.copied && extras.copied.length > 0
+      ? `Untracked files copied from the main checkout: ${extras.copied.slice(0, MAX_COPIED_SHOWN).join(', ')}${extras.copied.length > MAX_COPIED_SHOWN ? ` and ${extras.copied.length - MAX_COPIED_SHOWN} more` : ''}.`
+      : '',
+  ].filter(Boolean)
+  return parts.length > 0 ? ` ${parts.join(' ')}` : ''
+}
 
 const verifyLine = (verify: readonly string[] = []): string => (verify.length > 0 ? ` Verify with ${verify.map(command => `\`${command}\``).join(', ')}.` : '')
 
 export const briefFooter = (seat: string, cairn?: string, extras: FooterExtras = {}): string =>
-  `\n\n(You are worker \`${seat}\`${extras.branch ? ` on branch \`${extras.branch}\`` : ''}.${cairn ? ` Your Cairn task is ${cairn}: claim it first.` : ''}${verifyLine(extras.verify)} Report with the drove report tool when done, blocked, or when you need a decision.)`
+  `\n\n(You are worker \`${seat}\`${extras.branch ? ` on branch \`${extras.branch}\`` : ''}.${cairn ? ` Your Cairn task is ${cairn}: claim it first.` : ''}${verifyLine(extras.verify)}${isolationLine(extras)} Report with the drove report tool when done, blocked, or when you need a decision.)`
 
 type PackageJson = { scripts?: Record<string, unknown>; packageManager?: unknown }
 

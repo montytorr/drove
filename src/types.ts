@@ -32,6 +32,8 @@ export type DroveConfig = {
   claudeChannel: boolean
   briefVia: 'prompt' | 'launch-arg'
   workerEnv: Record<string, string>
+  workerPorts?: { base: number; stride: number }
+  workerCopy?: string[]
   workerMcp?: string[]
   workerSkills?: string[]
   workerPlugins?: string[]
@@ -94,6 +96,7 @@ export type Seat = {
   maxTurns?: number
   maxTokens?: number
   budgetNoticed?: boolean
+  slot?: number
   worktree: string
   branch: string
   state: SeatState

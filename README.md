@@ -125,7 +125,7 @@ A worker that hits its usage limit gets a `usage-limit` attention item and is ne
 
 ## State and config
 
-State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia`, `maxTurns` (a default turn budget for every worker; unset by default) and `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`). Defaults are in `src/commands.ts`.
+State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia`, `maxTurns` (a default turn budget for every worker; unset by default) `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`), and `workerPorts` and `workerCopy` (see "Isolating workers"). Defaults are in `src/commands.ts`.
 
 ### Lean workers
 
@@ -160,6 +160,18 @@ drove spawn w-ui --kind claude --cairn APP-12 --brief - --mcp claude-in-chrome -
 A mechanical edit can drop everything: `--mcp '' --plugins '' --user-memory off`.
 
 Codex workers run with approvals and the sandbox bypassed, like Claude workers with `--dangerously-skip-permissions`. Drove's guard hook still denies pushes. Set `codexWorkerSandbox` to `"workspace-write"` to turn that off.
+
+### Isolating workers
+
+A git worktree gives each worker its own files and branch. It does not give it its own ports, database or untracked config. These keys in `~/.drove/config.json` cover the common cases; each applies at launch, and the seat keeps its slot through restart, promote, `up` and migrate.
+
+| Need | Key | What a worker gets |
+|---|---|---|
+| its own dev-server port | `workerPorts`: `{ "base": 4100, "stride": 10 }` | `PORT` (= base + slot × stride), `DROVE_PORT_BASE` (the same) and `DROVE_PORT_COUNT` (= stride) in its env, and a line in its brief. Each open seat takes the lowest free slot, so a closed seat's slot is reused. |
+| its own database or paths | `workerEnv` values may use `{seat}`, `{run}`, `{slot}` and `{port}` | `DATABASE_URL=postgres://localhost/app_{seat}` becomes `app_w-api` for that seat. An unknown `{name}` is left as written and the spawn result says so. |
+| your untracked config | `workerCopy`: globs relative to the repo root, such as `[".env", ".env.local"]` | Files git ignores that a worktree lacks, copied from the main checkout at spawn. An existing file is never overwritten, and a file git does not ignore is refused with a note, so a copy never shows up as a change. |
+
+A container or VM per seat is not built; DESIGN's "Isolation" section says when it is worth it.
 
 ## Known limits
 
