@@ -4,6 +4,9 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+### Planner
+- The planner handles GitHub itself through `gh`: PRs (all), issues, releases (`create`, `edit`, `upload`), workflow runs, labels, and `repo create --private|--internal`, `clone`, `fork`, `sync`. Deletions, transfers, secrets and variables, repo `edit`/`rename`/`archive`, public repo creation and `gh api` writes stay with the human, and any `gh` write naming a `production` branch (`--base`, `-B`, `--target`, `--ref`, or the head of `pr create`) is denied. Worker rules are unchanged (DROVE-104).
+
 ## [0.3.0] - 2026-10-11
 
 Leaner workers the planner trims per spawn, a more reliable `/orchestrate`, and `drove init` for starting a goal in a new repo.

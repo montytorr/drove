@@ -49,16 +49,29 @@ const READ_ONLY_SUBCOMMANDS: Record<string, ReadonlySet<string>> = {
 }
 const PACKAGE_TOOLS = new Set(['npm', 'pnpm', 'yarn', 'bun', 'brew', 'cargo', 'go', 'pip', 'pip3', 'uv', 'poetry', 'gem', 'bundle', 'composer', 'gradle', 'mvn', 'docker', 'docker-compose', 'kubectl', 'make', 'npx', 'pnpx', 'bunx'])
 
-const GH_WRITES: Record<string, ReadonlySet<string>> = {
+// What `gh` may change for the planner, and what stays with the human because it deletes, publishes or reconfigures.
+const GH_PLANNER_WRITES: Record<string, ReadonlySet<string>> = {
   pr: new Set(['create', 'merge', 'close', 'reopen', 'edit', 'comment', 'review', 'ready', 'checkout', 'lock', 'unlock', 'update-branch']),
-  issue: new Set(['create', 'close', 'reopen', 'edit', 'comment', 'delete', 'transfer', 'lock', 'unlock', 'pin', 'unpin']),
-  release: new Set(['create', 'delete', 'edit', 'upload']),
-  repo: new Set(['create', 'delete', 'edit', 'fork', 'rename', 'archive', 'clone', 'sync']),
+  issue: new Set(['create', 'close', 'reopen', 'edit', 'comment', 'lock', 'unlock', 'pin', 'unpin']),
+  release: new Set(['create', 'edit', 'upload']),
+  repo: new Set(['create', 'fork', 'clone', 'sync']),
   workflow: new Set(['run', 'enable', 'disable']),
-  run: new Set(['rerun', 'cancel', 'delete']),
-  secret: new Set(['set', 'delete']),
-  variable: new Set(['set', 'delete']),
+  run: new Set(['rerun', 'cancel']),
+  label: new Set(['create', 'edit', 'clone']),
 }
+
+const GH_HUMAN_ONLY: Record<string, ReadonlySet<string>> = {
+  issue: new Set(['delete', 'transfer']),
+  release: new Set(['delete', 'delete-asset']),
+  run: new Set(['delete']),
+  repo: new Set(['delete', 'rename', 'archive', 'unarchive', 'edit']),
+  label: new Set(['delete']),
+  secret: new Set(['set', 'delete', 'remove']),
+  variable: new Set(['set', 'delete', 'remove']),
+}
+
+const GH_OPTIONS_WITH_VALUE = new Set(['-R', '--repo', '--hostname'])
+const GH_BRANCH_OPTIONS = new Set(['--base', '-B', '--target', '--ref', '-r', '--head', '-H'])
 
 const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   pane: new Set(['split', 'close', 'send-text', 'send-keys', 'run', 'move', 'resize', 'zoom']),
@@ -307,11 +320,26 @@ const gitReason = (words: readonly string[], scope: Scope): string | undefined =
   return pushesProduction(words, at, scope.cwd) ? 'nobody pushes to the production branch: push main (or master) instead' : undefined
 }
 
+const namesProduction = (words: readonly string[]): boolean =>
+  words.some((word, i) => {
+    const [name = '', inline] = word.includes('=') ? [word.slice(0, word.indexOf('=')), word.slice(word.indexOf('=') + 1)] : [word, undefined]
+    if (!GH_BRANCH_OPTIONS.has(name)) return false
+    return (inline ?? words[i + 1] ?? '').replace(/^[^:]*:/, '') === 'production'
+  })
+
 const ghReason = (words: readonly string[]): string | undefined => {
-  const [, group = '', action = ''] = words
-  if (GH_WRITES[group]?.has(action)) return `gh ${group} ${action} changes GitHub`
+  const at = firstPositional(words, 1, GH_OPTIONS_WITH_VALUE)
+  const group = words[at] ?? ''
+  const action = words[firstPositional(words, at + 1, GH_OPTIONS_WITH_VALUE)] ?? ''
+  if (GH_HUMAN_ONLY[group]?.has(action)) return `gh ${group} ${action} deletes, transfers or reconfigures GitHub: ask the human to run it`
   if (group === 'api' && words.some((word, i) => (/^-X$|^--method$/.test(words[i - 1] ?? '') && !/^get$/i.test(word)) || /^-(f|F)$|^--(field|raw-field|input)$/.test(word))) {
-    return 'gh api with a method or fields writes to GitHub'
+    return 'gh api with a method or fields writes to GitHub: ask the human to run it'
+  }
+  if (!GH_PLANNER_WRITES[group]?.has(action)) return undefined
+  if (group === 'pr' && action === 'merge' && words.includes('--admin')) return 'gh pr merge --admin bypasses branch protection: ask the human'
+  if (namesProduction(words)) return `gh ${group} ${action} names the production branch: nobody pushes to the production branch, use main (or master) instead`
+  if (group === 'repo' && action === 'create' && (words.includes('--public') || !words.some(word => word === '--private' || word === '--internal'))) {
+    return 'gh repo create without --private or --internal would publish a repo: ask the human to run it'
   }
   return undefined
 }
