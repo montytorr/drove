@@ -172,6 +172,8 @@ declare module 'claude-code' {
       boardBg: boolean
       scrollBack: number
       expanded: string | null
+      pendingGoal: string | null
+      pendingWakes: string[]
     }
   }
 }
