@@ -128,6 +128,13 @@ export const COMMANDS: Record<string, Spec> = {
         io,
       ),
   },
+  init: {
+    usage: 'drove init <dir> [--json]',
+    why: 'make a new git repo (main, one empty commit) in an empty or missing directory, for a run that needs one',
+    options: { json: { type: 'boolean' } },
+    run: async (values, positionals, io) =>
+      print(await commands.initRepo(commands.defaultDeps(), need(positionals[0], '<dir>'), process.cwd(), values.json === true), io),
+  },
   spawn: {
     usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--user-memory on|off] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]',
     why: 'open a worker in its own worktree and pane, and brief it',

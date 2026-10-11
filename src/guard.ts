@@ -69,7 +69,7 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'down'])
+const PLANNER_DROVE = new Set(['init', 'spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'down'])
 const WORKER_DROVE = new Set(['roster', 'capture'])
 
 const WORKER_PUSH = 'workers never push; report done and let the planner and the human decide'
@@ -162,6 +162,21 @@ export const isOwned = (path: string, owns: readonly string[], cwd: string): boo
   const candidates = parts.map((_, i) => parts.slice(0, i + 1).join('/'))
   return owns.some(glob => candidates.some(candidate => matchesGlob(candidate, glob)))
 }
+
+// A Claude Code session scratchpad: <tmp>/claude-<uid>/<project>/<session>/scratchpad. The planner may write there
+// and nowhere else in the temp directories; a glob or variable before the scratchpad segment is not a path we can trust.
+const SCRATCHPAD = /^claude-[^/*?[\]{}$`]+\/(?:[^/*?[\]{}$`]+\/)*scratchpad(?:\/|$)/
+
+export const isPlannerScratchpad = (path: string, cwd: string): boolean => {
+  if (/[$`]/.test(path)) return false
+  const target = canonical(path, cwd)
+  return [...new Set(['/tmp', '/private/tmp', tmpdir()])].some(base => {
+    const root = canonical(base, '/')
+    return target.startsWith(`${root}/`) && SCRATCHPAD.test(target.slice(root.length + 1))
+  })
+}
+
+const SCRATCHPAD_WRITERS = new Set(['rm', 'rmdir', 'mv', 'cp', 'mkdir', 'touch', 'tee'])
 
 const ownsText = (path: string, owns: readonly string[]): string =>
   `${path}: this file is outside the paths your brief gives you (${owns.join(', ')}); ask the planner with the drove report tool`
@@ -369,7 +384,7 @@ const patchReason = (text: string, scope: Scope): string | undefined => {
 const redirectReason = (target: string, scope: Scope): string | undefined => {
   if (HARMLESS_TARGETS.has(target)) return undefined
   if (/[$`]/.test(target)) return `redirecting output into ${target} writes to a path that cannot be checked`
-  return isInside(target, scope.roots, scope.cwd) ? undefined : `redirecting output into ${target} writes a file`
+  return isInside(target, scope.roots, scope.cwd) || isPlannerScratchpad(target, scope.cwd) ? undefined : `redirecting output into ${target} writes a file`
 }
 
 const plannerReason = (words: readonly string[], scope: Scope): string | undefined => {
@@ -378,7 +393,11 @@ const plannerReason = (words: readonly string[], scope: Scope): string | undefin
   const head = baseName(first)
   if (first.startsWith('$')) return 'the command name comes from a variable or a substitution, which cannot be checked'
   if (/^(\.{1,2}|~)\//.test(first) || (first.includes('/') && isInside(first, scope.roots, scope.cwd))) return `running ${first} executes a script`
-  if (FILE_WRITERS.has(head)) return `${head} changes files or processes`
+  if (FILE_WRITERS.has(head)) {
+    const targets = SCRATCHPAD_WRITERS.has(head) ? writeTargets(head, words) : []
+    if (targets.length > 0 && targets.every(target => isPlannerScratchpad(target, scope.cwd))) return undefined
+    return `${head} changes files or processes`
+  }
   if ((head === 'sed' || head === 'perl') && words.some(word => /^-[a-zA-Z]*i/.test(word) || word.startsWith('--in-place'))) return `${head} -i edits files in place`
   if (head === 'find' && words.some(word => FIND_ACTIONS.has(word))) return 'find with an action runs commands or deletes files'
   if (head === 'perl' || RUNTIMES.has(head)) return `${head} runs code`
