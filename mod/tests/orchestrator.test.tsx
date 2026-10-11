@@ -94,6 +94,8 @@ describe('drove client', () => {
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', plugins: [], userMemory: true }).slice(-4)).toEqual(['--plugins', '', '--user-memory', 'on'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: ['src/a.ts', 'test/**'], maxTurns: 25, maxTokens: 1000000 }).slice(-6)).toEqual(['--owns', 'src/a.ts,test/**', '--max-turns', '25', '--max-tokens', '1000000'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: [] })).toEqual(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low' }))
+    expect(spawnArgs({ name: 'r-x', kind: 'claude', effort: 'low', role: 'reviewer', target: 'w-x' }).slice(-4)).toEqual(['--role', 'reviewer', '--target', 'w-x'])
+    expect(spawnArgs({ name: 'w-y', kind: 'claude', effort: 'low', role: 'implementer' })).toEqual(spawnArgs({ name: 'w-y', kind: 'claude', effort: 'low' }))
   })
 
   test('failures, JSON results and guard verdicts are read from what the CLI prints', () => {
@@ -177,6 +179,14 @@ describe('board model', () => {
     expect(second[0]).toBe('└─')
     expect(second).toContain('owes you a review · ok')
     expect(second).toContain('codex·m')
+  })
+
+  test('a reviewer or tester wears R or T beside its name, and no seat gets the column while all are implementers', () => {
+    const plain = buildBoard({ ...base, frame: 0, seats: [seat(), seat({ name: 'w-b' })] })
+    expect(plain.workers[0]?.cells).toHaveLength(plain.workers[1]?.cells.length ?? -1)
+    const roles = buildBoard({ ...base, frame: 0, seats: [seat(), seat({ name: 'r-auth', role: 'reviewer', target: 'w-auth' }), seat({ name: 't-auth', role: 'tester', target: 'w-auth' })] })
+    expect(roles.workers.map(row => [row.cells[3]?.text, row.cells[4]?.text])).toEqual([['w-auth', ' '], ['r-auth', 'R'], ['t-auth', 'T']])
+    expect(roles.workers[0]?.cells).toHaveLength((plain.workers[0]?.cells.length ?? 0) + 1)
   })
 
   test('an asking seat pulses for a few seconds, then stays red; a bridge problem shows on the lead row', () => {
@@ -541,6 +551,35 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'spawn')).toHaveLength(2)
     await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many' })
     expect(droveCalls(world, 'spawn')[2]?.args.slice(-4)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20'])
+  })
+
+  test('spawn_worker passes role and target to drove spawn, and refuses a role without its target', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await callTool($, 'spawn_worker', { name: 'r-auth', brief: 'Review w-auth', role: 'reviewer', target: ' w-auth ' })
+    expect(droveCalls(world, 'spawn')[0]?.args.slice(-4)).toEqual(['--role', 'reviewer', '--target', 'w-auth'])
+    await callTool($, 'spawn_worker', { name: 't-auth', brief: 'Test w-auth', role: 'tester', target: 'w-auth', owns: ['spec/**'] })
+    expect(droveCalls(world, 'spawn')[1]?.args.slice(-6)).toEqual(['--role', 'tester', '--target', 'w-auth', '--owns', 'spec/**'])
+    expect(denial((await callTool($, 'spawn_worker', { name: 'r-x', brief: 'x', role: 'reviewer' })) as never)).toContain('needs target')
+    expect(denial((await callTool($, 'spawn_worker', { name: 'w-x', brief: 'x', target: 'w-auth' })) as never)).toContain('set role')
+    expect(denial((await callTool($, 'spawn_worker', { name: 'w-x', brief: 'x', role: 'lead', target: 'w-auth' })) as never)).toContain('implementer, reviewer or tester')
+    expect(droveCalls(world, 'spawn')).toHaveLength(2)
+    const { inputSchema } = world.toolSchemas.spawn_worker as { inputSchema: { properties: Record<string, { enum?: string[] }> } }
+    expect(inputSchema.properties.role?.enum).toEqual(['implementer', 'reviewer', 'tester'])
+    expect(inputSchema.properties.target).toBeDefined()
+  })
+
+  test('the orchestrator section tells when to use reviewer and tester seats, and that they take a pane', async ($, on) => {
+    engine(on)
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    const text = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections[1]?.text ?? ''
+    expect(text).toContain('## Reviewer and tester seats')
+    expect(text).toContain('`role`: `reviewer` or `tester`')
+    expect(text).toContain('large or risky, touches security')
+    expect(text).toMatch(/Each takes one of the \d+ panes like any worker/)
   })
 
   test('spawn_worker passes plugins and userMemory to drove spawn, and its schema says what they default to', async ($, on) => {

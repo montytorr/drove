@@ -21,6 +21,14 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - The guard denies the planner a `git merge` of a seat branch (`worktree-*`, `drove/*`) with "use drove merge <seat>: it runs the checks first", and denies `drove merge --no-checks` to the planner; `--no-checks` is for the human.
 - The planner's role text, in both planners, says to integrate with `drove merge <seat>` (`--pr` when the repo has a remote with CI), never a plain `git merge`.
 
+### Reviewer and tester seats
+- New `role` on spawn: `implementer` (the default, unchanged), `reviewer` or `tester`, with `--target <seat>` for the last two. It works in `drove spawn --role R --target SEAT`, the spawn tool (`role`, `target`) and the mod's `spawn_worker`, and is stored on the seat, so `promote`, a restart, `up` and `migrate` keep it. They are optional: a planner that never sets `role` sees no change, and the implementer's role text is the same text as before.
+- A **reviewer** is read-only. The guard denies its `Edit`, `Write` and `apply_patch` (scratch under `/tmp` excepted) and gives its Bash the planner's rules, with the repo's checks allowed (`npm test`, lint, typecheck, `make test`, `tsc --noEmit`, `eslint`, `pytest` and the like, without `--fix`, `--write` or `-u`) and only reading `git`. Its role text has it review the target's diff against the target's brief and report `done` with a recommendation, findings with file:line and the check results. It reads the target's worktree and stored brief, which its brief names.
+- A **tester** branches from the head of the target's branch and writes tests only: `--owns` defaults to `test/**`, `tests/**`, `**/*.test.*`, `**/*.spec.*` and `__tests__/**`, which the planner can override. It reports the tests added and what they caught; the planner merges its branch after the target's. The spawn result warns when the target has uncommitted changes the tester's branch will not hold.
+- One role text per role, the same for every seat of that role, so the prompt prefix still caches. The planner's role text, in the CLI and in the mod, has a "Reviewer and tester seats" paragraph: when to use them and that they take a pane of the budget.
+- The board shows `R` or `T` beside a reviewer or tester, and `drove roster` says `reviewer of <seat>`.
+- New env `DROVE_SEAT_ROLE` (set for a reviewer or tester only).
+
 ## [0.3.0] - 2026-10-11
 
 Leaner workers the planner trims per spawn, a more reliable `/orchestrate`, and `drove init` for starting a goal in a new repo.

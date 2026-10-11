@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto'
 import { homedir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
-import type { Identity, Role } from './types.ts'
+import type { Identity, Role, SeatRole } from './types.ts'
 
 export const ENV = {
   home: 'DROVE_HOME',
@@ -10,6 +10,7 @@ export const ENV = {
   seat: 'DROVE_SEAT',
   token: 'DROVE_TOKEN',
   owns: 'DROVE_OWNS',
+  seatRole: 'DROVE_SEAT_ROLE',
 } as const
 
 export const SEAT_RE = /^[a-z][a-z0-9_-]{0,31}$/
@@ -53,6 +54,9 @@ const ownsFromEnv = (value: string | undefined): string[] | undefined => {
   }
 }
 
+// Only a reviewer or a tester is carried: a seat with no DROVE_SEAT_ROLE is an implementer, as before.
+const seatRoleFromEnv = (value: string | undefined): SeatRole | undefined => (value === 'reviewer' || value === 'tester' ? value : undefined)
+
 export const identityFromEnv = (env: NodeJS.ProcessEnv = process.env): Identity | undefined => {
   const run = env[ENV.run]
   const role = env[ENV.role]
@@ -60,7 +64,8 @@ export const identityFromEnv = (env: NodeJS.ProcessEnv = process.env): Identity 
   if (!run || (role !== 'planner' && role !== 'worker') || !seat || !SEAT_RE.test(seat)) return undefined
   const token = env[ENV.token]
   const owns = ownsFromEnv(env[ENV.owns])
-  return { home: defaultHome(env), run, role: role as Role, seat, ...(token ? { token } : {}), ...(owns ? { owns } : {}) }
+  const seatRole = seatRoleFromEnv(env[ENV.seatRole])
+  return { home: defaultHome(env), run, role: role as Role, seat, ...(token ? { token } : {}), ...(owns ? { owns } : {}), ...(seatRole ? { seatRole } : {}) }
 }
 
 export const identityEnv = (identity: Identity): Record<string, string> => ({
@@ -70,4 +75,5 @@ export const identityEnv = (identity: Identity): Record<string, string> => ({
   [ENV.seat]: identity.seat,
   ...(identity.token ? { [ENV.token]: identity.token } : {}),
   ...(identity.owns && identity.owns.length > 0 ? { [ENV.owns]: JSON.stringify(identity.owns) } : {}),
+  ...(identity.seatRole && identity.seatRole !== 'implementer' ? { [ENV.seatRole]: identity.seatRole } : {}),
 })

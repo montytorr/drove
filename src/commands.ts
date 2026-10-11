@@ -16,7 +16,7 @@ import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
-  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, MergeGate, MergeRequest, MigrateRequest, PromoteRequest, Report, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
+  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, MergeGate, MergeRequest, MigrateRequest, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
 export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string }
@@ -25,6 +25,9 @@ export type ProcessPlan = { argv: string[]; env: Record<string, string>; cwd: st
 
 export const DROVE_ENTRY = fileURLToPath(new URL('./cli.ts', import.meta.url))
 export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+export const SEAT_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'tester']
+// What a tester owns unless the planner says otherwise (DROVE-91).
+export const TESTER_OWNS: readonly string[] = ['test/**', 'tests/**', '**/*.test.*', '**/*.spec.*', '__tests__/**']
 export const timing = { pollMs: 500, exitWaitMs: EXIT_WAIT_MS, closeWaitMs: 3_000, lockWaitMs: 5_000, promptWaitMs: 4_000, worktreeWaitMs: 15_000 }
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
@@ -328,7 +331,14 @@ const claudeOnlyNote = (seat: Seat): string[] =>
     : []
 
 // A Codex seat without a Drove-owned home got its role inside its brief, so a relaunch adds none.
-const seatRoleText = (run: RunMeta, config: DroveConfig, seat: Seat): string => (seat.kind === 'codex' && !seat.codexHome ? '' : workerRole(run, config))
+const seatRoleText = (run: RunMeta, config: DroveConfig, seat: Seat): string => (seat.kind === 'codex' && !seat.codexHome ? '' : workerRole(run, config, seat.role))
+
+// A seat's identity for its hooks and tools: its owns globs, and a reviewer's or tester's role, which the guard reads.
+const identityOfSeat = (deps: Deps, run: RunMeta, seat: Seat, token: string): Identity => ({
+  home: deps.home, run: run.id, role: 'worker', seat: seat.name, token,
+  ...(seat.owns ? { owns: seat.owns } : {}),
+  ...(seat.role && seat.role !== 'implementer' ? { seatRole: seat.role } : {}),
+})
 
 const LOCKFILES = ['yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock'] as const
 
@@ -693,7 +703,14 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const badPlugin = request.plugins?.find(name => !MCP_NAME_RE.test(name))
   if (badPlugin !== undefined) return failed('usage', `--plugins takes plugin names separated by commas; got "${badPlugin}"`)
   if (request.userMemory !== undefined && typeof request.userMemory !== 'boolean') return failed('usage', '--user-memory must be on or off')
-  const owns = ownsOf(request.owns)
+  const role = request.role ?? 'implementer'
+  if (!SEAT_ROLES.includes(role)) return failed('usage', `--role must be one of ${SEAT_ROLES.join(', ')}; got "${String(role)}"`)
+  const isReview = role !== 'implementer'
+  if (isReview && !request.target) return failed('usage', `a ${role} needs --target <seat>: the seat it ${role === 'reviewer' ? 'reviews' : 'tests'}`)
+  if (!isReview && request.target) return failed('usage', '--target applies to a reviewer or tester seat; give --role reviewer or --role tester')
+  if (request.target && (!SEAT_RE.test(request.target) || request.target === PLANNER_SEAT || request.target === request.seat)) return failed('usage', `--target must name another seat of this run; got "${request.target}"`)
+  if (role === 'reviewer' && ownsOf(request.owns)) return failed('usage', 'a reviewer is read-only, so --owns does not apply to it')
+  const owns = ownsOf(request.owns) ?? (role === 'tester' ? [...TESTER_OWNS] : undefined)
   const badOwns = owns?.find(glob => glob.startsWith('/') || glob.startsWith('~') || glob.split('/').includes('..'))
   if (badOwns !== undefined) return failed('usage', `--owns takes globs relative to the worktree, without .. or a leading / or ~; got "${badOwns}"`)
   const badBudget = [['--max-turns', request.maxTurns], ['--max-tokens', request.maxTokens]].find(([, value]) => value !== undefined && !isWhole(value))
@@ -706,6 +723,10 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
   const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn) : {}
   if ('error' in cairnCheck) return cairnCheck.error
+  const targetSeat = request.target ? findSeat(await loadRoster(deps.home, run.id), request.target) : undefined
+  if (request.target && !targetSeat) return failed('no-seat', `--target ${request.target}: no seat of run ${run.id} has that name (a reviewer or tester works on a seat that exists)`)
+  if (targetSeat?.role === 'reviewer') return failed('usage', `--target ${targetSeat.name} is a reviewer, which changes nothing: target the seat it reviewed`)
+  if (role === 'tester' && targetSeat && !(await git.branchExists(deps.exec, run.repo, targetSeat.branch))) return failed('git', `--target ${targetSeat.name}: its branch ${targetSeat.branch} does not exist, so a tester has nothing to branch from`)
 
   const config = await loadConfig(deps.home)
   const now = deps.clock.now()
@@ -721,6 +742,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const seat: Seat = {
     name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}),
     ...(request.plugins ? { plugins: [...new Set(request.plugins)] } : {}), ...(request.userMemory !== undefined ? { userMemory: request.userMemory } : {}),
+    ...(isReview && request.target ? { role, target: request.target } : {}),
     ...(owns ? { owns } : {}), model, effort, worktree, branch,
     ...(request.maxTurns ?? config.maxTurns ? { maxTurns: request.maxTurns ?? config.maxTurns } : {}), ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
@@ -760,21 +782,30 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
 
   const baseNotes: string[] = cairnCheck.note ? [cairnCheck.note] : []
   let claudeBase: string | undefined
+  let baseUsed: string | undefined
+  // A tester starts from the head of its target's branch, not from the run base (DROVE-91).
+  const testerBase = role === 'tester' ? targetSeat?.branch : undefined
   try {
+    if (testerBase && targetSeat) {
+      baseNotes.push(`${seat.name} branches from the head of ${testerBase}, the branch of ${targetSeat.name}${request.base ? `; --base ${request.base} was ignored` : ''}.`)
+      if (await git.hasUncommitted(deps.exec, targetSeat.worktree)) baseNotes.push(`${targetSeat.name} has uncommitted changes in ${targetSeat.worktree}, which ${seat.name}'s branch does not hold: have ${targetSeat.name} commit first (approve it), or the tester tests the code as of its last commit.`)
+    }
     if (isClaude) {
       isWorktreeNew = !existsSync(worktree)
       const wanted = await git.baseRef(deps.exec, run.repo, run.base)
       const resolved = await git.freshestBase(deps.exec, run.repo, wanted)
-      claudeBase = resolved.ref
-      if (request.base) baseNotes.push(`--base ${request.base} was ignored: Claude creates its own worktree, which Drove then fast-forwards to the run base ${claudeBase}.`)
-      if (resolved.ahead) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
-      if (resolved.note) baseNotes.push(resolved.note)
+      claudeBase = testerBase ?? resolved.ref
+      baseUsed = resolved.ref
+      if (request.base && !testerBase) baseNotes.push(`--base ${request.base} was ignored: Claude creates its own worktree, which Drove then fast-forwards to the run base ${claudeBase}.`)
+      if (resolved.ahead && !testerBase) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
+      if (resolved.note && !testerBase) baseNotes.push(resolved.note)
     } else if (!existsSync(worktree)) {
       const wanted = await git.baseRef(deps.exec, run.repo, request.base ?? run.base)
       const resolved = await git.freshestBase(deps.exec, run.repo, wanted)
-      await git.addWorktree(deps.exec, run.repo, worktree, branch, resolved.ref)
-      if (resolved.ahead) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
-      if (resolved.note) baseNotes.push(resolved.note)
+      baseUsed = resolved.ref
+      await git.addWorktree(deps.exec, run.repo, worktree, branch, testerBase ?? resolved.ref)
+      if (resolved.ahead && !testerBase) baseNotes.push(`The base used was ${resolved.ref}, the local branch ahead of ${wanted}.`)
+      if (resolved.note && !testerBase) baseNotes.push(resolved.note)
       isWorktreeNew = true
     }
   } catch (error) {
@@ -792,11 +823,15 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
 
   const token = mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
-  const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
+  const workerIdentity = identityOfSeat(deps, run, seat, token)
   const isBriefInline = isShellSafeArg(brief.trim())
+  const footerTarget = targetSeat
+    ? { seat: targetSeat.name, branch: targetSeat.branch, worktree: targetSeat.worktree, base: baseUsed ?? run.base, briefFile: join(seatDir(deps.home, run.id, targetSeat.name), 'brief.md') }
+    : undefined
   const footerText = briefFooter(seat.name, request.cairn, {
     branch,
     verify: await repoVerifyCommands(run.repo),
+    ...(isReview && footerTarget ? { role, target: footerTarget } : {}),
     ...(config.workerPorts && ports.PORT ? { ports: { port: Number(ports.PORT), count: config.workerPorts.stride } } : {}),
     ...(copyPlan && copyPlan.files.length > 0 ? { copied: copyPlan.files } : {}),
   })
@@ -808,7 +843,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (extras.unknownPlaceholders.length > 0) baseNotes.push(`workerEnv has placeholders Drove does not know, left as written: ${extras.unknownPlaceholders.join(', ')}. Known: {seat}, {run}, {slot}${config.workerPorts ? ', {port}' : ' and {port} (set workerPorts)'}.`)
   baseNotes.push(...missingMcpNote(seat, extras.missing), ...unknownPluginsNote(seat, extras.unknownPlugins), ...claudeOnlyNote(seat))
   const spec = specFor(
-    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: workerRole(run, config), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
+    launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: seatRoleText(run, config, seat), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
   )
   await writeLaunchFiles(spec)
   await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -860,11 +895,11 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   await recordEvent(deps, run.id, {
     type: 'seat.spawn',
     seat: seat.name,
-    data: { kind, model, effort, pane: paneId, worktree, branch, cairn: request.cairn, ...(adopted && !started.ok ? { ...(started.code === 'timeout' ? { startTimeout: true } : { startError: started.code }) } : {}), ...(baseNotes.length > 0 ? { notes: baseNotes } : {}) },
+    data: { kind, model, effort, pane: paneId, worktree, branch, cairn: request.cairn, ...(isReview ? { role, target: request.target } : {}), ...(adopted && !started.ok ? { ...(started.code === 'timeout' ? { startTimeout: true } : { startError: started.code }) } : {}), ...(baseNotes.length > 0 ? { notes: baseNotes } : {}) },
   })
   const via = isViaPrompt ? await queueBrief(deps, run, seat.name, briefText) : 'launch-arg'
   if (!isViaPrompt) await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, data: { kind: 'brief', via: 'launch-arg' } })
-  return ok(`Worker ${seat.name} (${kind}${model ? ` ${model}` : ''} ${effort}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${startNote ? ` Note: ${startNote}` : ''}${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch })
+  return ok(`${isReview ? `${role === 'reviewer' ? 'Reviewer' : 'Tester'}` : 'Worker'} ${seat.name} (${kind}${model ? ` ${model}` : ''} ${effort}${isReview ? `, ${role === 'reviewer' ? 'reviewing' : 'testing'} ${request.target}` : ''}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${startNote ? ` Note: ${startNote}` : ''}${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch })
 }
 
 // Claude creates its worktree from origin/main once the agent is up; bring it to the run base before the brief goes in.
@@ -1031,11 +1066,10 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
 
     const updated: Seat = { ...seat, ...change, sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
-    const identityOfSeat: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
     const controlText = formatControl(control, token)
     const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
     const spec = specFor(
-      launchRequest(deps, { identity: identityOfSeat, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seatRoleText(run, config, seat), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config),
+      launchRequest(deps, { identity: identityOfSeat(deps, run, seat, token), kind: seat.kind, repo: run.repo, cwd: seat.worktree, model, effort: request.effort, roleText: seatRoleText(run, config, seat), resumeId: sessionId, ...(isInline ? { initialPrompt: controlText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config),
     )
     await writeLaunchFiles(spec)
     await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -1200,11 +1234,11 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
       ...(kind === 'codex' ? { codexHome: codexHomeDir(deps.home, run.id) } : {}),
       migratedFrom: { kind: seat.kind, ...(oldSession ? { sessionId: oldSession } : {}), model: seat.model, at: iso, ...(request.reason ? { reason: request.reason } : {}) },
     }
-    const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
+    const workerIdentity = identityOfSeat(deps, run, migrated, token)
     const extras = await launchExtrasOf(deps, run, config, migrated)
     notes.push(...missingMcpNote(migrated, extras.missing), ...unknownPluginsNote(migrated, extras.unknownPlugins), ...claudeOnlyNote(migrated))
     const spec = specFor(
-      launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: seat.worktree, model, effort, roleText: workerRole(run, config), inWorktree: true, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
+      launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: seat.worktree, model, effort, roleText: seatRoleText(run, config, migrated), inWorktree: true, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
     )
     await writeLaunchFiles(spec)
     await writeLaunchJson(deps, run.id, seat.name, spec)
@@ -1679,7 +1713,7 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
   if (!seat.sessionId) return { error: `${seat.name} has no saved session id, so it cannot be resumed; close it and spawn a new one` }
   const token = (await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))) ?? mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
-  const identity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
+  const identity = identityOfSeat(deps, run, seat, token)
   const resumeText = resumePrompt(seat)
   const isInline = resolveBriefVia(config) === 'launch-arg'
   const spec = specFor(launchRequest(deps, { identity, kind: seat.kind, repo: run.repo, cwd: seat.worktree, model: seat.model, effort: seat.effort, roleText: seatRoleText(run, config, seat), resumeId: seat.sessionId, ...(isInline ? { initialPrompt: resumeText } : {}), ...(await launchExtrasOf(deps, run, config, seat)).parts }, config))

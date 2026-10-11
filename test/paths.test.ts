@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import * as paths from '../src/paths.ts'
 
 test('env names are fixed', () => {
-  assert.deepEqual(Object.values(paths.ENV), ['DROVE_HOME', 'DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_OWNS'])
+  assert.deepEqual(Object.values(paths.ENV), ['DROVE_HOME', 'DROVE_RUN', 'DROVE_ROLE', 'DROVE_SEAT', 'DROVE_TOKEN', 'DROVE_OWNS', 'DROVE_SEAT_ROLE'])
 })
 
 test('seat names follow the herdr agent-name rule', () => {

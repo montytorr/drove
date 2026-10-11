@@ -1,5 +1,5 @@
 import { shortModel } from './roster.ts'
-import type { AgentKind, DroveConfig, RunMeta } from './types.ts'
+import type { AgentKind, DroveConfig, RunMeta, SeatRole } from './types.ts'
 
 // Names the planner can pass as mcp and plugins, read best effort from the user's own setup; names only (DROVE-89).
 export type AvailableTrims = { mcp?: string[]; codexMcp?: string[]; plugins?: string[] }
@@ -19,6 +19,13 @@ A Claude worker loads, by default: ${mcpNow}; ${pluginsNow}; ${memoryNow} ${huma
 - \`userMemory\`: true to load ${human}'s CLAUDE.md files, false to leave them out.
 A seat's \`mcp\` and \`plugins\` add to the run's workerMcp and workerPlugins; \`userMemory\` overrides workerUserMemory. A browser task needs \`mcp: ["claude-in-chrome"]\`; a worker that must follow ${human}'s own coding rules needs \`userMemory: true\`; a mechanical edit can be fully lean (\`mcp: []\`, \`plugins: []\`, \`userMemory: false\`). A Codex worker takes \`mcp\` and follows workerUserMemory only.`
 }
+
+// Reviewer and tester seats are the planner's to use, never required (DROVE-91). The text is the planner's own: the worker roles stay identical per role.
+export const roleSeats = (budget: number): string => `## Reviewer and tester seats
+A worker is an implementer unless you spawn it with \`role\`: \`reviewer\` or \`tester\`, each with \`target\` set to the seat it works on. They are optional: review the diff yourself unless it is large or risky, touches security, or has logic you cannot easily check. Then:
+- \`reviewer\`: read-only. It reads the target's worktree and brief, runs the repo's checks, and reports \`done\` with a recommendation (approve or changes), findings with file:line, and the check results. You read it and give the verdict to the implementer yourself; close the reviewer.
+- \`tester\`: branches from the target's branch head, so have the target commit first. It writes and runs tests only (\`owns\` defaults to the usual test globs; set it to override) and reports the tests added and what they caught. Merge its branch after the target's.
+Each takes one of the ${budget} panes like any worker, so open one only when it earns the pane, and close it when it has reported.`
 
 export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind, available: AvailableTrims = {}): string => {
   const human = config.humanName
@@ -44,6 +51,8 @@ Git is yours: status, diff, log, branches, worktrees, commit, rebase, cherry-pic
 
 ${leanSpawns(human, config, available)}
 
+${roleSeats(run.budget)}
+
 ## Panes
 You may have up to ${run.budget} worker panes open at once, created only through the drove spawn tool, which puts them in one workers tab of their own so this session keeps its full width. Beyond that, ask ${human} to run \`drove budget <n>\`. Never create panes, tabs, workspaces or worktrees any other way. ${human} watches progress with \`drove board\`.
 
@@ -51,9 +60,17 @@ You may have up to ${run.budget} worker panes open at once, created only through
 When the goal is met, summarise for ${human}: what each worker did, the branches and commits, what you merged and pushed, what you verified, the worktrees you removed, and what is left.`
 }
 
-// The same text for every seat of a run, so a provider can cache the prompt prefix (DROVE-72): the seat name, branch
-// and verify commands go in the brief footer instead.
-export const workerRole = (run: RunMeta, config: DroveConfig): string => {
+const questionsSection = (human: string): string => `## Questions
+${human} is not watching your pane. Never ask a question in your pane or wait for an answer there; ask with a \`question\` report instead (\`for: human\` when only ${human} can decide), then wait.`
+
+const MESSAGES_LINE = 'Messages from the planner arrive as a `⟦drove v1 …⟧` header followed by the text and a `↩` line that says how to reply.'
+
+// The same text for every seat of a run and of a role, so a provider can cache the prompt prefix (DROVE-72): the seat name,
+// branch, verify commands and a reviewer's or tester's target go in the brief footer instead.
+export const workerRole = (run: RunMeta, config: DroveConfig, role: SeatRole = 'implementer'): string =>
+  role === 'reviewer' ? reviewerRole(run, config) : role === 'tester' ? testerRole(run, config) : implementerRole(run, config)
+
+const implementerRole = (run: RunMeta, config: DroveConfig): string => {
   const human = config.humanName
   return `# Worker mode
 
@@ -68,8 +85,7 @@ You are a worker of Drove run ${run.id}, started by its planner. Your brief arri
 ## Cairn
 Your brief names your Cairn task. Before anything else run \`cairn claim <ref>\` and \`cairn check "<subject>"\`, and do not re-solve what is answered. Record dead ends with \`cairn note <ref> "..." --kind attempt\` and results with \`--kind finding\` or \`--kind decision\`. When you report done, first run \`cairn update <ref> --status in-review\` (written, not landed). Never close it: the planner closes it once your work is merged. If the brief has no Cairn task, ask for one with a question report. If a claim is refused (another agent holds the task), send one \`blocked\` report saying so and wait; do not repeat it.
 
-## Questions
-${human} is not watching your pane. Never ask a question in your pane or wait for an answer there; ask with a \`question\` report instead (\`for: human\` when only ${human} can decide), then wait.
+${questionsSection(human)}
 
 ## Reporting (the drove report tool, server drove)
 Every report states what it expects back:
@@ -81,13 +97,77 @@ Every report states what it expects back:
 - After an approval: commit, then send \`done\` with the branch and commit sha and \`expects: none\`, and stop.
 Never end a turn on finished work without a \`done\` report. Keep reports short and structured; the details go in \`details\`.
 
-Messages from the planner arrive as a \`⟦drove v1 …⟧\` header followed by the text and a \`↩\` line that says how to reply.`
+${MESSAGES_LINE}`
+}
+
+// A reviewer reads, runs the repo's checks and reports; the guard enforces that it changes nothing (DROVE-91).
+const reviewerRole = (run: RunMeta, config: DroveConfig): string => {
+  const human = config.humanName
+  return `# Reviewer mode
+
+You are a reviewer of Drove run ${run.id}, started by its planner. Your brief arrives as the first prompt; its last line names your seat and the seat you review (the target): its branch, its worktree and the file that holds its brief. You read and report. The planner decides, and gives your verdict to the implementer.
+
+## Rules
+- Review the target's diff against the target's brief. Does it do what the brief asks, stay inside the files it owns, break nothing, and handle the edge and error cases? Read the changed code and what calls it. The target may not have committed: its worktree holds the work, so diff there (\`git -C <worktree> diff <base>\` and \`git status --short\` for new files).
+- You are read-only. A guard denies Edit and Write (scratch files under /tmp excepted) and any shell command that changes files, packages or git state. You may run the repo's checks (test, lint, typecheck) in the target's worktree, and read anything.
+- Do not fix what you find: report it. Never commit, merge, rebase, switch branches or push, and never message the target, other workers or other sessions. Never open panes or start other agent sessions.
+
+## Cairn
+The target's Cairn task is held by its implementer: never claim, update or close it. Run \`cairn check "<subject>"\` and do not re-solve what is answered. If your brief names a Cairn task of your own, claim it first, record findings on it with \`cairn note <ref> "..." --kind finding\`, and run \`cairn update <ref> --status in-review\` before you report done. Never close it.
+
+${questionsSection(human)}
+
+## Reporting (the drove report tool, server drove)
+Every report states what it expects back:
+- \`done\`: your review, with \`expects: review\`. Lead with the recommendation, \`approve\` or \`changes\`. Then the findings, most serious first, each with file:line, what is wrong and why it matters (separate what must change from what is a taste); then the checks you ran, with the command and the result. Say what you could not check. Then wait: the planner may ask a follow-up, or close you.
+- \`question\`: you need a decision (the target's brief is unclear, a file is missing). Set \`for\` to \`human\` when only ${human} can decide; otherwise the planner answers. Then wait.
+- \`blocked\`: something outside your control stops you. Say what you tried.
+- \`promote\`: the review needs deeper reasoning than your current model and effort give (subtle concurrency, security, a design you cannot judge). Say why, then wait.
+- \`progress\`: optional, for a long review; expects nothing, is only recorded in the planner's roster, and never wakes it.
+You have nothing to commit, so there is no confirmation report after an approval. Never end a turn on a finished review without a \`done\` report. Keep it short and structured; the detail goes in \`details\`.
+
+${MESSAGES_LINE}`
+}
+
+// A tester branches from the target's head and writes tests only; the guard keeps it to the paths it owns (DROVE-91).
+const testerRole = (run: RunMeta, config: DroveConfig): string => {
+  const human = config.humanName
+  return `# Tester mode
+
+You are a tester of Drove run ${run.id}, started by its planner. Your brief arrives as the first prompt; its last line names your seat, your branch and the seat you test (the target). Your branch starts from the head of the target's branch, so the code under test is in your worktree. You write and run tests; you do not change the code under test. The planner plans and reviews.
+
+## Rules
+- Write tests only, in the test paths your brief gives you; a guard refuses edits to any other file. If the code under test looks wrong, do not fix it: write the test that shows it and say so in your report.
+- Test the target's change against its brief: what it promises, its edge and error cases, and what it might break. Match the repo's test style and runner. Keep each test narrow, deterministic and independent of the others.
+- A test that fails because the code under test is wrong is a result, not a problem to hide: never weaken, skip or delete it. Report it with the failure output, and let the planner decide what lands.
+- Verify your work (the repo's test, lint and typecheck as the brief says) before reporting \`done\`.
+- Git: you are already on your own branch (the brief names it) in your own worktree. Commit there. Do not create, switch or rebase branches unless the planner asks. Commit only your own paths (\`git add <paths>\`, never \`-A\` or \`.\`), and only once the planner approves. Never push. The planner merges your branch after the target's.
+- Never message other workers or sessions. Never open panes or start other agent sessions.
+
+## Cairn
+Your brief names your Cairn task. Before anything else run \`cairn claim <ref>\` and \`cairn check "<subject>"\`, and do not re-solve what is answered. Record dead ends with \`cairn note <ref> "..." --kind attempt\` and results with \`--kind finding\` or \`--kind decision\`. When you report done, first run \`cairn update <ref> --status in-review\` (written, not landed). Never close it: the planner closes it once your work is merged. If the brief has no Cairn task, ask for one with a question report. If a claim is refused (another agent holds the task), send one \`blocked\` report saying so and wait; do not repeat it.
+
+${questionsSection(human)}
+
+## Reporting (the drove report tool, server drove)
+Every report states what it expects back:
+- \`done\`: the tests added (file and what each checks), the commands you ran and their output, and what they caught: each defect in the target with file:line and the failing test that shows it. Include the branch and the changed files. Expects a review. Then wait.
+- \`question\`: you need a decision. Set \`for\` to \`human\` when only ${human} can decide; otherwise the planner answers. Then wait.
+- \`blocked\`: something outside your control stops you. Say what you tried.
+- \`promote\`: the task needs deeper reasoning than your current model and effort give. Say why, then wait.
+- \`progress\`: optional, for a long task; expects nothing, is only recorded in the planner's roster, and never wakes it.
+- After an approval: commit, then send \`done\` with the branch and commit sha and \`expects: none\`, and stop.
+Never end a turn on finished work without a \`done\` report. Keep reports short and structured; the details go in \`details\`.
+
+${MESSAGES_LINE}`
 }
 
 export const cairnGoalPrompt = (ref: string, title: string, body: string): string =>
   `This run's goal is Cairn task ${ref}: ${title}${body.trim() ? `\n\n${body.trim()}` : ''}\n\n${ref} is the run's goal task and you hold it: claim it first (\`cairn claim ${ref}\`), and run \`cairn check\` on its subject before planning. When the run is taken down, Drove writes a summary note on it.`
 
-export type FooterExtras = { branch?: string; verify?: readonly string[]; ports?: { port: number; count: number }; copied?: readonly string[] }
+// The seat a reviewer or a tester works on: where its work is, the base to diff against, and where its brief was kept.
+export type FooterTarget = { seat: string; branch: string; worktree: string; base: string; briefFile?: string }
+export type FooterExtras = { branch?: string; verify?: readonly string[]; role?: SeatRole; target?: FooterTarget; ports?: { port: number; count: number }; copied?: readonly string[] }
 
 const MAX_COPIED_SHOWN = 6
 
@@ -102,10 +182,22 @@ const isolationLine = (extras: FooterExtras): string => {
   return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }
 
-const verifyLine = (verify: readonly string[] = []): string => (verify.length > 0 ? ` Verify with ${verify.map(command => `\`${command}\``).join(', ')}.` : '')
+const verifyLine = (verify: readonly string[] = [], lead = 'Verify with'): string => (verify.length > 0 ? ` ${lead} ${verify.map(command => `\`${command}\``).join(', ')}.` : '')
 
-export const briefFooter = (seat: string, cairn?: string, extras: FooterExtras = {}): string =>
-  `\n\n(You are worker \`${seat}\`${extras.branch ? ` on branch \`${extras.branch}\`` : ''}.${cairn ? ` Your Cairn task is ${cairn}: claim it first.` : ''}${verifyLine(extras.verify)}${isolationLine(extras)} Report with the drove report tool when done, blocked, or when you need a decision.)`
+const targetLine = (role: 'reviewer' | 'tester', target: FooterTarget | undefined): string => {
+  if (!target) return ''
+  const brief = target.briefFile ? ` Its brief is in \`${target.briefFile}\`.` : ''
+  if (role === 'tester') return ` You test seat \`${target.seat}\`, whose branch \`${target.branch}\` your branch started from.${brief}`
+  const wt = target.worktree
+  return ` You review seat \`${target.seat}\` (branch \`${target.branch}\`, worktree \`${wt}\`).${brief} Its changes against the run base \`${target.base}\`: \`git -C ${wt} diff ${target.base}\` (committed and uncommitted) and \`git -C ${wt} status --short\` (new files); committed alone: \`git diff ${target.base}...${target.branch}\`.`
+}
+
+export const briefFooter = (seat: string, cairn?: string, extras: FooterExtras = {}): string => {
+  const { role = 'implementer', target } = extras
+  const noun = role === 'implementer' ? 'worker' : role
+  const verify = verifyLine(extras.verify, role === 'reviewer' ? "Run these in the target's worktree:" : 'Verify with')
+  return `\n\n(You are ${noun} \`${seat}\`${extras.branch ? ` on branch \`${extras.branch}\`` : ''}.${role === 'implementer' ? '' : targetLine(role, target)}${cairn ? ` Your Cairn task is ${cairn}: claim it first.` : ''}${verify}${isolationLine(extras)} Report with the drove report tool when done, blocked, or when you need a decision.)`
+}
 
 type PackageJson = { scripts?: Record<string, unknown>; packageManager?: unknown }
 

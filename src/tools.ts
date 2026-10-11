@@ -4,7 +4,7 @@ import * as paths from './paths.ts'
 import * as protocol from './protocol.ts'
 import * as roster from './roster.ts'
 import * as store from './store.ts'
-import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SendRequest } from './types.ts'
+import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
 export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
@@ -34,6 +34,7 @@ export const defaultToolPorts: ToolPorts = {
 
 const KINDS: readonly AgentKind[] = ['claude', 'codex']
 const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+const SEAT_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'tester']
 const SEND_KINDS: readonly SendRequest['kind'][] = ['message', 'answer', 'nudge']
 const EXPECTS = ['review', 'answer', 'none'] as const
 const VERDICTS = ['approve', 'changes'] as const
@@ -146,6 +147,8 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         mcp: { type: 'array', items: { type: 'string' }, description: 'Optional: the user MCP servers this worker needs, by name (e.g. ["mongodb"]). Given, the worker loads Drove\'s server, these and the configured workerMcp only; [] for Drove\'s alone. Left out, it loads what workerMcp allows, or everything when that is unset.' },
         plugins: { type: 'array', items: { type: 'string' }, description: 'Optional, Claude workers only: the user plugins this worker needs, by name (e.g. ["context7"]). Given, the worker loads Drove\'s mod, these and the configured workerPlugins only; [] for Drove\'s alone. Left out, it loads what workerPlugins allows, or every enabled plugin when that is unset.' },
         userMemory: { type: 'boolean', description: 'Optional, Claude workers only: true loads the user\'s own memory files (~/.claude/CLAUDE.md and the CLAUDE.md files above the repo), false leaves them out. Left out, workerUserMemory decides (loaded by default). A Codex worker follows workerUserMemory alone, since its CODEX_HOME is shared by the run.' },
+        role: { type: 'string', enum: SEAT_ROLES, description: 'Optional, default implementer (today\'s worker). reviewer: read-only, reviews the target seat\'s diff against the target\'s brief and reports a recommendation, findings and check results; needs target. tester: branches from the target\'s branch head and writes tests only (owns defaults to the usual test globs); needs target.' },
+        target: { type: 'string', description: 'The seat a reviewer reviews or a tester tests. Required for those roles, not allowed for an implementer.' },
         owns: { type: 'array', items: { type: 'string' }, description: 'Optional: globs, relative to the worker\'s worktree, of the files it may change (e.g. ["src/guard.ts", "test/**"]). Given, Drove\'s guard refuses the worker\'s edits to any other file and tells it to ask you. Left out, the worker may edit anywhere.' },
         maxTurns: { type: 'integer', minimum: 1, description: 'Optional: how many turns (stops) the worker may take. At the limit you get a budget attention and the worker is told once to report progress or promote and stop; it is not killed. Left out, the configured maxTurns applies, or none.' },
         maxTokens: { type: 'integer', minimum: 1, description: 'Optional: how many tokens (input, cached input and output, read from the agent\'s own transcript) the worker may use. Same effect at the limit as maxTurns.' },
@@ -167,6 +170,8 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
             ...(args.mcp != null ? { mcp: names(args, 'mcp') } : {}),
             ...(args.plugins != null ? { plugins: names(args, 'plugins') } : {}),
             ...(args.userMemory != null ? { userMemory: bool(args, 'userMemory') } : {}),
+            ...(args.role != null ? { role: oneOf(args, 'role', SEAT_ROLES) as SeatRole } : {}),
+            ...(text(args, 'target', false) ? { target: text(args, 'target', false) } : {}),
             ...(args.owns != null ? { owns: names(args, 'owns') } : {}),
             ...(args.maxTurns != null ? { maxTurns: count(args, 'maxTurns', 1) } : {}),
             ...(args.maxTokens != null ? { maxTokens: count(args, 'maxTokens', 1) } : {}),
