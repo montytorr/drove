@@ -658,6 +658,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   await saveRun(deps.home, run)
   await updateRoster(deps.home, run.id, roster => roster)
   if (!isDetached) await recordEvent(deps, run.id, { type: 'run.up', data: { planner: kind, pane: paneId, attached: Boolean(request.run) } })
+  if (request.run && goal && goal !== previous?.goal) await recordEvent(deps, run.id, { type: 'goal.set', data: { goal, ...(previous?.goal ? { previous: previous.goal } : {}) } })
 
   const identity: Identity = { home: deps.home, run: run.id, role: 'planner', seat: PLANNER_SEAT }
   const prompt = goalTask?.prompt ?? request.goal ?? (kind === 'codex' ? SESSIONLESS_PROMPT : undefined)
@@ -2103,6 +2104,26 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
     return detachedResult(run, opened, started, options.json === true, `${summary.replace(/ is up/, ` is up in its own herdr workspace ${opened.workspaceId}`)} The ${planner.kind} planner is ${started.state}.`, { resumed, lost })
   }
   return ok(summary, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
+}
+
+// ---------- goal ----------
+
+export type GoalRequest = { goal: string; cairn?: string }
+
+// The planner's one line of what the run is doing now. It replaces the goal the run started with, so the board header and the
+// roster follow the work as it moves on.
+export const setGoal = async (deps: Deps, ref: RunRef, request: GoalRequest): Promise<CommandResult> => {
+  if (process.env[ENV.role] === 'worker') return failed('forbidden', 'only the planner or the human can set the run goal')
+  const goal = request.goal.replace(/\s+/g, ' ').trim()
+  if (!goal) return failed('usage', 'the goal is empty; give one plain line of what the run is doing')
+  if (request.cairn && !CAIRN_RE.test(request.cairn)) return failed('usage', `--cairn must look like DROVE-5; got "${request.cairn}"`)
+  const located = await locateRun(deps, ref, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  const next: RunMeta = { ...run, goal, ...(request.cairn ? { cairn: request.cairn } : {}) }
+  await saveRun(deps.home, next)
+  await recordEvent(deps, run.id, { type: 'goal.set', data: { goal, ...(request.cairn ? { cairn: request.cairn } : {}), ...(run.goal ? { previous: run.goal } : {}) } })
+  return ok(`Goal of run ${run.id} set${request.cairn ? ` (Cairn task ${request.cairn})` : ''}: ${goal}`, { goal, run: next })
 }
 
 // ---------- budget ----------

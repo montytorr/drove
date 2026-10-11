@@ -99,6 +99,7 @@ export type DroveEventType =
   | 'run.up'
   | 'run.down'
   | 'run.recovered'
+  | 'goal.set'
   | 'seat.spawn'
   | 'seat.start_failed'
   | 'seat.relaunch'

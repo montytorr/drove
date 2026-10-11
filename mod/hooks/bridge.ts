@@ -66,6 +66,8 @@ export const feedOf = (event: DroveEvent, bodies: Map<string, string[]>): FeedDr
       if (BLOCKED[to]) return { at, from: seat, to: HUMAN, kind: 'blocked', summary: BLOCKED[to] ?? to }
       return undefined
     }
+    case 'goal.set':
+      return { at, from: '⌘', to: HUMAN, kind: 'goal', summary: `goal: ${text(data.goal)}` }
     case 'seat.close':
       return { at, from: '⌘', to: seat, kind: 'close', summary: 'pane closed' }
     case 'seat.start_failed':

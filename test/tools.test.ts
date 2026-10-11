@@ -30,6 +30,7 @@ const fakeCommands = () => {
     merge: record('merge', 2),
     down: record('down'),
     raiseBudget: record('raiseBudget'),
+    setGoal: record('setGoal'),
   } as unknown as ToolPorts['commands']
   return { commands, calls }
 }
@@ -107,6 +108,19 @@ const plannerWith = async (extra: Partial<ToolPorts> = {}) => {
   }
   return { ctx, fake, tool }
 }
+
+test('set_goal passes the line and the optional Cairn ref for this run, and needs a goal', async () => {
+  const { ctx, fake, tool } = await plannerWith()
+  const ref = { run: ctx.run.id, repo: ctx.run.repo }
+  await tool('set_goal').call({ goal: 'Release 0.3.0', cairn: 'DROVE-102' })
+  await tool('set_goal').call({ goal: 'Software factory' })
+  const missing = await tool('set_goal').call({})
+  assert.equal(missing.isError, true)
+  assert.deepEqual(fake.calls, [
+    { name: 'setGoal', args: [ref, { goal: 'Release 0.3.0', cairn: 'DROVE-102' }] },
+    { name: 'setGoal', args: [ref, { goal: 'Software factory', cairn: undefined }] },
+  ])
+})
 
 test('planner tools map their arguments onto the commands', async () => {
   const { ctx, fake, tool } = await plannerWith()

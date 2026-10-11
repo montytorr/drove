@@ -1140,6 +1140,36 @@ test('capture reads the seat through herdr', async () => {
   assert.ok(fake.calls.some(call => call[2] === 'read' && call[3] === 'w1:p1'))
 })
 
+test('goal sets and replaces the run goal, records goal.set and takes a Cairn ref', async () => {
+  const { deps } = await setup()
+  const first = await commands.setGoal(deps, { run: RUN, repo: '/x' }, { goal: '  Work\nDROVE-86  ' })
+  assert.equal(first.ok, true)
+  assert.equal((await loadRun(deps.home, RUN))?.goal, 'Work DROVE-86')
+  const second = await commands.setGoal(deps, { run: RUN, repo: '/x' }, { goal: 'Release 0.3.0', cairn: 'DROVE-102' })
+  assert.equal(second.ok, true)
+  const run = await loadRun(deps.home, RUN)
+  assert.deepEqual([run?.goal, run?.cairn], ['Release 0.3.0', 'DROVE-102'])
+  const events = (await readEvents(deps)).filter(item => item.type === 'goal.set')
+  assert.deepEqual(events.map(item => item.data), [{ goal: 'Work DROVE-86' }, { goal: 'Release 0.3.0', cairn: 'DROVE-102', previous: 'Work DROVE-86' }])
+  const kept = await commands.setGoal(deps, { run: RUN, repo: '/x' }, { goal: 'Software factory' })
+  assert.equal((await loadRun(deps.home, RUN))?.cairn, 'DROVE-102')
+  assert.equal(kept.ok, true)
+})
+
+test('goal refuses an empty line, a bad ref, an unknown run and a worker', async () => {
+  const { deps } = await setup()
+  const empty = await commands.setGoal(deps, { run: RUN, repo: '/x' }, { goal: '  ' })
+  assert.equal(!empty.ok && empty.code, 'usage')
+  const bad = await commands.setGoal(deps, { run: RUN, repo: '/x' }, { goal: 'x', cairn: 'nope' })
+  assert.equal(!bad.ok && bad.code, 'usage')
+  const missing = await commands.setGoal(deps, { run: 'nothing', repo: '/x' }, { goal: 'x' })
+  assert.equal(!missing.ok && missing.code, 'no-run')
+  process.env.DROVE_ROLE = 'worker'
+  const denied = await commands.setGoal(deps, { run: RUN, repo: '/x' }, { goal: 'x' })
+  assert.equal(!denied.ok && denied.code, 'forbidden')
+  assert.equal((await loadRun(deps.home, RUN))?.goal, undefined)
+})
+
 test('budget is for the human only and validates the number', async () => {
   const { deps } = await setup()
   const raised = await commands.budget(deps, { run: RUN, repo: '/x' }, 6)

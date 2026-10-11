@@ -55,7 +55,6 @@ test('planner: reading is allowed (ported from the mod)', () => {
     'git push origin main',
     'wget -qO- https://example.com',
     'gh pr create --title x --body y',
-    'gh pr merge 12 --squash',
     'gh pr checkout 12',
     'gh issue comment 3 --body ok',
     'gh release create v1 --notes x',
@@ -65,8 +64,6 @@ test('planner: reading is allowed (ported from the mod)', () => {
     'gh repo create foo --private',
     'gh repo create foo --internal',
     'gh repo clone acme/api',
-    'gh -R acme/api pr merge 12',
-    'gh pr merge 12 --auto --squash',
   ]) {
     assert.deepEqual([command, planner(command)], [command, undefined])
   }
@@ -101,11 +98,22 @@ test('planner: writing, building and running are refused (ported from the mod)',
   }
 })
 
+test('planner: gh pr merge is denied in any form and points at drove merge', () => {
+  for (const command of ['gh pr merge 12', 'gh pr merge 12 --squash', 'gh -R acme/api pr merge 12 --auto']) {
+    assert.match(planner(command) ?? '', /use drove merge <seat> --pr.*ask the human to merge other PRs/)
+  }
+  assert.equal(planner('gh pr create --title x --body y'), undefined)
+  assert.equal(planner('drove goal "Release 0.3.0"'), undefined)
+})
+
 test('planner: gh deletions, settings, public repos, secrets and production stay with the human', () => {
   for (const command of [
     'gh issue delete 1',
     'gh label delete x',
     'gh pr merge 12 --admin --squash',
+    'gh pr merge 12 --squash',
+    'gh -R acme/api pr merge 12',
+    'gh pr merge 12 --auto --squash',
     'gh issue transfer 1 acme/other',
     'gh release delete v1',
     'gh run delete 1',

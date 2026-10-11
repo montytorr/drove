@@ -66,6 +66,9 @@ export const rosterArgs = (run: string): string[] => ['roster', '--run', run]
 
 export const reportsArgs = (run: string, seat?: string, all?: boolean): string[] => ['reports', ...(seat ? [seat] : []), ...(all ? ['--all'] : []), '--run', run]
 
+// The text goes on stdin (`-`), so a goal that starts with a dash or holds quotes reaches Drove whole.
+export const goalArgs = (run: string, cairn?: string): string[] => ['goal', '--run', run, ...(cairn ? ['--cairn', cairn] : []), '-']
+
 export const budgetArgs = (run: string, size: number): string[] => ['budget', String(size), '--run', run]
 
 export const downArgs = (run: string): string[] => ['down', '--run', run]
