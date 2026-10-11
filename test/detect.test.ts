@@ -366,3 +366,17 @@ test('DROVE-108: a seat that owes an answer counts a turn only when the prompt c
   const after = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('user-prompt-submit', 400), hook('stop', 299), hook('user-prompt-submit', 200)] }, NOW)
   assert.equal(after.state, 'working')
 })
+
+test('DROVE-109: a transcript write after a permission notification clears it, the agent went on after the approval', () => {
+  const hooks = [hook('notification', 60, 'permission_prompt')]
+  const derived = detect.deriveState(seatOf(), { herdr: live('idle'), hooks, transcriptAt: NOW.getTime() - 20_000 }, NOW)
+  assert.equal(derived.state, 'idle')
+  assert.equal(derived.attention.some(item => item.reason === 'permission'), false)
+})
+
+test('DROVE-109: a transcript written before, or within the grace of, the permission notification does not clear it', () => {
+  const hooks = [hook('notification', 60, 'permission_prompt')]
+  for (const transcriptAt of [NOW.getTime() - 61_000, NOW.getTime() - 59_500, undefined]) {
+    assert.equal(detect.deriveState(seatOf(), { herdr: live('idle'), hooks, ...(transcriptAt !== undefined ? { transcriptAt } : {}) }, NOW).state, 'needs-input')
+  }
+})

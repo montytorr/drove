@@ -70,6 +70,8 @@ export const HOOK_FRESH_MS = 10_000
 // An open turn (a prompt submitted, no Stop since) outranks herdr's idle for this long after the seat last showed life.
 // Claude does not fire Stop when the turn is interrupted, so a turn that has gone quiet this long is not trusted.
 export const OPEN_TURN_QUIET_MS = 5 * 60_000
+// A transcript write this long after a permission ask means the agent went on: a seat that is waiting writes nothing.
+export const ASK_TRANSCRIPT_GRACE_MS = 2_000
 export const EXIT_WAIT_MS = 20_000
 export const RESTART_BOUND_MS = 2 * EXIT_WAIT_MS + DEFAULT_START_TIMEOUT_MS
 export const NUDGE_GRACE_MS = 20_000
@@ -130,11 +132,14 @@ const hookLimit = (seat: string, hooks: readonly HookRecord[], at: string): Atte
 
 const isPermissionAsk = (hook: HookRecord): boolean => hook.event === 'permission-request' || (hook.event === 'notification' && PERMISSION_NOTICE.test(hook.detail ?? ''))
 
-const pendingAsk = (hooks: readonly HookRecord[]): HookRecord | undefined => {
+// Cleared by a Stop, a new prompt or session, or (DROVE-109) a transcript write after it: no hook fires when a
+// permission is approved, and herdr's own idle cannot be trusted to say the seat went on.
+const pendingAsk = (hooks: readonly HookRecord[], transcriptAt: number | undefined): HookRecord | undefined => {
   const ask = hooks.reduce<HookRecord | undefined>((best, hook) => (isPermissionAsk(hook) && !(ms(hook.at) < ms(best?.at)) ? hook : best), undefined)
   if (!ask) return undefined
   const cleared = latest(hooks, ['stop', 'user-prompt-submit', 'session-start'])
-  return cleared && ms(cleared.at) >= ms(ask.at) ? undefined : ask
+  if (cleared && ms(cleared.at) >= ms(ask.at)) return undefined
+  return transcriptAt !== undefined && transcriptAt > ms(ask.at) + ASK_TRANSCRIPT_GRACE_MS ? undefined : ask
 }
 
 const isOwed = (seat: Seat, reported: LastReport | undefined): boolean => {
@@ -177,7 +182,7 @@ export const deriveState = (seat: Seat, signals: TurnSignals, now: Date): Derive
   }
 
   const dialog = (signals.screen ? matchDialog(seat.name, signals.screen, now) : undefined) ?? hookLimit(seat.name, hooks, at)
-  const ask = pendingAsk(hooks)
+  const ask = pendingAsk(hooks, signals.transcriptAt)
   const isAskLive = ask !== undefined && (herdr?.status !== 'working' || nowMs - ms(ask.at) <= HOOK_FRESH_MS)
 
   let state: SeatState
