@@ -36,6 +36,8 @@ Recommended: the symlink survives `nvm use`. `src/cli.ts` is executable and runs
 
 Alternative: `npm link` from the repo. Under nvm a link exists for one Node version only, so `drove` disappears after switching versions. Use a link, not a global install: Node does not strip types from files under `node_modules`.
 
+Releases are listed on the [GitHub releases page](https://github.com/montytorr/drove/releases); [CHANGELOG.md](CHANGELOG.md) has what changed in each.
+
 ## Quick start
 
 Pick the planner (the table above), then use one of these.
