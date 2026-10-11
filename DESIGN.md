@@ -273,6 +273,24 @@ Codex runs a hook only if its trust is persisted in a `config.toml` [proven, CCS
 
 The human-approval path remains for what Drove does not own: a legacy seat and the Codex planner, whose hooks are inline `-c` overrides. Every Drove hook command is a constant string, with identity from the env, so the human approves each once, Codex persists the approval, and later launches reuse it [verify that inline `-c` hooks get stable trust keys]. Fallback: a per-launch `--dangerously-bypass-hook-trust`, enabled by the human in `~/.drove/config.json` (`codexBypassHookTrust: true`). See Open question 3.
 
+### Isolation (DROVE-93)
+
+**What a worktree isolates:** the working files, the index and the branch. Everything else is shared with the other seats and with the human: TCP ports, databases and caches on localhost, untracked config (`.env`, local certificates; a worktree has none of them), global installs (`npm -g`, brew, pip without a venv), system services and the home directory. Two workers that both start a dev server on 3000, or both run migrations against one local database, collide, and nothing in git says so.
+
+**What Drove adds, all opt-in in `~/.drove/config.json`:**
+- *Ports* (`workerPorts: { base, stride }`). Each open seat takes the lowest free slot index (`freeSlot` in `src/isolation.ts`, counting the open seats of every run in the home, since ports are machine-wide). Its env gets `PORT = base + slot × stride`, `DROVE_PORT_BASE` (the same) and `DROVE_PORT_COUNT = stride`. The slot is stored on the `Seat`, so relaunch, promote, `up` and migrate rebuild the same env; closing a seat frees it. Drove does not check that the ports are free on the machine, only that no seat shares one.
+- *Env templates.* `workerEnv` values may use `{seat}`, `{run}`, `{slot}` and `{port}`, filled per seat in `launchExtrasOf`. An unknown `{name}` stays as written and the spawn result names it. An explicit `PORT` in `workerEnv` wins over the computed one.
+- *Untracked files* (`workerCopy`: globs from the repo root). At spawn, `git ls-files -o -i --exclude-standard` over a `:(glob)` pathspec lists the ignored matches in the main checkout; they are copied with `COPYFILE_EXCL`, so a file the worktree has is never touched. A match that is untracked but not ignored is refused, since the copy would show in `git status` and could be committed by a worker's `git add`. A Claude seat's worktree appears after launch, so its copy runs after `alignClaudeWorktree`; a Codex seat's runs right after `git worktree add`. The brief footer names the ports and the copied files in one line, only when set.
+
+**What this does not cover:** a database server itself (a template can name a database per seat, not create it), a shared package cache or a global install a worker changes, a service that listens on a fixed port Drove does not know, and code that must not touch the host at all.
+
+**When a container or VM per seat is worth it** (not built): workers that mutate shared global state (global installs, system services, kernel or Docker settings), run untrusted or unreviewed code (a dependency's postinstall, a repo from the outside), need a different OS or toolchain than the host, or hold secrets the others must not read. Options and their cost:
+- *devcontainer* (one `devcontainer up` per worktree): reuses the repo's own definition, so workers match CI; needs Docker, adds tens of seconds and a few hundred MB per seat, and the agent CLI plus its auth, the Drove mod and the MCP socket path must be reachable inside it.
+- *Docker per seat* (a bind-mounted worktree, a fixed image): the cheapest hard boundary for ports, packages and the filesystem; the herdr pane runs `docker exec`, so the pane, hooks and `drove report` need the CLI and `DROVE_HOME` mounted in. Bind-mounted files keep the host's uid problems; no systemd inside.
+- *Lima or Tart VM per seat*: a real boundary, including services and a different kernel or macOS version; a full OS per seat means gigabytes of disk, minutes to clone, and RAM that caps the pane budget well below 5.
+
+Until a repo hits one of those, ports, templates and copied files are enough, and the worktree stays the unit of isolation.
+
 ## 6. Guards
 
 One module, `src/guard.ts`, with the shell parser in `src/shell.ts`, ported from the mod and fixed. It is pure: `decide(GuardInput) → GuardDecision`. It has three callers:

@@ -8,6 +8,7 @@ import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matc
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
+import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './isolation.ts'
 import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readClaudePlugins, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
@@ -92,14 +93,23 @@ const namesOf = (value: unknown): string[] | undefined =>
 
 const isWhole = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 1
 
+const portsOf = (value: unknown): DroveConfig['workerPorts'] => {
+  const { base, stride } = (value && typeof value === 'object' ? value : {}) as { base?: unknown; stride?: unknown }
+  return typeof base === 'number' && typeof stride === 'number' && Number.isInteger(base) && Number.isInteger(stride) && base >= 1 && base <= 65535 && stride >= 1 ? { base, stride } : undefined
+}
+
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const { workerMcp, workerSkills, workerPlugins, workerUserMemory, maxTurns, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, workerPlugins, workerUserMemory, maxTurns, workerPorts, workerCopy, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const ports = portsOf(workerPorts)
+  const copy = namesOf(workerCopy)
   const mcp = namesOf(workerMcp)
   const skills = namesOf(workerSkills)
   const plugins = namesOf(workerPlugins)
   return {
     ...DEFAULT_CONFIG,
     ...file,
+    ...(ports ? { workerPorts: ports } : {}),
+    ...(copy && copy.length > 0 ? { workerCopy: copy } : {}),
     ...(mcp ? { workerMcp: mcp } : {}),
     ...(skills ? { workerSkills: skills } : {}),
     ...(plugins ? { workerPlugins: plugins } : {}),
@@ -240,7 +250,7 @@ type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[]; unk
 // Codex's CODEX_HOME is shared by every seat of a run and Codex reads the user's AGENTS.md from it with no per-launch
 // way to skip it (probed in rust-v0.162.0: project_doc_* only gates the repo's own AGENTS.md). So a Codex seat follows
 // workerUserMemory alone, and a seat's plugins and userMemory options are Claude-only.
-const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
+const trimExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
   const mcpAllow = seatMcpAllow(config, seat)
   if (seat.kind === 'claude') {
     // The user's MCP servers, plugins and memory are read only when a switch asks for them (DROVE-72, DROVE-88).
@@ -271,6 +281,23 @@ const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
     missing: codexHome && mcpAllow ? mcpAllow.filter(name => name !== 'drove' && !known.includes(name)) : [],
     unknownPlugins: [],
   }
+}
+
+// The seat's launch env too: workerEnv with its placeholders filled and the seat's ports (DROVE-93), from the slot stored on
+// the seat, so relaunch, promote, up and migrate give the same env as the first launch.
+type SeatLaunchExtras = LaunchExtras & { unknownPlaceholders: string[] }
+
+const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<SeatLaunchExtras> => {
+  const extras = await trimExtrasOf(deps, run, config, seat)
+  const { env, unknown } = seatEnv(config.workerEnv, config.workerPorts, { run: run.id, seat: seat.name, slot: seat.slot })
+  return { ...extras, parts: { ...extras.parts, workerEnv: env }, unknownPlaceholders: unknown }
+}
+
+// Slots held by the open seats of the other runs of this home: ports are machine-wide, so runs must not share a slot.
+const slotsOfOtherRuns = async (deps: Deps, runId: string): Promise<number[]> => {
+  const names = await readdir(join(deps.home, 'runs')).catch(() => [] as string[])
+  const rosters = await Promise.all(names.filter(name => name !== runId).map(name => loadRoster(deps.home, name).catch(() => undefined)))
+  return rosters.flatMap(roster => (roster ? openSeats(roster).flatMap(entry => (entry.slot === undefined ? [] : [entry.slot])) : []))
 }
 
 // Names only, read best effort and never written: what the planner can pass as mcp and plugins (DROVE-89).
@@ -703,11 +730,13 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const clash = await heldByAnotherRun(deps, run, seat)
   if (clash) return failed('seat-taken', clash)
 
+  const otherSlots = await slotsOfOtherRuns(deps, run.id)
   try {
     await updateRoster(deps.home, run.id, roster => {
       const existing = findSeat(roster, seat.name)
       if (existing && !['closed', 'gone', 'down'].includes(existing.state)) throw new SeatTaken(`a seat named ${seat.name} is already open; pick another name or message it`)
       if (isOverBudget(roster, run.budget)) throw new OverBudget(`the pane budget of ${run.budget} is full; ask the human to run \`drove budget ${run.budget + 1}\``)
+      seat.slot = freeSlot([...otherSlots, ...openSeats(roster).filter(entry => entry.name !== seat.name).map(entry => entry.slot)])
       return upsertSeat(roster, seat)
     })
   } catch (error) {
@@ -753,16 +782,30 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     return failed('git', messageOf(error))
   }
 
+  const copyPlan = config.workerCopy ? await planCopy(deps.exec, run.repo, config.workerCopy) : undefined
+  if (copyPlan) {
+    baseNotes.push(...copyNotes({ files: [], refused: copyPlan.refused }))
+    if (!isClaude && existsSync(worktree)) baseNotes.push(...copyNotes({ files: [], refused: [] }, await applyCopy(run.repo, worktree, copyPlan.files)))
+  }
+  const ports = portEnv(config.workerPorts, seat.slot)
+  if (config.workerPorts && !ports.PORT) baseNotes.push(`workerPorts: slot ${seat.slot} is past port 65535, so ${seat.name} got no PORT.`)
+
   const token = mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
   const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
   const isBriefInline = isShellSafeArg(brief.trim())
-  const footerText = briefFooter(seat.name, request.cairn, { branch, verify: await repoVerifyCommands(run.repo) })
+  const footerText = briefFooter(seat.name, request.cairn, {
+    branch,
+    verify: await repoVerifyCommands(run.repo),
+    ...(config.workerPorts && ports.PORT ? { ports: { port: Number(ports.PORT), count: config.workerPorts.stride } } : {}),
+    ...(copyPlan && copyPlan.files.length > 0 ? { copied: copyPlan.files } : {}),
+  })
   const briefText = isBriefInline ? `${brief.trim()} ${footerText.trimStart()}` : `${brief}${footerText}`
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
   await saveBrief(deps, run.id, seat.name, briefText)
   const extras = await launchExtrasOf(deps, run, config, seat)
+  if (extras.unknownPlaceholders.length > 0) baseNotes.push(`workerEnv has placeholders Drove does not know, left as written: ${extras.unknownPlaceholders.join(', ')}. Known: {seat}, {run}, {slot}${config.workerPorts ? ', {port}' : ' and {port} (set workerPorts)'}.`)
   baseNotes.push(...missingMcpNote(seat, extras.missing), ...unknownPluginsNote(seat, extras.unknownPlugins), ...claudeOnlyNote(seat))
   const spec = specFor(
     launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: workerRole(run, config), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
@@ -799,6 +842,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   }
 
   if (isClaude && claudeBase) baseNotes.push(...(await alignClaudeWorktree(deps, worktree, branch, claudeBase)))
+  if (isClaude && copyPlan && copyPlan.files.length > 0 && existsSync(worktree)) baseNotes.push(...copyNotes({ files: [], refused: [] }, await applyCopy(run.repo, worktree, copyPlan.files)))
 
   const initialState: Seat['state'] = adopted ? adopted.state : isViaPrompt ? 'idle' : 'working'
   const liveSession = (live?.ok ? live.value.sessionId : undefined) ?? adopted?.sessionId

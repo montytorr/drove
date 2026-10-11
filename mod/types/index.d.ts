@@ -65,6 +65,7 @@ export type Seat = {
   maxTurns?: number
   maxTokens?: number
   budgetNoticed?: boolean
+  slot?: number
   worktree: string
   branch: string
   state: SeatState
