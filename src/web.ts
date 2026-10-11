@@ -2,12 +2,15 @@ import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
 import type { IncomingMessage, Server, ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
-import type { BoardModel } from '../mod/hooks/board.ts'
+import { SPINNER, STATUS_TONE } from '../mod/hooks/board.ts'
+import type { BoardModel, BoardRow, Tone } from '../mod/hooks/board.ts'
+import { shortModel } from '../mod/hooks/protocol.ts'
+import { isAsking } from '../mod/hooks/roster.ts'
 import { boardSource, isAnimated, modelOf, POLL_MS } from './board.ts'
 import type { BoardData, FrameInput } from './board.ts'
 import { capture } from './commands.ts'
 import { loadRoster, openSeats } from './roster.ts'
-import type { Deps, Seat } from './types.ts'
+import type { AgentKind, Deps, Effort, Seat } from './types.ts'
 import { pageOf } from './web/page.ts'
 
 // A read-only copy of the live board for a browser: the same boardSource and modelOf the terminal board uses,
@@ -22,10 +25,21 @@ const KEEPALIVE_MS = 15_000
 const TAIL_LINES = 40
 const TAIL_PATH = /^\/api\/seat\/([^/]+)\/tail$/
 
-// What the seat panel shows, from the roster the board already loads.
-export type WebSeat = Pick<Seat, 'name' | 'kind' | 'model' | 'effort' | 'state' | 'stateAt' | 'branch' | 'worktree' | 'cairn' | 'sessionId' | 'owes'>
+// What the seat panel and the graph show, from the roster the board already loads. `activity` is the board row's one line of what the seat is doing
+// (the spinner glyph cut off), `tone` is the colour of its state (alert while it needs you), and `needsYou` is set when it asks, is blocked or has an attention item.
+export type WebSeat = Pick<Seat, 'name' | 'kind' | 'model' | 'effort' | 'state' | 'stateAt' | 'branch' | 'worktree' | 'cairn' | 'sessionId' | 'owes'> & {
+  modelLabel: string
+  activity: string
+  tone: Tone
+  needsYou: boolean
+}
 
-export type WebPayload = { run: string; status: string; model: BoardModel; seats: WebSeat[] }
+export type WebLead = { kind: AgentKind; model: string; modelLabel: string; effort: Effort; activity: string; tone: Tone; isBusy: boolean }
+
+// A timeline entry for the page: the board's feed without the hidden entries, so the page needs no cell parsing.
+export type WebFeedEntry = { id: string; at: number; from: string; to: string; kind: string; summary: string; full?: string }
+
+export type WebPayload = { run: string; status: string; model: BoardModel; lead: WebLead; seats: WebSeat[]; feed: WebFeedEntry[] }
 
 export type WebServer = {
   url: string
@@ -49,11 +63,38 @@ const sameToken = (given: string | null, token: string): boolean => {
   return a.length === b.length && timingSafeEqual(a, b)
 }
 
+// The cell of a board row that holds what its seat is doing: the only one without a fixed width.
+const doingOf = (row: BoardRow | undefined): { text: string; tone: Tone } => {
+  const cell = row?.cells.find(({ width }) => width === undefined)
+  const text = (cell?.text ?? '').replace(new RegExp(`^[${SPINNER.join('')}] `), '')
+  return { text, tone: cell?.tone ?? 'muted' }
+}
+
+export const webFeedOf = (feed: BoardData['feed']): WebFeedEntry[] =>
+  feed
+    .filter(({ isHidden }) => isHidden !== true)
+    .map(({ id, at, from, to, kind, summary, full }) => ({ id: id ?? `${at}:${from}:${to}:${kind}`, at, from, to, kind, summary, ...(full === undefined ? {} : { full }) }))
+
 export const payloadOf = (data: BoardData, now: number, offsetMinutes: number): WebPayload => {
   const input: FrameInput = { ...data, now, frame: 0, columns: WEB_COLUMNS, rows: WEB_ROWS, offsetMinutes }
   const frame = isAnimated(input) ? Math.floor(now / POLL_MS) % 1000 : 0
-  const seats = openSeats(data.roster).map(({ name, kind, model, effort, state, stateAt, branch, worktree, cairn, sessionId, owes }) => ({ name, kind, model, effort, state, stateAt, branch, worktree, cairn, sessionId, owes }))
-  return { run: data.run.id, status: data.run.status, model: modelOf({ ...input, frame }), seats }
+  const model = modelOf({ ...input, frame })
+  const rows = new Map(model.workers.map(row => [row.key, row]))
+  const seats = openSeats(data.roster).map((seat): WebSeat => {
+    const { name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes } = seat
+    const needsYou = isAsking(seat, data.status[name]) || state === 'blocked' || seat.attention.length > 0
+    return {
+      name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes,
+      modelLabel: shortModel(seatModel),
+      activity: doingOf(rows.get(`w:${name}`)).text,
+      tone: needsYou ? 'alert' : STATUS_TONE[state],
+      needsYou,
+    }
+  })
+  const doing = doingOf(model.lead)
+  const { kind, model: leadModel, effort } = data.run.planner
+  const lead: WebLead = { kind, model: leadModel, modelLabel: shortModel(leadModel), effort, activity: doing.text, tone: doing.tone, isBusy: doing.tone === 'text' }
+  return { run: data.run.id, status: data.run.status, model, lead, seats, feed: webFeedOf(data.feed) }
 }
 
 export const startWeb = async (deps: Deps, run: string, options: WebOptions = {}): Promise<WebServer> => {
