@@ -154,6 +154,16 @@ describe('board model', () => {
     expect(board.progress[0]?.text).toBe('✓ all done · 1m')
   })
 
+  test('the header shows the goal, or says there is none and shows the lead status', () => {
+    const titleOf = (goal: string | undefined, activity: string | undefined) =>
+      buildBoard({ ...base, orchestrator: { ...orchestrator, goal }, lead: activity === undefined ? null : { activity, since: NOW }, frame: 0, seats: [] }).title[1]
+    expect(titleOf('Ship it', 'thinking')).toMatchObject({ text: 'Ship it', tone: 'text', isBold: true })
+    expect(titleOf(undefined, 'waiting on the workers')).toMatchObject({ text: 'no goal set · waiting on the workers', tone: 'muted', isBold: false })
+    expect(titleOf(undefined, '⠙ waiting on the workers')?.text).toBe('no goal set · waiting on the workers')
+    expect(titleOf(undefined, undefined)).toMatchObject({ text: 'no goal yet', tone: 'muted' })
+    expect(titleOf(undefined, 'waiting for a goal')?.text).toBe('no goal yet')
+  })
+
   test('seats hang off the lead with a stripe, a spinner, the mod status and what the lead owes', () => {
     const board = buildBoard({ ...base, frame: 2, status: { 'w-auth': { activity: 'editing a.ts', ctx: 31 } }, seats: [seat({ cairn: 'CCS-77' }), seat({ name: 'w-b', kind: 'codex', model: '', state: 'idle', owes: 'review', lastReport: done })] })
     const first = board.workers[0]?.cells.map(({ text }) => text) ?? []

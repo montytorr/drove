@@ -177,9 +177,11 @@ export const buildBoard = (input: {
   const { done, total } = progressOf(seats)
   const isAllDone = total > 0 && done === total && open.every(({ state }) => state === 'done' || state === 'idle')
 
+  const leadStatus = (lead?.activity ?? '').replace(new RegExp(`^(?:[${SPINNER.join('')}]\\s*)+`), '').trim()
+  const noGoalText = leadStatus && !/^waiting for a goal/i.test(leadStatus) ? `no goal set · ${leadStatus}` : 'no goal yet'
   const title: Cell[] = [
     { text: '◆ orchestra', tone: 'lead', isBold: true },
-    { text: orchestrator.goal ?? 'waiting for a goal', tone: orchestrator.goal ? 'text' : 'muted', isBold: Boolean(orchestrator.goal) },
+    { text: orchestrator.goal ?? noGoalText, tone: orchestrator.goal ? 'text' : 'muted', isBold: Boolean(orchestrator.goal) },
   ]
   const elapsed = since(now - orchestrator.startedAt)
   const progress: Cell[] = isAllDone
