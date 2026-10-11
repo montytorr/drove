@@ -299,12 +299,15 @@ The mod's `bashReason` regex-scans the whole raw command for `$(…)` and backti
 | Edit/Write/MultiEdit/NotebookEdit/apply_patch | deny, except in `/tmp`, `/private/tmp`, `~/.claude/plans`, `$DROVE_HOME/runs/<run>/scratch` | allow |
 | Bash: file writers, in-place sed/perl, runtimes, `./script`, redirects to files | deny (mod rules), **except** `mkdir`, `touch`, `tee`, `cp`, `mv`, `rm`, `rmdir` and redirects whose every write target is inside a Claude Code session scratchpad (below) | allow |
 | Package tools | read-only subcommands only (mod table) | allow |
-| `gh` writes, `curl`/`wget` writes | deny | allow |
+| `gh` writes | allow PRs (all), issues (not `delete`, `transfer`), releases (`create`, `edit`, `upload`), workflow `run`/`enable`/`disable`, run `rerun`/`cancel`, labels (not `delete`), repo `clone`/`fork`/`sync` and `create --private\|--internal`; deny deletions, transfers, repo `edit`/`rename`/`archive`, a repo `create` that would be public, `label delete`, `pr merge --admin` (it bypasses branch protection), `secret`/`variable` writes and `gh api` writes ("ask the human"); deny any of them naming `production` in `--base`/`-B`/`--target`/`--ref`/`--head`/`-H` (DROVE-104) | allow |
+| `curl`/`wget` writes | deny | allow |
 | `git` | allow, except a push to `production` | allow, except any `push` |
 | `herdr` writes | deny, **except** `herdr agent prompt\|wait <seat>` where `<seat>` is an open seat of this run, given as its name, namespaced agent name, pane id or session id (CCS-50, DROVE-43) | deny |
 | `herdr` reads (`list`, `get`, `read`, `explain`, `wait`) | allow | allow |
 | `claude`, `codex` | deny, except `--help`, `--version` and `codex queue` to an open seat of this run | deny, except `--help`, `--version` and `claude plugin test [dir]` (DROVE-39) |
 | `drove` | allow `init`, `spawn`, `send`, `prompt`, `promote`, `roster`, `capture`, `close`, `board --once`, `down`; deny `budget`, `plan`, `up`, `guard`, `mcp` | allow `roster`, `capture`; deny the rest |
+
+The guard cannot see a PR's base when a merge names the PR by number (`gh pr merge 12`), so the `production` rule covers only the branches named on the command line.
 
 The `--help` and `--version` exception fixes a real annoyance: the mod denied `claude --help` to this worker while it wrote this design.
 

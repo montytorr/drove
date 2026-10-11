@@ -52,6 +52,19 @@ test('planner: reading is allowed (ported from the mod)', () => {
     'git stash',
     'git push origin main',
     'wget -qO- https://example.com',
+    'gh pr create --title x --body y',
+    'gh pr merge 12 --squash',
+    'gh pr checkout 12',
+    'gh issue comment 3 --body ok',
+    'gh release create v1 --notes x',
+    'gh run rerun 1',
+    'gh workflow run ci.yml',
+    'gh label create x',
+    'gh repo create foo --private',
+    'gh repo create foo --internal',
+    'gh repo clone acme/api',
+    'gh -R acme/api pr merge 12',
+    'gh pr merge 12 --auto --squash',
   ]) {
     assert.deepEqual([command, planner(command)], [command, undefined])
   }
@@ -73,7 +86,6 @@ test('planner: writing, building and running are refused (ported from the mod)',
     'python3 -c "print(1)"',
     './deploy.sh',
     'bash run.sh',
-    'gh pr merge 12',
     'gh api -X POST repos/acme/api/issues -f title=x',
     'herdr pane split --pane w1:p1',
     'herdr agent prompt w-auth "go"',
@@ -85,6 +97,40 @@ test('planner: writing, building and running are refused (ported from the mod)',
   ]) {
     assert.deepEqual([command, typeof planner(command)], [command, 'string'])
   }
+})
+
+test('planner: gh deletions, settings, public repos, secrets and production stay with the human', () => {
+  for (const command of [
+    'gh issue delete 1',
+    'gh label delete x',
+    'gh pr merge 12 --admin --squash',
+    'gh issue transfer 1 acme/other',
+    'gh release delete v1',
+    'gh run delete 1',
+    'gh repo delete acme/api --yes',
+    'gh repo rename new',
+    'gh repo archive acme/api',
+    'gh repo edit --visibility public',
+    'gh repo create foo --public',
+    'gh repo create foo',
+    'gh repo create foo --private --public',
+    'gh secret set X',
+    'gh variable delete X',
+    'gh api -X DELETE repos/acme/api',
+    'gh pr create --base production',
+    'gh pr create -B production',
+    'gh pr create --base=production',
+    'gh pr create --head production',
+    'gh pr create --head fork:production',
+    'gh release create v1 --target production',
+    'gh workflow run x --ref production',
+  ]) {
+    assert.deepEqual([command, typeof planner(command)], [command, 'string'])
+  }
+  assert.match(planner('gh issue delete 1') ?? '', /ask the human/)
+  assert.match(planner('gh repo create foo') ?? '', /ask the human/)
+  assert.match(planner('gh pr create --base production') ?? '', /nobody pushes to the production branch/)
+  assert.equal(planner('gh pr create --base main --head feature'), undefined)
 })
 
 test('planner: bypasses the mod missed are refused', () => {
@@ -218,6 +264,7 @@ test('workers may do anything but push, drive panes or start sessions (ported fr
   assert.equal(worker('herdr agent wait w-api'), undefined)
   assert.ok(worker('claude -p hi'))
   assert.equal(worker('rm -rf dist && echo x > src/a.ts && node build.js && gh pr create'), undefined)
+  assert.equal(worker('gh issue delete 1 && gh repo create foo'), undefined)
   assert.equal(worker('cairn add "t" --body - <<\'EOF\'\n`herdr pane split` <ref>\nEOF'), undefined)
 })
 
