@@ -40,8 +40,10 @@ export type DroveConfig = {
   workerCopy?: string[]
   workerMcp?: string[]
   workerSkills?: string[]
+  workerAgents?: string[]
   workerPlugins?: string[]
   workerUserMemory?: boolean
+  workerUserHooks?: boolean
   maxTurns?: number
 }
 
@@ -97,9 +99,12 @@ export type Seat = {
   codexHome?: string
   mcp?: string[]
   plugins?: string[]
+  skills?: string[]
+  agents?: string[]
   userMemory?: boolean
   role?: SeatRole
   target?: string
+  userHooks?: boolean
   owns?: string[]
   maxTurns?: number
   maxTokens?: number
@@ -296,7 +301,13 @@ export type LaunchRequest = {
   userMcp?: Record<string, unknown>
   pluginAllow?: string[]
   userPlugins?: UserPlugins
+  skillAllow?: string[]
+  userSkills?: string[]
+  agentAllow?: string[]
+  userAgents?: string[]
   userMemory?: boolean
+  userHooks?: boolean
+  userSettings?: Record<string, unknown>
   claudeDir?: string
 }
 
@@ -329,9 +340,12 @@ export type SpawnRequest = {
   base?: string
   mcp?: string[]
   plugins?: string[]
+  skills?: string[]
+  agents?: string[]
   userMemory?: boolean
   role?: SeatRole
   target?: string
+  userHooks?: boolean
   owns?: string[]
   maxTurns?: number
   maxTokens?: number

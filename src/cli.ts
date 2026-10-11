@@ -60,9 +60,12 @@ export const spawnRequestOf = (values: Values, positionals: readonly string[], b
   base: str(values, 'base'),
   mcp: nameList(values, 'mcp'),
   plugins: nameList(values, 'plugins'),
+  skills: nameList(values, 'skills'),
+  agents: nameList(values, 'agents'),
   userMemory: onOff(values, 'user-memory'),
   role: str(values, 'role') as SeatRole | undefined,
   target: str(values, 'target'),
+  userHooks: onOff(values, 'user-hooks'),
   owns: str(values, 'owns') === undefined ? undefined : splitGlobs(str(values, 'owns') as string),
   maxTurns: count(values, 'max-turns'),
   maxTokens: count(values, 'max-tokens'),
@@ -152,9 +155,9 @@ export const COMMANDS: Record<string, Spec> = {
       print(await commands.initRepo(commands.defaultDeps(), need(positionals[0], '<dir>'), process.cwd(), values.json === true), io),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--user-memory on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]',
+    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on|off] [--user-hooks on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]',
     why: 'open a worker in its own worktree and pane, and brief it',
-    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, 'user-memory': { type: 'string' }, role: { type: 'string' }, target: { type: 'string' }, owns: { type: 'string' }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
+    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, skills: { type: 'string' }, agents: { type: 'string' }, 'user-memory': { type: 'string' }, 'user-hooks': { type: 'string' }, role: { type: 'string' }, target: { type: 'string' }, owns: { type: 'string' }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
     run: async (values, positionals, io) => {
       const brief = need(str(values, 'brief'), '--brief')
       return print(await commands.spawn(commands.defaultDeps(), commands.identityOrPlanner(), spawnRequestOf(values, positionals, brief === '-' ? await io.stdin() : brief)), io)

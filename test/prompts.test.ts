@@ -104,16 +104,19 @@ test('planner files one task per worker with --no-start and never hands over a t
 
 test('planner role has a Lean spawns section naming the options, the defaults under the config and the names it can pick', () => {
   const open = prompts.plannerRole(run, config, 'claude')
-  assert.match(open, /## Lean spawns\nA Claude worker loads, by default: all of Sam's MCP servers and Claude in Chrome; every enabled plugin; all of Sam's own CLAUDE\.md files\./)
+  assert.match(open, /## Lean spawns\nA Claude worker loads, by default: all of Sam's MCP servers and Claude in Chrome; every enabled plugin; all of Sam's skills; all of Sam's agent types; all of Sam's own CLAUDE\.md files; all of Sam's own settings hooks\./)
   assert.doesNotMatch(open, /Claude servers:|Plugins:/, 'no names unless they were read')
 
-  const lean = prompts.plannerRole(run, { ...config, workerMcp: ['notion'], workerPlugins: [], workerUserMemory: false }, 'codex', { mcp: ['mongodb', 'notion'], codexMcp: [], plugins: ['context7'] })
-  assert.match(lean, /by default: only notion of Sam's MCP servers, and no Claude in Chrome unless it is listed; only Drove's own mod; none of Sam's own CLAUDE\.md files\./)
+  const lean = prompts.plannerRole(run, { ...config, workerMcp: ['notion'], workerPlugins: [], workerSkills: ['cairn'], workerAgents: [], workerUserMemory: false, workerUserHooks: false }, 'codex', { mcp: ['mongodb', 'notion'], codexMcp: [], plugins: ['context7'], skills: ['cairn', 'arb'], agents: ['debugger'] })
+  assert.match(lean, /by default: only notion of Sam's MCP servers, and no Claude in Chrome unless it is listed; only Drove's own mod; only cairn of Sam's skills; none of Sam's agent types; none of Sam's own CLAUDE\.md files; none of Sam's own settings hooks\./)
+  assert.match(lean, /Skills: cairn, arb\./)
+  assert.match(lean, /Agent types: debugger\./)
+  assert.match(lean, /`userHooks`: false to leave out the hooks in Sam's settings\.json.*drops those too\./)
   assert.match(lean, /Claude servers: mongodb, notion\./)
   assert.match(lean, /Codex servers: none found\./)
   assert.match(lean, /Plugins: context7\./)
-  assert.match(lean, /`mcp: \["claude-in-chrome"\]`.*`userMemory: true`.*fully lean/)
-  assert.match(lean, /A Codex worker takes `mcp` and follows workerUserMemory only\./)
+  assert.match(lean, /`mcp: \["claude-in-chrome"\]`.*`userMemory: true`.*fully lean \(`mcp: \[\]`, `plugins: \[\]`, `skills: \[\]`, `agents: \[\]`, `userMemory: false`, `userHooks: false`\)/)
+  assert.match(lean, /A Codex worker takes `mcp` and follows workerUserMemory and workerUserHooks only\./)
 })
 
 test('the Lean spawns names are the planner\'s only: the worker role is untouched by them', () => {

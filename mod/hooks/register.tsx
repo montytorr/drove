@@ -174,6 +174,32 @@ const readJsonAt = async ($: EngineInterface, path: string): Promise<Record<stri
 const stringsOf = (value: unknown): string[] | undefined =>
   Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.trim()).filter(Boolean) : undefined
 
+// Entry names in a folder, whatever shape the engine lists them in (a name, or an object that has one).
+const namesIn = async ($: EngineInterface, dir: string): Promise<string[]> => {
+  const listed: unknown = await $.fs.list(dir).catch(() => [])
+  return Array.isArray(listed) ? listed.map(entry => (typeof entry === 'string' ? entry : typeof (entry as { name?: unknown } | null)?.name === 'string' ? (entry as { name: string }).name : '')).filter(name => name && !name.startsWith('.')) : []
+}
+
+// The names Claude lists as the user's skills and agent types: skills/<name>/SKILL.md, the claude.ai ones synced as
+// anthropic-skills:<name>, commands/*.md, and agents/**/*.md by file name. Same rule as readClaudeSkills in src/launch.ts.
+const skillNamesOf = async ($: EngineInterface, claudeDir: string): Promise<string[]> => {
+  const own = (await namesIn($, `${claudeDir}/skills`)).filter(name => name !== 'synced')
+  const ownSkills = await Promise.all(own.map(async name => (await $.fs.exists(`${claudeDir}/skills/${name}/SKILL.md`).catch(() => false) ? [name] : [])))
+  const accounts = await namesIn($, `${claudeDir}/skills/synced`)
+  const synced = await Promise.all(accounts.map(async account => {
+    const names = await namesIn($, `${claudeDir}/skills/synced/${account}`)
+    return (await Promise.all(names.map(async name => (await $.fs.exists(`${claudeDir}/skills/synced/${account}/${name}/SKILL.md`).catch(() => false) ? [`anthropic-skills:${name}`] : [])))).flat()
+  }))
+  const commands = (await namesIn($, `${claudeDir}/commands`)).filter(name => name.endsWith('.md')).map(name => name.slice(0, -3))
+  return [...new Set([...ownSkills.flat(), ...synced.flat(), ...commands])]
+}
+
+const agentNamesOf = async ($: EngineInterface, claudeDir: string, dir = `${claudeDir}/agents`, depth = 0): Promise<string[]> => {
+  const names = await namesIn($, dir)
+  const found = await Promise.all(names.map(async name => (name.endsWith('.md') ? [name.slice(0, -3)] : depth < 2 ? agentNamesOf($, claudeDir, `${dir}/${name}`, depth + 1) : [])))
+  return [...new Set(found.flat())]
+}
+
 const keysOf = (value: unknown): string[] => (value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : [])
 
 // What a spawned worker loads under Drove's settings, and the MCP server and plugin names the orchestrator can choose
@@ -183,12 +209,14 @@ const trimsOf = ($: EngineInterface): Promise<LeanSpawnTrims> => {
   leanTrims ??= (async () => {
     const [home, userHome, claudeConfigDir, codexHome, cwd] = await Promise.all([homeDir($), $.env.get('HOME'), $.env.get('CLAUDE_CONFIG_DIR'), $.env.get('CODEX_HOME'), $.session.cwd()])
     const claudeDir = claudeConfigDir || `${userHome ?? ''}/.claude`
-    const [droveConfig, claudeJson, projectMcp, settings, codexConfig] = await Promise.all([
+    const [droveConfig, claudeJson, projectMcp, settings, codexConfig, skills, agents] = await Promise.all([
       readJsonAt($, `${home}/config.json`),
       readJsonAt($, `${claudeConfigDir || userHome || ''}/.claude.json`),
       readJsonAt($, `${cwd}/.mcp.json`),
       readJsonAt($, `${claudeDir}/settings.json`),
       $.fs.read(`${codexHome || `${userHome ?? ''}/.codex`}/config.toml`).catch(() => undefined),
+      skillNamesOf($, claudeDir),
+      agentNamesOf($, claudeDir),
     ])
     const local = (claudeJson.projects as Record<string, { mcpServers?: unknown } | undefined> | undefined)?.[cwd]?.mcpServers
     const mcp = [...new Set([...keysOf(claudeJson.mcpServers), ...keysOf(projectMcp.mcpServers), ...keysOf(local)])].filter(name => name !== 'drove')
@@ -205,8 +233,11 @@ const trimsOf = ($: EngineInterface): Promise<LeanSpawnTrims> => {
     return {
       ...(stringsOf(droveConfig.workerMcp) ? { workerMcp: stringsOf(droveConfig.workerMcp) } : {}),
       ...(stringsOf(droveConfig.workerPlugins) ? { workerPlugins: stringsOf(droveConfig.workerPlugins) } : {}),
+      ...(stringsOf(droveConfig.workerSkills) ? { workerSkills: stringsOf(droveConfig.workerSkills) } : {}),
+      ...(stringsOf(droveConfig.workerAgents) ? { workerAgents: stringsOf(droveConfig.workerAgents) } : {}),
       ...(typeof droveConfig.workerUserMemory === 'boolean' ? { workerUserMemory: droveConfig.workerUserMemory } : {}),
-      mcp, plugins, ...(codexMcp ? { codexMcp } : {}),
+      ...(typeof droveConfig.workerUserHooks === 'boolean' ? { workerUserHooks: droveConfig.workerUserHooks } : {}),
+      mcp, plugins, ...(skills.length > 0 ? { skills } : {}), ...(agents.length > 0 ? { agents } : {}), ...(codexMcp ? { codexMcp } : {}),
     }
   })()
   return leanTrims
@@ -296,9 +327,12 @@ const ORCHESTRATOR_TOOLS = [
         cairn: { type: 'string', description: 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
         mcp: { type: 'array', items: { type: 'string' }, description: 'optional: the user MCP servers this worker needs, by name; [] for Drove’s alone. Left out, Drove’s workerMcp setting decides' },
         plugins: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: the user plugins this worker needs, by name; [] for Drove’s mod alone. Left out, Drove’s workerPlugins setting decides (every enabled plugin when unset)' },
+        skills: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: the user skills this worker needs, by name; [] loads no skill at all, plugin skills follow plugins. Left out, Drove’s workerSkills setting decides (every skill when unset)' },
+        agents: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: your own agent types this worker may use, by name; [] hides all of them, built-in agents stay. Left out, Drove’s workerAgents setting decides (every agent when unset)' },
         userMemory: { type: 'boolean', description: 'optional, Claude workers: true loads your own CLAUDE.md files, false leaves them out. Left out, Drove’s workerUserMemory setting decides (loaded by default). Codex workers follow the setting alone' },
         role: { type: 'string', enum: ['implementer', 'reviewer', 'tester'], description: 'optional, default implementer. reviewer: read-only, reads the target’s diff and brief and reports a recommendation, findings and check results (needs target). tester: branches from the target’s branch head and writes tests only, owns defaulting to the usual test globs (needs target)' },
         target: { type: 'string', description: 'the worker a reviewer reviews or a tester tests; required for those roles' },
+        userHooks: { type: 'boolean', description: 'optional, Claude workers: false leaves out the hooks in your own settings.json, and with them your own skills, agents and commands, which Claude reads from the same source; Drove’s hooks stay. Left out, Drove’s workerUserHooks setting decides (kept by default). Codex workers follow the setting alone' },
         owns: { type: 'array', items: { type: 'string' }, description: 'optional: globs, relative to the worktree, of the files this worker may change; Drove’s guard refuses its edits elsewhere. Left out, it may edit anywhere (a tester: the usual test globs)' },
         maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
         maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
@@ -480,7 +514,10 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   if (!(await herdrPane($))) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
   const mcp = Array.isArray(input.mcp) ? input.mcp.filter((entry): entry is string => typeof entry === 'string') : undefined
   const plugins = Array.isArray(input.plugins) ? input.plugins.filter((entry): entry is string => typeof entry === 'string') : undefined
+  const skills = Array.isArray(input.skills) ? input.skills.filter((entry): entry is string => typeof entry === 'string') : undefined
+  const agents = Array.isArray(input.agents) ? input.agents.filter((entry): entry is string => typeof entry === 'string') : undefined
   const userMemory = typeof input.userMemory === 'boolean' ? input.userMemory : undefined
+  const userHooks = typeof input.userHooks === 'boolean' ? input.userHooks : undefined
   const owns = Array.isArray(input.owns) ? input.owns.filter((entry): entry is string => typeof entry === 'string') : undefined
   if (input.role !== undefined && input.role !== 'implementer' && input.role !== 'reviewer' && input.role !== 'tester') return { deny: 'role must be implementer, reviewer or tester.' }
   const role: SeatRole = input.role === 'reviewer' || input.role === 'tester' ? input.role : 'implementer'
@@ -489,7 +526,7 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })

@@ -712,3 +712,135 @@ test('writeLaunchFiles applies the memory unlinks to a symlink an earlier spawn 
   await assert.rejects(lstat(join(home, 'AGENTS.md')))
   assert.equal(await readFile(join(home, 'AGENTS.override.md'), 'utf8'), 'made by hand')
 })
+
+// ---------- lean workers drop skills, agents and (opt-in) the user's settings hooks (DROVE-98) ----------
+
+const USER_SKILLS = ['arb', 'cairn', 'anthropic-skills:docx', 'audit']
+const USER_AGENTS = ['debugger', 'code-reviewer']
+
+test('workerSkills switches off the user skills the list leaves out, by exact name, and an entry may drop the claude.ai prefix', () => {
+  assert.ok(!('skillOverrides' in settingsOf(launch.claudeWorkerSpec(request({})))), 'no list, nothing changed')
+  const some = settingsOf(launch.claudeWorkerSpec(request({ skillAllow: ['cairn', 'docx'], userSkills: USER_SKILLS })))
+  assert.deepEqual(some.skillOverrides, { arb: 'off', audit: 'off' })
+  assert.ok(!launch.claudeWorkerSpec(request({ skillAllow: ['cairn'], userSkills: USER_SKILLS })).argv.includes('--disable-slash-commands'))
+  assert.ok(!('skillOverrides' in settingsOf(launch.claudePlannerSpec(request({ identity: planner, skillAllow: [], userSkills: USER_SKILLS })))), 'the planner is never trimmed')
+})
+
+test('an empty workerSkills list is --disable-slash-commands for the worker: no skill at all', () => {
+  const none = launch.claudeWorkerSpec(request({ skillAllow: [], userSkills: USER_SKILLS }))
+  assert.ok(none.argv.includes('--disable-slash-commands'))
+  assert.deepEqual(settingsOf(none).skillOverrides, { arb: 'off', cairn: 'off', 'anthropic-skills:docx': 'off', audit: 'off' })
+  assert.ok(!launch.claudePlannerSpec(request({ identity: planner, skillAllow: [] })).argv.includes('--disable-slash-commands'))
+})
+
+test('workerAgents denies the Agent(<name>) of every user agent the list leaves out', () => {
+  assert.ok(!('permissions' in settingsOf(launch.claudeWorkerSpec(request({})))))
+  const some = settingsOf(launch.claudeWorkerSpec(request({ agentAllow: ['debugger'], userAgents: USER_AGENTS })))
+  assert.deepEqual(some.permissions, { deny: ['Agent(code-reviewer)'] })
+  const none = settingsOf(launch.claudeWorkerSpec(request({ agentAllow: [], userAgents: USER_AGENTS })))
+  assert.deepEqual(none.permissions, { deny: ['Agent(debugger)', 'Agent(code-reviewer)'] })
+  assert.ok(!('permissions' in settingsOf(launch.claudePlannerSpec(request({ identity: planner, agentAllow: [], userAgents: USER_AGENTS })))))
+})
+
+test("workerUserHooks false drops the user setting source and carries the user's settings.json minus its hooks into Drove's settings", () => {
+  const userSettings = {
+    hooks: { SessionStart: [{ hooks: [{ type: 'command', command: 'cairn-start' }] }] },
+    env: { NOTION_API_KEY: 'k', CLAUDE_CODE_PLUGIN_DIRS: '~/mods/a:~/mods/b' },
+    permissions: { allow: ['Bash(ls)'], deny: ['Bash(rm -rf *)'] },
+    enabledPlugins: { 'context7@claude-plugins-official': true, 'ccc-skills@ccc': true },
+    skipDangerousModePermissionPrompt: true,
+    claudeMdExcludes: ['/user/exclude.md'],
+  }
+  const open = launch.claudeWorkerSpec(request({ userHooks: false, userSettings }))
+  assert.deepEqual(open.argv.slice(open.argv.indexOf('--setting-sources'), open.argv.indexOf('--setting-sources') + 2), ['--setting-sources', 'project,local'])
+  const settings = settingsOf(open)
+  assert.deepEqual(Object.keys(settings.hooks as object), ['PreToolUse', 'SessionStart', 'UserPromptSubmit', 'Stop', 'StopFailure', 'Notification'], "Drove's hooks only")
+  assert.ok(!JSON.stringify(settings.hooks).includes('cairn-start'))
+  assert.deepEqual(settings.env, userSettings.env)
+  assert.deepEqual(settings.permissions, userSettings.permissions)
+  assert.deepEqual(settings.enabledPlugins, userSettings.enabledPlugins)
+  assert.equal(settings.skipDangerousModePermissionPrompt, true)
+  assert.deepEqual(settings.claudeMdExcludes, ['/user/exclude.md'])
+
+  const merged = settingsOf(launch.claudeWorkerSpec(request({
+    userHooks: false, userSettings, pluginAllow: ['context7'], userPlugins: { enabled: ['context7@claude-plugins-official', 'ccc-skills@ccc'], dirs: [{ entry: '~/mods/a', name: 'a' }, { entry: '~/mods/b', name: 'b' }] },
+    agentAllow: [], userAgents: USER_AGENTS, skillAllow: ['cairn'], userSkills: USER_SKILLS, userMemory: false, claudeDir: '/home/user/.claude',
+  })))
+  assert.deepEqual(merged.enabledPlugins, { 'context7@claude-plugins-official': true, 'ccc-skills@ccc': false })
+  assert.deepEqual(merged.env, { NOTION_API_KEY: 'k', CLAUDE_CODE_PLUGIN_DIRS: '' }, "Drove's plugin dir list replaces the user's, the rest of env stays")
+  assert.deepEqual(merged.permissions, userSettings.permissions, 'the user skills and agents are not loaded without the source: nothing to deny')
+  assert.ok(!('skillOverrides' in merged))
+  assert.deepEqual((merged.claudeMdExcludes as string[]).slice(0, 2), ['/user/exclude.md', '/home/user/.claude/CLAUDE.md'])
+
+  const off = launch.claudeWorkerSpec(request({ userHooks: false }))
+  assert.deepEqual(Object.keys(settingsOf(off)), ['hooks'], 'a settings.json that could not be read carries nothing')
+  assert.ok(!launch.claudeWorkerSpec(request({ userHooks: true, userSettings })).argv.includes('--setting-sources'))
+  const planned = launch.claudePlannerSpec(request({ identity: planner, userHooks: false, userSettings }))
+  assert.ok(!planned.argv.includes('--setting-sources'), 'the planner keeps the user source')
+  assert.deepEqual(Object.keys(settingsOf(planned)), ['hooks'])
+})
+
+test('a worker without the user setting source is handed the user-scope MCP servers, since Claude no longer reads them', () => {
+  const userMcp = { mongodb: { command: 'mongo-mcp' }, notion: { command: 'notion-mcp' }, drove: { command: 'stale' } }
+  const mcpOf = (spec: { files: readonly { path: string; content: string }[] }): string[] => Object.keys((JSON.parse(fileOf(spec, 'mcp.json')) as { mcpServers: object }).mcpServers)
+  assert.deepEqual(mcpOf(launch.claudeWorkerSpec(request({ userHooks: false, userMcp }))), ['mongodb', 'notion', 'drove'])
+  assert.deepEqual(mcpOf(launch.claudeWorkerSpec(request({ userHooks: false, userMcp, mcpAllow: ['notion'] }))), ['notion', 'drove'], 'an allowlist still wins')
+  assert.deepEqual(mcpOf(launch.claudeWorkerSpec(request({ userMcp }))), ['drove'], 'with the source kept, Claude loads them itself')
+  assert.ok(!launch.claudeWorkerSpec(request({ userHooks: false, userMcp })).argv.includes('--strict-mcp-config'))
+})
+
+test("workerUserHooks false leaves the user's Codex hooks out of the shared home's hooks.json and their trust out of config.toml", () => {
+  const on = JSON.parse(fileOf(launch.codexWorkerSpec(homeRequest({})), 'hooks.json')) as { hooks: Record<string, unknown[]> }
+  assert.equal(on.hooks.SessionStart?.length, 2)
+  const spec = launch.codexWorkerSpec(homeRequest({ userHooks: false }))
+  const hooks = (JSON.parse(fileOf(spec, 'hooks.json')) as { hooks: Record<string, { hooks: { command: string }[] }[]> }).hooks
+  assert.deepEqual(hooks.SessionStart?.map(group => group.hooks[0]?.command), [`${HOME}/g-d43caf1d session-start`])
+  assert.deepEqual(hooks.Stop?.map(group => group.hooks[0]?.command), [`${HOME}/g-d43caf1d stop`])
+  const config = fileOf(spec, 'config.toml')
+  assert.ok(!config.includes('user-approved') && !config.includes('user-stop'))
+  assert.ok(config.includes(`hooks.json:session_start:0:0"]\ntrusted_hash = "sha256:`), "Drove's own hook moves to index 0 and stays trusted")
+})
+
+test("readClaudeSkills and readClaudeAgents read the names Claude lists: skill folders, synced claude.ai skills, commands and agent files", async () => {
+  const { mkdir, writeFile: write, symlink } = await import('node:fs/promises')
+  const root = await tmp('claude-names')
+  const put = async (path: string, text: string): Promise<void> => {
+    await mkdir(join(path, '..'), { recursive: true })
+    await write(path, text)
+  }
+  await put(join(root, 'skills', 'cairn', 'SKILL.md'), '---\nname: cairn\ndescription: x\n---\n')
+  await put(join(root, 'skills', 'renamed', 'SKILL.md'), '---\nname: "pretty-name"\n---\n')
+  await put(join(root, 'skills', 'lib', 'helper.sh'), 'not a skill')
+  await put(join(root, 'skills', 'synced', 'acct-1', 'docx', 'SKILL.md'), '---\nname: docx\n---\n')
+  await put(join(root, 'skills', 'synced', 'acct-2', 'docx', 'SKILL.md'), '---\nname: docx\n---\n')
+  await put(join(root, 'skills', 'synced', 'acct-1', 'manifest.json'), '{}')
+  await put(join(root, 'commands', 'audit.md'), 'x')
+  await put(join(root, 'commands', 'team', 'plan.md'), 'x')
+  await put(join(root, 'agents', 'debugger.md'), '---\nname: debugger\n---\n')
+  await put(join(root, 'agents', 'design', 'ui.md'), '---\ndescription: no name\n---\n')
+  await put(join(root, 'agents', 'design', 'named.md'), '---\nname: ux-lead\n---\n')
+  await symlink(join(root, 'skills', 'cairn'), join(root, 'skills', 'linked'))
+  assert.deepEqual((await launch.readClaudeSkills(root)).sort(), ['anthropic-skills:docx', 'audit', 'cairn', 'pretty-name', 'team:plan'])
+  assert.deepEqual((await launch.readClaudeAgents(root)).sort(), ['debugger', 'ui', 'ux-lead'])
+  assert.deepEqual(await launch.readClaudeSkills(join(root, 'absent')), [])
+  assert.deepEqual(await launch.readClaudeAgents(join(root, 'absent')), [])
+  assert.deepEqual(await launch.readClaudeSettings(join(root, 'absent.json')), {})
+})
+
+test('redactSpec masks env values in settings.json, mcp.json (not Drove\'s server) and config.toml env tables, and keeps Drove\'s own variables', () => {
+  const spec = launch.redactSpec({
+    kind: 'claude', role: 'worker', cwd: '/x', env: { DROVE_RUN: 'r-1', DROVE_TOKEN: 'tok-1', DROVE_AGENT: 'claude', MY_KEY: 'k-1' }, argv: ['--note', 'tok-1'],
+    files: [
+      { path: '/s/settings.json', mode: 0o600, content: JSON.stringify({ env: { A: 'a-secret', CLAUDE_CODE_PLUGIN_DIRS: 'dirs' }, permissions: { allow: ['x'] } }) },
+      { path: '/s/mcp.json', mode: 0o600, content: JSON.stringify({ mcpServers: { drove: { command: 'node', env: { DROVE_TOKEN: 'tok-1', DROVE_RUN: 'r-1' } }, n: { command: 'n', env: { T: 't-secret' }, headers: { H: 'h-secret' } } } }) },
+      { path: '/h/config.toml', mode: 0o600, content: '[mcp_servers.d]\ncommand = "d"\n\n[mcp_servers.d.env]\nTOKEN = "c-secret"\nOTHER = "o-secret"\n\n[projects."/x"]\ntrust_level = "trusted"\n' },
+    ],
+  })
+  const all = JSON.stringify(spec)
+  for (const secret of ['a-secret', 'dirs', 't-secret', 'h-secret', 'c-secret', 'o-secret', 'k-1', 'tok-1']) assert.ok(!all.includes(secret), secret)
+  assert.deepEqual([spec.env.DROVE_RUN, spec.env.DROVE_AGENT, spec.env.MY_KEY], ['r-1', 'claude', '<redacted>'])
+  const mcp = JSON.parse(spec.files[1]?.content ?? '{}') as { mcpServers: { drove: { env: Record<string, string> } } }
+  assert.deepEqual(mcp.mcpServers.drove.env, { DROVE_TOKEN: '<redacted>', DROVE_RUN: 'r-1' })
+  assert.ok(spec.files[2]?.content.includes('[projects."/x"]\ntrust_level = "trusted"'))
+  assert.ok(spec.files[2]?.content.includes('command = "d"'))
+})

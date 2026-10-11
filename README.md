@@ -127,7 +127,7 @@ Review and testing can be seats of their own. They are optional: the planner rea
 | Command | Use |
 |---|---|
 | `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT \| --from-cairn REF \| --next PROJECT] [--run ID] [--detached [--json]]` | start a planner in this pane; `--from-cairn` makes a Cairn task the run's goal, `--next` the top task of a Cairn project; `--detached` opens a herdr workspace of its own instead and returns at once (see "Unattended runs") |
-| `drove spawn <seat> --kind claude\|codex --cairn REF --brief TEXT\|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--user-memory on\|off] [--role implementer\|reviewer\|tester --target SEAT] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]` | open a worker and brief it; `--mcp`, `--plugins` and `--user-memory` are under "Lean workers", `--role` and `--target` under "Reviewer and tester seats", `--owns` and the budgets under "Rules Drove enforces" |
+| `drove spawn <seat> --kind claude\|codex --cairn REF --brief TEXT\|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on\|off] [--user-hooks on\|off] [--role implementer\|reviewer\|tester --target SEAT] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]` | open a worker and brief it; `--mcp`, `--plugins`, `--skills`, `--agents`, `--user-memory` and `--user-hooks` are under "Lean workers", `--role` and `--target` under "Reviewer and tester seats", `--owns` and the budgets under "Rules Drove enforces" |
 | `drove send <seat> --kind message\|answer\|verdict [--verdict approve\|changes] [--expects review\|answer\|none] [--run ID] TEXT\|-` | send one control message; `--run` names the run when you send from outside it |
 | `drove prompt <seat> TEXT\|-` | raw prompt into a seat of this run (guarded) |
 | `drove promote <seat> [--model M] --effort E [--reason TEXT]` | change a worker's model or effort |
@@ -252,7 +252,7 @@ State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `
 
 ### Lean workers
 
-A worker loads your whole Claude setup unless you trim it: every MCP server, Claude in Chrome, every enabled plugin and your own memory files. Each trim has a run-wide key in `~/.drove/config.json` and, for a Claude worker, an option on one spawn (`drove spawn`, the planner's `spawn` tool, or the mod's `spawn_worker`). The planner chooses the options for each worker: its role text has a short "Lean spawns" paragraph that says what a worker loads under your config and lists your MCP server and plugin names, read from your Claude and Codex files (names only, never written).
+A worker loads your whole Claude setup unless you trim it: every MCP server, Claude in Chrome, every enabled plugin, your skills, your agent types, your own memory files and the hooks in your `settings.json`. Each trim has a run-wide key in `~/.drove/config.json` and, for a Claude worker, an option on one spawn (`drove spawn`, the planner's `spawn` tool, or the mod's `spawn_worker`). The planner chooses the options for each worker: its role text has a short "Lean spawns" paragraph that says what a worker loads under your config and lists your MCP server, plugin, skill and agent names, read from your Claude and Codex files (names only, never written).
 
 | A worker loads | Run-wide key | Per spawn | Default | Saves per worker |
 |---|---|---|---|---|
@@ -260,18 +260,23 @@ A worker loads your whole Claude setup unless you trim it: every MCP server, Cla
 | Claude in Chrome | the same list: a lean worker runs `--no-chrome` unless the list names `claude-in-chrome` | the same option | loaded | about 2.2k tokens |
 | plugins and mods | `workerPlugins`: a list of names, with or without `@marketplace` | `--plugins a,b` / `plugins` | every enabled one | about 0.2k tokens |
 | your memory files | `workerUserMemory`: `false` to leave them out | `--user-memory on\|off` / `userMemory` | loaded | about 5.3k tokens |
-| Codex skills | `workerSkills`: a list of names | none | all of them | the skills left out |
+| skills: yours, your commands and your claude.ai ones (Claude); the skills linked into the run's Codex home (Codex) | `workerSkills`: a list of names; `[]` loads none | `--skills a,b` / `skills` (Claude) | all of them | about 5k tokens with `[]` (up to about 6.5k with the claude.ai ones named), about 0.1k per skill left out |
+| your agent types (`~/.claude/agents`) | `workerAgents`: a list of names; `[]` hides all of yours | `--agents a,b` / `agents` | all of them | about 2.3k tokens for 28 agents |
+| the hooks in your `settings.json` | `workerUserHooks`: `false` to leave them out | `--user-hooks on\|off` / `userHooks` | run | about 2.8k tokens of hook output; with it your skills, agents and commands (see below), about 10k |
 
 - Lists add up: a worker gets the run's list plus its own. A list on a spawn makes that worker lean even when the config key is unset, and `[]` means Drove's server (or Drove's mod) alone. Left out, the run's setting decides, and with neither set nothing is trimmed.
 - `userMemory` on a spawn wins over `workerUserMemory`, in both directions: `true` loads your memory files for one worker of a lean run, `false` leaves them out of one worker of a normal run. Memory files are your `~/.claude/CLAUDE.md` and any `CLAUDE.md` in the folders above the repo; the repo's own files always stay.
 - The options belong to the seat, so `promote`, a restart, `up` and `migrate` keep them. A name that matches nothing you have is reported in the spawn result, and the worker runs without it.
+- Skills (Claude): the names are the folders in `~/.claude/skills`, the files in `~/.claude/commands`, and your claude.ai skills as `anthropic-skills:<name>` (a name without the prefix matches too). A skill the list leaves out is switched off for that worker only, and `[]` starts it with `--disable-slash-commands`, which drops every skill including the plugin and bundled ones. Plugin skills follow `workerPlugins`; Claude's own bundled skills (`/debug`, `/simplify`) stay, because switching them off made the first request bigger (checked on Claude Code 2.1.296). `workerSkills` was Codex-only before; set today, it now trims Claude workers too.
+- Agents: an agent the list leaves out is hidden from the worker's Agent tool with a `permissions.deny` rule `Agent(<name>)`. Claude's built-in agents (`Explore`, `Plan`, `general-purpose`), plugin agents and the repo's own `.claude/agents` stay.
+- User hooks: Claude has no switch for the hooks in your `settings.json` alone (`disableAllHooks` also turns Drove's own off). The one lever is to start the worker without the `user` setting source, which Drove does with `--setting-sources project,local`. That also takes away what Claude reads from the same place: your own skills, agents and commands (so `workerSkills` and `workerAgents` have nothing left to trim) and your user-scope MCP servers. Drove puts back what it can: your `settings.json` minus its hooks (env, permissions, plugins, the bypass consent) goes into the worker's own settings, your user-scope MCP servers go into its `mcp.json` (an allowlist still narrows them), and `CLAUDE.md` is untouched, because memory has its own switch. Project and local hooks, and the hooks of the plugins you leave enabled, stay. For Codex the key leaves your `hooks.json` out of the run's `CODEX_HOME`, and Drove's own hooks stay.
 - Drove's own report tool, `mcp__drove__report`, is the worker's one report tool, and Drove's own mod is never trimmed.
-- Codex: `mcp` works per seat, and `workerSkills` and `workerUserMemory` apply to the run. A Codex worker reads your `AGENTS.md` from its `CODEX_HOME`, which every seat of a run shares, and Codex has no per-launch switch for it (checked on Codex 0.162.0: `project_doc_max_bytes` only limits the repo's own `AGENTS.md`). So `userMemory` and `plugins` on a Codex spawn change nothing, and the spawn result says so; set `workerUserMemory: false` for the whole run instead.
+- Codex: `mcp` works per seat, and `workerSkills`, `workerUserMemory` and `workerUserHooks` apply to the run. A Codex worker reads your `AGENTS.md` from its `CODEX_HOME`, which every seat of a run shares, and Codex has no per-launch switch for it (checked on Codex 0.162.0: `project_doc_max_bytes` only limits the repo's own `AGENTS.md`). So `userMemory`, `userHooks`, `plugins`, `skills` and `agents` on a Codex spawn change nothing, and the spawn result says so; set `workerUserMemory: false` or `workerUserHooks: false` for the whole run instead.
 
 A run-wide setting, in `~/.drove/config.json`:
 
 ```json
-{ "workerMcp": ["notion"], "workerPlugins": ["context7"], "workerUserMemory": false }
+{ "workerMcp": ["notion"], "workerPlugins": ["context7"], "workerSkills": ["cairn"], "workerAgents": [], "workerUserMemory": false }
 ```
 
 One worker that needs a browser and your own coding rules, on top of that:
@@ -280,7 +285,7 @@ One worker that needs a browser and your own coding rules, on top of that:
 drove spawn w-ui --kind claude --cairn APP-12 --brief - --mcp claude-in-chrome --user-memory on
 ```
 
-A mechanical edit can drop everything: `--mcp '' --plugins '' --user-memory off`.
+A mechanical edit can drop everything: `--mcp '' --plugins '' --skills '' --agents '' --user-memory off --user-hooks off`.
 
 Codex workers run with approvals and the sandbox bypassed, like Claude workers with `--dangerously-skip-permissions`. Drove's guard hook still denies pushes. Set `codexWorkerSandbox` to `"workspace-write"` to turn that off.
 

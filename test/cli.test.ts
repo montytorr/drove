@@ -66,6 +66,10 @@ test("an empty --mcp or --plugins is the empty list, not a dropped option, and a
   assert.deepEqual([named.mcp, named.plugins, named.userMemory], [['notion', 'mongodb'], ['context7'], true])
   const open = requestOf()
   assert.deepEqual([open.mcp, open.plugins, open.userMemory], [undefined, undefined, undefined])
+  assert.deepEqual([open.skills, open.agents, open.userHooks], [undefined, undefined, undefined])
+  const trimmed = requestOf('--skills', '', '--agents', 'debugger, code-reviewer', '--user-hooks', 'off')
+  assert.deepEqual([trimmed.skills, trimmed.agents, trimmed.userHooks], [[], ['debugger', 'code-reviewer'], false])
+  assert.equal(requestOf('--user-hooks', 'on').userHooks, true)
 })
 
 test('cli --help prints usage and exits 0', async () => {

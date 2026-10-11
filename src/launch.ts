@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto'
-import { chmod, lstat, mkdir, readdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
+import { chmod, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, join } from 'node:path'
 import { ENV, identityEnv, plannerDir, seatDir } from './paths.ts'
@@ -56,7 +57,11 @@ const CLAUDE_MD_FILES = ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md'] as
 
 export type ClaudeSettingsOptions = {
   plugins?: { allow: readonly string[]; user: UserPlugins }
+  skills?: { allow: readonly string[]; user: readonly string[] }
+  agents?: { allow: readonly string[]; user: readonly string[] }
   claudeMdExcludes?: readonly string[]
+  // The user's settings.json minus its hooks, carried when the user setting source is dropped (workerUserHooks: false).
+  userSettings?: Record<string, unknown>
 }
 
 const pluginNameOf = (key: string): string => key.split('@')[0] ?? key
@@ -81,18 +86,48 @@ const pluginSettings = ({ allow, user }: { allow: readonly string[]; user: UserP
   }
 }
 
-export const claudeSettings = (droveEntry: string, _role: Role, options: ClaudeSettingsOptions = {}): Record<string, unknown> => ({
-  hooks: {
-    PreToolUse: [{ matcher: CLAUDE_GUARDED_TOOLS, hooks: [claudeHook(droveEntry, 'pre-tool-use')] }],
-    SessionStart: [{ hooks: [claudeHook(droveEntry, 'session-start')] }],
-    UserPromptSubmit: [{ hooks: [claudeHook(droveEntry, 'user-prompt-submit')] }],
-    Stop: [{ hooks: [claudeHook(droveEntry, 'stop')] }],
-    StopFailure: [{ hooks: [claudeHook(droveEntry, 'stop-failure')] }],
-    Notification: [{ hooks: [claudeHook(droveEntry, 'notification')] }],
-  },
-  ...(options.plugins ? pluginSettings(options.plugins) : {}),
-  ...(options.claudeMdExcludes ? { claudeMdExcludes: [...options.claudeMdExcludes] } : {}),
-})
+// A list entry names a skill or agent whole, or without the prefix its source gives it ("docx" for "anthropic-skills:docx").
+const isNameListed = (allow: readonly string[], name: string): boolean => allow.some(item => item === name || name.endsWith(`:${item}`))
+
+const recordOf = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {})
+
+const listOf = (value: unknown): unknown[] => (Array.isArray(value) ? value : [])
+
+// workerSkills (DROVE-98): the user's own skills and commands, and the claude.ai ones synced into ~/.claude/skills/synced,
+// that the list leaves out get skillOverrides "off". Probed on Claude Code 2.1.296: exact names only, no wildcard, and
+// it does not reach plugin skills (workerPlugins) or the bundled ones (switching those off made the prompt larger).
+const skillOverrides = ({ allow, user }: { allow: readonly string[]; user: readonly string[] }): Record<string, string> =>
+  Object.fromEntries(user.filter(name => !isNameListed(allow, name)).map(name => [name, 'off']))
+
+// workerAgents (DROVE-98): a permissions.deny rule Agent(<name>) takes that agent out of the Agent tool's list.
+const agentDenies = ({ allow, user }: { allow: readonly string[]; user: readonly string[] }): string[] =>
+  user.filter(name => !isNameListed(allow, name)).map(name => `Agent(${name})`)
+
+export const claudeSettings = (droveEntry: string, _role: Role, options: ClaudeSettingsOptions = {}): Record<string, unknown> => {
+  const carried = Object.fromEntries(Object.entries(options.userSettings ?? {}).filter(([key]) => key !== 'hooks'))
+  const plugin = options.plugins ? pluginSettings(options.plugins) : {}
+  const enabledPlugins = { ...recordOf(carried.enabledPlugins), ...recordOf(plugin.enabledPlugins) }
+  const env = { ...recordOf(carried.env), ...recordOf(plugin.env) }
+  const excludes = [...listOf(carried.claudeMdExcludes), ...(options.claudeMdExcludes ?? [])]
+  const offs = { ...recordOf(carried.skillOverrides), ...(options.skills ? skillOverrides(options.skills) : {}) }
+  const deny = [...listOf(recordOf(carried.permissions).deny), ...(options.agents ? agentDenies(options.agents) : [])]
+  return {
+    ...carried,
+    hooks: {
+      PreToolUse: [{ matcher: CLAUDE_GUARDED_TOOLS, hooks: [claudeHook(droveEntry, 'pre-tool-use')] }],
+      SessionStart: [{ hooks: [claudeHook(droveEntry, 'session-start')] }],
+      UserPromptSubmit: [{ hooks: [claudeHook(droveEntry, 'user-prompt-submit')] }],
+      Stop: [{ hooks: [claudeHook(droveEntry, 'stop')] }],
+      StopFailure: [{ hooks: [claudeHook(droveEntry, 'stop-failure')] }],
+      Notification: [{ hooks: [claudeHook(droveEntry, 'notification')] }],
+    },
+    ...(Object.keys(enabledPlugins).length > 0 ? { enabledPlugins } : {}),
+    ...(Object.keys(env).length > 0 ? { env } : {}),
+    ...(excludes.length > 0 ? { claudeMdExcludes: excludes } : {}),
+    ...(Object.keys(offs).length > 0 ? { skillOverrides: offs } : {}),
+    ...(deny.length > 0 ? { permissions: { ...recordOf(carried.permissions), deny } } : {}),
+  }
+}
 
 const dirsAbove = (dir: string): string[] => {
   const parent = dirname(dir)
@@ -116,8 +151,12 @@ export const claudeMcpConfig = (droveEntry: string, env: Record<string, string> 
 
 // An allowlist (DROVE-72) turns on --strict-mcp-config: the seat loads Drove's server and the named user servers only.
 // Without one the seat loads the user's whole MCP setup, as before.
-const allowedMcp = (request: LaunchRequest): Record<string, unknown> =>
-  Object.fromEntries((request.mcpAllow ?? []).filter(name => name !== 'drove' && request.userMcp?.[name] !== undefined).map(name => [name, request.userMcp?.[name]]))
+// A worker that drops the user setting source (workerUserHooks: false) no longer gets the user-scope servers from
+// Claude, so without an allowlist they are handed over here, all of them.
+const allowedMcp = (request: LaunchRequest): Record<string, unknown> => {
+  const names = request.mcpAllow ?? (request.userHooks === false ? Object.keys(request.userMcp ?? {}) : [])
+  return Object.fromEntries(names.filter(name => name !== 'drove' && request.userMcp?.[name] !== undefined).map(name => [name, request.userMcp?.[name]]))
+}
 
 export const userClaudeConfig = (env: NodeJS.ProcessEnv = process.env): string => join(env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json')
 
@@ -146,8 +185,6 @@ export const readClaudeMcp = async (configPath: string, repo: string): Promise<R
 
 const expandHome = (path: string): string => (path === '~' ? homedir() : path.startsWith('~/') ? join(homedir(), path.slice(2)) : path)
 
-const recordOf = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {})
-
 const pluginNameOfDir = async (dir: string): Promise<string> => {
   const name = recordOf(await readJsonFile(join(dir, '.claude-plugin', 'plugin.json'))).name
   return typeof name === 'string' && name.trim() ? name.trim() : basename(dir)
@@ -164,13 +201,70 @@ export const readClaudePlugins = async (settingsPath: string): Promise<UserPlugi
   return { enabled, ...(dirs ? { dirs } : {}) }
 }
 
+// Reads only: the user's settings.json as a whole, for a worker that drops the user setting source (workerUserHooks: false).
+export const readClaudeSettings = async (settingsPath: string): Promise<Record<string, unknown>> => recordOf(await readJsonFile(settingsPath))
+
+// The prefix Claude Code gives the claude.ai skills it syncs into ~/.claude/skills/synced/<account>/<name>/ (2.1.296).
+const SYNCED_SKILL_PREFIX = 'anthropic-skills'
+
+const frontmatterName = (text: string): string | undefined => {
+  const header = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text)?.[1]
+  const name = header ? /^name:\s*(.+?)\s*$/m.exec(header)?.[1]?.replace(/^["']|["']$/g, '').trim() : undefined
+  return name || undefined
+}
+
+type DirEntry = { name: string; path: string; isDir: boolean }
+
+const entriesOf = async (dir: string): Promise<DirEntry[]> => {
+  const names = await readdir(dir).catch(() => [] as string[])
+  const entries = await Promise.all(names.filter(name => !name.startsWith('.')).sort().map(async (name): Promise<DirEntry | undefined> => {
+    const path = join(dir, name)
+    const info = await stat(path).catch(() => undefined)
+    return info ? { name, path, isDir: info.isDirectory() } : undefined
+  }))
+  return entries.filter((entry): entry is DirEntry => entry !== undefined)
+}
+
+const markdownFiles = async (dir: string, prefix: string[] = []): Promise<{ parts: string[]; path: string }[]> => {
+  const found = await Promise.all((await entriesOf(dir)).map(async entry =>
+    entry.isDir ? markdownFiles(entry.path, [...prefix, entry.name]) : entry.name.endsWith('.md') ? [{ parts: [...prefix, entry.name.slice(0, -3)], path: entry.path }] : []))
+  return found.flat()
+}
+
+// Reads only: the names Claude lists as skills for this user: ~/.claude/skills/<name>/SKILL.md, the synced claude.ai
+// skills as anthropic-skills:<name>, and the commands in ~/.claude/commands (nested folders become folder:name).
+export const readClaudeSkills = async (claudeDir: string): Promise<string[]> => {
+  const skillDirs = await entriesOf(join(claudeDir, 'skills'))
+  const own = await Promise.all(skillDirs.filter(entry => entry.isDir && entry.name !== 'synced').map(async entry => {
+    const text = await readFile(join(entry.path, 'SKILL.md'), 'utf8').catch(() => undefined)
+    return text === undefined ? [] : [frontmatterName(text) ?? entry.name]
+  }))
+  const accounts = await entriesOf(join(claudeDir, 'skills', 'synced'))
+  const synced = await Promise.all(accounts.filter(entry => entry.isDir).map(async account =>
+    (await entriesOf(account.path)).filter(entry => entry.isDir && existsSync(join(entry.path, 'SKILL.md'))).map(entry => `${SYNCED_SKILL_PREFIX}:${entry.name}`)))
+  const commands = (await markdownFiles(join(claudeDir, 'commands'))).map(file => file.parts.join(':'))
+  return [...new Set([...own.flat(), ...synced.flat(), ...commands])]
+}
+
+// Reads only: the names of the agent definitions in ~/.claude/agents, nested folders included.
+export const readClaudeAgents = async (claudeDir: string): Promise<string[]> => {
+  const files = await markdownFiles(join(claudeDir, 'agents'))
+  const names = await Promise.all(files.map(async file => frontmatterName(await readFile(file.path, 'utf8').catch(() => '')) ?? file.parts.at(-1) ?? ''))
+  return [...new Set(names.filter(Boolean))]
+}
+
 const jsonFile = (path: string, value: unknown): LaunchFile => ({ path, content: `${JSON.stringify(value, null, 2)}\n`, mode: 0o600 })
 
 const dirOf = (identity: Identity): string => (identity.role === 'planner' ? plannerDir(identity.home, identity.run) : seatDir(identity.home, identity.run, identity.seat))
 
-// A plugin allowlist (workerPlugins) and workerUserMemory: false shape a worker's settings; a planner is never trimmed.
+// The lists and switches (workerPlugins, workerSkills, workerAgents, workerUserMemory: false, workerUserHooks: false)
+// shape a worker's settings; a planner is never trimmed. A worker without the user setting source has no user skills or
+// agents left to switch off.
 const workerSettingsOptions = (request: LaunchRequest): ClaudeSettingsOptions => ({
   ...(request.pluginAllow && request.userPlugins ? { plugins: { allow: request.pluginAllow, user: request.userPlugins } } : {}),
+  ...(request.userHooks !== false && request.skillAllow && request.userSkills ? { skills: { allow: request.skillAllow, user: request.userSkills } } : {}),
+  ...(request.userHooks !== false && request.agentAllow && request.userAgents ? { agents: { allow: request.agentAllow, user: request.userAgents } } : {}),
+  ...(request.userHooks === false ? { userSettings: request.userSettings ?? {} } : {}),
   ...(request.userMemory === false ? { claudeMdExcludes: claudeMdExcludes(request.claudeDir ?? userClaudeDir(), request.repo, request.cwd) } : {}),
 })
 
@@ -192,6 +286,8 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     ...(!isWorker && request.channel ? [CHANNEL_FLAG, 'server:drove'] : []),
     ...(isWorker && request.mcpAllow ? ['--strict-mcp-config'] : []),
     ...(isWorker && request.mcpAllow && !request.mcpAllow.includes(CHROME_SERVER) ? ['--no-chrome'] : []),
+    ...(isWorker && request.skillAllow?.length === 0 ? ['--disable-slash-commands'] : []),
+    ...(isWorker && request.userHooks === false ? ['--setting-sources', 'project,local'] : []),
     '--mcp-config', mcpPath,
     '--settings', settingsPath,
     ...(request.roleText ? ['--append-system-prompt-file', rolePath] : []),
@@ -225,7 +321,7 @@ export type CodexHome = {
 
 // homeMcpAllow and skillAllow are the run's lists (workerMcp, workerSkills) and shape the shared home; a seat's own
 // mcpAllow differs from the home's only through -c mcp_servers.<name>.enabled overrides on its launch line.
-export type CodexLaunchRequest = LaunchRequest & { bypassSandbox?: boolean; codexHome?: CodexHome; homeMcpAllow?: string[]; skillAllow?: string[] }
+export type CodexLaunchRequest = LaunchRequest & { bypassSandbox?: boolean; codexHome?: CodexHome; homeMcpAllow?: string[] }
 
 // The Codex launch line is typed into a shell, so every byte counts (DROVE-23). One shim per drove entry, named by a
 // hash of it so two checkouts sharing a home never overwrite each other, replaces `node <entry> guard` in all hooks.
@@ -379,14 +475,15 @@ const handlersOf = (group: unknown): HookHandler[] => {
 const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: string, envNames: readonly string[]): { files: LaunchFile[]; links: LaunchLink[]; unlinks: string[] } => {
   const sections = tomlSections(home.userConfig)
   const userTrust = userHookTrust(sections)
-  const hooks: Record<string, unknown[]> = Object.fromEntries(Object.entries(home.userHooks).map(([event, groups]) => [event, [...groups]]))
+  const userHooks = request.userHooks === false ? {} : home.userHooks
+  const hooks: Record<string, unknown[]> = Object.fromEntries(Object.entries(userHooks).map(([event, groups]) => [event, [...groups]]))
   for (const [event, group] of Object.entries(droveCodexHooks(shim))) hooks[event] = [...(hooks[event] ?? []), group]
   const hooksPath = join(home.dir, 'hooks.json')
   const trust: [string, HookTrust][] = []
   for (const [event, groups] of Object.entries(hooks)) {
     const label = HOOK_LABELS[event]
     if (!label) continue
-    const userCount = home.userHooks[event]?.length ?? 0
+    const userCount = userHooks[event]?.length ?? 0
     groups.forEach((group, groupIndex) => {
       handlersOf(group).forEach((handler, handlerIndex) => {
         const position = `${label}:${groupIndex}:${handlerIndex}`
@@ -546,15 +643,73 @@ export const specFor = (request: CodexLaunchRequest): LaunchSpec => {
   return request.identity.role === 'worker' ? codexWorkerSpec(request) : codexPlannerSpec(request)
 }
 
+// The launch.json record (DROVE-98) never holds the user's secrets: the values of the user's env (carried into a worker's
+// settings.json when it drops the user setting source), of the user's MCP servers (env and headers), of a Codex home's
+// MCP env tables and of workerEnv are masked. The real files, written 0600, keep them: Claude and Codex need them.
+const maskedValues = (value: unknown): unknown =>
+  value && typeof value === 'object' && !Array.isArray(value) ? Object.fromEntries(Object.keys(value).map(key => [key, REDACTED])) : value
+
+const redactJson = (content: string, redact: (parsed: Record<string, unknown>) => Record<string, unknown>): string => {
+  try {
+    const parsed: unknown = JSON.parse(content)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? `${JSON.stringify(redact(parsed as Record<string, unknown>), null, 2)}\n` : content
+  } catch {
+    return content
+  }
+}
+
+const redactSettings = (parsed: Record<string, unknown>): Record<string, unknown> => ('env' in parsed ? { ...parsed, env: maskedValues(parsed.env) } : parsed)
+
+const redactMcp = (parsed: Record<string, unknown>): Record<string, unknown> => {
+  const servers = recordOf(parsed.mcpServers)
+  return {
+    ...parsed,
+    mcpServers: Object.fromEntries(Object.entries(servers).map(([name, server]) => [
+      name,
+      name === 'drove' ? server : { ...recordOf(server), ...('env' in recordOf(server) ? { env: maskedValues(recordOf(server).env) } : {}), ...('headers' in recordOf(server) ? { headers: maskedValues(recordOf(server).headers) } : {}) },
+    ])),
+  }
+}
+
+const SECRET_TABLE = /^\[[^\]]*\.(env|http_headers|env_http_headers)\s*\]\s*(#.*)?$/
+const SECRET_INLINE = /^(\s*(?:env|http_headers|env_http_headers)\s*=\s*)\{.*\}\s*(#.*)?$/
+
+const redactToml = (content: string): string => {
+  let inSecretTable = false
+  return content.split('\n').map(line => {
+    if (/^\s*\[/.test(line)) {
+      inSecretTable = SECRET_TABLE.test(line.trim())
+      return line
+    }
+    const inline = SECRET_INLINE.exec(line)
+    if (inline) return `${inline[1]}"${REDACTED}"`
+    const pair = /^(\s*[^=#\s][^=]*=\s*).+$/.exec(line)
+    return inSecretTable && pair ? `${pair[1]}"${REDACTED}"` : line
+  }).join('\n')
+}
+
+const redactFile = (file: LaunchFile): LaunchFile => {
+  if (file.path.endsWith('/settings.json')) return { ...file, content: redactJson(file.content, redactSettings) }
+  if (file.path.endsWith('/mcp.json')) return { ...file, content: redactJson(file.content, redactMcp) }
+  if (file.path.endsWith('/config.toml')) return { ...file, content: redactToml(file.content) }
+  return file
+}
+
+const KEPT_ENV = /^(DROVE_|CODEX_HOME$|PORT$)/
+
+// A planner has no token and carries none of the user's env, so its spec is returned as it is.
 export const redactSpec = (spec: LaunchSpec): LaunchSpec => {
   const token = spec.env[ENV.token]
   if (!token) return spec
   const scrub = (text: string): string => text.replaceAll(token, REDACTED)
   return {
     ...spec,
-    env: Object.fromEntries(Object.entries(spec.env).map(([key, value]) => [key, scrub(value)])),
+    env: Object.fromEntries(Object.entries(spec.env).map(([key, value]) => [key, KEPT_ENV.test(key) ? scrub(value) : REDACTED])),
     argv: spec.argv.map(scrub),
-    files: spec.files.map(file => ({ ...file, content: scrub(file.content) })),
+    files: spec.files.map(file => {
+      const masked = redactFile(file)
+      return { ...masked, content: scrub(masked.content) }
+    }),
   }
 }
 
