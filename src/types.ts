@@ -34,6 +34,8 @@ export type DroveConfig = {
   workerEnv: Record<string, string>
   workerMcp?: string[]
   workerSkills?: string[]
+  workerPlugins?: string[]
+  workerUserMemory?: boolean
   maxTurns?: number
 }
 
@@ -229,6 +231,7 @@ export type Deps = {
   home: string
   codexUserHome?: string
   claudeUserConfig?: string
+  claudeUserDir?: string
 }
 
 export type HerdrAgent = {
@@ -272,6 +275,17 @@ export type LaunchRequest = {
   workerEnv?: Record<string, string>
   mcpAllow?: string[]
   userMcp?: Record<string, unknown>
+  pluginAllow?: string[]
+  userPlugins?: UserPlugins
+  userMemory?: boolean
+  claudeDir?: string
+}
+
+// What Drove read from the user's Claude settings.json, read only: the plugins it enables, and the dirs of
+// env.CLAUDE_CODE_PLUGIN_DIRS as written there, each with the plugin name it holds.
+export type UserPlugins = {
+  enabled: string[]
+  dirs?: { entry: string; name: string }[]
 }
 
 export type Transport = 'launch-arg' | 'herdr-prompt' | 'codex-queue' | 'mod' | 'channel' | 'piggyback'

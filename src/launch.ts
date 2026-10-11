@@ -1,9 +1,9 @@
 import { createHash, randomBytes } from 'node:crypto'
 import { chmod, lstat, mkdir, readdir, readFile, readlink, realpath, rename, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { basename, delimiter, dirname, join } from 'node:path'
 import { ENV, identityEnv, plannerDir, seatDir } from './paths.ts'
-import type { Identity, LaunchFile, LaunchLink, LaunchRequest, LaunchSpec, Role } from './types.ts'
+import type { Identity, LaunchFile, LaunchLink, LaunchRequest, LaunchSpec, Role, UserPlugins } from './types.ts'
 
 export const CLAUDE_GUARDED_TOOLS = 'Bash|Edit|Write|MultiEdit|NotebookEdit'
 export const CODEX_GUARDED_TOOLS = 'Bash|shell|exec_command|apply_patch'
@@ -13,6 +13,7 @@ const REDACTED = '<redacted>'
 const CODEX_BYPASS_FLAG = '--dangerously-bypass-approvals-and-sandbox'
 const CODEX_NETWORK_FLAG = 'sandbox_workspace_write.network_access=true'
 const CHANNEL_FLAG = '--dangerously-load-development-channels'
+export const CHROME_SERVER = 'claude-in-chrome'
 
 export const tomlString = (value: string): string => {
   const escaped = [...value]
@@ -48,7 +49,35 @@ const hookCommand = (droveEntry: string, event: string): string => `node ${shell
 
 const claudeHook = (droveEntry: string, event: string) => ({ type: 'command', command: hookCommand(droveEntry, event), timeout: HOOK_TIMEOUT_S })
 
-export const claudeSettings = (droveEntry: string, _role: Role): Record<string, unknown> => ({
+// The mod Drove ships is plugin "orchestrator" (mod/.claude-plugin/plugin.json); a plugin allowlist never turns it off.
+const DROVE_PLUGIN = 'orchestrator'
+const INLINE_MARKETPLACE = 'inline'
+const CLAUDE_MD_FILES = ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md'] as const
+
+export type ClaudeSettingsOptions = {
+  plugins?: { allow: readonly string[]; user: UserPlugins }
+  claudeMdExcludes?: readonly string[]
+}
+
+const pluginNameOf = (key: string): string => key.split('@')[0] ?? key
+
+// An allowlist entry names a plugin with or without its marketplace: "context7" or "context7@claude-plugins-official".
+const isPluginAllowed = (allow: readonly string[], key: string): boolean =>
+  pluginNameOf(key) === DROVE_PLUGIN || allow.some(item => item === key || item === pluginNameOf(key))
+
+// Turns off what the user enabled and the list leaves out, for this session only: enabledPlugins false for marketplace
+// plugins, and CLAUDE_CODE_PLUGIN_DIRS cut to the allowed mod dirs. Probed on Claude Code 2.1.296: both override the
+// user's settings.json when they come from --settings.
+const pluginSettings = ({ allow, user }: { allow: readonly string[]; user: UserPlugins }): Record<string, unknown> => {
+  const disabled = user.enabled.filter(key => !isPluginAllowed(allow, key))
+  const dirs = user.dirs?.filter(dir => isPluginAllowed(allow, `${dir.name}@${INLINE_MARKETPLACE}`))
+  return {
+    ...(disabled.length > 0 ? { enabledPlugins: Object.fromEntries(disabled.map(key => [key, false])) } : {}),
+    ...(dirs ? { env: { CLAUDE_CODE_PLUGIN_DIRS: dirs.map(dir => dir.entry).join(delimiter) } } : {}),
+  }
+}
+
+export const claudeSettings = (droveEntry: string, _role: Role, options: ClaudeSettingsOptions = {}): Record<string, unknown> => ({
   hooks: {
     PreToolUse: [{ matcher: CLAUDE_GUARDED_TOOLS, hooks: [claudeHook(droveEntry, 'pre-tool-use')] }],
     SessionStart: [{ hooks: [claudeHook(droveEntry, 'session-start')] }],
@@ -57,7 +86,25 @@ export const claudeSettings = (droveEntry: string, _role: Role): Record<string, 
     StopFailure: [{ hooks: [claudeHook(droveEntry, 'stop-failure')] }],
     Notification: [{ hooks: [claudeHook(droveEntry, 'notification')] }],
   },
+  ...(options.plugins ? pluginSettings(options.plugins) : {}),
+  ...(options.claudeMdExcludes ? { claudeMdExcludes: [...options.claudeMdExcludes] } : {}),
 })
+
+const dirsAbove = (dir: string): string[] => {
+  const parent = dirname(dir)
+  return parent === dir ? [dir] : [dir, ...dirsAbove(parent)]
+}
+
+const isWithin = (dir: string, root: string): boolean => dir === root || dir.startsWith(root.endsWith('/') ? root : `${root}/`)
+
+// What "the user's memory" means for a worker (DROVE-88): the user's own CLAUDE.md, and every CLAUDE.md, CLAUDE.local.md
+// and .claude/CLAUDE.md in the folders above the repo root. The repo's own files, and the worktree's, stay. Probed on
+// Claude Code 2.1.296: claudeMdExcludes from --settings skips ~/.claude/CLAUDE.md as well as the ancestors' files.
+export const claudeMdExcludes = (claudeDir: string, repo: string, cwd: string): string[] => {
+  const above = [...dirsAbove(dirname(repo)), ...dirsAbove(dirname(cwd)).filter(dir => !isWithin(dir, repo))]
+  const files = [...new Set(above)].flatMap(dir => CLAUDE_MD_FILES.map(name => join(dir, name)))
+  return [...new Set([join(claudeDir, 'CLAUDE.md'), ...files])]
+}
 
 export const claudeMcpConfig = (droveEntry: string, env: Record<string, string> = {}, user: Record<string, unknown> = {}): Record<string, unknown> => ({
   mcpServers: { ...user, drove: { command: 'node', args: [droveEntry, 'mcp'], ...(Object.keys(env).length > 0 ? { env } : {}) } },
@@ -69,6 +116,9 @@ const allowedMcp = (request: LaunchRequest): Record<string, unknown> =>
   Object.fromEntries((request.mcpAllow ?? []).filter(name => name !== 'drove' && request.userMcp?.[name] !== undefined).map(name => [name, request.userMcp?.[name]]))
 
 export const userClaudeConfig = (env: NodeJS.ProcessEnv = process.env): string => join(env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json')
+
+// Where Claude keeps the user's settings.json and CLAUDE.md: CLAUDE_CONFIG_DIR, or ~/.claude.
+export const userClaudeDir = (env: NodeJS.ProcessEnv = process.env): string => env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 
 const serversOf = (value: unknown): Record<string, unknown> => {
   const servers = (value as { mcpServers?: unknown } | null)?.mcpServers
@@ -90,9 +140,35 @@ export const readClaudeMcp = async (configPath: string, repo: string): Promise<R
   return { ...serversOf(config), ...serversOf(await readJsonFile(join(repo, '.mcp.json'))), ...serversOf(projects?.[repo]) }
 }
 
+const expandHome = (path: string): string => (path === '~' ? homedir() : path.startsWith('~/') ? join(homedir(), path.slice(2)) : path)
+
+const recordOf = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {})
+
+const pluginNameOfDir = async (dir: string): Promise<string> => {
+  const name = recordOf(await readJsonFile(join(dir, '.claude-plugin', 'plugin.json'))).name
+  return typeof name === 'string' && name.trim() ? name.trim() : basename(dir)
+}
+
+// Reads only: the plugins the user enabled, and the mod dirs they load through env.CLAUDE_CODE_PLUGIN_DIRS, each with
+// the plugin name from its .claude-plugin/plugin.json (the dir's basename when it has none).
+export const readClaudePlugins = async (settingsPath: string): Promise<UserPlugins> => {
+  const settings = recordOf(await readJsonFile(settingsPath))
+  const enabled = Object.entries(recordOf(settings.enabledPlugins)).filter(([, on]) => on === true).map(([key]) => key)
+  const raw = recordOf(settings.env).CLAUDE_CODE_PLUGIN_DIRS
+  const entries = typeof raw === 'string' ? raw.split(delimiter).map(entry => entry.trim()).filter(Boolean) : undefined
+  const dirs = entries ? await Promise.all(entries.map(async entry => ({ entry, name: await pluginNameOfDir(expandHome(entry)) }))) : undefined
+  return { enabled, ...(dirs ? { dirs } : {}) }
+}
+
 const jsonFile = (path: string, value: unknown): LaunchFile => ({ path, content: `${JSON.stringify(value, null, 2)}\n`, mode: 0o600 })
 
 const dirOf = (identity: Identity): string => (identity.role === 'planner' ? plannerDir(identity.home, identity.run) : seatDir(identity.home, identity.run, identity.seat))
+
+// A plugin allowlist (workerPlugins) and workerUserMemory: false shape a worker's settings; a planner is never trimmed.
+const workerSettingsOptions = (request: LaunchRequest): ClaudeSettingsOptions => ({
+  ...(request.pluginAllow && request.userPlugins ? { plugins: { allow: request.pluginAllow, user: request.userPlugins } } : {}),
+  ...(request.userMemory === false ? { claudeMdExcludes: claudeMdExcludes(request.claudeDir ?? userClaudeDir(), request.repo, request.cwd) } : {}),
+})
 
 const claudeSpec = (request: LaunchRequest): LaunchSpec => {
   const { identity } = request
@@ -111,6 +187,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     ...(request.resumeId ? ['--resume', request.resumeId] : request.sessionId ? ['--session-id', request.sessionId] : []),
     ...(!isWorker && request.channel ? [CHANNEL_FLAG, 'server:drove'] : []),
     ...(isWorker && request.mcpAllow ? ['--strict-mcp-config'] : []),
+    ...(isWorker && request.mcpAllow && !request.mcpAllow.includes(CHROME_SERVER) ? ['--no-chrome'] : []),
     '--mcp-config', mcpPath,
     '--settings', settingsPath,
     ...(request.roleText ? ['--append-system-prompt-file', rolePath] : []),
@@ -125,7 +202,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     argv,
     files: [
       jsonFile(mcpPath, claudeMcpConfig(request.droveEntry, identityEnv(identity), isWorker ? allowedMcp(request) : {})),
-      jsonFile(settingsPath, claudeSettings(request.droveEntry, identity.role)),
+      jsonFile(settingsPath, claudeSettings(request.droveEntry, identity.role, isWorker ? workerSettingsOptions(request) : {})),
       ...(request.roleText ? [{ path: rolePath, content: `${request.roleText}\n`, mode: 0o600 }] : []),
     ],
   }
@@ -322,6 +399,7 @@ const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: s
     return server ? [{ section, isEnabled: isAllowed(request.homeMcpAllow, server) }] : []
   })
   const skills = home.skills.filter(name => request.skillAllow?.includes(name) ?? true)
+  const links = home.links.filter(name => request.userMemory !== false || !CODEX_MEMORY_LINKS.some(memory => memory === name))
   const config = [
     "# Written by Drove on every Codex worker launch in this run (DROVE-34). Edits here, Codex's included, are overwritten.",
     ...rootKeys,
@@ -351,14 +429,19 @@ const codexHomeContents = (request: CodexLaunchRequest, home: CodexHome, shim: s
       { path: hooksPath, content: `${JSON.stringify({ hooks }, null, 2)}\n`, mode: 0o600 },
     ],
     links: [
-      ...home.links.map(name => ({ path: join(home.dir, name), target: join(home.user, name) })),
+      ...links.map(name => ({ path: join(home.dir, name), target: join(home.user, name) })),
       ...skills.map(name => ({ path: join(home.dir, 'skills', name), target: join(home.user, 'skills', name) })),
     ],
-    unlinks: (home.linkedSkills ?? []).filter(name => !skills.includes(name)).map(name => join(home.dir, 'skills', name)),
+    unlinks: [
+      ...(request.userMemory === false ? CODEX_MEMORY_LINKS.map(name => join(home.dir, name)) : []),
+      ...(home.linkedSkills ?? []).filter(name => !skills.includes(name)).map(name => join(home.dir, 'skills', name)),
+    ],
   }
 }
 
-export const CODEX_HOME_LINKS = ['auth.json', 'AGENTS.md', 'AGENTS.override.md'] as const
+// The user's AGENTS files are Codex's memory; workerUserMemory: false (DROVE-88) leaves them out of the shared home.
+export const CODEX_MEMORY_LINKS = ['AGENTS.md', 'AGENTS.override.md'] as const
+export const CODEX_HOME_LINKS = ['auth.json', ...CODEX_MEMORY_LINKS] as const
 
 const parseUserHooks = (text: string): Record<string, unknown[]> => {
   try {

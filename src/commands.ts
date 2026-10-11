@@ -8,7 +8,7 @@ import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matc
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
-import { type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readCodexHome, redactSpec, specFor, userClaudeConfig, writeLaunchFiles } from './launch.ts'
+import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readClaudePlugins, readCodexHome, redactSpec, specFor, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
@@ -93,14 +93,17 @@ const namesOf = (value: unknown): string[] | undefined =>
 const isWhole = (value: unknown): value is number => typeof value === 'number' && Number.isInteger(value) && value >= 1
 
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const { workerMcp, workerSkills, maxTurns, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, workerPlugins, workerUserMemory, maxTurns, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const mcp = namesOf(workerMcp)
   const skills = namesOf(workerSkills)
+  const plugins = namesOf(workerPlugins)
   return {
     ...DEFAULT_CONFIG,
     ...file,
     ...(mcp ? { workerMcp: mcp } : {}),
     ...(skills ? { workerSkills: skills } : {}),
+    ...(plugins ? { workerPlugins: plugins } : {}),
+    ...(typeof workerUserMemory === 'boolean' ? { workerUserMemory } : {}),
     ...(isWhole(maxTurns) ? { maxTurns } : {}),
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
     workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel },
@@ -228,10 +231,20 @@ type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[] }
 
 const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
   const mcpAllow = seatMcpAllow(config, seat)
+  const isMemoryOff = config.workerUserMemory === false
   if (seat.kind === 'claude') {
-    if (!mcpAllow) return { parts: {}, missing: [] }
-    const userMcp = await readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo)
-    return { parts: { mcpAllow, userMcp }, missing: mcpAllow.filter(name => name !== 'drove' && userMcp[name] === undefined) }
+    // The user's MCP servers, plugins and memory are read only when a switch asks for them (DROVE-72, DROVE-88).
+    const claudeDir = deps.claudeUserDir ?? userClaudeDir()
+    const userMcp = mcpAllow ? await readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo) : undefined
+    const userPlugins = config.workerPlugins ? await readClaudePlugins(join(claudeDir, 'settings.json')) : undefined
+    return {
+      parts: {
+        ...(mcpAllow && userMcp ? { mcpAllow, userMcp } : {}),
+        ...(config.workerPlugins && userPlugins ? { pluginAllow: config.workerPlugins, userPlugins } : {}),
+        ...(isMemoryOff ? { userMemory: false, claudeDir } : {}),
+      },
+      missing: mcpAllow && userMcp ? mcpAllow.filter(name => name !== 'drove' && name !== CHROME_SERVER && userMcp[name] === undefined) : [],
+    }
   }
   const { codexHome } = await codexHomeOf(deps, seat)
   const known = codexHome ? codexMcpNames(codexHome.userConfig) : []
@@ -241,6 +254,7 @@ const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
       ...(mcpAllow ? { mcpAllow } : {}),
       ...(config.workerMcp ? { homeMcpAllow: config.workerMcp } : {}),
       ...(config.workerSkills ? { skillAllow: config.workerSkills } : {}),
+      ...(isMemoryOff ? { userMemory: false } : {}),
     },
     missing: codexHome && mcpAllow ? mcpAllow.filter(name => name !== 'drove' && !known.includes(name)) : [],
   }

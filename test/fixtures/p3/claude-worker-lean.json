@@ -23,6 +23,7 @@
     "--session-id",
     "11111111-2222-3333-4444-555555555555",
     "--strict-mcp-config",
+    "--no-chrome",
     "--mcp-config",
     "/home/user/.drove/runs/drove-20261009-1042-a3f1/seats/w-api/mcp.json",
     "--settings",

@@ -326,23 +326,6 @@ const ORCHESTRATOR_TOOLS = [
   },
 ] as const
 
-const REPORT_TOOL = {
-  name: 'report',
-  description:
-    "Worker mode: report to your planner (the same as Drove's own report tool, mcp__drove__report). kind: done (finished and verified; expects review), question (you need a decision; for: human when only the human can decide), blocked, promote (you need a stronger model or more effort; say why), progress (optional, expects nothing). summary is one line; details carries the rest (branch, files, test output).",
-  inputSchema: {
-    type: 'object',
-    properties: {
-      kind: { type: 'string', enum: ['done', 'question', 'blocked', 'promote', 'progress'] },
-      summary: { type: 'string', description: 'one line' },
-      details: { type: 'string' },
-      expects: { type: 'string', enum: ['review', 'answer', 'none'], description: 'default: done → review, progress → none, others → answer' },
-      for: { type: 'string', enum: ['orchestrator', 'human', 'cal'], description: 'question only: who must decide (cal is an old alias of human)' },
-    },
-    required: ['kind', 'summary'],
-  },
-} as const
-
 const registerOrchestratorTools = async ($: EngineInterface) => {
   for (const tool of ORCHESTRATOR_TOOLS) await $.tool.register(tool as never)
 }
@@ -775,16 +758,7 @@ const startWorker = async ($: EngineInterface) => {
   if (!run || !seat) return
   workerToken = token || undefined
   await update($, workerAtom, current => (current?.name === seat && current.run === run ? current : { name: seat, run, home }))
-  await $.tool.register(REPORT_TOOL as never)
   await refreshSelf($)
-}
-
-const sendReport = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
-  if (!(await read($, workerAtom))) return { deny: 'This session is not a Drove worker.' }
-  const forWho = input.for === 'cal' || input.for === 'human' ? { for: 'human' } : {}
-  const args = { kind: input.kind, summary: input.summary, ...(input.details !== undefined ? { details: input.details } : {}), ...(input.expects !== undefined ? { expects: input.expects } : {}), ...forWho }
-  const result = drove.jsonResultOf(await runDrove($, ['mod', 'report'], { stdin: JSON.stringify(args) }))
-  return result.ok ? { result: result.text } : { deny: `Not recorded: ${result.text}. Use mcp__drove__report, or tell ${await humanNameOf($)} in your answer.` }
 }
 
 // The turn a promote notice wakes is not work that owes a report; a progress report after it keeps Drove from reading it as idle-without-report.
@@ -1126,9 +1100,6 @@ export const register: Register = (on, options) => {
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__read_reports' as never }, async ($, e): Promise<ToolAnswer> => readReportsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({
-    deny: toolFailure(next.error),
-  }))
-  on('tool.call', { tool: 'mcp__orchestrator__report' as never }, async ($, e): Promise<ToolAnswer> => sendReport($, e as Record<string, unknown>)).catch(($, e, next) => ({
     deny: toolFailure(next.error),
   }))
 
