@@ -25,7 +25,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 
 | Command | Who runs it | Why it exists |
 |---|---|---|
-| `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT] [--run ID]` | human, in a herdr pane | Creates a run (or attaches to `--run`), records this pane as the planner pane, then `exec`s `claude` or `codex` with the planner MCP server, the planner guard and the planner role attached. This is the only way a planner starts outside the mod. |
+| `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT \| --from-cairn REF \| --next PROJECT] [--run ID] [--detached [--json]]` | human, in a herdr pane; a job with `--detached` | Creates a run (or attaches to `--run`), records this pane as the planner pane, then `exec`s `claude` or `codex` with the planner MCP server, the planner guard and the planner role attached. This is the only way a planner starts outside the mod. With `--detached` it needs no pane: it opens a herdr workspace of its own and starts the planner there (§14). |
 | `drove spawn <seat> --kind claude\|codex --cairn REF --brief TEXT\|-  [--model M] [--effort E] [--base BRANCH] [--role implementer\|reviewer\|tester --target SEAT]` | planner | Opens a pane in the run's worker tab (grid), launches the agent with its launch spec, and delivers the first brief. A Codex worker gets a worktree and branch made by Drove (`git worktree add`); a Claude worker creates its own through `claude --worktree <seat>` (§5). `--base` applies to Codex only. `--role` and `--target` make a reviewer or tester seat (§8, Seat roles). Enforces the 5-pane budget. |
 | `drove send <seat> --kind message\|answer\|verdict [--verdict approve\|changes] [--expects E] TEXT` | planner | Sends one enveloped control message through the best transport for that seat (see §4), with a guarded send and a retry queue. Verdicts and answers are kinds of `send`. |
 | `drove prompt <seat> TEXT` | planner, human | Raw `herdr agent prompt` into a seat the run owns, with no envelope. This is the escape hatch for a re-brief after a restart, or when `codex queue` is unavailable. It still refuses a `blocked` pane. |
@@ -34,11 +34,12 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove init <dir> [--json]` | planner, human | Makes a new git repo (`main`, one empty commit) in an empty or missing directory; see §6. |
 | `drove merge <seat> [--pr] [--squash] [-m MSG] [--no-checks] [--run ID]` | planner, human | Integrates a seat's branch behind the repo's checks (§6, Merge gate). Also the `merge` MCP tool and the mod's `merge_worker`; neither can pass `--no-checks`, which is the human's. |
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
+| `drove attention [--run ID \| --all] [--json] [--follow]` | human, a poller | The things that wait on a person, as data: a dialog or approval, a report for the human, a refused 6th pane, a gone seat. One snapshot, or JSON lines of new and resolved items with `--follow` (§14). |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
 | `drove board [--once] [--web [--port N]]` | human | A live coloured board for a herdr pane, drawn from the orchestrator mod's board model (`mod/hooks/board.ts`) on the terminal's own background: the lead and what it owes, seats with state stripes, gauges and a spinner, and the timeline. It uses the alternate screen, redraws in place only while something moves, and fits the pane. `--once` or a non-TTY stdout prints a single frame; it has no colour escapes when piped or under `NO_COLOR`. `--web` serves the same model to a browser (see the web board below). |
 | `drove down [--run ID]` | human, planner | Saves every session id, quits the agents, closes the panes and marks the run `down`. |
-| `drove up [--run ID] [--seat SEAT]` | human | Reopens the worker tab and resumes each worker by session id, then `exec`s the planner with its resume argument in the current pane. With `--seat`, it relaunches only that one `gone` or `down` seat. Each relaunch records a `seat.relaunch` event (§9). |
+| `drove up [--run ID] [--seat SEAT] [--detached [--json]]` | human, a job with `--detached` | Reopens the worker tab and resumes each worker by session id, then `exec`s the planner with its resume argument in the current pane. With `--seat`, it relaunches only that one `gone` or `down` seat. Each relaunch records a `seat.relaunch` event (§9). |
 | `drove budget <n>` | human only | Raises the pane budget for the current run. The guard denies it to every agent, so it is the human's OK for a 6th pane when the client cannot show a dialog (§3). |
 | `drove guard <event>` | hooks only | The hook entry point for Claude and Codex. For `pre-tool-use` it prints the guard's decision. For `session-start`, `stop`, `stop-failure`, `notification`, `permission-request` and `user-prompt-submit` it records state in the seat's `hooks.jsonl`. Identity comes from the env, so the command string is identical across launches (this matters for Codex hook trust, §5). A Codex hook reaches it through one `g-<hash>` shim in `$DROVE_HOME` (§5). |
 | `drove mcp` | agents only | The stdio MCP server. Its role comes from `DROVE_ROLE`: the planner gets the planner tools plus the outbox watcher, and a worker gets `report`. |
@@ -623,3 +624,45 @@ Recommendations accepted by the planner on 2026-10-09; the human-run [verify] it
 11. **Codex launch line over 1024 bytes.** **Answered (DROVE-23, DROVE-34):** the readiness gate plus one retry make a long line safe (§5), and a Drove-owned `CODEX_HOME` makes the worker line about 150 to 200 bytes, so a Codex worker no longer depends on the gate.
 12. **Several runs at once.** **Answered (DROVE-43):** herdr agent names are global per server, so Drove namespaces them `<seat>-<run tag>` and addresses a seat by pane id once it has one (§2). In one repo, the same seat name in two runs is refused. Not yet run live with two runs side by side.
 13. **Run live, all passed (DROVE-49, 2026-10-10):** a Codex planner with Codex workers; asking the human for a 6th pane in both clients (the mod's dialog and MCP elicitation); two runs with the same seat name (DROVE-43); a Claude planner without the mod woken by the channel; signed messages checked in Claude and Codex workers (DROVE-47). Nothing is left in the "not run live" list.
+
+## 14. Unattended runs (DROVE-95, DROVE-96)
+
+A job that is not in herdr (Bothy: cron, a signed webhook, chat, a poll) has to start a run, watch it, hear what needs a person, and resume it. This is Drove's side of that; the job is Bothy's. **None of it has run against a real herdr server yet** (the Bothy proof, DROVE-95, does that): what is written here is the design and what the tests pin against a fake herdr.
+
+**Detached start.** `drove plan --detached` and `drove up --detached` replace "this pane" with a workspace of Drove's own. The steps, through the same herdr adapter the worker panes use (`src/herdr.ts`):
+
+1. `herdr workspace list` as a probe. It changes nothing and fails when no server is reachable; Drove then refuses with `herdr-down` before it writes anything. It never starts the server.
+2. The run is made or loaded as usual, and the planner's launch spec is built (its env is the run's identity; the launch files are written as for any seat).
+3. `herdr workspace create --cwd <repo> --label "drove · <repo> · <run tag>" --no-focus --env …` opens the workspace; its `root_pane` is the planner pane. The reply names workspace, tab and pane (`parseNewWorkspace`).
+4. The run records the pane as `planner.paneId`, so the wake (`herdr agent prompt` to the planner pane), `workspaceOf` (the workers' tab opens in the same workspace) and the board find it as they do for an in-pane planner.
+5. After the shell prompt settles (§5), `herdr agent start planner-<tag> --kind <kind> --pane <root pane> -- <planner argv>`, retried while the pane is busy. `agent_not_ready` is not a failure: the planner is at a startup dialog (folder trust, the dev channel, Codex hook trust), which is reported as `planner.state: "blocked"` with the dialog's reason and left for a person. A goal that has a newline cannot ride in the typed launch line, so it is typed with `herdr agent prompt` once the planner is up.
+6. The command prints the run id, the planner pane and the workspace and returns. With `--json` the shape is `DetachedStart` (`src/types.ts`).
+
+`up --detached` opens the workspace before the seats are relaunched (they place their tab in the planner's workspace), then relaunches them and starts the planner with its resume argument. A planner that fails to start leaves the run as `up --detached` made it and says where the pane is; a new run whose start failed is put back `down`, with its workspace closed, so the same command can try it again.
+
+What it needs on the host: a running herdr server on the default socket or `HERDR_SOCKET_PATH`; `herdr`, `git`, `node` and the planner's agent CLI on `PATH`; `cairn` for `--from-cairn` and `--next`; one `DROVE_HOME`. The workspace is opened with `--no-focus`.
+
+**The attention list.** The board, the planner's wake ("Needs the human") and the web page each look at part of the run's state; `src/attention.ts` is that state as one list. `attentionCandidates` is pure over what the run holds:
+
+| Source | Where it is read | Item kind |
+|---|---|---|
+| each seat's `attention` list in the roster (`detect.ts` derives it) | `roster.json` | the `Attention` reasons: `dialog`, `permission`, `trust`, `hook-trust`, `channel-confirm`, `codex-version-mismatch`, `usage-limit`, `stalled`, `idle-without-report`, `gone`, `budget`, `pending-delivery` |
+| a worker's question in its pane (`asking`) | `seats/<seat>/mod.json`, the same `isAsking` the board uses | `asking`, which replaces the generic `permission` line for that seat |
+| each owing seat's latest report that is `for: human` | `outbox.jsonl` (token-checked, as `drove reports`); open while the seat's `owes` is not `none` | `question`, `blocked`, `promote` |
+| a spawn refused by the pane budget | an `attention` event with `reason: pane-budget`, written by `spawn` | `pane-budget`, open until the budget is raised, a slot frees or the seat starts |
+| the planner's own pane | `herdr agent get` on `planner.paneId` (plus a screen read when blocked) | `dialog` or `gone` with `seat: "planner"`; "gone" waits 30 s after a `run.up` |
+
+**Ids.** The derived attention lines are rewritten on every poll (their `at` is the poll time) and a poller is a new process each time, so an item cannot take its id from either. `runs/<id>/attention.json` is a ledger written under a lock: the first sighting of a key (`<seat>:<kind>[:<report id>]`) records its start (the seat's `stateAt` for a dialog, the report's `at`, the event's `at`) and an episode number; a key seen open keeps both; a key that went away is closed, and its next sighting is the next episode. The id is `<run>:<key>:<n>`. The ledger is the only thing the command writes besides what `roster` already refreshes.
+
+**Freshness.** The roster is refreshed from herdr (`refreshRoster`, what `drove roster` does) when it was last written more than 10 s ago, so a run whose planner and watcher are dead still reports truthfully. While a watcher runs it keeps the roster fresh and nothing is rewritten.
+
+**`--follow`.** A loop over the same snapshot every 3 s that diffs ids, prints `new` for ids it has not announced and `resolved` for ids that left (with the item as last seen), and ends on abort. It holds no state a restart needs: ids are stable across processes, so the first poll of a new follower re-announces what is open and the consumer dedupes.
+
+**Decisions.**
+
+- *Answering is not Drove's.* An item says how a person answers (an exact command, or the pane); nothing in the stream answers anything. A dialog is never answered by a script (§6).
+- *`drove send` takes `--run`* so an answer can be sent from a job that is in no run's directory. It applies only when the caller has no run identity of its own (a human), so an agent cannot reach another run with it.
+- *Run status is `drove roster --json`.* It already held `run.status` and each seat's state and last report; it now also says whether the planner pane is alive (`planner.state`), gives the latest report across seats, and the roster's write time. There is no separate `status` command.
+- *Errors are data with `--json`.* `{"ok":false,"code","error"}` on stderr, exit 1; usage errors exit 2.
+
+**Open (the Bothy proof).** Whether a workspace opened with no client attached accepts `agent start` the way a visible one does; whether the Claude planner's wake (the channel, or `herdr agent prompt`) lands in a workspace nobody looks at; whether `workspace list` is the right liveness probe on every herdr version Drove supports (`herdr status server --json` also exists, but its shape is not pinned here); and which dialogs a first unattended launch really meets.
