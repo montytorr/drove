@@ -53,6 +53,7 @@ drove plan --kind codex     # Codex; add --goal "..." to either for a first inst
 drove plan --from-cairn DROVE-12   # the goal is that Cairn task's title and body
 drove plan --next DROVE            # the goal is the top task `cairn next --project DROVE` ranks
 drove board                 # in a spare pane: live seats, states and what needs a human
+drove board --web           # the same board in a browser, read-only
 ```
 
 `drove plan` creates a run, records the pane as the planner pane and replaces itself with `claude` or `codex`, with Drove's MCP server, guard hooks and role text attached.
@@ -88,10 +89,12 @@ A worker that hits its usage limit gets a `usage-limit` attention item and is ne
 | `drove roster [--json] [--run ID]` | one line per seat |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
-| `drove board [--once] [--run ID]` | live coloured board, the orchestrator mod's layout on your terminal's own background; one frame with `--once` or when piped; no colour when piped or with `NO_COLOR` (this repo's latest run unless `--run` or `DROVE_RUN`) |
+| `drove board [--once] [--web [--port N]] [--run ID]` | live coloured board, the orchestrator mod's layout on your terminal's own background; one frame with `--once` or when piped; no colour when piped or with `NO_COLOR`; `--web` serves the same board read-only in a browser (see below); this repo's latest run unless `--run` or `DROVE_RUN` |
 | `drove down [--run ID]` / `drove up [--run ID] [--seat SEAT]` | stop and resume a run |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only; agents are denied) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
+
+`drove board --web` serves the board to a browser on `127.0.0.1`, on a free port or the one you give with `--port N`. It prints a URL that ends in a token made at each start; open that URL. The page shows the same header, seats, needs-you items and timeline as the terminal board, and updates live. It is read-only: only GET and HEAD are answered. A request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>`, or that has no token, is refused. Ctrl-C stops it. Drove has no daemon, so the page is there only while the command runs.
 
 `drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `roster`, `capture` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
 
