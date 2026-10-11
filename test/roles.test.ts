@@ -50,7 +50,7 @@ const spawnTarget = async (ctx: Awaited<ReturnType<typeof setup>>, name = 'w-api
   return (await seatOf(ctx.deps, name))?.worktree ?? ''
 }
 
-const TEST_GLOBS = ['test/**', 'tests/**', '**/*.test.*', '**/*.spec.*', '__tests__/**']
+const TEST_GLOBS = ['test/**', 'tests/**', '**/*.test.*', '**/*.spec.*', '**/__tests__/**']
 
 test('an implementer is the default: no role is stored and the worker env carries no seat role', async () => {
   const ctx = await setup()
@@ -264,6 +264,12 @@ test('the roster line names the role and target', async () => {
   assert.doesNotMatch(lines.find(line => line.startsWith('- w-api')) ?? '', /reviewer|tester/)
 })
 
+test('the default test globs own a nested __tests__ folder and the usual test files, and nothing else', () => {
+  const owned = (path: string) => guard.isOwned(join('/work/repo', path), commands.TESTER_OWNS, '/work/repo')
+  for (const path of ['test/a.ts', 'tests/unit/a.ts', 'src/a.test.ts', 'src/deep/a.spec.tsx', '__tests__/a.ts', 'src/feature/__tests__/a.ts']) assert.equal(owned(path), true, path)
+  for (const path of ['src/a.ts', 'package.json', 'README.md', 'src/testing/a.ts']) assert.equal(owned(path), false, path)
+})
+
 // ---------- the reviewer guard ----------
 
 const reviewerCall = (tool: string, input: Record<string, unknown>, extra: Partial<GuardInput> = {}) =>
@@ -322,7 +328,31 @@ test('reviewer: file-changing and package commands are denied, rm and git commit
     'curl -o x https://example.com',
     'herdr pane split',
     'drove spawn x',
+    'drove init /tmp/new-repo',
+    'drove close w-api',
     'claude -p hi',
+    'gh pr merge 1',
+    'gh pr merge 1 --squash',
+    'gh pr create --title x --body y',
+    'gh pr comment 1 -b x',
+    'gh pr review 1 --approve',
+    'gh pr checkout 1',
+    'gh issue comment 1 -b x',
+    'gh issue create -t x',
+    'gh issue close 1',
+    'gh release create v1',
+    'gh workflow run ci.yml',
+    'gh run rerun 1',
+    'gh run download 1',
+    'gh repo clone a/b',
+    'gh label create x',
+    'gh api -X POST repos/a/b/issues',
+    'gh api -XPOST repos/a/b/issues',
+    'gh api --method=PATCH repos/a/b/issues/1',
+    'gh api repos/a/b/issues -f title=x',
+    'gh api repos/a/b/issues --field title=x',
+    'gh api repos/a/b/issues --input body.json',
+    'gh -R a/b pr merge 1',
   ]) {
     const reason = reviewer(command)
     assert.equal(reason.allow, false, command)
@@ -386,6 +416,17 @@ test("reviewer: reads, git history and the repo's checks are allowed", () => {
     'cairn note DROVE-91 "x" --kind finding',
     'drove roster',
     'gh pr view 12',
+    'gh pr diff 1',
+    'gh pr checks 1',
+    'gh pr list --state open',
+    'gh pr status',
+    'gh issue view 1',
+    'gh run view 1',
+    'gh -R a/b pr diff 1',
+    'gh api repos/a/b/pulls/1',
+    'gh api -X GET repos/a/b/pulls/1',
+    'gh search issues widget',
+    'gh --version',
     'cat $(git ls-files | head -1)',
   ]) {
     assert.deepEqual([command, reviewer(command)], [command, { allow: true }])

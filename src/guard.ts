@@ -73,6 +73,19 @@ const GH_HUMAN_ONLY: Record<string, ReadonlySet<string>> = {
   variable: new Set(['set', 'delete', 'remove']),
 }
 
+// What a reviewer may ask GitHub (DROVE-91): reads only, whatever the planner is allowed to write above.
+const GH_READS: Record<string, ReadonlySet<string>> = {
+  pr: new Set(['view', 'list', 'diff', 'checks', 'status']),
+  issue: new Set(['view', 'list', 'status']),
+  release: new Set(['view', 'list']),
+  run: new Set(['view', 'list']),
+  workflow: new Set(['view', 'list']),
+  repo: new Set(['view', 'list']),
+  label: new Set(['list']),
+  auth: new Set(['status']),
+}
+const GH_READ_GROUPS = new Set(['search', 'status', 'help', 'version'])
+
 const GH_OPTIONS_WITH_VALUE = new Set(['-R', '--repo', '--hostname'])
 const GH_BRANCH_OPTIONS = new Set(['--base', '-B', '--target', '--ref', '-r', '--head', '-H'])
 
@@ -403,6 +416,25 @@ const namesProduction = (words: readonly string[]): boolean =>
     return (inline ?? words[i + 1] ?? '').replace(/^[^:]*:/, '') === 'production'
   })
 
+// gh api reads with GET and writes with another method or with fields, in the separate and the joined spellings.
+const ghApiWrites = (words: readonly string[]): boolean =>
+  words.some((word, i) => {
+    const joined = /^(?:-X|--method=)(.+)$/.exec(word)?.[1]
+    const method = word === '-X' || word === '--method' ? words[i + 1] : joined
+    if (method !== undefined && !/^get$/i.test(method)) return true
+    return /^(?:-f|-F|--field|--raw-field|--input)(?:=.*)?$/.test(word) || /^-[fF]./.test(word)
+  })
+
+const ghReadOnlyReason = (words: readonly string[]): string | undefined => {
+  if (isHelpOrVersion(words)) return undefined
+  const at = firstPositional(words, 1, GH_OPTIONS_WITH_VALUE)
+  const group = words[at] ?? ''
+  const action = words[firstPositional(words, at + 1, GH_OPTIONS_WITH_VALUE)] ?? ''
+  if (group === 'api') return ghApiWrites(words) ? 'gh api with a method or fields writes to GitHub; a reviewer reads only' : undefined
+  if (GH_READ_GROUPS.has(group) || GH_READS[group]?.has(action)) return undefined
+  return `gh ${group}${action ? ` ${action}` : ''} can change GitHub or the checkout; a reviewer reads only (gh pr view, list, diff, checks and the like, and gh api GETs)`
+}
+
 const ghReason = (words: readonly string[]): string | undefined => {
   const at = firstPositional(words, 1, GH_OPTIONS_WITH_VALUE)
   const group = words[at] ?? ''
@@ -545,7 +577,7 @@ const plannerReason = (words: readonly string[], scope: Scope): string | undefin
   if (head === 'find' && words.some(word => FIND_ACTIONS.has(word))) return 'find with an action runs commands or deletes files'
   if (scope.readOnly && isCheckCommand(head, words)) return undefined
   if (head === 'perl' || RUNTIMES.has(head)) return `${head} runs code`
-  if (head === 'gh') return ghReason(words)
+  if (head === 'gh') return scope.readOnly ? ghReadOnlyReason(words) : ghReason(words)
   if (head === 'curl' || head === 'wget') return curlReason(head, words)
   if (PACKAGE_TOOLS.has(head)) return packageReason(head, words)
   return undefined

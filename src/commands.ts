@@ -27,7 +27,7 @@ export const DROVE_ENTRY = fileURLToPath(new URL('./cli.ts', import.meta.url))
 export const EFFORTS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max']
 export const SEAT_ROLES: readonly SeatRole[] = ['implementer', 'reviewer', 'tester']
 // What a tester owns unless the planner says otherwise (DROVE-91).
-export const TESTER_OWNS: readonly string[] = ['test/**', 'tests/**', '**/*.test.*', '**/*.spec.*', '__tests__/**']
+export const TESTER_OWNS: readonly string[] = ['test/**', 'tests/**', '**/*.test.*', '**/*.spec.*', '**/__tests__/**']
 export const timing = { pollMs: 500, exitWaitMs: EXIT_WAIT_MS, closeWaitMs: 3_000, lockWaitMs: 5_000, promptWaitMs: 4_000, worktreeWaitMs: 15_000 }
 
 const SESSIONLESS_PROMPT = 'Read the roster and wait for the human.'
