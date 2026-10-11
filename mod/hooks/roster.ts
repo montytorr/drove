@@ -19,6 +19,12 @@ export const modelLetter = (seat: Pick<Seat, 'kind' | 'model'>): string => (seat
 
 export const isAsking = (seat: Seat, status: OrchModStatus | undefined): boolean => Boolean(status?.asking) || seat.state === 'needs-input'
 
+// Attention the planner acts on by itself (a nudge to the seat, a retry, a wrap-up): a person is never asked about it, so
+// it is not "needs you" on any board and not an item of `drove attention` (DROVE-108).
+const PLANNER_ATTENTION: ReadonlySet<string> = new Set(['idle-without-report', 'stalled', 'budget', 'pending-delivery'])
+
+export const isForHuman = (item: { reason: string }): boolean => !PLANNER_ATTENTION.has(item.reason)
+
 export const FEED_MAX = 50
 
 export const pushFeed = (feed: readonly OrchFeedEntry[], entry: OrchFeedEntry): OrchFeedEntry[] => [...feed, entry].slice(-FEED_MAX)

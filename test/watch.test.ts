@@ -278,6 +278,21 @@ test('the herdr poll feeds deriveState into the roster and raises attention once
   assert.equal(seat?.state, 'blocked')
 })
 
+test('DROVE-108: idle-without-report reaches the planner under its own heading, never as needs-the-human', async () => {
+  const ctx = await setup()
+  const idle = { seat: 'w-api', reason: 'idle-without-report' as const, detail: 'The seat stopped without sending a report.', at: '2026-10-09T10:00:00.000Z' }
+  const dialog = { seat: 'w-api', reason: 'dialog' as const, detail: 'needs you', at: '2026-10-09T10:00:00.000Z' }
+  const { ports } = fakePorts({
+    agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'idle' }],
+    deriveState: () => ({ state: 'idle', attention: [idle, dialog] }),
+  })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  const text = await watcher.piggyback('r')
+  assert.match(text, /Needs the human:\n⚠ w-api: dialog: needs you\n\nFor you to act on:\n⚠ w-api: idle-without-report: /)
+  assert.doesNotMatch(text.split('For you to act on:')[0] ?? '', /idle-without-report/)
+})
+
 test('herdr is polled every 5 s, not on every tick', async () => {
   const ctx = await setup()
   let listed = 0

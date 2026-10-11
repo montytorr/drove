@@ -1,4 +1,6 @@
+import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
+import { isForHuman } from '../mod/hooks/roster.ts'
 import * as commands from './commands.ts'
 import * as deliver from './deliver.ts'
 import * as detect from './detect.ts'
@@ -47,6 +49,7 @@ export type WatchPorts = {
   nudgeText: typeof prompts.nudgeText
   advanceTokens: typeof usage.advanceTokens
   findRollout: typeof usage.findRollout
+  modifiedAt: (path: string) => Promise<number | undefined>
 }
 
 export const defaultWatchPorts: WatchPorts = {
@@ -75,6 +78,7 @@ export const defaultWatchPorts: WatchPorts = {
   nudgeText: prompts.nudgeText,
   advanceTokens: usage.advanceTokens,
   findRollout: usage.findRollout,
+  modifiedAt: async path => (await stat(path).catch(() => undefined))?.mtimeMs,
 }
 
 export type WatchOptions = {
@@ -251,7 +255,11 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     return ports.renderReports(reports, humanName)
   }
 
-  const attentionText = (): string => (freshAttention.length === 0 ? '' : `\n\nNeeds the human:\n${freshAttention.map(attentionLine).join('\n')}`)
+  const attentionText = (): string => {
+    const human = freshAttention.filter(isForHuman)
+    const planner = freshAttention.filter(item => !isForHuman(item))
+    return `${human.length === 0 ? '' : `\n\nNeeds the human:\n${human.map(attentionLine).join('\n')}`}${planner.length === 0 ? '' : `\n\nFor you to act on:\n${planner.map(attentionLine).join('\n')}`}`
+  }
 
   const ingest = async (run: RunMeta) => {
     const scan = await scanOutboxes(deps, run, ports)
@@ -421,7 +429,10 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         const read = await deps.exec(ports.agentReadArgv(target, 40, 'visible'))
         screen = read.code === 0 ? read.stdout : undefined
       }
-      const result = ports.deriveState(seat, { herdr: agent, hooks, lastReport: seat.lastReport, screen }, now)
+      // herdr's own 'working' needs no second opinion; otherwise the transcript's last write says whether an open turn is alive.
+      const transcript = agent?.status === 'working' ? undefined : hookWindows.get(seat.name)?.transcript
+      const transcriptAt = transcript ? await ports.modifiedAt(transcript) : undefined
+      const result = ports.deriveState(seat, { herdr: agent, hooks, lastReport: seat.lastReport, screen, ...(transcriptAt !== undefined ? { transcriptAt } : {}) }, now)
       if (result.state !== 'gone' && (seat.maxTurns !== undefined || seat.maxTokens !== undefined)) {
         const tokens = await tokensOf(seat).catch(() => undefined)
         const detail = detect.budgetDetail(seat, { turns: hookWindows.get(seat.name)?.turns ?? 0, ...(tokens !== undefined ? { tokens } : {}) })

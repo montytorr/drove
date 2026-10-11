@@ -1,0 +1,6 @@
+{"at":"2026-10-11T19:04:10.744Z","agent":"claude","event":"session-start","sessionId":"session-w-sender","detail":"startup","transcript":"TRANSCRIPT"}
+{"at":"2026-10-11T19:04:13.762Z","agent":"claude","event":"user-prompt-submit","sessionId":"session-w-sender","transcript":"TRANSCRIPT"}
+{"at":"2026-10-11T19:05:55.176Z","agent":"claude","event":"stop","sessionId":"session-w-sender","transcript":"TRANSCRIPT"}
+{"at":"2026-10-11T19:06:08.009Z","agent":"claude","event":"user-prompt-submit","sessionId":"session-w-sender","transcript":"TRANSCRIPT"}
+{"at":"2026-10-11T19:08:29.394Z","agent":"claude","event":"user-prompt-submit","sessionId":"session-w-sender","transcript":"TRANSCRIPT"}
+{"at":"2026-10-11T19:16:22.196Z","agent":"claude","event":"user-prompt-submit","sessionId":"session-w-sender","transcript":"TRANSCRIPT"}

@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net'
 import { SPINNER, STATUS_TONE } from '../mod/hooks/board.ts'
 import type { BoardModel, BoardRow, Tone } from '../mod/hooks/board.ts'
 import { shortModel } from '../mod/hooks/protocol.ts'
-import { isAsking } from '../mod/hooks/roster.ts'
+import { isAsking, isForHuman } from '../mod/hooks/roster.ts'
 import { boardSource, isAnimated, modelOf, POLL_MS } from './board.ts'
 import type { BoardData, FrameInput } from './board.ts'
 import { capture } from './commands.ts'
@@ -26,7 +26,7 @@ const TAIL_LINES = 40
 const TAIL_PATH = /^\/api\/seat\/([^/]+)\/tail$/
 
 // What the seat panel and the graph show, from the roster the board already loads. `activity` is the board row's one line of what the seat is doing
-// (the spinner glyph cut off), `tone` is the colour of its state (alert while it needs you), and `needsYou` is set when it asks, is blocked or has an attention item.
+// (the spinner glyph cut off), `tone` is the colour of its state (alert while it needs you), and `needsYou` is set when it asks, is blocked or has an attention item that is a person's (the planner's own items do not count).
 export type WebSeat = Pick<Seat, 'name' | 'kind' | 'model' | 'effort' | 'state' | 'stateAt' | 'branch' | 'worktree' | 'cairn' | 'sessionId' | 'owes'> & {
   modelLabel: string
   activity: string
@@ -82,7 +82,7 @@ export const payloadOf = (data: BoardData, now: number, offsetMinutes: number): 
   const rows = new Map(model.workers.map(row => [row.key, row]))
   const seats = openSeats(data.roster).map((seat): WebSeat => {
     const { name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes } = seat
-    const needsYou = isAsking(seat, data.status[name]) || state === 'blocked' || seat.attention.length > 0
+    const needsYou = isAsking(seat, data.status[name]) || state === 'blocked' || seat.attention.some(isForHuman)
     return {
       name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes,
       modelLabel: shortModel(seatModel),

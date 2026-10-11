@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { isAsking } from '../mod/hooks/roster.ts'
+import { isAsking, isForHuman } from '../mod/hooks/roster.ts'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
 import { runDir } from './paths.ts'
 import { CLOSED_STATES, openSeats } from './roster.ts'
@@ -95,6 +95,7 @@ const seatCandidates = (input: AttentionInput, asking: ReadonlySet<string>): Att
     .filter(seat => seat.state !== 'closed' && seat.state !== 'closing')
     .flatMap(seat =>
       seat.attention
+        .filter(isForHuman)
         // The question the worker asks in its pane says more than the generic approval line, so it replaces it.
         .filter(item => !(item.reason === 'permission' && asking.has(seat.name)))
         .map(item => ({

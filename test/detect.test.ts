@@ -101,9 +101,11 @@ test('a fresh stop hook outranks a lagging herdr working', () => {
   assert.equal(detect.deriveState(seatOf(), { herdr: live('working'), hooks: [hook('pre-tool-use', 20), hook('stop', 40)] }, NOW).state, 'working')
 })
 
-test('a fresh hook counts as working even when herdr says idle', () => {
+test('an open turn counts as working even when herdr says idle, for as long as the seat shows life', () => {
   assert.equal(detect.deriveState(seatOf({ state: 'idle' }), { herdr: live('idle'), hooks: [hook('pre-tool-use', 4)] }, NOW).state, 'working')
-  assert.equal(detect.deriveState(seatOf({ state: 'idle' }), { herdr: live('idle'), hooks: [hook('pre-tool-use', 40)] }, NOW).state, 'idle')
+  assert.equal(detect.deriveState(seatOf({ state: 'idle' }), { herdr: live('idle'), hooks: [hook('pre-tool-use', 40)] }, NOW).state, 'working')
+  const quiet = detect.OPEN_TURN_QUIET_MS / 1000 + 1
+  assert.equal(detect.deriveState(seatOf({ state: 'idle' }), { herdr: live('idle'), hooks: [hook('user-prompt-submit', quiet)] }, NOW).state, 'idle')
 })
 
 test('herdr done and unknown map through', () => {
@@ -315,4 +317,52 @@ test('shouldReadScreen: a seat that went idle with no report since it worked is 
   assert.equal(detect.shouldReadScreen(live('idle'), started, { ...silent, lastReport: report('done', 'review', 30), owes: 'review' }), false)
   assert.equal(detect.shouldReadScreen(live('idle'), started, { ...silent, lastWorkingAt: undefined }), false)
   assert.equal(detect.shouldReadScreen(live('idle'), started), false)
+})
+
+const IDLE_SEAT = (overrides: Partial<Seat> = {}) => seatOf({ state: 'idle', ...overrides })
+
+test('DROVE-108: a prompt with no Stop after it is a turn in flight, whatever herdr says and however old the prompt', () => {
+  const hooks = [hook('user-prompt-submit', 120)]
+  for (const status of ['idle', 'done', 'unknown'] as const) {
+    const derived = detect.deriveState(IDLE_SEAT(), { herdr: live(status), hooks }, NOW)
+    assert.equal(derived.state, 'working', status)
+    assert.deepEqual(derived.attention, [])
+  }
+})
+
+test('DROVE-108: a Stop, a StopFailure or a new session ends the turn', () => {
+  for (const closing of ['stop', 'stop-failure', 'session-start'] as const) {
+    const derived = detect.deriveState(IDLE_SEAT(), { herdr: live('idle'), hooks: [hook('user-prompt-submit', 120), hook(closing, 100)] }, NOW)
+    assert.equal(derived.state, 'idle', closing)
+  }
+  const reopened = detect.deriveState(IDLE_SEAT(), { herdr: live('idle'), hooks: [hook('user-prompt-submit', 120), hook('stop', 100), hook('user-prompt-submit', 50)] }, NOW)
+  assert.equal(reopened.state, 'working')
+})
+
+test('DROVE-108: an open turn is not flagged idle-without-report, however long the seat has been silent', () => {
+  const seat = IDLE_SEAT({ lastWorkingAt: ago(900), stateAt: ago(600) })
+  const derived = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('user-prompt-submit', 200)] }, NOW)
+  assert.equal(derived.state, 'working')
+  assert.deepEqual(derived.attention, [])
+})
+
+test('DROVE-108: an open turn goes quiet after the bound unless the transcript is still being written (Esc fires no Stop)', () => {
+  const stale = detect.OPEN_TURN_QUIET_MS / 1000 + 30
+  const hooks = [hook('user-prompt-submit', stale)]
+  const seat = IDLE_SEAT({ lastWorkingAt: ago(stale), stateAt: ago(stale) })
+  const interrupted = detect.deriveState(seat, { herdr: live('idle'), hooks }, NOW)
+  assert.equal(interrupted.state, 'idle')
+  assert.deepEqual(interrupted.attention.map(item => item.reason), ['idle-without-report'])
+  const writing = detect.deriveState(seat, { herdr: live('idle'), hooks, transcriptAt: NOW.getTime() - 20_000 }, NOW)
+  assert.equal(writing.state, 'working')
+  const old = detect.deriveState(seat, { herdr: live('idle'), hooks, transcriptAt: NOW.getTime() - detect.OPEN_TURN_QUIET_MS - 1 }, NOW)
+  assert.equal(old.state, 'idle')
+})
+
+test('DROVE-108: a seat that owes an answer counts a turn only when the prompt came after its report', () => {
+  const seat = IDLE_SEAT({ owes: 'answer', lastReport: report('question', 'answer', 300) })
+  const before = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('user-prompt-submit', 400)] }, NOW)
+  assert.equal(before.state, 'idle')
+  const after = detect.deriveState(seat, { herdr: live('idle'), hooks: [hook('user-prompt-submit', 400), hook('stop', 299), hook('user-prompt-submit', 200)] }, NOW)
+  assert.equal(after.state, 'working')
 })

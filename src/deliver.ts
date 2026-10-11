@@ -158,6 +158,16 @@ const setAttention = async (deps: Deps, run: string, seat: string, reason: Atten
 const isReplyToOpenAsk = (seat: Seat, control: Control): boolean =>
   (control.kind === 'message' || control.kind === 'answer') && (seat.lastReport?.kind === 'question' || seat.lastReport?.kind === 'blocked')
 
+// A verdict or an answer settles what the planner owed the seat; so does a message sent after the seat's question or block.
+const clearsOwed = (control: Control): boolean => control.kind === 'answer' || control.kind === 'verdict'
+
+// Only the report the planner answered is cleared: a newer one that arrived meanwhile still owes its answer.
+const settleSent = (entry: Seat, sent: Seat, control: Control, isReply: boolean, sentAt: string): Seat => {
+  const isStamped = control.expects !== 'none' || isReply
+  const isSettled = (isReply || clearsOwed(control)) && entry.lastReport?.id === sent.lastReport?.id
+  return { ...entry, ...(isStamped ? { lastSentAt: sentAt } : {}), ...(isSettled ? { owes: 'none' as const } : {}) }
+}
+
 const hooksFileOf = (deps: Deps, run: string, seat: Seat): string =>
   join(seat.name === PLANNER_SEAT ? plannerDir(deps.home, run) : seatDir(deps.home, run, seat.name), 'hooks.jsonl')
 
@@ -181,7 +191,8 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
   if (delivery.ok) {
     const sentAt = deps.clock.now().toISOString()
     await appendJsonl(sentFile(deps, run, seat.name), { id: control.id, via: delivery.via, at: sentAt } satisfies Sent)
-    if (control.expects !== 'none' || isReplyToOpenAsk(seat, control)) await updateRoster(deps.home, run, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? { ...entry, lastSentAt: sentAt } : entry)) }))
+    const isReply = isReplyToOpenAsk(seat, control)
+    if (control.expects !== 'none' || isReply || clearsOwed(control)) await updateRoster(deps.home, run, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? settleSent(entry, seat, control, isReply, sentAt) : entry)) }))
     const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
     await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
     attempts.delete(control.id)

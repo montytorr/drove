@@ -5,7 +5,7 @@ import { afterEach, test } from 'node:test'
 import * as deliver from '../src/deliver.ts'
 import { deriveState } from '../src/detect.ts'
 import { seatDir } from '../src/paths.ts'
-import { loadRoster } from '../src/roster.ts'
+import { loadRoster, updateRoster } from '../src/roster.ts'
 import type { Control, DeliveryAdapter, Report, RunMeta, Seat } from '../src/types.ts'
 import { FakeHerdr, herdrFail, makeDeps, makeSeat, result, seedRun } from './p3-helpers.ts'
 
@@ -418,4 +418,48 @@ test('a pane that vanished between the prompt and the status check is reported a
   const { deps, run } = await setup(makeSeat('w-ui'), 'working', fake)
   const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
   assert.match(!delivery.ok ? delivery.reason : '', /pane is gone or unknown to herdr/)
+})
+
+test('DROVE-108: a message or answer sent after a question or a block clears what the seat was owed', async () => {
+  const asked = { id: 'r-1', kind: 'question' as const, expects: 'answer' as const, summary: 'which table?', at: '2000-01-01T00:00:00.000Z' }
+  for (const kind of ['message', 'answer'] as const) {
+    const { deps, run } = await setup(makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1', state: 'idle', lastReport: asked, owes: 'answer' }))
+    assert.equal((await deliver.deliverControl(deps, run, control('w-api', { kind, expects: 'none' }))).ok, true)
+    assert.equal((await loadRoster(deps.home, run.id)).seats[0]?.owes, 'none', kind)
+  }
+  const blocked = { ...asked, id: 'r-2', kind: 'blocked' as const }
+  const { deps, run } = await setup(makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1', state: 'idle', lastReport: blocked, owes: 'answer' }))
+  assert.equal((await deliver.deliverControl(deps, run, control('w-api', { kind: 'message', expects: 'none' }))).ok, true)
+  assert.equal((await loadRoster(deps.home, run.id)).seats[0]?.owes, 'none')
+})
+
+test('DROVE-108: a verdict clears a review; a plain message, a nudge or a promote after a done report does not', async () => {
+  const done = { id: 'r-1', kind: 'done' as const, expects: 'review' as const, summary: 'done', at: '2000-01-01T00:00:00.000Z' }
+  const seat = () => makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1', state: 'idle', lastReport: done, owes: 'review' })
+  for (const kind of ['message', 'nudge', 'promote'] as const) {
+    const { deps, run } = await setup(seat())
+    assert.equal((await deliver.deliverControl(deps, run, control('w-api', { kind, expects: 'none' }))).ok, true)
+    assert.equal((await loadRoster(deps.home, run.id)).seats[0]?.owes, 'review', kind)
+  }
+  const { deps, run } = await setup(seat())
+  assert.equal((await deliver.deliverControl(deps, run, control('w-api', { kind: 'verdict', expects: 'review', verdict: 'approve' }))).ok, true)
+  assert.equal((await loadRoster(deps.home, run.id)).seats[0]?.owes, 'none')
+})
+
+test('DROVE-108: a report that arrived while the answer was typed is still owed its own answer', async () => {
+  const asked = { id: 'r-1', kind: 'question' as const, expects: 'answer' as const, summary: 'which table?', at: '2000-01-01T00:00:00.000Z' }
+  const { deps, run } = await setup(makeSeat('w-api', { kind: 'codex', sessionId: 'thread-1', state: 'idle', lastReport: asked, owes: 'answer' }))
+  const mod: DeliveryAdapter = {
+    transport: 'mod',
+    canDeliver: () => true,
+    deliver: async () => {
+      const roster = await loadRoster(deps.home, run.id)
+      await updateRoster(deps.home, run.id, () => ({ ...roster, seats: roster.seats.map(entry => ({ ...entry, lastReport: { ...asked, id: 'r-2', summary: 'and which schema?' }, owes: 'answer' as const })) }))
+      return { ok: true, via: 'mod' }
+    },
+  }
+  deliver.registerAdapter(mod)
+  assert.equal((await deliver.deliverControl(deps, run, control('w-api', { kind: 'message', expects: 'none' }))).ok, true)
+  const seat = (await loadRoster(deps.home, run.id)).seats[0]
+  assert.deepEqual([seat?.lastReport?.id, seat?.owes], ['r-2', 'answer'])
 })

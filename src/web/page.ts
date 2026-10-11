@@ -17,6 +17,7 @@ export const KIND_TONES: Readonly<Record<string, string>> = {
   asking: 'warn',
   blocked: 'warn',
   attention: 'warn',
+  notice: 'muted',
   promote: 'you',
   demote: 'you',
   queued: 'you',
@@ -51,6 +52,7 @@ export const KIND_ICONS: Readonly<Record<string, string>> = {
   queued: '⏸',
   failed: '✕',
   attention: '⚠',
+  notice: '·',
 }
 
 // Who the page draws as the lead node when it shows up in a feed entry's from or to, besides the seats' own names.
@@ -422,7 +424,7 @@ const PAGE = String.raw`<!doctype html>
     const fields = [
       ['kind', seat.kind], ['model', seat.model], ['effort', seat.effort],
       ['state', seat.state + ' for ' + ageOf(seat.stateAt)], ['branch', seat.branch], ['worktree', seat.worktree],
-      ['cairn', seat.cairn || '-'], ['session', seat.sessionId || '-'], ['owes', seat.owes],
+      ['cairn', seat.cairn || '-'], ['session', seat.sessionId || '-'], ['waiting for the planner', seat.owes === 'none' ? '-' : seat.owes],
     ]
     const items = []
     for (const [label, value] of fields) items.push(el('dt', '', label), el('dd', '', value))
