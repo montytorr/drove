@@ -227,9 +227,8 @@ A snapshot is `{"v":1,"at":"…","runs":["…"],"items":[…]}`; each item:
 | `pane-budget` | a spawn the pane budget refused (a 6th pane) | `command`: `drove budget <n> --run ID` |
 | `gone` | a seat's pane is gone (or the planner's, while the run is `up`) | `command`: `drove up --run ID --seat SEAT` (the planner: `drove up --run ID --detached`) |
 | `usage-limit` | the agent hit its plan limit | `pane`: it resumes when the limit resets |
-| `stalled`, `idle-without-report`, `budget`, `pending-delivery` | the planner's to handle | `planner`: nothing for a person unless the planner asks |
 
-`answer.type` is `command` (an exact command; `<answer>` is yours to fill in), `pane` (answer it where the agent is; Drove will not), or `planner`. Every item is something Drove itself calls "needs the human" or "needs you", so a forwarder can filter on `kind`.
+`answer.type` is `command` (an exact command; `<answer>` is yours to fill in) or `pane` (answer it where the agent is; Drove will not). Every item is something Drove itself calls "needs the human" or "needs you", so a forwarder can filter on `kind`. What the planner handles (`idle-without-report`, `stalled`, `budget`, `pending-delivery`) is not a "needs you": it is not listed here and not counted on the web board, and the planner reads it in `drove roster` and under "For you to act on" in its wake.
 
 - **`id` is stable** for as long as the item is open, across polls and across processes; it is `<run>:<seat>:<kind>:<n>`, where `n` counts the episodes of that same thing. An item that went away and came back is a new `id`. `since` is when it began and does not move.
 - **`--follow`** prints one JSON line per change, `{"v":1,"event":"new"|"resolved","at":"…","item":{…}}`, and polls every 3 seconds. It starts by announcing everything already open as `new`, so a restarted follower repeats those: dedupe on `id`. A `resolved` line carries the item as last seen. It stops on Ctrl-C or SIGTERM. Drove has no daemon: a snapshot is computed when you ask, and nothing is watched in between.
