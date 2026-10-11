@@ -595,6 +595,41 @@ describe('orchestrator session', () => {
     await ui.unmount()
   })
 
+  test('the first human prompt is saved to run.json, clipped to one line; later prompts do not replace it', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    const long = `${'x'.repeat(200)}`
+    await $.prompt.submit({ text: `\n  ${long}  \nsecond line`, wait: false, origin: { kind: 'composer' } } as never)
+    await $.prompt.submit({ text: 'another prompt', wait: false, origin: { kind: 'composer' } } as never)
+    const attaches = droveCalls(world, 'mod').filter(({ args }) => args.includes('--goal'))
+    expect(attaches).toHaveLength(1)
+    expect(attaches[0]?.args).toEqual(expect.arrayContaining(['--run', RUN, '--goal', `${'x'.repeat(119)}…`]))
+    expect(world.store.get(`drove:session:${SELF}`)).toMatchObject({ goal: `${'x'.repeat(119)}…` })
+  })
+
+  test('an existing goal is kept', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'Ship the thing')
+    await $.prompt.submit({ text: 'something else', wait: false, origin: { kind: 'composer' } } as never)
+    expect(droveCalls(world, 'mod').filter(({ args }) => args.includes('--run'))).toHaveLength(0)
+    expect(world.store.get(`drove:session:${SELF}`)).toMatchObject({ goal: 'Ship the thing' })
+  })
+
+  test('a wake, a plugin prompt, an envelope, a slash command and empty text are never the goal', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await $.prompt.submit({ text: 'w-auth: done', wait: false, origin: { kind: 'plugin', name: 'orchestrator' } } as never)
+    await $.prompt.submit({ text: 'the goal', wait: false, origin: { kind: 'plugin', name: 'orchestrator', asUser: true } } as never)
+    await $.prompt.submit({ text: '⟦drove v1 id=r-1 run=r from=w-auth to=planner kind=report⟧\nhello\n↩ Reply with drove report', wait: false, origin: { kind: 'composer' } } as never)
+    await $.prompt.submit({ text: '/orchestrate status', wait: false, origin: { kind: 'composer' } } as never)
+    await $.prompt.submit({ text: '   ', wait: false, origin: { kind: 'composer' } } as never)
+    expect(droveCalls(world, 'mod').filter(({ args }) => args.includes('--goal'))).toHaveLength(0)
+    expect((world.store.get(`drove:session:${SELF}`) as { goal?: string }).goal).toBeUndefined()
+  })
+
   test('a restarted session re-attaches its run from the store; an old-mod record is reported and dropped', async ($, on) => {
     const { world, clock } = engine(on, undefined, {
       [`drove:session:${SELF}`]: { run: RUN, goal: 'Ship it', startedAt: NOW, savedAt: NOW },

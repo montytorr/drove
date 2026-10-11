@@ -178,6 +178,23 @@ export const locateEnvelope = (text: string): LocatedEnvelope | undefined => {
   return { envelope: { fields, body: rest.slice(0, last.index).trim() }, reply: last[1], ...(after ? { after } : {}), ...located }
 }
 
+export const GOAL_MAX = 120
+const WAKE_LINE_RE = /^\[worker \S+ · /
+
+// A run's goal from the first prompt its human types: the first non-empty line, clipped. A slash command, a Drove envelope or an
+// empty prompt is not a goal. The mod's goalFromPrompt (mod/hooks/protocol.ts) is the same rule.
+export const goalFromPrompt = (text: string): string | undefined => {
+  if (text.includes(ENVELOPE_OPEN)) return undefined
+  const first = text
+    .replace(/<\/?pasted_content(?:\s[^>]*)?>/g, '')
+    .split('\n')
+    .map(line => line.trim())
+    .find(line => line !== '')
+  if (!first || first.startsWith('/') || WAKE_LINE_RE.test(first)) return undefined
+  const flat = first.replace(/\s+/g, ' ')
+  return flat.length > GOAL_MAX ? `${flat.slice(0, GOAL_MAX - 1)}…` : flat
+}
+
 const NEXT: Record<ReportKind, string> = {
   progress: '',
   done: 'Review the work (read-only: git diff, Read, Grep), then answer with drove send, kind verdict (approve, or changes with notes).',

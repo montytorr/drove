@@ -25,6 +25,7 @@ const fakeDeps = (overrides: Partial<hooks.HookDeps> = {}) => {
     append: async (path, value) => void written.push({ path, value: value as Record<string, unknown> }),
     openIds: async () => ['w-api', 'sess-1'],
     seatToken: async () => undefined,
+    adoptGoal: async () => undefined,
     ...overrides,
   }
   return { deps, written }
@@ -409,4 +410,42 @@ test('the Codex hook finds, splits and words an envelope exactly as the Claude m
     assert.equal(ours?.after, theirs?.envelope.after, input)
     assert.equal(ours?.before, theirs?.before, input)
   }
+})
+
+test('user-prompt-submit: the planner\'s first human prompt becomes the run goal; wakes, envelopes, commands and empty text do not', async () => {
+  const goals: string[] = []
+  const { deps } = fakeDeps({ adoptGoal: async (_identity, goal) => void goals.push(goal) })
+  const submit = (prompt: string, env = PLANNER) => hooks.runHook('user-prompt-submit', JSON.stringify({ hook_event_name: 'UserPromptSubmit', session_id: 's1', prompt }), env, deps)
+  await submit('')
+  await submit('   \n ')
+  await submit('/orchestrate now')
+  await submit('⟦drove v1 id=r1 kind=done⟧\nall done\n↩ Reply with drove send')
+  await submit('[worker w-api · done · expects review]\nsummary')
+  await submit('Add rate limiting', WORKER)
+  assert.deepEqual(goals, [])
+  await submit(`\n  Add rate limiting to the API  \nsecond line`)
+  await submit(`x${'y'.repeat(200)}`)
+  assert.deepEqual(goals, ['Add rate limiting to the API', `x${'y'.repeat(118)}…`])
+})
+
+test('user-prompt-submit: the default adoptGoal writes run.json once and keeps an existing goal', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'drove-goal-'))
+  const { saveRun, loadRun } = await import('../src/roster.ts')
+  const run = 'r-goal'
+  await saveRun(home, { v: 1, id: run, repo: '/r', base: 'main', hasRemote: false, createdAt: NOW.toISOString(), status: 'up', planner: { kind: 'claude', model: 'm', effort: 'high', viaMod: false } } as never)
+  const env = { DROVE_HOME: home, DROVE_RUN: run, DROVE_ROLE: 'planner', DROVE_SEAT: 'planner' }
+  const submit = (prompt: string) => hooks.runHook('user-prompt-submit', JSON.stringify({ session_id: 's1', prompt }), env)
+  await submit('First goal')
+  await submit('Second prompt')
+  assert.equal((await loadRun(home, run))?.goal, 'First goal')
+})
+
+test('user-prompt-submit: a mod planner\'s run takes no goal from the hook', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'drove-goal-'))
+  const { saveRun, loadRun } = await import('../src/roster.ts')
+  const run = 'r-mod'
+  await saveRun(home, { v: 1, id: run, repo: '/r', base: 'main', hasRemote: false, createdAt: NOW.toISOString(), status: 'up', planner: { kind: 'claude', model: 'm', effort: 'high', viaMod: true } } as never)
+  const env = { DROVE_HOME: home, DROVE_RUN: run, DROVE_ROLE: 'planner', DROVE_SEAT: 'planner' }
+  await hooks.runHook('user-prompt-submit', JSON.stringify({ session_id: 's1', prompt: 'w-goal · done · expects review — x' }), env)
+  assert.equal((await loadRun(home, run))?.goal, undefined)
 })

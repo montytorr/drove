@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { commandOf, decide, denyText } from './guard.ts'
 import { agentName } from './herdr.ts'
 import { identityFromEnv, plannerDir, runDir, seatDir } from './paths.ts'
-import { locateEnvelope, UNVERIFIED, verifyControl } from './protocol.ts'
+import { goalFromPrompt, locateEnvelope, UNVERIFIED, verifyControl } from './protocol.ts'
 import type { AgentKind, GuardDecision, GuardInput, HookEventName, HookInput, HookRecord, Identity } from './types.ts'
 
 export const HOOK_EVENTS: readonly HookEventName[] = ['session-start', 'user-prompt-submit', 'pre-tool-use', 'stop', 'stop-failure', 'notification', 'permission-request']
@@ -23,6 +23,7 @@ export type HookDeps = {
   append: (path: string, value: unknown) => Promise<void>
   openIds: (identity: Identity) => Promise<string[]>
   seatToken: (identity: Identity) => Promise<string | undefined>
+  adoptGoal: (identity: Identity, goal: string) => Promise<void>
 }
 
 export const defaultHookDeps: HookDeps = {
@@ -37,6 +38,11 @@ export const defaultHookDeps: HookDeps = {
     return roster.openSeats(await roster.loadRoster(identity.home, identity.run)).flatMap(seat => [seat.name, agentName(identity.run, seat.name), ...(seat.paneId ? [seat.paneId] : []), ...(seat.sessionId ? [seat.sessionId] : [])])
   },
   seatToken: async identity => (await import('./store.ts')).readToken(join(seatDir(identity.home, identity.run, identity.seat), 'token')),
+  adoptGoal: async (identity, goal) => {
+    const roster = await import('./roster.ts')
+    const run = await roster.loadRun(identity.home, identity.run)
+    if (run && !run.goal && !run.planner.viaMod) await roster.saveRun(identity.home, { ...run, goal })
+  },
 }
 
 const text = (value: unknown): string | undefined => (typeof value === 'string' && value.length > 0 ? value : undefined)
@@ -172,6 +178,8 @@ export const runHook = async (event: HookEventName, stdin: string, env: NodeJS.P
     if (event === 'pre-tool-use') return await preToolUse(identity, raw, agent, deps)
     const notice = event ==='user-prompt-submit' && agent === 'codex' && identity.role === 'worker' ? await promptNotice(identity, raw, deps) : undefined
     const input = parseHookInput(event, raw, agent)
+    const goal = event === 'user-prompt-submit' && identity.role === 'planner' && typeof raw.prompt === 'string' ? goalFromPrompt(raw.prompt) : undefined
+    if (goal) await deps.adoptGoal(identity, goal).catch(() => undefined)
     try {
       await recordHook(identity, toRecord(notice === UNVERIFIED ? { ...input, detail: 'unverified control' } : input, deps.now()), deps)
     } catch {
