@@ -59,6 +59,7 @@ const FEED_ICON: Record<string, string> = {
   queued: '⏸',
   failed: '✕',
   attention: '⚠',
+  notice: '·',
 }
 
 const FEED_TONE: Record<string, Tone> = {
@@ -132,12 +133,21 @@ export const progressOf = (seats: readonly Seat[]): { done: number; total: numbe
   return { done: counted.filter(({ lastReport, state }) => lastReport?.kind === 'done' || state === 'done').length, total: counted.length }
 }
 
-const seatDoing = (seat: Seat, status: OrchModStatus | undefined, spin: string): Cell => {
+// Who reads the board: the planner owes the seat its answer or review ("waiting for your answer"); a person watching
+// from outside sees the seat waiting on the planner.
+export type Viewer = 'planner' | 'human'
+
+const waitingText = (seat: Seat, viewer: Viewer): string => {
+  const what = seat.owes === 'review' ? 'review' : 'answer'
+  return `${viewer === 'human' ? 'waiting for the planner' : `waiting for your ${what}`} · ${seat.lastReport?.summary ?? ''}`
+}
+
+const seatDoing = (seat: Seat, status: OrchModStatus | undefined, spin: string, viewer: Viewer): Cell => {
   if (status?.asking) return { text: status.asking, tone: 'alert' }
   if (seat.state === 'needs-input') return { text: 'needs an approval in its pane', tone: 'alert' }
   if (seat.state === 'blocked') return { text: seat.attention[0]?.detail ?? 'waiting on a dialog in its pane', tone: 'alert' }
   if (seat.state === 'starting') return { text: `${spin} starting`, tone: 'muted' }
-  if (seat.owes !== 'none' && seat.lastReport) return { text: `owes you ${seat.owes === 'review' ? 'a review' : 'an answer'} · ${seat.lastReport.summary}`, tone: 'warn' }
+  if (seat.owes !== 'none' && seat.lastReport) return { text: waitingText(seat, viewer), tone: 'warn' }
   if (seat.gate && Date.parse(seat.gate.at) >= (Date.parse(seat.lastReport?.at ?? '') || 0)) return { text: `${seat.gate.result === 'passed' ? 'merged' : `merge ${seat.gate.result}`} · ${seat.gate.detail}`, tone: seat.gate.result === 'passed' ? 'good' : seat.gate.result === 'pending' ? 'warn' : 'alert' }
   if (seat.state === 'done' && seat.lastReport) return { text: seat.lastReport.summary, tone: 'text' }
   const doing = status?.activity ?? seat.lastReport?.summary ?? ''
@@ -169,8 +179,10 @@ export const buildBoard = (input: {
   offsetMinutes: number
   columns: number
   rows: number
+  viewer?: Viewer
 }): BoardModel => {
   const { orchestrator, seats, status, asksAt, feed, lead, now, columns, frame } = input
+  const viewer = input.viewer ?? 'planner'
   const open = openSeats(seats).sort((a, b) => spawnedMs(a) - spawnedMs(b))
   const isWide = columns >= 70
   const names = [...seats.map(({ name }) => name), ...feed.flatMap(({ from, to }) => [from, to])]
@@ -227,7 +239,7 @@ export const buildBoard = (input: {
         ...(hasRoles ? [{ text: ROLE_TAG[seat.role ?? 'implementer'], tone: 'muted' as const, width: 1 }] : []),
         ...(isWide ? [{ text: clip(`${model}·${effortShort(seat.effort)}`, 9), tone: 'muted' as const, width: 9 }] : []),
         ...(isWide && seat.cairn ? [{ text: seat.cairn, tone: 'dim' as const, width: 8 }] : []),
-        seatDoing(seat, mine, spin),
+        seatDoing(seat, mine, spin, viewer),
         ...(isWide && mine?.ctx !== undefined ? [{ text: `${gauge(mine.ctx, 4)} ${String(mine.ctx).padStart(2)}%`, tone: ctxTone(mine.ctx), width: 9 }] : []),
         { text: since(now - (Date.parse(seat.lastReport?.at ?? seat.spawnedAt) || now)), tone: 'dim', width: 5 },
       ],

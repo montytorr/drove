@@ -159,15 +159,24 @@ test('a planner stopped at a dialog, or gone while the run is up, is an item of 
   assert.equal(gone[0]?.answer.type === 'command' && gone[0].answer.command, `drove up --run ${RUN} --detached`)
 })
 
-test('a seat that is gone offers the relaunch command; a seat the planner handles says so', async () => {
+test('a seat that is gone offers the relaunch command', async () => {
+  const { deps } = await setup([makeSeat('w-a', { state: 'gone', attention: [dialogOn('w-a', 'gone', 'pane w1:p-w-a is gone')] })])
+  const gone = (await itemsOf(deps)).find(item => item.kind === 'gone')
+  assert.equal(gone?.answer.type === 'command' && gone.answer.command, `drove up --run ${RUN} --seat w-a`)
+})
+
+test('what the planner handles is not an item for a person: idle-without-report, stalled, budget, pending-delivery (DROVE-108)', async () => {
+  const planners = [
+    ['w-b', 'idle-without-report', 'The seat stopped without sending a report.'],
+    ['w-d', 'stalled', 'agent_prompt_stalled'],
+    ['w-e', 'budget', 'used 20 of its 20 turns'],
+    ['w-f', 'pending-delivery', 'message c-1 is waiting'],
+  ] as const
   const { deps } = await setup([
-    makeSeat('w-a', { state: 'gone', attention: [dialogOn('w-a', 'gone', 'pane w1:p-w-a is gone')] }),
-    makeSeat('w-b', { state: 'idle', attention: [dialogOn('w-b', 'idle-without-report', 'The seat stopped without sending a report.')] }),
+    ...planners.map(([name, reason, detail]) => makeSeat(name, { state: 'idle', attention: [dialogOn(name, reason, detail)] })),
+    makeSeat('w-c', { state: 'blocked', stateAt: AT, attention: [dialogOn('w-c')] }),
   ])
-  const items = await itemsOf(deps)
-  const byKind = Object.fromEntries(items.map(item => [item.kind, item]))
-  assert.equal(byKind.gone?.answer.type === 'command' && byKind.gone.answer.command, `drove up --run ${RUN} --seat w-a`)
-  assert.equal(byKind['idle-without-report']?.answer.type, 'planner')
+  assert.deepEqual((await itemsOf(deps)).map(item => item.seat), ['w-c'])
 })
 
 test('--all lists the items of every run that is up, and not a run that is down', async () => {

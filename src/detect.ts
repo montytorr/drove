@@ -67,11 +67,17 @@ export const DIALOGS: readonly Dialog[] = [
 ]
 
 export const HOOK_FRESH_MS = 10_000
+// An open turn (a prompt submitted, no Stop since) outranks herdr's idle for this long after the seat last showed life.
+// Claude does not fire Stop when the turn is interrupted, so a turn that has gone quiet this long is not trusted.
+export const OPEN_TURN_QUIET_MS = 5 * 60_000
 export const EXIT_WAIT_MS = 20_000
 export const RESTART_BOUND_MS = 2 * EXIT_WAIT_MS + DEFAULT_START_TIMEOUT_MS
 export const NUDGE_GRACE_MS = 20_000
 
 const DERIVED_REASONS: ReadonlySet<Attention['reason']> = new Set(['dialog', 'permission', 'trust', 'hook-trust', 'channel-confirm', 'codex-version-mismatch', 'usage-limit', 'idle-without-report', 'gone', 'budget'])
+// What the transcript's last write says about a seat whose turn the hooks call open; the watcher stats it (mtime, ms).
+export type TurnSignals = SeatSignals & { transcriptAt?: number }
+
 const SETTLED: ReadonlySet<SeatState> = new Set(['idle', 'done'])
 const PERMISSION_NOTICE = /permission|approv|elicitation|dialog|trust/i
 
@@ -136,16 +142,26 @@ const isOwed = (seat: Seat, reported: LastReport | undefined): boolean => {
   return seat.owes !== 'none'
 }
 
-const hookWorkingAfter = (hooks: readonly HookRecord[], since: number, now: number, freshMs: number): boolean => {
-  const work = latest(hooks, ['user-prompt-submit', 'pre-tool-use'])
-  const at = ms(work?.at)
-  return work !== undefined && at > since && now - at <= freshMs
+// The prompt (or tool call) that started a turn nothing has ended: no Stop, StopFailure or new session since (DROVE-108).
+// herdr flips a busy seat to idle after a prompt is typed into it, so the hooks are the truth while a turn is open.
+const openTurn = (hooks: readonly HookRecord[]): HookRecord | undefined => {
+  const opened = latest(hooks, ['user-prompt-submit', 'pre-tool-use'])
+  const closed = latest(hooks, ['stop', 'stop-failure', 'session-start'])
+  return opened !== undefined && !(closed !== undefined && ms(closed.at) >= ms(opened.at)) ? opened : undefined
+}
+
+// `since` is the report the turn must come after when the seat owes one: the turn that filed it is about to stop.
+const isTurnLive = (hooks: readonly HookRecord[], since: number, signals: TurnSignals, now: number): boolean => {
+  const turn = openTurn(hooks)
+  const opened = ms(turn?.at)
+  if (turn === undefined || Number.isNaN(opened) || opened <= since) return false
+  return now - Math.max(opened, signals.transcriptAt ?? Number.NEGATIVE_INFINITY) <= OPEN_TURN_QUIET_MS
 }
 
 const idleWithoutReport = (seat: Seat, state: SeatState, reported: LastReport | undefined, now: Date): boolean =>
   SETTLED.has(state) && isSilentSinceWork(seat, reported) && now.getTime() - ms(seat.stateAt) >= NUDGE_GRACE_MS
 
-export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derived => {
+export const deriveState = (seat: Seat, signals: TurnSignals, now: Date): Derived => {
   if (seat.state === 'closed' || seat.state === 'down' || seat.state === 'closing') return { state: seat.state, attention: [] }
   if (isRestarting(seat, now)) return { state: seat.state, attention: [] }
   const at = now.toISOString()
@@ -179,8 +195,8 @@ export const deriveState = (seat: Seat, signals: SeatSignals, now: Date): Derive
     const isStoppedFresh = stopped !== undefined && ms(stopped.at) >= ms(worked?.at) && nowMs - ms(stopped.at) <= HOOK_FRESH_MS
     const reportedAt = ms((reported ?? seat.lastReport)?.at)
     const isWorking = owed
-      ? hookWorkingAfter(hooks, Number.isNaN(reportedAt) ? 0 : reportedAt, nowMs, HOOK_FRESH_MS)
-      : hookWorkingAfter(hooks, ms(stopped?.at) || 0, nowMs, HOOK_FRESH_MS) || (herdr?.status === 'working' && !isStoppedFresh)
+      ? isTurnLive(hooks, Number.isNaN(reportedAt) ? 0 : reportedAt, signals, nowMs)
+      : isTurnLive(hooks, 0, signals, nowMs) || (herdr?.status === 'working' && !isStoppedFresh)
     if (isWorking) state = 'working'
     else if (!herdr) state = 'starting'
     else if (herdr.status === 'done') state = 'done'

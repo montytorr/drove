@@ -1,5 +1,6 @@
 import type { DroveEvent, OrchFeedEntry, OrchModStatus, Roster, RunMeta } from '../types/index.d.ts'
 import { HUMAN, oneLine } from './protocol.ts'
+import { isForHuman } from './roster.ts'
 
 // What `drove mod bridge` writes, one JSON object per line (src/modhost.ts BridgeLine).
 export type BridgeLine =
@@ -76,8 +77,12 @@ export const feedOf = (event: DroveEvent, bodies: Map<string, string[]>): FeedDr
       return data.ok === false
         ? { at, from: '⌘', to: seat, kind: 'failed', summary: `relaunch failed: ${text(data.error)}` }
         : { at, from: '⌘', to: seat, kind: 'relaunch', summary: `relaunched${data.resumed ? ' (resumed)' : ''}${data.pane ? ` in pane ${text(data.pane)}` : ''}` }
-    case 'attention':
-      return text(data.reason) === 'report-rejected' ? { at, from: seat, to: '⌘', kind: 'attention', summary: `report rejected: ${text(data.why)}` } : { at, from: seat, to: HUMAN, kind: 'attention', summary: `${text(data.reason)}${data.detail ? `: ${text(data.detail)}` : ''}` }
+    case 'attention': {
+      if (text(data.reason) === 'report-rejected') return { at, from: seat, to: '⌘', kind: 'attention', summary: `report rejected: ${text(data.why)}` }
+      const summary = `${text(data.reason)}${data.detail ? `: ${text(data.detail)}` : ''}`
+      // What the planner acts on is a notice to the planner, not a "needs you" for the person (DROVE-108).
+      return isForHuman({ reason: text(data.reason) }) ? { at, from: seat, to: HUMAN, kind: 'attention', summary } : { at, from: seat, to: '⌘', kind: 'notice', summary }
+    }
     default:
       return undefined
   }

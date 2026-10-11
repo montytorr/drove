@@ -354,7 +354,7 @@ test('the lead and each seat carry what the graph draws: model label, activity, 
   const payload = payloadOfRun(await boardSource(deps, RUN.id)())
   assert.deepEqual(payload.lead, { kind: 'claude', model: 'claude-opus-5-5', modelLabel: 'Opus 5.5', effort: 'high', activity: 'waiting · owes 1 review', tone: 'muted', isBusy: false })
   const by = Object.fromEntries(payload.seats.map(item => [item.name, item]))
-  assert.deepEqual([by['w-core']?.tone, by['w-core']?.needsYou, by['w-core']?.activity], ['good', false, 'owes you a review · core finished, 48 tests green'])
+  assert.deepEqual([by['w-core']?.tone, by['w-core']?.needsYou, by['w-core']?.activity], ['good', false, 'waiting for the planner · core finished, 48 tests green'])
   assert.deepEqual([by['w-web']?.tone, by['w-web']?.needsYou, by['w-web']?.activity], ['working', false, 'editing src/web.ts'])
   assert.deepEqual([by['w-ask']?.tone, by['w-ask']?.needsYou, by['w-ask']?.cairn], ['alert', true, 'DROVE-90'])
   assert.doesNotMatch(payload.seats.map(item => item.activity).join('\n'), /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)
@@ -569,4 +569,20 @@ test('runWeb prints the URL and stops cleanly when its signal aborts', async () 
   controller.abort()
   await done
   await assert.rejects(call(Number(new URL(url).port), '/api/board'))
+})
+
+test('DROVE-108: only a person\'s attention is "needs you": the planner\'s items, and the notices they leave in the feed, are not', async () => {
+  const deps = await makeHome()
+  const planners = ['idle-without-report', 'stalled', 'budget', 'pending-delivery'] as const
+  const withItem = (name: string, reason: Seat['attention'][number]['reason']) => seat({ name, attention: [{ seat: name, reason, detail: 'd', at: '2026-10-09T10:40:00.000Z' }] })
+  const seats = [...planners.map(reason => withItem(`w-${reason}`, reason)), withItem('w-dialog', 'dialog'), withItem('w-limit', 'usage-limit')]
+  await writeJsonAtomic(join(runDir(deps.home, RUN.id), 'roster.json'), { ...ROSTER, seats: [...ROSTER.seats, ...seats] })
+  for (const reason of [...planners, 'dialog']) await appendJsonl(join(runDir(deps.home, RUN.id), 'events.jsonl'), { at: '2026-10-09T10:41:00.000Z', type: 'attention', seat: `w-${reason}`, data: { reason, detail: 'd' } })
+  const payload = payloadOfRun(await boardSource(deps, RUN.id)())
+  const needs = payload.seats.filter(item => item.needsYou).map(item => item.name)
+  assert.deepEqual(needs, ['w-dialog', 'w-limit'])
+  const attention = payload.feed.filter(entry => entry.kind === 'attention' || entry.kind === 'notice')
+  assert.deepEqual(attention.map(entry => [entry.kind, entry.to]), [...planners.map(() => ['notice', '⌘']), ['attention', 'Human']])
+  assert.ok(!NEEDS_YOU_KINDS.includes('notice'))
+  assert.ok(KIND_TONES.notice && KIND_ICONS.notice)
 })

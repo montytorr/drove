@@ -135,7 +135,7 @@ test('rosterLines describes open seats and lists gone ones', () => {
     now,
   )
   assert.equal(lines.length, 2)
-  assert.match(lines[0] ?? '', /^- w-api \[working\] claude Sonnet 5\.5 medium · DROVE-7 · pane p1 · up 10m · last report done 3m ago: tests pass · owes review$/)
+  assert.match(lines[0] ?? '', /^- w-api \[working\] claude Sonnet 5\.5 medium · DROVE-7 · pane p1 · up 10m · last report done 3m ago: tests pass · waiting for your review$/)
   assert.match(lines[1] ?? '', /^- w-ui \[gone\].*attention: gone$/)
 })
 

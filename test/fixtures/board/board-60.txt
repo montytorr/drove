@@ -1,7 +1,7 @@
 ◆ drove Build Drove v1 pieces P1…  1/5 done · 5/5 open · 42m
 
 ⌘  lead          waiting · owes 1 review               41m
-├─ ▌ ✓  w-core     owes you a review · P1 core state … 7m
+├─ ▌ ✓  w-core     waiting for the planner · P1 core … 7m
 ├─ ▌ ⛔ w-guard    a trust dialog waits in its pane    40m
 ├─ ▌ ⚙  w-runtime  ⠋ editing src/herdr.ts              39m
 ├─ ▌ ·  w-store    store written                       22m

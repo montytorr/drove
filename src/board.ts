@@ -244,6 +244,7 @@ export const modelOf = (input: FrameInput): BoardModel => {
     offsetMinutes: input.offsetMinutes,
     columns: input.columns,
     rows: input.rows,
+    viewer: 'human',
   })
   const [brand, ...rest] = model.title
   return { ...model, title: [{ ...(brand ?? { tone: 'lead', isBold: true }), text: '◆ drove' }, ...rest], feedTitle: model.feedTitle.replace(' · scroll for more', '') }
