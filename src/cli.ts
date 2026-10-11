@@ -12,7 +12,7 @@ import { serveMcp } from './mcp.ts'
 import * as modhost from './modhost.ts'
 import { ENV, identityFromEnv } from './paths.ts'
 import { CONTROL_KINDS } from './protocol.ts'
-import type { AgentKind, CommandResult, Effort, HookEventName, Role, SendRequest } from './types.ts'
+import type { AgentKind, CommandResult, Effort, HookEventName, Role, SendRequest, SpawnRequest } from './types.ts'
 
 type Values = Record<string, string | boolean | undefined>
 type Io = { out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number> }
@@ -40,6 +40,30 @@ export const splitGlobs = (text: string): string[] => {
   }
   return globs.map(glob => glob.trim()).filter(Boolean)
 }
+
+const onOff = (values: Values, key: string): boolean | undefined => {
+  const value = str(values, key)
+  if (value === undefined) return undefined
+  if (value !== 'on' && value !== 'off') throw new UsageError(`--${key} must be on or off; got "${value}"`)
+  return value === 'on'
+}
+// An empty value is the empty list ("--mcp ''" keeps Drove's server alone); a flag left out is undefined.
+const nameList = (values: Values, key: string): string[] | undefined => str(values, key)?.split(',').map(name => name.trim()).filter(Boolean)
+export const spawnRequestOf = (values: Values, positionals: readonly string[], brief: string): SpawnRequest => ({
+  seat: need(positionals[0], '<seat>'),
+  kind: need(str(values, 'kind'), '--kind') as AgentKind,
+  cairn: str(values, 'cairn'),
+  brief,
+  model: str(values, 'model'),
+  effort: str(values, 'effort') as Effort | undefined,
+  base: str(values, 'base'),
+  mcp: nameList(values, 'mcp'),
+  plugins: nameList(values, 'plugins'),
+  userMemory: onOff(values, 'user-memory'),
+  owns: str(values, 'owns') === undefined ? undefined : splitGlobs(str(values, 'owns') as string),
+  maxTurns: count(values, 'max-turns'),
+  maxTokens: count(values, 'max-tokens'),
+})
 
 const count = (values: Values, key: string): number | undefined => (str(values, key) === undefined ? undefined : Number(str(values, key)))
 
@@ -105,27 +129,12 @@ export const COMMANDS: Record<string, Spec> = {
       ),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]',
+    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--user-memory on|off] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]',
     why: 'open a worker in its own worktree and pane, and brief it',
-    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, owns: { type: 'string' }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
+    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, 'user-memory': { type: 'string' }, owns: { type: 'string' }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
     run: async (values, positionals, io) => {
       const brief = need(str(values, 'brief'), '--brief')
-      return print(
-        await commands.spawn(commands.defaultDeps(), commands.identityOrPlanner(), {
-          seat: need(positionals[0], '<seat>'),
-          kind: need(str(values, 'kind'), '--kind') as AgentKind,
-          cairn: str(values, 'cairn'),
-          brief: brief === '-' ? await io.stdin() : brief,
-          model: str(values, 'model'),
-          effort: str(values, 'effort') as Effort | undefined,
-          base: str(values, 'base'),
-          mcp: str(values, 'mcp')?.split(',').map(name => name.trim()).filter(Boolean),
-          owns: str(values, 'owns') === undefined ? undefined : splitGlobs(str(values, 'owns') as string),
-          maxTurns: count(values, 'max-turns'),
-          maxTokens: count(values, 'max-tokens'),
-        }),
-        io,
-      )
+      return print(await commands.spawn(commands.defaultDeps(), commands.identityOrPlanner(), spawnRequestOf(values, positionals, brief === '-' ? await io.stdin() : brief)), io)
     },
   },
   send: {

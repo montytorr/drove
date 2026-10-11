@@ -9,6 +9,10 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - A Claude worker no longer gets a second report tool from the mod: `mcp__drove__report` is the one.
 - New `workerPlugins` config key: a Claude worker loads only the plugins and mods you list, plus Drove's own mod.
 - New `workerUserMemory: false` config key: a worker skips your `~/.claude/CLAUDE.md` and the `CLAUDE.md` files above the repo (Claude), and your `AGENTS.md` and `AGENTS.override.md` (Codex). It stays on by default.
+- A spawn can trim one worker: `plugins` (`--plugins a,b`) adds to `workerPlugins` and makes that worker plugin-lean even when the key is unset, and `userMemory` (`--user-memory on|off`) overrides `workerUserMemory` for that worker. They work in `drove spawn`, the spawn tool and the mod's `spawn_worker`, and a promote, restart or migrate keeps them. They are Claude-only: Codex has no per-launch switch for your `AGENTS.md`, so a Codex worker follows `workerUserMemory` and the spawn result says so.
+- The planner's role text has a "Lean spawns" paragraph: what a worker loads under your config, when to pass `mcp`, `plugins` and `userMemory`, and the MCP server and plugin names it can choose from (read from your Claude and Codex files, names only).
+- A spawn reports a `plugins` name that matches no plugin you have enabled, as it already does for MCP servers.
+- The README has a "Lean workers" section with a table of each switch, its default and what it saves.
 
 ## [0.2.0] - 2026-10-11
 

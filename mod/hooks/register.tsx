@@ -7,7 +7,7 @@ import type { BoardRow, Cell, Tone } from './board'
 import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeHeadlines } from './bridge'
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
-import { modelNotice, orchestratorSection, workerModelSection } from './prompts'
+import { type LeanSpawnTrims, modelNotice, orchestratorSection, workerModelSection } from './prompts'
 import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, goalFromPrompt, oneLine, raiseEffort, renderControl, shortModel, verifyEnvelope } from './protocol'
 import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
 
@@ -157,6 +157,56 @@ const humanNameOf = async ($: EngineInterface): Promise<string> => {
   }
 }
 
+const readJsonAt = async ($: EngineInterface, path: string): Promise<Record<string, unknown>> => {
+  try {
+    const value = JSON.parse(await $.fs.read(path)) as unknown
+    return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
+const stringsOf = (value: unknown): string[] | undefined =>
+  Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.trim()).filter(Boolean) : undefined
+
+const keysOf = (value: unknown): string[] => (value && typeof value === 'object' && !Array.isArray(value) ? Object.keys(value) : [])
+
+// What a spawned worker loads under Drove's settings, and the MCP server and plugin names the orchestrator can choose
+// from. Read only, best effort, names only; held for the session because the prompt is composed every request.
+let leanTrims: Promise<LeanSpawnTrims> | undefined
+const trimsOf = ($: EngineInterface): Promise<LeanSpawnTrims> => {
+  leanTrims ??= (async () => {
+    const [home, userHome, claudeConfigDir, codexHome, cwd] = await Promise.all([homeDir($), $.env.get('HOME'), $.env.get('CLAUDE_CONFIG_DIR'), $.env.get('CODEX_HOME'), $.session.cwd()])
+    const claudeDir = claudeConfigDir || `${userHome ?? ''}/.claude`
+    const [droveConfig, claudeJson, projectMcp, settings, codexConfig] = await Promise.all([
+      readJsonAt($, `${home}/config.json`),
+      readJsonAt($, `${claudeConfigDir || userHome || ''}/.claude.json`),
+      readJsonAt($, `${cwd}/.mcp.json`),
+      readJsonAt($, `${claudeDir}/settings.json`),
+      $.fs.read(`${codexHome || `${userHome ?? ''}/.codex`}/config.toml`).catch(() => undefined),
+    ])
+    const local = (claudeJson.projects as Record<string, { mcpServers?: unknown } | undefined> | undefined)?.[cwd]?.mcpServers
+    const mcp = [...new Set([...keysOf(claudeJson.mcpServers), ...keysOf(projectMcp.mcpServers), ...keysOf(local)])].filter(name => name !== 'drove')
+    const dirs = typeof (settings.env as { CLAUDE_CODE_PLUGIN_DIRS?: unknown } | undefined)?.CLAUDE_CODE_PLUGIN_DIRS === 'string'
+      ? ((settings.env as { CLAUDE_CODE_PLUGIN_DIRS: string }).CLAUDE_CODE_PLUGIN_DIRS.split(':').map(entry => entry.trim()).filter(Boolean))
+      : []
+    const dirNames = await Promise.all(dirs.map(async dir => {
+      const name = (await readJsonAt($, `${dir.replace(/^~(?=\/)/, userHome ?? '~')}/.claude-plugin/plugin.json`)).name
+      return typeof name === 'string' && name.trim() ? name.trim() : dir.split('/').filter(Boolean).at(-1) ?? dir
+    }))
+    const enabled = Object.entries((settings.enabledPlugins as Record<string, unknown> | undefined) ?? {}).filter(([, on]) => on === true).map(([key]) => key.split('@')[0] ?? key)
+    const plugins = [...new Set([...enabled, ...dirNames])].filter(name => name !== 'orchestrator')
+    const codexMcp = codexConfig === undefined ? undefined : [...new Set([...codexConfig.matchAll(/^\[mcp_servers\.([A-Za-z0-9_-]+)\]/gm)].map(match => match[1] ?? '').filter(name => name && name !== 'drove'))]
+    return {
+      ...(stringsOf(droveConfig.workerMcp) ? { workerMcp: stringsOf(droveConfig.workerMcp) } : {}),
+      ...(stringsOf(droveConfig.workerPlugins) ? { workerPlugins: stringsOf(droveConfig.workerPlugins) } : {}),
+      ...(typeof droveConfig.workerUserMemory === 'boolean' ? { workerUserMemory: droveConfig.workerUserMemory } : {}),
+      mcp, plugins, ...(codexMcp ? { codexMcp } : {}),
+    }
+  })()
+  return leanTrims
+}
+
 const entryOf = ($: EngineInterface): string => drove.entryOf($.plugin.root, config.droveEntry)
 
 type RunInit = { env?: Record<string, string>; stdin?: string; timeoutMs?: number; cwd?: string }
@@ -231,6 +281,8 @@ const ORCHESTRATOR_TOOLS = [
         model: { type: 'string', description: 'Claude: sonnet (default) or opus, or a full model id. Codex: a model id, or leave out for Drove’s default' },
         cairn: { type: 'string', description: 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
         mcp: { type: 'array', items: { type: 'string' }, description: 'optional: the user MCP servers this worker needs, by name; [] for Drove’s alone. Left out, Drove’s workerMcp setting decides' },
+        plugins: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: the user plugins this worker needs, by name; [] for Drove’s mod alone. Left out, Drove’s workerPlugins setting decides (every enabled plugin when unset)' },
+        userMemory: { type: 'boolean', description: 'optional, Claude workers: true loads your own CLAUDE.md files, false leaves them out. Left out, Drove’s workerUserMemory setting decides (loaded by default). Codex workers follow the setting alone' },
         owns: { type: 'array', items: { type: 'string' }, description: 'optional: globs, relative to the worktree, of the files this worker may change; Drove’s guard refuses its edits elsewhere. Left out, it may edit anywhere' },
         maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
         maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
@@ -385,10 +437,12 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const model = kind === 'claude' ? resolveModel(input.model, config.workerModel) : typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
   if (!(await herdrPane($))) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
   const mcp = Array.isArray(input.mcp) ? input.mcp.filter((entry): entry is string => typeof entry === 'string') : undefined
+  const plugins = Array.isArray(input.plugins) ? input.plugins.filter((entry): entry is string => typeof entry === 'string') : undefined
+  const userMemory = typeof input.userMemory === 'boolean' ? input.userMemory : undefined
   const owns = Array.isArray(input.owns) ? input.owns.filter((entry): entry is string => typeof entry === 'string') : undefined
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
@@ -1018,6 +1072,7 @@ export const register: Register = (on, options) => {
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
+    leanTrims = undefined
     if (!e.isInteractive || (await isSummariser($))) return started
     const role = await $.env.get('DROVE_ROLE')
     if (role === 'worker') {
@@ -1157,7 +1212,7 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
-    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, { ...config, humanName: await humanNameOf($) }), scope: 'session' as const }] }
+    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, { ...config, humanName: await humanNameOf($), trims: await trimsOf($) }), scope: 'session' as const }] }
     const model = self ? workerModelSection(self) : undefined
     if (model) return { sections: [...composed.sections, { id: 'orchestrator:worker-model', text: model, scope: 'session' as const }] }
     return composed

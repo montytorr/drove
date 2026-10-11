@@ -90,6 +90,8 @@ describe('drove client', () => {
     expect(spawnArgs({ name: 'w-x', kind: 'codex', effort: 'low' })).toEqual(['spawn', 'w-x', '--kind', 'codex', '--brief', '-', '--effort', 'low'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', mcp: ['mongodb', 'notion'] }).slice(-2)).toEqual(['--mcp', 'mongodb,notion'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', mcp: [] }).slice(-2)).toEqual(['--mcp', ''])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', plugins: ['context7', 'ccc-skills'], userMemory: false }).slice(-4)).toEqual(['--plugins', 'context7,ccc-skills', '--user-memory', 'off'])
+    expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', plugins: [], userMemory: true }).slice(-4)).toEqual(['--plugins', '', '--user-memory', 'on'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: ['src/a.ts', 'test/**'], maxTurns: 25, maxTokens: 1000000 }).slice(-6)).toEqual(['--owns', 'src/a.ts,test/**', '--max-turns', '25', '--max-tokens', '1000000'])
     expect(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low', owns: [] })).toEqual(spawnArgs({ name: 'w-x', kind: 'claude', effort: 'low' }))
   })
@@ -218,6 +220,7 @@ type Call = { args: string[]; stdin?: string; env?: Record<string, string>; cwd?
 
 type World = {
   registeredTools: string[]
+  toolSchemas: Record<string, unknown>
   commands: string[]
   calls: Call[]
   spawned: string[][]
@@ -298,7 +301,7 @@ const fakeDrove = (world: World, call: Call) => {
 const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HERDR_PANE_ID: 'w1:p2' }, stored: Record<string, unknown> = {}) => {
   const bridge = channel()
   const world: World = {
-    registeredTools: [], commands: [], calls: [], spawned: [], submitted: [], asked: [], toasts: [], stepped: [], files: {},
+    registeredTools: [], toolSchemas: {}, commands: [], calls: [], spawned: [], submitted: [], asked: [], toasts: [], stepped: [], files: {},
     answer: 'Open it', isOverBudget: false, isGuardBroken: false, bridge, bridgeCode: 0, store: new Map(Object.entries(stored)),
   }
   const clock = mock.clock(on, { now: NOW })
@@ -311,7 +314,7 @@ const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HER
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: env.DROVE_ROLE === 'worker' ? 's-auth' : SELF }))
   on('session.cwd', () => ({ value: '/work/repo' }))
-  on('tool.register', ($, e) => (world.registeredTools.push(e.name), { value: { tool: `mcp__orchestrator__${e.name}` } }))
+  on('tool.register', ($, e) => (world.registeredTools.push(e.name), (world.toolSchemas[e.name] = e), { value: { tool: `mcp__orchestrator__${e.name}` } }))
   on('command.register', ($, e) => (world.commands.push(e.name), { value: { command: e.name } }))
   on('ui.toast', ($, e) => (world.toasts.push(e.text), { value: undefined }))
   on('prompt.submit', ($, e) => (world.submitted.push(e.text), { text: e.text, context: e.context ?? [] }))
@@ -499,6 +502,36 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'spawn')).toHaveLength(2)
     await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many' })
     expect(droveCalls(world, 'spawn')[2]?.args.slice(-4)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20'])
+  })
+
+  test('spawn_worker passes plugins and userMemory to drove spawn, and its schema says what they default to', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await callTool($, 'spawn_worker', { name: 'w-lean', brief: 'Edit it', plugins: ['context7', 4], userMemory: false })
+    expect(droveCalls(world, 'spawn')[0]?.args.slice(-4)).toEqual(['--plugins', 'context7', '--user-memory', 'off'])
+    await callTool($, 'spawn_worker', { name: 'w-mem', brief: 'Follow the rules', userMemory: 'yes' })
+    expect(droveCalls(world, 'spawn')[1]?.args).not.toContain('--user-memory')
+    const { inputSchema } = world.toolSchemas.spawn_worker as { inputSchema: { properties: Record<string, { type: string; description: string }> } }
+    expect([inputSchema.properties.plugins?.type, inputSchema.properties.userMemory?.type]).toEqual(['array', 'boolean'])
+    expect(inputSchema.properties.plugins?.description).toContain('workerPlugins')
+    expect(inputSchema.properties.userMemory?.description).toContain('workerUserMemory')
+  })
+
+  test("the orchestrator section has Lean spawns: what a worker loads under Drove's config and the names it can pick", async ($, on) => {
+    const { world } = engine(on)
+    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ workerMcp: ['notion'], workerUserMemory: false })
+    world.files['/Users/test/.claude.json'] = JSON.stringify({ mcpServers: { notion: {}, mongodb: {}, drove: {} } })
+    world.files['/Users/test/.claude/settings.json'] = JSON.stringify({ enabledPlugins: { 'context7@claude-plugins-official': true, 'old@x': false } })
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    const text = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections[1]?.text ?? ''
+    expect(text).toContain('## Lean spawns')
+    expect(text).toContain("by default: only notion of the human's MCP servers, and no Claude in Chrome unless it is listed; every enabled plugin; none of the human's own CLAUDE.md files.")
+    expect(text).toContain('Claude servers: notion, mongodb.')
+    expect(text).toContain('Plugins: context7.')
+    expect(text).toContain('`mcp: ["claude-in-chrome"]`')
   })
 
   test('a full pane budget asks the human; yes raises the budget by one and spawns, no refuses', async ($, on) => {

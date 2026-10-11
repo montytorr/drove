@@ -1,7 +1,26 @@
 import { shortModel } from './roster.ts'
 import type { AgentKind, DroveConfig, RunMeta } from './types.ts'
 
-export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind): string => {
+// Names the planner can pass as mcp and plugins, read best effort from the user's own setup; names only (DROVE-89).
+export type AvailableTrims = { mcp?: string[]; codexMcp?: string[]; plugins?: string[] }
+
+const listOf = (names: readonly string[] | undefined, none: string): string => (names && names.length > 0 ? names.join(', ') : none)
+
+// The planner's own text only: the worker role stays identical across seats so it caches (DROVE-72).
+export const leanSpawns = (human: string, config: Pick<DroveConfig, 'workerMcp' | 'workerPlugins' | 'workerUserMemory'>, available: AvailableTrims = {}): string => {
+  const mcpNow = config.workerMcp ? `only ${listOf(config.workerMcp, "Drove's own server")} of ${human}'s MCP servers, and no Claude in Chrome unless it is listed` : `all of ${human}'s MCP servers and Claude in Chrome`
+  const pluginsNow = config.workerPlugins ? `only ${listOf(config.workerPlugins, "Drove's own mod")}` : 'every enabled plugin'
+  const memoryNow = config.workerUserMemory === false ? 'none of' : 'all of'
+  const seen = (label: string, names: readonly string[] | undefined): string => (names ? ` ${label}: ${listOf(names, 'none found')}.` : '')
+  return `## Lean spawns
+A Claude worker loads, by default: ${mcpNow}; ${pluginsNow}; ${memoryNow} ${human}'s own CLAUDE.md files. Each costs context on every turn, so trim per worker with spawn options:
+- \`mcp\`: the MCP servers it needs, by name; [] for Drove's alone, which also drops Claude in Chrome.${seen('Claude servers', available.mcp)}${seen('Codex servers', available.codexMcp)}
+- \`plugins\`: the plugins it needs, by name; [] for Drove's mod alone.${seen('Plugins', available.plugins)}
+- \`userMemory\`: true to load ${human}'s CLAUDE.md files, false to leave them out.
+A seat's \`mcp\` and \`plugins\` add to the run's workerMcp and workerPlugins; \`userMemory\` overrides workerUserMemory. A browser task needs \`mcp: ["claude-in-chrome"]\`; a worker that must follow ${human}'s own coding rules needs \`userMemory: true\`; a mechanical edit can be fully lean (\`mcp: []\`, \`plugins: []\`, \`userMemory: false\`). A Codex worker takes \`mcp\` and follows workerUserMemory only.`
+}
+
+export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind, available: AvailableTrims = {}): string => {
   const human = config.humanName
   const workerModel = shortModel(config.workerModel.claude)
   const promotedModel = shortModel(config.promotedModel.claude)
@@ -22,6 +41,8 @@ Git is yours: status, diff, log, branches, worktrees, commit, merge, rebase, che
 7. Promotion: when a worker asks, prefer raising its effort on ${workerModel} first; move it to ${promotedModel} with the drove promote tool when the problem needs deeper reasoning (hard debugging, design, subtle concurrency or security). Say why. Demote when the hard part is done.
 8. Close each worker with the drove close tool once its work is approved and committed, or no longer needed.
 9. Decisions that belong to ${human} (scope, prod, money, anything irreversible or unclear) go to ${human} ${ask}, never as prose in a report.
+
+${leanSpawns(human, config, available)}
 
 ## Panes
 You may have up to ${run.budget} worker panes open at once, created only through the drove spawn tool, which puts them in one workers tab of their own so this session keeps its full width. Beyond that, ask ${human} to run \`drove budget <n>\`. Never create panes, tabs, workspaces or worktrees any other way. ${human} watches progress with \`drove board\`.

@@ -8,9 +8,9 @@ import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matc
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
-import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readClaudePlugins, readCodexHome, redactSpec, specFor, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
+import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readClaudePlugins, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
-import { approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
+import { type AvailableTrims, approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
@@ -227,23 +227,35 @@ const codexHomeOf = async (deps: Deps, seat: Seat): Promise<Pick<CodexLaunchRequ
 const seatMcpAllow = (config: DroveConfig, seat: Pick<Seat, 'mcp'>): string[] | undefined =>
   config.workerMcp === undefined && seat.mcp === undefined ? undefined : [...new Set([...(config.workerMcp ?? []), ...(seat.mcp ?? [])])]
 
-type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[] }
+// The same rule for plugins (DROVE-89): workerPlugins or a seat's --plugins makes a Claude seat plugin-lean, Drove's own
+// mod aside, and the seat's list adds to the run's.
+const seatPluginAllow = (config: DroveConfig, seat: Pick<Seat, 'plugins'>): string[] | undefined =>
+  config.workerPlugins === undefined && seat.plugins === undefined ? undefined : [...new Set([...(config.workerPlugins ?? []), ...(seat.plugins ?? [])])]
 
+// A seat's own userMemory wins over workerUserMemory; a Codex seat cannot use it (see below).
+const isSeatMemoryOff = (config: DroveConfig, seat: Pick<Seat, 'userMemory'>): boolean => (seat.userMemory ?? config.workerUserMemory) === false
+
+type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[]; unknownPlugins: string[] }
+
+// Codex's CODEX_HOME is shared by every seat of a run and Codex reads the user's AGENTS.md from it with no per-launch
+// way to skip it (probed in rust-v0.162.0: project_doc_* only gates the repo's own AGENTS.md). So a Codex seat follows
+// workerUserMemory alone, and a seat's plugins and userMemory options are Claude-only.
 const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
   const mcpAllow = seatMcpAllow(config, seat)
-  const isMemoryOff = config.workerUserMemory === false
   if (seat.kind === 'claude') {
     // The user's MCP servers, plugins and memory are read only when a switch asks for them (DROVE-72, DROVE-88).
     const claudeDir = deps.claudeUserDir ?? userClaudeDir()
+    const pluginAllow = seatPluginAllow(config, seat)
     const userMcp = mcpAllow ? await readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo) : undefined
-    const userPlugins = config.workerPlugins ? await readClaudePlugins(join(claudeDir, 'settings.json')) : undefined
+    const userPlugins = pluginAllow ? await readClaudePlugins(join(claudeDir, 'settings.json')) : undefined
     return {
       parts: {
         ...(mcpAllow && userMcp ? { mcpAllow, userMcp } : {}),
-        ...(config.workerPlugins && userPlugins ? { pluginAllow: config.workerPlugins, userPlugins } : {}),
-        ...(isMemoryOff ? { userMemory: false, claudeDir } : {}),
+        ...(pluginAllow && userPlugins ? { pluginAllow, userPlugins } : {}),
+        ...(isSeatMemoryOff(config, seat) ? { userMemory: false, claudeDir } : {}),
       },
       missing: mcpAllow && userMcp ? mcpAllow.filter(name => name !== 'drove' && name !== CHROME_SERVER && userMcp[name] === undefined) : [],
+      unknownPlugins: pluginAllow && userPlugins ? unknownPlugins(pluginAllow, userPlugins) : [],
     }
   }
   const { codexHome } = await codexHomeOf(deps, seat)
@@ -254,14 +266,39 @@ const launchExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
       ...(mcpAllow ? { mcpAllow } : {}),
       ...(config.workerMcp ? { homeMcpAllow: config.workerMcp } : {}),
       ...(config.workerSkills ? { skillAllow: config.workerSkills } : {}),
-      ...(isMemoryOff ? { userMemory: false } : {}),
+      ...(config.workerUserMemory === false ? { userMemory: false } : {}),
     },
     missing: codexHome && mcpAllow ? mcpAllow.filter(name => name !== 'drove' && !known.includes(name)) : [],
+    unknownPlugins: [],
+  }
+}
+
+// Names only, read best effort and never written: what the planner can pass as mcp and plugins (DROVE-89).
+const availableTrimsOf = async (deps: Deps, run: RunMeta): Promise<AvailableTrims> => {
+  const claudeDir = deps.claudeUserDir ?? userClaudeDir()
+  const [claudeMcp, plugins, codexConfig] = await Promise.all([
+    readClaudeMcp(deps.claudeUserConfig ?? userClaudeConfig(), run.repo).catch(() => undefined),
+    readClaudePlugins(join(claudeDir, 'settings.json')).catch(() => undefined),
+    readFile(join(deps.codexUserHome ?? userCodexHome(deps.home), 'config.toml'), 'utf8').catch(() => undefined),
+  ])
+  return {
+    ...(claudeMcp ? { mcp: Object.keys(claudeMcp).filter(name => name !== 'drove') } : {}),
+    ...(codexConfig !== undefined ? { codexMcp: codexMcpNames(codexConfig) } : {}),
+    ...(plugins ? { plugins: [...new Set([...plugins.enabled.map(key => key.split('@')[0] ?? key), ...(plugins.dirs ?? []).map(dir => dir.name)])].filter(name => name !== 'orchestrator') } : {}),
   }
 }
 
 const missingMcpNote = (seat: Seat, missing: readonly string[]): string[] =>
   missing.length > 0 ? [`MCP server${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} not in the user's ${seat.kind === 'claude' ? 'Claude' : 'Codex'} setup, so ${seat.name} runs without ${missing.length > 1 ? 'them' : 'it'}.`] : []
+
+const unknownPluginsNote = (seat: Seat, unknown: readonly string[]): string[] =>
+  unknown.length > 0 ? [`Plugin${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')} ${unknown.length > 1 ? 'are' : 'is'} not enabled in the user's Claude settings, so ${seat.name} runs without ${unknown.length > 1 ? 'them' : 'it'}.`] : []
+
+// plugins and userMemory shape a Claude seat's settings only; saying so beats a silent no-op.
+const claudeOnlyNote = (seat: Seat): string[] =>
+  seat.kind === 'codex' && (seat.plugins !== undefined || seat.userMemory !== undefined)
+    ? [`${seat.name} is a Codex seat: ${[seat.plugins !== undefined ? 'plugins' : '', seat.userMemory !== undefined ? 'userMemory' : ''].filter(Boolean).join(' and ')} apply to Claude seats only. A Codex seat follows the workerUserMemory config key, since its CODEX_HOME is shared by the run.`]
+    : []
 
 // A Codex seat without a Drove-owned home got its role inside its brief, so a relaunch adds none.
 const seatRoleText = (run: RunMeta, config: DroveConfig, seat: Seat): string => (seat.kind === 'codex' && !seat.codexHome ? '' : workerRole(run, config))
@@ -505,7 +542,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     deps,
     {
       identity, kind, repo, cwd: repo, model, effort,
-      roleText: plannerRole(run, config, kind),
+      roleText: plannerRole(run, config, kind, await availableTrimsOf(deps, run)),
       initialPrompt: goalTask?.prompt ?? request.goal ?? (kind === 'codex' ? SESSIONLESS_PROMPT : undefined),
       channel: kind === 'claude' && config.claudeChannel,
       ...(sessionId ? { sessionId } : {}),
@@ -626,6 +663,9 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (request.effort && !EFFORTS.includes(request.effort)) return failed('usage', `--effort must be one of ${EFFORTS.join(', ')}`)
   const badMcp = request.mcp?.find(name => !MCP_NAME_RE.test(name))
   if (badMcp !== undefined) return failed('usage', `--mcp takes server names separated by commas; got "${badMcp}"`)
+  const badPlugin = request.plugins?.find(name => !MCP_NAME_RE.test(name))
+  if (badPlugin !== undefined) return failed('usage', `--plugins takes plugin names separated by commas; got "${badPlugin}"`)
+  if (request.userMemory !== undefined && typeof request.userMemory !== 'boolean') return failed('usage', '--user-memory must be on or off')
   const owns = ownsOf(request.owns)
   const badOwns = owns?.find(glob => glob.startsWith('/') || glob.startsWith('~') || glob.split('/').includes('..'))
   if (badOwns !== undefined) return failed('usage', `--owns takes globs relative to the worktree, without .. or a leading / or ~; got "${badOwns}"`)
@@ -652,7 +692,9 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const launchCwd = isClaude ? run.repo : worktree
   const sessionId = kind === 'claude' ? randomUUID() : undefined
   const seat: Seat = {
-    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}), ...(owns ? { owns } : {}), model, effort, worktree, branch,
+    name: request.seat, kind, ...(request.cairn ? { cairn: request.cairn } : {}), ...(request.mcp ? { mcp: [...new Set(request.mcp)] } : {}),
+    ...(request.plugins ? { plugins: [...new Set(request.plugins)] } : {}), ...(request.userMemory !== undefined ? { userMemory: request.userMemory } : {}),
+    ...(owns ? { owns } : {}), model, effort, worktree, branch,
     ...(request.maxTurns ?? config.maxTurns ? { maxTurns: request.maxTurns ?? config.maxTurns } : {}), ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
     ...(isClaude ? {} : { codexHome: codexHomeDir(deps.home, run.id) }),
@@ -721,7 +763,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const initialPrompt = isViaPrompt ? undefined : briefText
   await saveBrief(deps, run.id, seat.name, briefText)
   const extras = await launchExtrasOf(deps, run, config, seat)
-  baseNotes.push(...missingMcpNote(seat, extras.missing))
+  baseNotes.push(...missingMcpNote(seat, extras.missing), ...unknownPluginsNote(seat, extras.unknownPlugins), ...claudeOnlyNote(seat))
   const spec = specFor(
     launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: workerRole(run, config), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
   )
@@ -1116,7 +1158,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
     }
     const workerIdentity: Identity = { home: deps.home, run: run.id, role: 'worker', seat: seat.name, token, ...(seat.owns ? { owns: seat.owns } : {}) }
     const extras = await launchExtrasOf(deps, run, config, migrated)
-    notes.push(...missingMcpNote(migrated, extras.missing))
+    notes.push(...missingMcpNote(migrated, extras.missing), ...unknownPluginsNote(migrated, extras.unknownPlugins), ...claudeOnlyNote(migrated))
     const spec = specFor(
       launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: seat.worktree, model, effort, roleText: workerRole(run, config), inWorktree: true, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
     )
@@ -1489,7 +1531,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
   const sessionId = planner.kind === 'claude' ? planner.sessionId ?? randomUUID() : undefined
   const resumeId = planner.sessionId
   const spec = specFor(
-    launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: plannerRole(run, config, planner.kind), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
+    launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: plannerRole(run, config, planner.kind, await availableTrimsOf(deps, run)), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
   )
   await writeLaunchFiles(spec)
   const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}`

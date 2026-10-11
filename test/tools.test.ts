@@ -152,6 +152,24 @@ test('the spawn tool passes owns, maxTurns and maxTokens through, and checks the
   assert.equal(fake.calls.length, 1)
 })
 
+test('the spawn tool passes plugins and userMemory through, and says what they do and default to', async () => {
+  const { fake, tool } = await plannerWith()
+  await tool('spawn').call({ seat: 'w-ui', kind: 'claude', brief: 'x', plugins: ['context7', ' '], userMemory: false })
+  await tool('spawn').call({ seat: 'w-db', kind: 'claude', brief: 'x', plugins: [], userMemory: true })
+  assert.deepEqual(fake.calls, [
+    { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, plugins: ['context7'], userMemory: false }] },
+    { name: 'spawn', args: [{ seat: 'w-db', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, plugins: [], userMemory: true }] },
+  ])
+  const schema = tool('spawn').inputSchema as { properties: Record<string, { type: string; description: string }> }
+  assert.deepEqual([schema.properties.plugins?.type, schema.properties.userMemory?.type], ['array', 'boolean'])
+  assert.match(schema.properties.plugins?.description ?? '', /Claude workers only.*Left out.*workerPlugins/)
+  assert.match(schema.properties.userMemory?.description ?? '', /Claude workers only.*Left out.*workerUserMemory/)
+  for (const args of [{ plugins: 'context7' }, { plugins: [1] }, { userMemory: 'false' }]) {
+    assert.equal((await tool('spawn').call({ seat: 'w-x', kind: 'claude', brief: 'x', ...args })).isError, true, JSON.stringify(args))
+  }
+  assert.equal(fake.calls.length, 2)
+})
+
 test('planner tools reject bad arguments before calling a command', async () => {
   const { fake, tool } = await plannerWith()
   const bad: [string, Record<string, unknown>][] = [

@@ -88,6 +88,8 @@ export type Seat = {
   sessionId?: string
   codexHome?: string
   mcp?: string[]
+  plugins?: string[]
+  userMemory?: boolean
   owns?: string[]
   maxTurns?: number
   maxTokens?: number
@@ -309,6 +311,8 @@ export type SpawnRequest = {
   effort?: Effort
   base?: string
   mcp?: string[]
+  plugins?: string[]
+  userMemory?: boolean
   owns?: string[]
   maxTurns?: number
   maxTokens?: number
