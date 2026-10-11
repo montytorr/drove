@@ -29,6 +29,14 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - The board shows `R` or `T` beside a reviewer or tester, and `drove roster` says `reviewer of <seat>`.
 - New env `DROVE_SEAT_ROLE` (set for a reviewer or tester only).
 
+### Unattended runs (unproven live until the Bothy proof)
+- New `--detached` on `drove plan` and `drove up` (DROVE-95): Drove opens a herdr workspace of its own for the run, through its herdr adapter (`herdr workspace create --no-focus`), starts the planner in its root pane and returns at once, so a job outside herdr needs no pane. It works with `--goal`, `--from-cairn REF`, `--next PROJECT` and `drove up --run ID` (the run may also be a bare argument). With `--json` it prints the run id, the workspace, the planner pane and the planner's state; a planner stopped at a startup dialog is reported as `blocked`, not as a failure. When no herdr server is reachable it refuses with `herdr-down` and creates nothing: Drove never starts the server. A start that fails closes its workspace and puts a new run back `down`.
+- New `drove attention [--run ID | --all] [--json] [--follow]` (DROVE-96): the board's needs-a-person items as data. Each has a stable `id` (across polls and processes, new per episode), `run`, `seat`, `kind`, `text`, `since` and `answer` (the exact command, or "answer in the pane"). It covers seat dialogs and approvals, workers asking in their pane, reports addressed to the human, pane-budget requests (a 6th pane), gone seats, and the planner's own dialog or absence. `--follow` prints `new` and `resolved` items as JSON lines.
+- A spawn the pane budget refuses now records an `attention` event (`reason: pane-budget`), so the request outlives the planner's dialog.
+- `drove roster --json` also gives `planner.state` (whether the planner pane is alive), `lastReport` (the latest of any seat) and `updatedAt`.
+- `drove send` takes `--run ID`, for an answer sent from outside the run's folder. With `--json`, a failure of `plan --detached`, `up --detached` or `attention` is one JSON object on stderr.
+- The README has an "Unattended runs" section and DESIGN a §14 on the interface and what it needs on the host.
+
 ## [0.3.0] - 2026-10-11
 
 Leaner workers the planner trims per spawn, a more reliable `/orchestrate`, and `drove init` for starting a goal in a new repo.

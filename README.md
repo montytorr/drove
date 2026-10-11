@@ -123,25 +123,113 @@ Review and testing can be seats of their own. They are optional: the planner rea
 
 | Command | Use |
 |---|---|
-| `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT \| --from-cairn REF \| --next PROJECT] [--run ID]` | start a planner in this pane; `--from-cairn` makes a Cairn task the run's goal, `--next` the top task of a Cairn project |
+| `drove plan [--kind claude\|codex] [--model M] [--effort E] [--goal TEXT \| --from-cairn REF \| --next PROJECT] [--run ID] [--detached [--json]]` | start a planner in this pane; `--from-cairn` makes a Cairn task the run's goal, `--next` the top task of a Cairn project; `--detached` opens a herdr workspace of its own instead and returns at once (see "Unattended runs") |
 | `drove spawn <seat> --kind claude\|codex --cairn REF --brief TEXT\|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--user-memory on\|off] [--role implementer\|reviewer\|tester --target SEAT] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]` | open a worker and brief it; `--mcp`, `--plugins` and `--user-memory` are under "Lean workers", `--role` and `--target` under "Reviewer and tester seats", `--owns` and the budgets under "Rules Drove enforces" |
-| `drove send <seat> --kind message\|answer\|verdict [--verdict approve\|changes] [--expects review\|answer\|none] TEXT\|-` | send one control message |
+| `drove send <seat> --kind message\|answer\|verdict [--verdict approve\|changes] [--expects review\|answer\|none] [--run ID] TEXT\|-` | send one control message; `--run` names the run when you send from outside it |
 | `drove prompt <seat> TEXT\|-` | raw prompt into a seat of this run (guarded) |
 | `drove promote <seat> [--model M] --effort E [--reason TEXT]` | change a worker's model or effort |
 | `drove migrate <seat> --kind claude\|codex [--model M] [--effort E] [--reason TEXT]` | move a worker to the other kind in the same worktree, with a handoff brief |
 | `drove init <dir> [--json]` | make a new git repo (branch `main`, one empty commit) in an empty or missing directory, then attach the run there; refuses a non-empty directory or an existing repo |
-| `drove roster [--json] [--run ID]` | one line per seat |
+| `drove roster [--json] [--run ID]` | one line per seat; `--json` also gives the run's status, the planner pane's state and the latest report (see "Unattended runs") |
+| `drove attention [--run ID \| --all] [--json] [--follow]` | what waits on a person, as data: dialogs, questions for the human, pane-budget requests, gone seats; `--follow` streams new and resolved items as JSON lines (see "Unattended runs") |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
 | `drove merge <seat> [--pr] [--squash] [-m MSG] [--run ID]` | integrate a worker's branch behind the repo's checks: they run in the seat's worktree, then the branch is merged `--no-ff` into the base; `--pr` goes through a GitHub pull request instead (see "The merge gate") |
 | `drove board [--once] [--web [--port N]] [--run ID]` | live coloured board, the orchestrator mod's layout on your terminal's own background; one frame with `--once` or when piped; no colour when piped or with `NO_COLOR`; `--web` serves the same board read-only in a browser (see below); this repo's latest run unless `--run` or `DROVE_RUN` |
-| `drove down [--run ID]` / `drove up [--run ID] [--seat SEAT]` | stop and resume a run |
+| `drove down [--run ID]` / `drove up [--run ID] [--seat SEAT] [--detached [--json]]` | stop and resume a run; the run may also be given as a bare argument, and `--detached` resumes it in a workspace of its own |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only; agents are denied) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
 
 `drove board --web` serves the board to a browser on `127.0.0.1`, on a free port or the one you give with `--port N`. It prints a URL that ends in a token made at each start; open that URL. The page opens on a graph: the lead in the middle (or on top on a narrow screen) and each open seat a node around it, with its name, kind, model and effort, Cairn ref, current activity and a state colour; a seat that is working pulses, and one that asks, is blocked or has an attention item carries a "needs you" badge. When a new brief, report or verdict reaches the timeline, a dot labelled with its kind travels along the edge between the lead and the seat (nothing moves for entries already there at load, or with `prefers-reduced-motion`, where the edge only lights up). A Graph | Board switch next to the title goes to the terminal board's rows; the page remembers the choice. Click a seat (node or row) to open its detail: kind, model, effort, state and age, branch, worktree, Cairn ref and session id, and the last 40 lines of its pane as plain text, refreshed every few seconds while it is open. The commands to copy (`drove capture <seat>` and the worktree path) are shown as text. The timeline is one line per entry (time, icon, from → to, kind, summary clipped, newest first); click it, or press Enter or Space, to open its full text below, and again to close. Chips above it show only what needs you, only reports, or everything. The page follows your system's light or dark theme. It is read-only: only GET and HEAD are answered. A request whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>`, whose `Origin` is another site, or that has no token, is refused. Ctrl-C stops it. Drove has no daemon, so the page is there only while the command runs.
 
 `drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `roster`, `capture` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
+
+## Unattended runs
+
+> **Unproven live.** This interface is built and tested against a fake herdr, not yet against a real herdr server and a job that wakes on its own. Every statement about a live run below is a design claim until the Bothy proof (DROVE-95) has run it. The JSON shapes are meant to stay stable; the proof may still change them.
+
+A job outside herdr (cron, a webhook, a chat command; Bothy is the first) can start a run, watch it, hear what needs a person, and resume it, using four commands and no pane.
+
+**Start.** `--detached` makes Drove open its own herdr workspace for the run and start the planner in it, then return at once:
+
+```bash
+drove plan --from-cairn DROVE-5 --detached --json     # the goal is a Cairn task
+drove plan --next DROVE --detached --json             # the top task of a Cairn project
+drove plan --goal "Ship the widget" --detached --json
+drove up --run drove-20261009-1042-a3f1 --detached --json   # resume a stopped or crashed run (the run may also be a bare argument)
+```
+
+It prints one JSON object (without `--json`, one sentence with the same facts):
+
+```json
+{
+  "run": "drove-20261009-1042-a3f1",
+  "repo": "/Users/me/drove",
+  "status": "up",
+  "workspace": "w2",
+  "tab": "w2:t7",
+  "planner": { "kind": "claude", "pane": "w2:p7", "name": "planner-a3f1", "model": "claude-opus-5-5", "effort": "high", "state": "working", "sessionId": "…" },
+  "goal": "DROVE-5: Detach the planner",
+  "cairn": "DROVE-5",
+  "resumed": ["w-api"],
+  "lost": []
+}
+```
+
+`planner.state` is the seat state at return: `working`, `idle`, or `blocked` when the planner stopped on a startup dialog (then `planner.attention` has the reason). `resumed` and `lost` are there for `drove up`. The workers' tab opens in the same workspace, so the whole run is in one place in herdr.
+
+**What it needs on the host.**
+
+- A running herdr server that the command can reach: Drove asks it for its workspaces first and refuses with code `herdr-down` and nothing created when it cannot. It never starts the server (that is a person's session, and its panes are theirs to lose). `HERDR_SOCKET_PATH` names the socket when it is not the default; the command needs no herdr pane around it, so `HERDR_PANE_ID` is not read.
+- `herdr` on `PATH`, Node 22.18 or newer, `git`, the planner's agent CLI (`claude` or `codex`) on `PATH` and signed in, and `cairn` for `--from-cairn` and `--next`. The workspace is opened without taking focus, in the repo's root.
+- The same `DROVE_HOME` in every command that touches the run (the default is `~/.drove`).
+- Drove never answers a dialog. A first launch in a folder may ask to trust it, a Claude planner on the development channel asks to confirm it, a Codex planner may ask to approve Drove's hooks: each shows as `planner.state: "blocked"` and as an attention item for a person to answer in the pane. Trust the repo and approve the hooks once, by hand, before leaving a job to run alone.
+
+**What needs a person.** `drove attention` prints the same things the board shows red and the planner's wake lists under "Needs the human", as data:
+
+```bash
+drove attention --run ID --json          # one snapshot of one run
+drove attention --all --json             # every run that is up
+drove attention --run ID --json --follow # JSON lines: new and resolved items
+```
+
+A snapshot is `{"v":1,"at":"…","runs":["…"],"items":[…]}`; each item:
+
+```json
+{
+  "id": "drove-20261009-1042-a3f1:w-api:trust:1",
+  "run": "drove-20261009-1042-a3f1",
+  "seat": "w-api",
+  "kind": "trust",
+  "text": "Claude is asking to trust the folder",
+  "since": "2026-10-09T09:20:00.000Z",
+  "answer": { "type": "pane", "pane": "w2:p9", "inspect": "drove capture w-api --run drove-20261009-1042-a3f1", "note": "Answer it in the pane. Drove never answers a dialog or an approval." }
+}
+```
+
+| `kind` | What it is | `answer` |
+|---|---|---|
+| `dialog`, `permission`, `trust`, `hook-trust`, `channel-confirm`, `codex-version-mismatch` | a seat (or the planner, `seat: "planner"`) is stopped at a dialog or an approval | `pane`: the pane id, and a command that reads the screen |
+| `asking` | a worker asked a question in its pane (the mod's status line carries it) | `pane` |
+| `question`, `blocked`, `promote` | a worker's report addressed to the human (`for: human`) that is still unanswered | `command`: `drove send <seat> --run ID --kind answer <answer>` (`-` reads stdin) |
+| `pane-budget` | a spawn the pane budget refused (a 6th pane) | `command`: `drove budget <n> --run ID` |
+| `gone` | a seat's pane is gone (or the planner's, while the run is `up`) | `command`: `drove up --run ID --seat SEAT` (the planner: `drove up --run ID --detached`) |
+| `usage-limit` | the agent hit its plan limit | `pane`: it resumes when the limit resets |
+| `stalled`, `idle-without-report`, `budget`, `pending-delivery` | the planner's to handle | `planner`: nothing for a person unless the planner asks |
+
+`answer.type` is `command` (an exact command; `<answer>` is yours to fill in), `pane` (answer it where the agent is; Drove will not), or `planner`. Every item is something Drove itself calls "needs the human" or "needs you", so a forwarder can filter on `kind`.
+
+- **`id` is stable** for as long as the item is open, across polls and across processes; it is `<run>:<seat>:<kind>:<n>`, where `n` counts the episodes of that same thing. An item that went away and came back is a new `id`. `since` is when it began and does not move.
+- **`--follow`** prints one JSON line per change, `{"v":1,"event":"new"|"resolved","at":"…","item":{…}}`, and polls every 3 seconds. It starts by announcing everything already open as `new`, so a restarted follower repeats those: dedupe on `id`. A `resolved` line carries the item as last seen. It stops on Ctrl-C or SIGTERM. Drove has no daemon: a snapshot is computed when you ask, and nothing is watched in between.
+- **What "resolved" means.** A dialog is resolved when the pane is no longer at it; a report for the human when the worker is no longer owed an answer (you answered it, or it sent a later report); a pane-budget request when the budget is raised, a slot frees or the seat starts; a `gone` item when the pane is back.
+
+**What the run is doing.** `drove roster --run ID --json` is the status read: `run.status` (`up` or `down`), `seats[]` (each with `state`, `owes`, `lastReport`, `attention`), `planner.state` (`idle`, `working`, `blocked`, `done`, `unknown`, `gone`, `unreachable` when herdr could not be asked, or `down`), `lastReport` (the latest of any seat, with its `seat`) and `updatedAt`. A run that is `up` while `planner.state` is `gone` is a crash: resume it with `drove up --run ID --detached`.
+
+**Resume.** `drove down` and a crash both leave the run resumable: `drove up --run ID --detached` reopens the seats with their saved sessions, then the planner with its own, in a new workspace. A run that is still `up` is resumed only when none of its panes is alive.
+
+**Failure.** With `--json`, a failure is one JSON object on stderr, `{"ok":false,"code":"herdr-down","error":"…"}`, and the exit status is 1; bad usage exits 2. Codes a job should expect: `herdr-down` (no server), `herdr` (herdr refused a step), `no-run`, `no-task` and `task-closed` (Cairn), `not-a-repo`, `not-down` (the run still has a live pane), `usage`. A start that cannot finish closes the workspace it opened and marks a new run `down`, so `drove up --run ID --detached` can try it again.
+
+**Not proven.** A real herdr server opening a workspace without a client attached; a planner started by `agent start` in a workspace nobody is looking at; the wake reaching it there; and the shapes above under a real poller. Until then treat a stuck start as a bug to report, not a state to build on.
 
 ## Rules Drove enforces
 

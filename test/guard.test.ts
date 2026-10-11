@@ -271,7 +271,7 @@ test('workers may do anything but push, drive panes or start sessions (ported fr
 })
 
 test('drove subcommands are allowed or denied per role', () => {
-  for (const sub of ['spawn w-x', 'send w-x hi', 'prompt w-x hi', 'promote w-x', 'merge w-x', 'merge w-x --pr --squash -m "merge: x"', 'roster --json', 'capture w-x', 'close w-x', 'board --once', 'down']) {
+  for (const sub of ['spawn w-x', 'send w-x hi', 'prompt w-x hi', 'promote w-x', 'merge w-x', 'merge w-x --pr --squash -m "merge: x"', 'roster --json', 'attention --run r --json', 'capture w-x', 'close w-x', 'board --once', 'down']) {
     assert.equal(planner(`drove ${sub}`), undefined, sub)
   }
   for (const sub of ['budget 6', 'plan', 'up', 'guard pre-tool-use', 'mcp', 'board', 'nonsense', '']) {
@@ -281,7 +281,7 @@ test('drove subcommands are allowed or denied per role', () => {
   assert.match(planner('drove budget 6') ?? '', /ask the human/)
   assert.equal(worker('drove roster'), undefined)
   assert.equal(worker('drove capture w-api --lines 5'), undefined)
-  for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once', 'merge w-x']) assert.ok(worker(`drove ${sub}`), sub)
+  for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once', 'merge w-x', 'attention']) assert.ok(worker(`drove ${sub}`), sub)
 })
 
 test('planner: a git merge of a seat branch is denied and points at drove merge, in any spelling', () => {
