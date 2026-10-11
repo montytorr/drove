@@ -4,6 +4,11 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+### Runs from a Lab subject (DROVE-94)
+- `drove plan --from-cairn LAB-n` starts a run from a Lab subject, read with `cairn --instance croft subject show LAB-n --json`. The goal is "LAB-n: <title>" and `run.cairn` is `LAB-n`. The planner's first prompt gives the write-up, the open todos (closed ones omitted) and the rules: one worker per todo spawned with the todo's own ref, progress noted with `subject note`, the subject never closed by the run.
+- New `labInstance` config key (default `croft`) names the Cairn instance that holds Lab subjects.
+- `drove down` writes its summary with `cairn --instance <labInstance> subject note` when the run's `cairn` is a LAB ref. `--next PROJECT` is unchanged.
+
 ### Planner
 - The planner handles GitHub itself through `gh`: PRs (all), issues, releases (`create`, `edit`, `upload`), workflow runs, labels, and `repo create --private|--internal`, `clone`, `fork`, `sync`. Deletions, transfers, secrets and variables, repo `edit`/`rename`/`archive`, public repo creation and `gh api` writes stay with the human, and any `gh` write naming a `production` branch (`--base`, `-B`, `--target`, `--ref`, or the head of `pr create`) is denied. Worker rules are unchanged (DROVE-104).
 

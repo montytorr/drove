@@ -64,6 +64,7 @@ drove plan --kind claude    # Claude Code without the mod
 drove plan --kind codex     # Codex; add --goal "..." to either for a first instruction
 drove plan --from-cairn DROVE-12   # the goal is that Cairn task's title and body
 drove plan --next DROVE            # the goal is the top task `cairn next --project DROVE` ranks
+drove plan --from-cairn LAB-21     # the goal is a Lab subject; its open todos become the workers
 drove board                 # in a spare pane: live seats, states and what needs a human
 drove board --web           # the same board in a browser, read-only
 ```
@@ -73,6 +74,8 @@ drove board --web           # the same board in a browser, read-only
 A run started without `--goal` takes the first prompt you type to the planner as its goal, the same way, in the mod and in the planner's `user-prompt-submit` hook.
 
 `--from-cairn REF` and `--next PROJECT` start a run from a Cairn task. The planner's first prompt carries the task's title and body and says it is the run's goal task, which the planner holds; Drove stores the ref as the run's `cairn`. The task must exist and be open (a done or cancelled one is refused), and `--goal` cannot be combined with either flag. `drove down` then writes a summary note on that task: the seats, which are closed, their branches and what is still open (best effort: a failure to write it never holds the run up).
+
+`--from-cairn LAB-21` starts a run from a Lab subject. Drove reads it with `cairn --instance croft subject show LAB-21 --json` (set `labInstance` in `~/.drove/config.json` for another instance). The run's goal is "LAB-21: <title>" and `run.cairn` is `LAB-21`. The planner's first prompt carries the subject's write-up and its open todos as refs and titles (done and cancelled ones are left out), and tells it to run one worker per todo, each spawned with the todo's own ref, to note progress with `cairn --instance croft subject note LAB-21 "…" --kind finding|decision`, and never to close the subject, since closing it needs your conclusion. `drove down` writes its summary with `subject note`. `--next PROJECT` is unchanged.
 
 ## How a worker's life goes
 
@@ -244,7 +247,7 @@ A snapshot is `{"v":1,"at":"…","runs":["…"],"items":[…]}`; each item:
 
 ## State and config
 
-State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia`, `maxTurns` (a default turn budget for every worker; unset by default) `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`), and `workerPorts` and `workerCopy` (see "Isolating workers"). Defaults are in `src/commands.ts`.
+State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia`, `labInstance` (the Cairn instance that holds Lab subjects, `croft` by default), `maxTurns` (a default turn budget for every worker; unset by default) `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`), and `workerPorts` and `workerCopy` (see "Isolating workers"). Defaults are in `src/commands.ts`.
 
 ### Lean workers
 

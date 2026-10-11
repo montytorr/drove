@@ -121,7 +121,7 @@ const textArg = async (positionals: string[], from: number, io: Io): Promise<str
 
 export const COMMANDS: Record<string, Spec> = {
   plan: {
-    usage: 'drove plan [--kind claude|codex] [--model M] [--effort E] [--goal TEXT | --from-cairn REF | --next PROJECT] [--run ID] [--detached [--json]]',
+    usage: 'drove plan [--kind claude|codex] [--model M] [--effort E] [--goal TEXT | --from-cairn REF|LAB-n | --next PROJECT] [--run ID] [--detached [--json]]',
     why: "start a planner in this pane; --from-cairn makes a Cairn task the run's goal, --next picks the top task of a Cairn project; --detached opens a herdr workspace of its own and returns at once (no pane needed)",
     options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, goal: { type: 'string' }, run: { type: 'string' }, 'from-cairn': { type: 'string' }, next: { type: 'string' }, detached: { type: 'boolean' }, json: { type: 'boolean' } },
     run: async (values, _positionals, io) => {

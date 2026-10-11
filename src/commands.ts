@@ -13,7 +13,7 @@ import * as herdr from './herdr.ts'
 import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './isolation.ts'
 import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readClaudePlugins, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
-import { type AvailableTrims, approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
+import { type AvailableTrims, LAB_RE, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
@@ -48,6 +48,7 @@ export const DEFAULT_CONFIG: DroveConfig = {
   codexWorkerSandbox: 'bypass',
   claudeChannel: false,
   briefVia: 'prompt',
+  labInstance: 'croft',
   workerEnv: {},
 }
 
@@ -104,7 +105,7 @@ const portsOf = (value: unknown): DroveConfig['workerPorts'] => {
 }
 
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const { workerMcp, workerSkills, workerPlugins, workerUserMemory, maxTurns, workerPorts, workerCopy, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, workerPlugins, workerUserMemory, maxTurns, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const ports = portsOf(workerPorts)
   const copy = namesOf(workerCopy)
   const mcp = namesOf(workerMcp)
@@ -120,6 +121,7 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
     ...(plugins ? { workerPlugins: plugins } : {}),
     ...(typeof workerUserMemory === 'boolean' ? { workerUserMemory } : {}),
     ...(isWhole(maxTurns) ? { maxTurns } : {}),
+    ...(typeof labInstance === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(labInstance.trim()) ? { labInstance: labInstance.trim() } : {}),
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
     workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel },
     promotedModel: { ...DEFAULT_CONFIG.promotedModel, ...file.promotedModel },
@@ -449,7 +451,7 @@ const cairnJson = async (deps: Deps, argv: string[]): Promise<{ value: Record<st
   try {
     const ran = await deps.exec(['cairn', ...argv], { timeoutMs: 15_000 })
     const output = `${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, '')
-    const gone = /^No (task|project) /m.exec(output)
+    const gone = /^No (task|project|subject) /m.exec(output)
     if (gone) return { missing: clip(output) }
     if (ran.code !== 0) return { skipped: `cairn exited ${ran.code}: ${clip(output)}` }
     const value: unknown = JSON.parse(ran.stdout)
@@ -487,7 +489,21 @@ const pickNextTask = async (deps: Deps, project: string): Promise<{ ref: string 
   return ref ? { ref } : { error: failed('no-task', `Cairn has no task to pick up in ${project}`) }
 }
 
-const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next'>): Promise<GoalTask | { error: CommandResult } | undefined> => {
+const readLabSubject = async (deps: Deps, instance: string, ref: string): Promise<{ subject: LabSubject } | { error: CommandResult }> => {
+  const read = await cairnJson(deps, ['--instance', instance, 'subject', 'show', ref, '--json'])
+  if ('missing' in read) return { error: failed('no-task', `Lab subject ${ref} does not exist on the ${instance} instance (${read.missing})`) }
+  if ('skipped' in read) return { error: failed('cairn', `could not read Lab subject ${ref}: ${read.skipped}`) }
+  const { value } = read
+  const title = textOf(value.title)
+  if (!title) return { error: failed('cairn', `Lab subject ${ref} has no title to use as a goal`) }
+  const todos = (Array.isArray(value.todos) ? value.todos : [])
+    .map(todo => (todo && typeof todo === 'object' ? (todo as Record<string, unknown>) : {}))
+    .map(todo => ({ ref: textOf(todo.ref), title: textOf(todo.title), status: textOf(todo.status) }))
+    .filter(todo => todo.ref && !CAIRN_CLOSED.includes(todo.status))
+  return { subject: { ref: textOf(value.ref) || ref, title, body: textOf(value.body), todos } }
+}
+
+const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next'>, labInstance: string): Promise<GoalTask | { error: CommandResult } | undefined> => {
   if (request.cairn === undefined && request.next === undefined) return undefined
   if (request.cairn !== undefined && request.next !== undefined) return { error: failed('usage', '--from-cairn and --next are exclusive') }
   if (request.goal) return { error: failed('usage', '--goal cannot be combined with --from-cairn or --next: the goal is the task') }
@@ -497,7 +513,13 @@ const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | '
     if ('error' in picked) return picked
     ref = picked.ref
   }
-  if (!ref || !CAIRN_RE.test(ref)) return { error: failed('usage', `--from-cairn must look like DROVE-5; got "${request.cairn ?? ''}"`) }
+  if (ref && LAB_RE.test(ref)) {
+    const read = await readLabSubject(deps, labInstance, ref)
+    if ('error' in read) return read
+    const { subject } = read
+    return { ref, goal: `${ref}: ${subject.title}`, prompt: labSubjectPrompt(subject, labInstance) }
+  }
+  if (!ref || !CAIRN_RE.test(ref)) return { error: failed('usage', `--from-cairn must look like DROVE-5 or LAB-21; got "${request.cairn ?? ''}"`) }
   const read = await readCairnTask(deps, ref)
   if ('missing' in read) return { error: failed('no-task', `Cairn task ${ref} does not exist (${read.missing})`) }
   if ('skipped' in read) return { error: failed('cairn', `could not read Cairn task ${ref}: ${read.skipped}`) }
@@ -513,7 +535,7 @@ const seatLine = (seat: Seat): string => {
 }
 
 // DROVE-70: best effort; a run that comes down must never be held up by Cairn.
-const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[], at: string): Promise<string | undefined> => {
+const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[], at: string, labInstance: string): Promise<string | undefined> => {
   if (!run.cairn) return undefined
   const open = seats.filter(seat => seat.state !== 'closed')
   const lines = [
@@ -522,9 +544,11 @@ const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[]
     ...seats.map(seatLine),
     open.length ? `Still open: ${open.map(seat => seat.cairn ?? seat.name).join(', ')}. Resume with \`drove up --run ${run.id}\`.` : 'Nothing is left open.',
   ]
+  const lab = LAB_RE.test(run.cairn)
   try {
-    const ran = await deps.exec(['cairn', 'note', run.cairn, lines.join('\n')], { timeoutMs: 15_000 })
-    if (ran.code === 0) return `Wrote a summary note on the goal task ${run.cairn}.`
+    const argv = lab ? ['cairn', '--instance', labInstance, 'subject', 'note', run.cairn, lines.join('\n')] : ['cairn', 'note', run.cairn, lines.join('\n')]
+    const ran = await deps.exec(argv, { timeoutMs: 15_000 })
+    if (ran.code === 0) return `Wrote a summary note on the goal ${lab ? 'subject' : 'task'} ${run.cairn}.`
     return `Note: the summary note on ${run.cairn} was not written (cairn exited ${ran.code}: ${clip(`${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, ''))}).`
   } catch (error) {
     return `Note: the summary note on ${run.cairn} was not written (${messageOf(error)}).`
@@ -627,7 +651,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const model = request.model ?? config.plannerModel[kind]
   const effort = request.effort ?? config.plannerEffort
   const sessionId = kind === 'claude' ? randomUUID() : undefined
-  const goalTask = await resolveGoalTask(deps, request)
+  const goalTask = await resolveGoalTask(deps, request, config.labInstance)
   if (goalTask && 'error' in goalTask) return goalTask.error
   const goal = goalTask?.goal ?? request.goal
 
@@ -684,10 +708,10 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     await writeLaunchFiles(spec)
     const started = await startDetachedPlanner(deps, run, spec, opened.paneId, typedPrompt)
     if ('code' in started) return abandonDetached(deps, run, previous, started, opened.workspaceId)
-    return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on Cairn task ${goalTask.ref}` : ''}.`)
+    return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.`)
   }
   await writeLaunchFiles(spec)
-  return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on Cairn task ${goalTask.ref}` : ''}.`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
+  return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
 }
 
 // ---------- spawn ----------
@@ -1916,7 +1940,7 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
   const plannerId = run.planner.sessionId ?? (await plannerSessionId(deps, run)) ?? (run.planner.paneId ? (await herdr.getAgent(deps.exec, run.planner.paneId).then(result => (result.ok ? result.value.sessionId : undefined))) : undefined)
   await saveRun(deps.home, { ...run, status: 'down', tabId: undefined, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } })
   await recordEvent(deps, run.id, { type: 'run.down', data: { saved, unsaved } })
-  const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString())
+  const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString(), (await loadConfig(deps.home)).labInstance)
   return ok(
     [`Run ${run.id} is down: ${saved.length} seat(s) saved for resume${saved.length ? ` (${saved.join(', ')})` : ''}.`, ...(unsaved.length ? [`No session id for ${unsaved.join(', ')}: they cannot be resumed.`] : []), `Resume with \`drove up --run ${run.id}\`.`, ...(cairnNote ? [cairnNote] : [])].join(' '),
     { saved, unsaved },
