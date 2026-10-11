@@ -32,6 +32,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove promote <seat> [--model M] --effort E [--reason TEXT]` | planner | Changes a worker's model or effort (§8). `--model` is optional: a Codex seat is promoted by effort alone and keeps its model (or Codex's default when none is recorded). It is a separate command because it can restart the agent; demote is the same command with a lower setting. |
 | `drove migrate <seat> --kind claude\|codex [--model M] [--effort E] [--reason TEXT]` | planner | Moves a worker to the other agent kind in the same worktree, with a handoff brief and no resume (§8, Migrate). Also the `migrate` MCP tool and the mod's `migrate_worker`. |
 | `drove init <dir> [--json]` | planner, human | Makes a new git repo (`main`, one empty commit) in an empty or missing directory; see §6. |
+| `drove merge <seat> [--pr] [--squash] [-m MSG] [--no-checks] [--run ID]` | planner, human | Integrates a seat's branch behind the repo's checks (§6, Merge gate). Also the `merge` MCP tool and the mod's `merge_worker`; neither can pass `--no-checks`, which is the human's. |
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
@@ -319,11 +320,11 @@ The mod's `bashReason` regex-scans the whole raw command for `$(…)` and backti
 | Package tools | read-only subcommands only (mod table) | allow |
 | `gh` writes | allow PRs (all), issues (not `delete`, `transfer`), releases (`create`, `edit`, `upload`), workflow `run`/`enable`/`disable`, run `rerun`/`cancel`, labels (not `delete`), repo `clone`/`fork`/`sync` and `create --private\|--internal`; deny deletions, transfers, repo `edit`/`rename`/`archive`, a repo `create` that would be public, `label delete`, `pr merge --admin` (it bypasses branch protection), `secret`/`variable` writes and `gh api` writes ("ask the human"); deny any of them naming `production` in `--base`/`-B`/`--target`/`--ref`/`--head`/`-H` (DROVE-104) | allow |
 | `curl`/`wget` writes | deny | allow |
-| `git` | allow, except a push to `production` | allow, except any `push` |
+| `git` | allow, except a push to `production` and a `merge` of a seat branch (`worktree-*`, `drove/*`, in any spelling) | allow, except any `push` |
 | `herdr` writes | deny, **except** `herdr agent prompt\|wait <seat>` where `<seat>` is an open seat of this run, given as its name, namespaced agent name, pane id or session id (CCS-50, DROVE-43) | deny |
 | `herdr` reads (`list`, `get`, `read`, `explain`, `wait`) | allow | allow |
 | `claude`, `codex` | deny, except `--help`, `--version` and `codex queue` to an open seat of this run | deny, except `--help`, `--version` and `claude plugin test [dir]` (DROVE-39) |
-| `drove` | allow `init`, `spawn`, `send`, `prompt`, `promote`, `roster`, `capture`, `close`, `board --once`, `down`; deny `budget`, `plan`, `up`, `guard`, `mcp` | allow `roster`, `capture`; deny the rest |
+| `drove` | allow `init`, `spawn`, `send`, `prompt`, `promote`, `merge` (but not with `--no-checks`), `roster`, `capture`, `close`, `board --once`, `down`; deny `budget`, `plan`, `up`, `guard`, `mcp` | allow `roster`, `capture`; deny the rest |
 
 The guard cannot see a PR's base when a merge names the PR by number (`gh pr merge 12`), so the `production` rule covers only the branches named on the command line.
 
@@ -336,6 +337,22 @@ The writable roots (`isInside`) are resolved after `realpath`, so `/tmp/../repo`
 **Planner scratchpad** (DROVE-101). A planner in a Claude Code session may write in that session's scratchpad: a path under `/tmp`, `/private/tmp` or `tmpdir()` shaped `claude-<uid>/<project>/<session>/…/scratchpad`, checked after `realpath` so `..` and symlinks do not count. Every write target of the command must be inside one; a glob or variable before the `scratchpad` segment, a plain `/tmp` path and a mix of targets are denied. Interpreters, `chmod` and the rest of the file writers stay denied, and the worker rules are unchanged.
 
 **`drove init <dir>`** (DROVE-101) makes a new repo for a goal that needs one: it creates `<dir>` (with parents) if missing or empty, runs `git init -b main` and makes one empty commit, `chore: initial empty commit`. It refuses a non-empty directory, an existing repo and a directory inside a repo. `--json` prints `{path, branch, commit}`. The planner then attaches the run there (`/orchestrate --repo <dir>` in the mod, `drove plan` from the directory otherwise), because a run is bound to the repo of the session's cwd.
+
+### Merge gate (DROVE-92, DROVE-105)
+
+Until this, the planner merged after reading the diff and Drove had no say. Now the guard denies the planner a `git merge` whose argument names a seat branch (`worktree-<seat>` or `drove/<seat>`, also as `origin/...`, `refs/heads/...` or with `~n` or `^`; every branch Drove creates has one of the two prefixes, so the roster need not be read), and `drove merge <seat>` is the way in. It lives in `src/commands.ts` (`merge`), is exposed as the planner tool `merge` and the mod's `merge_worker`, and fails closed: a run that cannot say its checks passed does not merge.
+
+**Where the checks come from.** `checksOf(repo)` reads `checks` from `<main checkout>/.drove.json` (an array of shell commands; `[]` declares none), else `repoVerifyCommands`: the `typecheck`, `lint`, `test` scripts of `package.json` or the `typecheck`, `lint`, `test`, `check` Makefile targets, the same detection that fills a worker's brief footer. None found refuses with how to declare them. It reads the base, not the seat's worktree, so a branch cannot edit its way past its gate; it does not stop a branch that rewrites the script a check runs (`npm test` running `true`), which is review's job. The checks run with `sh -c` in the seat's worktree, with the `DROVE_*` identity variables blanked, each with a 15 minute limit.
+
+**What is tested.** The branch tip, in its own worktree, which must have no uncommitted tracked or untracked changes (untracked files under `.claude/` are ignored). The merge result is not tested: when the base moved on since the branch was cut, a local merge can combine two green branches into a red one. `--pr` tests the merge result, because GitHub's `pull_request` workflows run on the merge ref.
+
+**Local.** The main checkout must be on the run's base branch (`run.base` without `origin/`) and clean (`git status --porcelain`, ignoring untracked `.claude/`). After the checks, `git merge --no-ff -m <msg> <branch>`; a failed merge is `git merge --abort`ed. The message is `-m` or `merge: <the branch's last commit subject>`. Nothing is pushed.
+
+**`--pr`.** In order: a repo with no `.github/workflows` (in the main checkout or the worktree) runs the local checks first, before anything leaves the machine. Then `git push origin refs/heads/<branch>:refs/heads/<branch>` (explicit refspec, no upstream, no force, never the `production` branch), `gh pr view <branch>` (else `gh pr create --head --base --title --body`), then the PR is judged: closed, conflicting or changes requested is refused; `gh pr checks --json name,bucket,link` with a `fail` or `cancel` bucket is refused by name; a `pending` bucket, a repo with workflows and no check reported within `CI_GRACE_MS` (10 minutes), or `reviewDecision: REVIEW_REQUIRED` returns `pending` with the PR URL and records `merge.pending`; no checks at all, outside the grace, runs the local checks. Green is `gh pr merge <n> --squash|--merge --subject <msg>` (no `--delete-branch`: gh would try to delete the local branch, which a worktree holds), a re-read of the PR state, `git push origin --delete <branch>`, then `git fetch origin <base>` and `git merge --ff-only origin/<base>` when the main checkout is on the base and clean (otherwise a note says the local base was not updated). Rerunning a pending merge is idempotent: the push is a no-op and the PR is reused; a PR already merged on GitHub goes straight to the base update.
+
+**Record.** `merge.passed`, `merge.refused` (with a `code`: `checks-failed`, `dirty-checkout`, `wrong-branch`, `merge-conflict`, `no-checks`, `pr-conflicts` and so on) and `merge.pending` are appended to the run's events with the seat, branch, mode and detail, and the last result is kept on the seat as `gate` for the board line (it is hidden once the seat reports again). Refusals before a seat is found (no such seat, not the planner) record nothing.
+
+**`--no-checks`** skips the local checks (GitHub's checks still apply under `--pr`). It is the human's: the guard denies it to the planner, and the command refuses it when it runs inside a Drove session (`DROVE_RUN` set), so the human runs it from their own terminal with `--run ID`.
 
 Stricter planner denials added in P2:
 
@@ -432,7 +449,7 @@ A conversation cannot move between Claude Code and Codex, but the work can. `dro
 
 ## 10. The mod as a thin layer
 
-The Claude orchestrator mod lives in this repo at `mod/` (loaded by pointing `CLAUDE_CODE_PLUGIN_DIRS` at it). It keeps `/orchestrate` and the tool names (`mcp__orchestrator__spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `migrate_worker`, `close_worker`, `roster`, and a worker's `report`) and adds Codex workers (`spawn_worker` takes `kind: claude|codex`).
+The Claude orchestrator mod lives in this repo at `mod/` (loaded by pointing `CLAUDE_CODE_PLUGIN_DIRS` at it). It keeps `/orchestrate` and the tool names (`mcp__orchestrator__spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `migrate_worker`, `merge_worker`, `close_worker`, `roster`, and a worker's `report`) and adds Codex workers (`spawn_worker` takes `kind: claude|codex`).
 
 **It cannot import Drove** (DROVE-9; this answers §13 Q5). Claude Code's plugin runtime has no Node and imports only files of the plugin, and every Drove module uses `node:fs`, `node:crypto` or `node:child_process`. So the mod reaches Drove through its CLI, `node <drove>/src/cli.ts …` (the path is `<mod>/../src/cli.ts`, or the mod's `droveEntry` setting), and keeps a copy of the run-state types in `mod/types/index.d.ts` that `test/mod-types.test.ts` holds to `src/types.ts`. `src/mod.ts` stays the facade for Node callers.
 
@@ -472,7 +489,7 @@ What stays Claude-only in the mod:
 4. **Review.** The planner reads `git -C .claude/worktrees/w-api diff main…` (read-only, allowed by the guard).
 5. **Verdict.** `drove.send{seat:w-api, kind:verdict, verdict:approve}`. Drove sends `codex queue --thread <id> --message "⟦drove v1 … kind=verdict …⟧ …"`, records the control id in `sent.jsonl`, and sets `owes: none`.
 6. **Commit confirmation.** `w-api` commits its own paths, then reports `done` with `expects: none`. The wake text says "confirms approved work; close it".
-7. **Merge.** The planner runs `git merge --no-ff drove/w-api` in the main checkout. Git is allowed; the guard checks only the push target.
+7. **Merge.** The planner calls `drove.merge{seat:w-api}`: Drove runs the repo's checks in `.claude/worktrees/w-api` and, when they pass, merges `--no-ff` into `main` in the main checkout. A plain `git merge drove/w-api` is denied by the guard (§6, Merge gate); with a remote and CI the planner passes `pr: true` instead.
 8. **Close.** `drove.close{seat:w-api, removeWorktree:true}` sends `/quit`, closes the pane (and the tab if empty), runs `git worktree remove` (the branch is merged) and marks the seat `closed`. The planner then closes Cairn DROVE-7.
 
 ### (b) Codex planner + Claude worker
@@ -483,7 +500,7 @@ What stays Claude-only in the mod:
 4. **Review.** The planner reads the diff through its shell, which the guard allows as read-only git.
 5. **Verdict.** The planner calls `send{seat:w-ui, kind:verdict, verdict:approve}`. This is a guarded send: `herdr agent get <pane>` is not blocked, so `herdr agent prompt <pane> "<envelope>"` runs. If the pane is blocked, the control waits in `pending.jsonl` and an attention item goes out.
 6. **Commit confirmation.** `w-ui` reports `done` with `expects: none`, which reaches the planner through `codex queue`.
-7. **Merge.** The planner merges in its own shell (workspace-write in the repo, plus `--add-dir .git`).
+7. **Merge.** The planner calls the MCP tool `merge{seat:w-ui}` (or `pr: true`), which runs the checks and merges; the shell is not used for it.
 8. **Close.** The planner calls `close{seat:w-ui}`, which closes the pane (no `/exit`, §5) and marks the seat closed.
 
 ## 12. Build plan

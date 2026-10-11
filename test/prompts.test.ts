@@ -65,6 +65,18 @@ test('planner role follows the git rules', () => {
   assert.match(text, /the human's git rules/)
 })
 
+test('planner role integrates with drove merge, --pr when the repo has a remote with CI, never a plain git merge', () => {
+  for (const kind of ['claude', 'codex'] as const) {
+    const text = prompts.plannerRole(run, config, kind)
+    assert.match(text, /integrate it with the drove merge tool \(`drove merge <seat>`\), never a plain `git merge`/)
+    assert.match(text, /it runs the repo's checks in the worker's worktree first and refuses the merge if they fail/)
+    assert.match(text, /remote with CI, use `pr: true` \(`drove merge <seat> --pr`/)
+    assert.match(text, /"pending" carries the PR URL: call it again later, do not poll/)
+    assert.doesNotMatch(text, /commit, merge, rebase/)
+  }
+  assert.doesNotMatch(prompts.workerRole(run, config), /drove merge/)
+})
+
 test('worker role covers rules, cairn, questions and reporting', () => {
   const text = prompts.workerRole(run, config)
   assert.match(text, /You are a worker of Drove run drove-20261009-1042-a3f1/)

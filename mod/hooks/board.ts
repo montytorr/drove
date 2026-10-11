@@ -136,6 +136,7 @@ const seatDoing = (seat: Seat, status: OrchModStatus | undefined, spin: string):
   if (seat.state === 'blocked') return { text: seat.attention[0]?.detail ?? 'waiting on a dialog in its pane', tone: 'alert' }
   if (seat.state === 'starting') return { text: `${spin} starting`, tone: 'muted' }
   if (seat.owes !== 'none' && seat.lastReport) return { text: `owes you ${seat.owes === 'review' ? 'a review' : 'an answer'} · ${seat.lastReport.summary}`, tone: 'warn' }
+  if (seat.gate && Date.parse(seat.gate.at) >= (Date.parse(seat.lastReport?.at ?? '') || 0)) return { text: `${seat.gate.result === 'passed' ? 'merged' : `merge ${seat.gate.result}`} · ${seat.gate.detail}`, tone: seat.gate.result === 'passed' ? 'good' : seat.gate.result === 'pending' ? 'warn' : 'alert' }
   if (seat.state === 'done' && seat.lastReport) return { text: seat.lastReport.summary, tone: 'text' }
   const doing = status?.activity ?? seat.lastReport?.summary ?? ''
   return { text: seat.state === 'working' && doing ? `${spin} ${doing}` : doing, tone: 'text' }

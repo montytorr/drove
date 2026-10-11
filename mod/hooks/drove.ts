@@ -52,6 +52,14 @@ export const migrateArgs = (input: { name: string; kind: AgentKind; model?: stri
 
 export const closeArgs = (name: string, removeWorktree: boolean): string[] => ['close', name, ...(removeWorktree ? ['--remove-worktree'] : [])]
 
+// --no-checks is the human's, so no builder here can produce it.
+export const mergeArgs = (input: { name: string; pr?: boolean; squash?: boolean; message?: string }): string[] => [
+  'merge', input.name,
+  ...(input.pr ? ['--pr'] : []),
+  ...(input.squash ? ['--squash'] : []),
+  ...(input.message ? ['-m', input.message] : []),
+]
+
 export const rosterArgs = (run: string): string[] => ['roster', '--run', run]
 
 export const reportsArgs = (run: string, seat?: string, all?: boolean): string[] => ['reports', ...(seat ? [seat] : []), ...(all ? ['--all'] : []), '--run', run]

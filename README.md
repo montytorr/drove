@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/montytorr/drove/actions/workflows/ci.yml/badge.svg)](https://github.com/montytorr/drove/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-Drove runs one planner and several worker agents side by side in [herdr](https://herdr.dev) panes. You choose the planner: Claude Code or Codex. It splits work into Cairn tasks, starts a worker for each, reviews their diffs and merges. The workers write the code, each in its own pane and its own git worktree, and they are Claude Code or Codex under either planner.
+Drove runs one planner and several worker agents side by side in [herdr](https://herdr.dev) panes. You choose the planner: Claude Code or Codex. It splits work into Cairn tasks, starts a worker for each, reviews their diffs and merges them once the repo's checks pass. The workers write the code, each in its own pane and its own git worktree, and they are Claude Code or Codex under either planner.
 
 **Why the name.** A drove is a herd driven together, and the drover drives it: Drove runs on herdr and keeps one planner's workers moving. Drove roads were the old Scottish cattle routes the drovers walked to market, which fits the names in this family (Bothy, Cairn, Croft, Trig, Holloway).
 
@@ -55,7 +55,7 @@ Pick the planner (the table above), then use one of these.
 **Claude Code with the mod.** From a Claude Code session:
 
 1. Start Claude in a herdr pane with `mod/` in `CLAUDE_CODE_PLUGIN_DIRS`.
-2. Type `/orchestrate <goal>`. The session becomes the planner and gets the tools `spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `migrate_worker`, `close_worker` and `roster`. A board and a wake bridge run inside Claude. Typing `/orchestrate` again in the same session re-attaches to the run. With no goal, the first prompt you type becomes the run's goal (its first line, clipped to 120 characters) and is saved on the run; a Drove wake, a slash command or an empty prompt never is, and an existing goal is never replaced.
+2. Type `/orchestrate <goal>`. The session becomes the planner and gets the tools `spawn_worker`, `message_worker`, `review_verdict`, `promote_worker`, `demote_worker`, `migrate_worker`, `merge_worker`, `close_worker` and `roster`. A board and a wake bridge run inside Claude. Typing `/orchestrate` again in the same session re-attaches to the run. With no goal, the first prompt you type becomes the run's goal (its first line, clipped to 120 characters) and is saved on the run; a Drove wake, a slash command or an empty prompt never is, and an existing goal is never replaced.
 
 **Claude Code without the mod, or Codex.** From any herdr pane:
 
@@ -80,7 +80,19 @@ A run started without `--goal` takes the first prompt you type to the planner as
 2. **Work.** A Claude worker gets its worktree from `claude --worktree` (branch `worktree-<seat>`). A Codex worker gets one made by Drove (branch `drove/<seat>`). The worker never pushes; a hook denies it.
 3. **Report.** The worker calls its `report` tool: `done`, `question`, `blocked`, `promote` or `progress`. Anything but `progress` wakes the planner.
 4. **Verdict.** The planner reads the diff and sends `approve` or `changes`. After an approve the worker commits its own paths and reports `done` again.
-5. **Close.** The planner merges, then closes the seat. A Claude seat is closed by closing its pane, never with `/exit`; Drove releases the worktree lock Claude leaves behind. Codex gets `/quit` first. A worktree is removed only on request and only when its branch is merged.
+5. **Merge, then close.** The planner merges with `drove merge <seat>` (see "The merge gate" below), then closes the seat. A Claude seat is closed by closing its pane, never with `/exit`; Drove releases the worktree lock Claude leaves behind. Codex gets `/quit` first. A worktree is removed only on request and only when its branch is merged.
+
+### The merge gate
+
+The planner never merges a worker's branch by hand: the guard denies `git merge` of a `worktree-*` or `drove/*` branch with "use drove merge <seat>: it runs the checks first". `drove merge <seat>` (the planner's `merge` tool, the mod's `merge_worker`) is the way in.
+
+**Which checks.** The `checks` list in the repo's `.drove.json` (`{"checks": ["npm run typecheck", "npm test"]}`, run in order with `sh -c`; an empty list declares that there are none). Without one, the repo's own verify commands, as `drove spawn` already lists them in a worker's brief: the `typecheck`, `lint` and `test` scripts of `package.json`, else the `typecheck`, `lint`, `test` and `check` targets of its Makefile. A repo with none of these is refused until it declares some. The list is read from the main checkout (the base), not from the worker's branch, and run in the seat's worktree, so a branch cannot loosen its own gate; the human can still pass `--no-checks`.
+
+**Local (default).** The seat's worktree must have no uncommitted changes (the checks would test what the merge does not carry). The main checkout must be on the run's base branch and clean. The checks run in the seat's worktree; the first failure refuses the merge and returns that check's output tail. When they pass, Drove merges `--no-ff` into the base with the message `merge: <the branch's last commit subject>` (`-m` overrides it). A conflict is aborted and refused, leaving the base untouched. The result is local and unpushed; the planner pushes when the work is done.
+
+**`--pr`** (the repo needs a remote). Drove pushes the seat's branch to `origin` (never `production`, never forced), opens a pull request with `gh pr create` (title: the last commit's subject and the seat's Cairn ref; body: the commits, the Cairn ref, the run and seat), and reads `gh pr checks`. Failed checks refuse and name them. Checks still running, no check reported yet while the repo has workflows, or a review still required on GitHub return `pending: ... <PR URL>`: run `drove merge <seat> --pr` again later (it reuses the PR; do not poll). When everything is green it runs `gh pr merge` (`--squash` for one commit, else a merge commit), deletes the remote branch and fast-forwards the local base from `origin`. A repo with no CI counts as green only after the local checks pass (they run before anything is pushed); a repo with workflows whose PR shows no check ten minutes after it opened is treated the same way. A conflicting PR, requested changes and a `gh pr merge` that GitHub refuses are refused with the reason.
+
+Every outcome is an event (`merge.passed`, `merge.refused`, `merge.pending`) and the last one shows on the seat's board line. `--no-checks` skips the local checks and is for the human, from their own terminal with `--run ID`: Drove refuses it inside a Drove session and the guard denies it to the planner.
 
 Planner messages are signed with a per-seat token. The signature covers the header fields that change what a worker does (`kind`, `to`, `run`, `model`, `effort`, `verdict`, `expects`) as well as the body, so editing any of them on a genuine message fails the check. A Claude worker with the mod marks a message that fails the check as unverified, and acts on a `promote` only when it verifies. A Codex worker's `UserPromptSubmit` hook (`drove guard user-prompt-submit`) runs the same check and, on a failure, hands Codex the same "not signed by your planner" notice as additional context and a warning, without blocking the turn. Text that follows a signed message in the same paste is shown under a "not signed by Drove" label.
 
@@ -104,6 +116,7 @@ A worker that hits its usage limit gets a `usage-limit` attention item and is ne
 | `drove roster [--json] [--run ID]` | one line per seat |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
+| `drove merge <seat> [--pr] [--squash] [-m MSG] [--run ID]` | integrate a worker's branch behind the repo's checks: they run in the seat's worktree, then the branch is merged `--no-ff` into the base; `--pr` goes through a GitHub pull request instead (see "The merge gate") |
 | `drove board [--once] [--web [--port N]] [--run ID]` | live coloured board, the orchestrator mod's layout on your terminal's own background; one frame with `--once` or when piped; no colour when piped or with `NO_COLOR`; `--web` serves the same board read-only in a browser (see below); this repo's latest run unless `--run` or `DROVE_RUN` |
 | `drove down [--run ID]` / `drove up [--run ID] [--seat SEAT]` | stop and resume a run |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only; agents are denied) |

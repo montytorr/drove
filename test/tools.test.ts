@@ -27,6 +27,7 @@ const fakeCommands = () => {
     roster: record('roster'),
     capture: record('capture'),
     close: record('close', 2),
+    merge: record('merge', 2),
     down: record('down'),
     raiseBudget: record('raiseBudget'),
   } as unknown as ToolPorts['commands']
@@ -170,6 +171,25 @@ test('the spawn tool passes plugins and userMemory through, and says what they d
   assert.equal(fake.calls.length, 2)
 })
 
+test('the merge tool is drove merge: local by default, pr and squash on request, and never --no-checks', async () => {
+  const { ctx, fake, tool } = await plannerWith()
+  await tool('merge').call({ seat: 'w-ui' })
+  await tool('merge').call({ seat: 'w-ui', pr: true, squash: true, message: 'feat: ui (DROVE-9)', noChecks: true })
+  const ref = { run: ctx.run.id, repo: ctx.run.repo }
+  assert.deepEqual(fake.calls, [
+    { name: 'merge', args: [ref, { seat: 'w-ui', pr: false, squash: false, message: undefined }] },
+    { name: 'merge', args: [ref, { seat: 'w-ui', pr: true, squash: true, message: 'feat: ui (DROVE-9)' }] },
+  ])
+  const schema = tool('merge').inputSchema as { properties: Record<string, unknown> }
+  assert.equal('noChecks' in schema.properties, false)
+  assert.match(tool('merge').description, /never a plain git merge/)
+  assert.match(tool('merge').description, /pending/)
+  for (const args of [{ seat: 'W Bad' }, { seat: 'w-ui', pr: 'yes' }, { seat: 'w-ui', message: 4 }, {}]) {
+    assert.equal((await tool('merge').call(args)).isError, true, JSON.stringify(args))
+  }
+  assert.equal(fake.calls.length, 2)
+})
+
 test('planner tools reject bad arguments before calling a command', async () => {
   const { fake, tool } = await plannerWith()
   const bad: [string, Record<string, unknown>][] = [
@@ -204,7 +224,7 @@ test('planner tool descriptions tell the model what to do next', async () => {
   const tools = plannerTools(ctx.deps, { home: ctx.home, run: ctx.run.id, role: 'planner', seat: 'planner' })
   const by = Object.fromEntries(tools.map((tool) => [tool.name, tool.description]))
   assert.match(by.spawn ?? '', /Do NOT wait, poll or sleep/)
-  assert.match(by.verdict ?? '', /merge its branch and close the seat/)
+  assert.match(by.verdict ?? '', /integrate its branch with the merge tool \(never a plain git merge\) and close the seat/)
   assert.match(by.send ?? '', /do not wait/)
   assert.match(by.close ?? '', /Cairn task/)
 })

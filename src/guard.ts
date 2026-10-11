@@ -18,6 +18,8 @@ const HELP_FLAGS = new Set(['--help', '-h', '--version', '-V', '-v'])
 const PUSH_FLAGS_WITH_VALUE = new Set(['--repo', '-o', '--push-option', '--receive-pack', '--exec'])
 const PUSH_FLAGS_FOR_ALL = new Set(['--all', '--mirror'])
 const GIT_OPTIONS_WITH_VALUE = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--exec-path'])
+const MERGE_FLAGS_WITH_VALUE = new Set(['-m', '-F', '-s', '-X', '--message', '--file', '--strategy', '--strategy-option', '--into-name', '--cleanup'])
+const SEAT_BRANCH = /^(?:worktree-|drove\/)(.+)$/
 const HERDR_OPTIONS_WITH_VALUE = new Set(['--timeout', '-t'])
 const FIND_ACTIONS = new Set(['-exec', '-execdir', '-ok', '-okdir', '-delete', '-fprint', '-fprint0', '-fprintf', '-fls'])
 
@@ -82,7 +84,7 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['init', 'spawn', 'send', 'prompt', 'promote', 'roster', 'capture', 'close', 'down'])
+const PLANNER_DROVE = new Set(['init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'capture', 'close', 'down'])
 const WORKER_DROVE = new Set(['roster', 'capture'])
 
 const WORKER_PUSH = 'workers never push; report done and let the planner and the human decide'
@@ -312,8 +314,34 @@ const pushesProduction = (words: readonly string[], pushAt: number, cwd: string)
   })
 }
 
+// The seat a revision names, whatever the spelling: worktree-w-x, drove/w-x, origin/worktree-w-x, refs/heads/drove/w-x~2.
+// Every seat branch Drove makes has one of the two prefixes, so the roster itself need not be read. A seat's branch is never
+// merged by hand: the gate that runs its checks cannot be skipped.
+const seatOfRevision = (revision: string): string | undefined => {
+  const name = revision.replace(/^refs\/(?:heads|remotes\/[^/]+)\//, '').replace(/[~^@:].*$/, '')
+  const unremoted = name.includes('/') && !name.startsWith('drove/') ? name.slice(name.indexOf('/') + 1) : name
+  for (const candidate of [name, unremoted]) {
+    const seat = SEAT_BRANCH.exec(candidate)?.[1]
+    if (seat) return seat
+  }
+  return undefined
+}
+
+const mergeReason = (words: readonly string[], mergeAt: number): string | undefined => {
+  for (let i = mergeAt + 1; i < words.length; i += 1) {
+    const word = words[i] ?? ''
+    if (MERGE_FLAGS_WITH_VALUE.has(word)) i += 1
+    else if (!word.startsWith('-')) {
+      const seat = seatOfRevision(word)
+      if (seat) return `git merge ${word} merges a worker's branch unchecked: use drove merge ${seat}: it runs the checks first`
+    }
+  }
+  return undefined
+}
+
 const gitReason = (words: readonly string[], scope: Scope): string | undefined => {
   const at = firstPositional(words, 1, GIT_OPTIONS_WITH_VALUE)
+  if (words[at] === 'merge' && scope.role === 'planner') return mergeReason(words, at)
   if (words[at] !== 'push') return undefined
   if (scope.role === 'worker') return WORKER_PUSH
   if (words.some(word => PUSH_FLAGS_FOR_ALL.has(word))) return 'git push --all or --mirror would also push production, which nobody pushes to'
@@ -377,6 +405,9 @@ const droveReason = (words: readonly string[], scope: Scope): string | undefined
   const sub = words[at] ?? ''
   const allowed = scope.role === 'planner' ? PLANNER_DROVE : WORKER_DROVE
   const isBoardOnce = scope.role === 'planner' && sub === 'board' && words.includes('--once')
+  if (scope.role === 'planner' && sub === 'merge' && words.some(word => word === '--no-checks' || word.startsWith('--no-checks='))) {
+    return "drove merge --no-checks skips the repo's checks and is for the human to run: let the checks pass, or ask the human"
+  }
   if (allowed.has(sub) || isBoardOnce) return undefined
   return `drove ${sub || '<nothing>'} is not available to a ${scope.role}${sub === 'budget' ? ': ask the human to run it' : ''}`
 }
