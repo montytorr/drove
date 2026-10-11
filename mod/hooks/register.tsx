@@ -391,6 +391,15 @@ const ORCHESTRATOR_TOOLS = [
     },
   },
   {
+    name: 'set_goal',
+    description: 'Orchestrator mode: set the run\'s goal, one plain line of what the run is doing now. Call it when the run has no goal, when it is vague (a bare ref, a fragment), or when the human\'s ask moves on to new work. The board header shows it. cairn is the goal task\'s ref, if there is one.',
+    inputSchema: {
+      type: 'object',
+      properties: { goal: { type: 'string', description: 'one plain line of what the run is doing now' }, cairn: { type: 'string', description: 'optional: the Cairn task ref of the goal task, e.g. DROVE-5' } },
+      required: ['goal'],
+    },
+  },
+  {
     name: 'roster',
     description: 'Orchestrator mode: list the workers, their state, model, effort, last report and what you owe them.',
     inputSchema: { type: 'object', properties: {} },
@@ -438,6 +447,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__migrate_worker: input => `moving ${String(input.name ?? '')} to ${String(input.kind ?? '')}`,
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
   mcp__orchestrator__merge_worker: input => `merging ${String(input.name ?? '')}`,
+  mcp__orchestrator__set_goal: () => 'setting the goal',
   mcp__orchestrator__roster: () => 'checking the roster',
   Bash: input => `running ${oneLine(String(input.command ?? ''), 60)}`,
   Read: input => `reading ${String(input.file_path ?? '').split('/').pop() ?? ''}`,
@@ -586,6 +596,21 @@ const mergeWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   return answerOf(await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS }))
 }
 
+const setGoalTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const goal = String(input.goal ?? '').replace(/\s+/g, ' ').trim()
+  if (!goal) return { deny: 'The goal is empty; give one plain line of what the run is doing.' }
+  const cairn = typeof input.cairn === 'string' && input.cairn.trim() ? input.cairn.trim() : undefined
+  if (cairn && !CAIRN_RE.test(cairn)) return { deny: `cairn must look like CCS-12; got "${cairn}".` }
+  const orchestrator = await read($, orchestratorAtom)
+  if (!orchestrator) return { deny: OFF }
+  const ran = await plannerRun($, drove.goalArgs(orchestrator.run, cairn), { stdin: goal })
+  if (ran.exitCode === 0) {
+    await update($, orchestratorAtom, current => (current ? { ...current, goal } : current))
+    await persist($)
+  }
+  return answerOf(ran)
+}
+
 const rosterTool = async ($: EngineInterface): Promise<ToolAnswer> => {
   const orchestrator = await read($, orchestratorAtom)
   return orchestrator ? answerOf(await plannerRun($, drove.rosterArgs(orchestrator.run))) : { deny: OFF }
@@ -621,7 +646,7 @@ const onBridgeLine = async ($: EngineInterface, line: BridgeLine) => {
   }
   if (line.t === 'run') {
     lastRun = line.run
-    await update($, orchestratorAtom, current => (current ? { ...current, budget: line.run.budget, goal: current.goal ?? line.run.goal } : current))
+    await update($, orchestratorAtom, current => (current ? { ...current, budget: line.run.budget, goal: line.run.goal ?? current.goal } : current))
     return
   }
   if (line.t === 'roster') {
@@ -957,6 +982,13 @@ const attachRun = async ($: EngineInterface, input: { goal?: string; run?: strin
   return run ? { ok: true, run } : { ok: false, text: result.ok ? 'Drove returned no run' : `${result.text} [${result.code}]` }
 }
 
+// The mod held a goal the run never got: write it through Drove, so run.json, the board and the other planners see it.
+const pushGoal = async ($: EngineInterface, run: RunMeta, goal: string) => {
+  const home = await droveHome($)
+  const ran = await runDrove($, drove.goalArgs(run.id), { stdin: goal, cwd: run.repo, env: drove.plannerEnv(run.id, home) })
+  if (ran.exitCode === 0) run.goal = goal
+}
+
 const restore = async ($: EngineInterface) => {
   try {
     const sessionId = await $.session.id()
@@ -976,10 +1008,12 @@ const restore = async ($: EngineInterface) => {
       return
     }
     const now = await $.clock.now()
+    const heldGoal = (await read($, orchestratorAtom))?.goal ?? saved.goal
+    if (!attached.run.goal && heldGoal) await pushGoal($, attached.run, heldGoal)
     await update($, orchestratorAtom, current => ({
       run: attached.run.id,
       repo: attached.run.repo,
-      goal: current?.goal ?? saved.goal ?? attached.run.goal,
+      goal: attached.run.goal ?? current?.goal ?? saved.goal,
       startedAt: current?.startedAt ?? saved.startedAt ?? now,
       budget: attached.run.budget,
     }))
@@ -1365,6 +1399,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__orchestrator__merge_worker' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? mergeWorker($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__set_goal' as never }, async ($, e): Promise<ToolAnswer> => setGoalTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__read_reports' as never }, async ($, e): Promise<ToolAnswer> => readReportsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({
     deny: toolFailure(next.error),

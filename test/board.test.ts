@@ -103,6 +103,14 @@ test('the frame never outgrows the pane height', () => {
   assert.equal(board.renderFrame(input(120, 40), 0).length, 5 + 5 + DATA.feed.length)
 })
 
+test('the header shows the run goal, follows a change, and says no goal set only when there is none', () => {
+  const header = (run: RunMeta) => board.renderFrame({ ...input(120), run }, 0)[0] ?? ''
+  assert.match(header(RUN), /^◆ drove Build Drove v1 pieces/)
+  assert.match(header({ ...RUN, goal: 'Release 0.3.0' }), /^◆ drove Release 0\.3\.0/)
+  assert.doesNotMatch(header({ ...RUN, goal: 'Release 0.3.0' }), /no goal/)
+  assert.match(header({ ...RUN, goal: undefined }), /no goal set/)
+})
+
 test('the narrow frame drops the wide columns and the gauge but keeps the goal', () => {
   const lines = board.renderFrame(input(60), 0)
   assert.match(lines[0] ?? '', /^◆ drove Build Drove/)

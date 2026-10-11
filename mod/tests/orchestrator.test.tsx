@@ -131,6 +131,7 @@ describe('bridge stream', () => {
     expect(feedOf({ at: ISO, type: 'control.sent', seat: 'w-auth', data: { kind: 'nudge' } }, bodies)?.summary).toBe('stopped without a report')
     expect(feedOf({ at: ISO, type: 'seat.state', seat: 'w-auth', data: { from: 'working', to: 'gone' } }, bodies)?.kind).toBe('gone')
     expect(feedOf({ at: ISO, type: 'report.delivered', seat: 'w-auth' }, bodies)).toBeUndefined()
+    expect(feedOf({ at: ISO, type: 'goal.set', data: { goal: 'Release 0.3.0' } }, bodies)).toMatchObject({ from: '⌘', kind: 'goal', summary: 'goal: Release 0.3.0' })
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: true, resumed: true, pane: 'w1:p2' } }, bodies)).toMatchObject({ kind: 'relaunch', to: 'w-auth', summary: 'relaunched (resumed) in pane w1:p2' })
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: false, error: 'no pane' } }, bodies)).toMatchObject({ kind: 'failed', summary: 'relaunch failed: no pane' })
   })
@@ -241,6 +242,7 @@ type World = {
   files: Record<string, string>
   answer: string
   isOverBudget: boolean
+  runGoal?: string
   isGuardBroken: boolean
   bridge: { push: (text: string | null) => void }
   bridgeCode: number
@@ -292,7 +294,7 @@ const fakeDrove = (world: World, call: Call) => {
     const repo = call.cwd ?? '/work/repo'
     if (repo.startsWith('/work/plain')) return ok(JSON.stringify({ ok: false, code: 'not-a-repo', text: `${repo} is not inside a git repository` }), 1)
     const id = repo === '/work/repo' || call.args.includes('--run') ? RUN : `${repo.split('/').at(-1)}-20261006-1000-abcd`
-    return ok(JSON.stringify({ ok: true, text: `Run ${id} is up`, data: { run: runMeta({ id, ...(call.args.includes('--run') ? {} : { repo }), ...(at > 0 ? { goal: call.args[at + 1] } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}) }) } }))
+    return ok(JSON.stringify({ ok: true, text: `Run ${id} is up`, data: { run: runMeta({ id, ...(call.args.includes('--run') ? {} : { repo }), ...(at > 0 ? { goal: call.args[at + 1] } : world.runGoal && call.args.includes('--run') ? { goal: world.runGoal } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}) }) } }))
   }
   if (command === 'mod' && action === 'report') return ok(JSON.stringify({ ok: true, text: 'report r-1 recorded (done, expects review).' }))
   if (command === 'guard') {
@@ -815,6 +817,41 @@ describe('orchestrator session', () => {
     expect(world.spawned).toHaveLength(1)
     expect(world.toasts.some(text => text.includes('old orchestrator mod') && text.includes('1 open worker'))).toBe(true)
     expect(world.store.has(`session:${SELF}`)).toBe(false)
+  })
+
+  test('on restore a goal only the mod holds is written to the run through drove goal', async ($, on) => {
+    const { world, clock } = engine(on, undefined, { [`drove:session:${SELF}`]: { run: RUN, goal: 'Ship it', startedAt: NOW, savedAt: NOW } })
+    await $.session.start(START)
+    await settle(clock)
+    const [goal] = droveCalls(world, 'goal')
+    expect(goal?.args).toEqual(['goal', '--run', RUN, '-'])
+    expect(goal?.stdin).toBe('Ship it')
+    expect(goal?.env).toMatchObject({ DROVE_RUN: RUN, DROVE_ROLE: 'planner' })
+    expect(((await runCommand($, 'status')) as { text: string }).text).toContain('goal: Ship it')
+  })
+
+  test('on restore the run goal fills an empty mod goal and is not written back', async ($, on) => {
+    const { world, clock } = engine(on, undefined, { [`drove:session:${SELF}`]: { run: RUN, startedAt: NOW, savedAt: NOW } })
+    world.runGoal = 'Work the DROVE-33 follow-ups'
+    await $.session.start(START)
+    await settle(clock)
+    expect(droveCalls(world, 'goal')).toHaveLength(0)
+    expect(((await runCommand($, 'status')) as { text: string }).text).toContain('goal: Work the DROVE-33 follow-ups')
+  })
+
+  test('set_goal runs drove goal with the line on stdin and updates the mod goal', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'DROVE-33..')
+    const set = await callTool($, 'set_goal', { goal: '  Release 0.3.0\nand the factory ', cairn: 'DROVE-107' })
+    expect(denial(set as never)).toBeUndefined()
+    const [goal] = droveCalls(world, 'goal')
+    expect(goal?.args).toEqual(['goal', '--run', RUN, '--cairn', 'DROVE-107', '-'])
+    expect(goal?.stdin).toBe('Release 0.3.0 and the factory')
+    expect(((await runCommand($, 'status')) as { text: string }).text).toContain('goal: Release 0.3.0 and the factory')
+    expect(denial((await callTool($, 'set_goal', { goal: '   ' })) as never)).toContain('empty')
+    expect(denial((await callTool($, 'set_goal', { goal: 'x', cairn: 'nope' })) as never)).toContain('cairn must look like')
+    expect(droveCalls(world, 'goal')).toHaveLength(1)
   })
 
   test('a goal the engine refuses is retried once, then toasted and sent with the next prompt you type', async ($, on) => {

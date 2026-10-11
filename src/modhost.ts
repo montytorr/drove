@@ -99,6 +99,7 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
   await saveRun(deps.home, run)
   await updateRoster(deps.home, run.id, roster => roster)
   await recordEvent(deps, run.id, { type: 'run.up', data: { planner: 'claude', pane: paneId, viaMod: true, attached: Boolean(existing) } })
+  if (existing && request.goal && request.goal !== existing.goal) await recordEvent(deps, run.id, { type: 'goal.set', data: { goal: request.goal, ...(existing.goal ? { previous: existing.goal } : {}) } })
   return ok(`Run ${run.id} is up with this session as its planner${existing ? ' (re-attached)' : ''}.`, { run })
 }
 

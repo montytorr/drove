@@ -112,6 +112,8 @@ const printThenLaunch = async (result: CommandResult, io: Io): Promise<number> =
   return plan?.argv ? (io.launch ?? launchProcess)(plan) : code
 }
 
+const RUN_ID_RE = /^[a-z0-9_-]+-\d{8}-\d{4}-[0-9a-f]+$/
+
 const runRef = (values: Values) => ({ run: str(values, 'run'), repo: process.cwd() })
 
 const textArg = async (positionals: string[], from: number, io: Io): Promise<string> => {
@@ -322,6 +324,18 @@ export const COMMANDS: Record<string, Spec> = {
         process.off('SIGINT', stop)
         process.off('SIGTERM', stop)
       }
+    },
+  },
+  goal: {
+    usage: 'drove goal [--run ID] [--cairn REF] <text>|-',
+    why: "set the run's goal: one plain line of what it is doing now (the planner or the human)",
+    options: { run: { type: 'string' }, cairn: { type: 'string' } },
+    run: async (values, positionals, io) => {
+      const [first, ...rest] = positionals
+      const named = rest.length > 0 && first !== undefined && RUN_ID_RE.test(first)
+      const ref = { run: named ? first : str(values, 'run') ?? process.env[ENV.run], repo: process.cwd() }
+      const goal = await textArg(positionals, named ? 1 : 0, io)
+      return print(await commands.setGoal(commands.defaultDeps(), ref, { goal, cairn: str(values, 'cairn') }), io)
     },
   },
   budget: {

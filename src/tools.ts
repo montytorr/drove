@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'set_goal', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -281,6 +281,16 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       { seat: seatProp, lines: { type: 'number', description: 'How many recent lines (default 60).' } },
       ['seat'],
       async (args) => asResult(await cmd.capture(deps, await ref(), seatName(args), count(args, 'lines', 60))),
+    ),
+    defineTool(
+      'set_goal',
+      'Set the run\'s goal: one plain line of what the run is doing now. Call it when the run has no goal, when the goal is vague (a bare ref, a fragment), or when the human\'s ask moves on to new work. The board header and the roster show it. Optionally pass the Cairn ref of the goal task.',
+      {
+        goal: { type: 'string', description: 'One plain line of what the run is doing now.' },
+        cairn: { type: 'string', description: 'Optional: the Cairn task ref that is the run\'s goal task (e.g. DROVE-5).' },
+      },
+      ['goal'],
+      async (args) => asResult(await cmd.setGoal(deps, await ref(), { goal: text(args, 'goal') as string, cairn: text(args, 'cairn', false) })),
     ),
     defineTool(
       'down',
