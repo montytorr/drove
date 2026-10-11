@@ -34,6 +34,7 @@ export type DroveConfig = {
   codexWorkerSandbox: 'bypass' | 'workspace-write'
   claudeChannel: boolean
   briefVia: 'prompt' | 'launch-arg'
+  labInstance: string
   workerEnv: Record<string, string>
   workerPorts?: { base: number; stride: number }
   workerCopy?: string[]

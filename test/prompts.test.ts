@@ -15,6 +15,7 @@ const config: DroveConfig = {
   codexWorkerSandbox: 'bypass',
   claudeChannel: false,
   briefVia: 'prompt',
+  labInstance: 'croft',
   workerEnv: {},
 }
 

@@ -34,7 +34,7 @@ export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind, 
   const ask = kind === 'claude' ? 'with AskUserQuestion' : 'in plain text, then wait for the answer'
   return `# Drove planner mode
 
-${human} started this session as the planner of Drove run ${run.id}${run.goal ? ` for this goal: ${run.goal}` : ''}${run.cairn ? ` (Cairn task ${run.cairn}, the run's goal task)` : ''}. You plan, delegate, manage and review. You never write or change code yourself, and you never run builds, tests or scripts: a guard denies edits and shell commands that change files or packages. Reading is free: Read, Grep, Glob, gh reads, herdr reads, Cairn and Croft.
+${human} started this session as the planner of Drove run ${run.id}${run.goal ? ` for this goal: ${run.goal}` : ''}${run.cairn ? ` (${LAB_RE.test(run.cairn) ? 'Lab subject' : 'Cairn task'} ${run.cairn}, the run's goal ${LAB_RE.test(run.cairn) ? 'subject' : 'task'})` : ''}. You plan, delegate, manage and review. You never write or change code yourself, and you never run builds, tests or scripts: a guard denies edits and shell commands that change files or packages. Reading is free: Read, Grep, Glob, gh reads, herdr reads, Cairn and Croft.
 
 Git is yours: status, diff, log, branches, worktrees, commit, rebase, cherry-pick, tag, pull and push, except that a worker's branch is merged only with the drove merge tool (below), never a plain \`git merge\`. Clean up the workers' worktrees, and push when the work is done and verified. Follow ${human}'s git rules from CLAUDE.md: create branches with \`--no-track\` from origin/main, never push to a \`production\` branch (push to main or master instead), and read a push's destination before running it. GitHub is yours too: PRs, reviews, issues, releases and workflow runs go through gh, except that a worker's branch becomes a PR, and any merge is made, only through the drove merge tool with \`pr: true\`, which gates it on the checks; \`gh pr merge\` is denied, and other PRs are merged by the human. Deletions, secrets, repo settings and public repos stay with the human, and nothing names the production branch. When the goal needs a brand-new repo, run \`drove init <dir>\` (an empty or missing directory), then attach the run there: \`/orchestrate --repo <dir>\` in the Claude mod, or \`drove plan\` from that directory for a CLI planner. You may write files under your session scratchpad (\`/tmp/claude-*/**/scratchpad\`), nowhere else.
 
@@ -160,6 +160,20 @@ Every report states what it expects back:
 Never end a turn on finished work without a \`done\` report. Keep reports short and structured; the details go in \`details\`.
 
 ${MESSAGES_LINE}`
+}
+
+export const LAB_RE = /^LAB-\d+$/
+
+export type LabSubject = { ref: string; title: string; body: string; todos: readonly { ref: string; title: string; status: string }[] }
+
+export const labSubjectPrompt = (subject: LabSubject, instance: string): string => {
+  const todos = subject.todos.map(todo => `- ${todo.ref}: ${todo.title} (${todo.status})`)
+  const note = `cairn --instance ${instance} subject note ${subject.ref}`
+  return [
+    `This run's goal is Lab subject ${subject.ref}: ${subject.title}${subject.body.trim() ? `\n\n${subject.body.trim()}` : ''}`,
+    todos.length > 0 ? `Its open todos (closed ones are left out):\n${todos.join('\n')}` : 'It has no open todos: say so to the human and wait.',
+    `Run one worker per todo, each spawned with the todo's own ref as its Cairn task. Note progress on the subject with \`${note} "…" --kind finding|decision\`. Never close the subject itself: closing it needs the human's conclusion. Run \`cairn --instance ${instance} subject show ${subject.ref} --full\` to read it again. When the run is taken down, Drove writes a summary note on the subject.`,
+  ].join('\n\n')
 }
 
 export const cairnGoalPrompt = (ref: string, title: string, body: string): string =>
