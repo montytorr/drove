@@ -34,7 +34,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
-| `drove board [--once]` | human | A live coloured board for a herdr pane, drawn from the orchestrator mod's board model (`mod/hooks/board.ts`) on the terminal's own background: the lead and what it owes, seats with state stripes, gauges and a spinner, and the timeline. It uses the alternate screen, redraws in place only while something moves, and fits the pane. `--once` or a non-TTY stdout prints a single frame; it has no colour escapes when piped or under `NO_COLOR`. |
+| `drove board [--once] [--web [--port N]]` | human | A live coloured board for a herdr pane, drawn from the orchestrator mod's board model (`mod/hooks/board.ts`) on the terminal's own background: the lead and what it owes, seats with state stripes, gauges and a spinner, and the timeline. It uses the alternate screen, redraws in place only while something moves, and fits the pane. `--once` or a non-TTY stdout prints a single frame; it has no colour escapes when piped or under `NO_COLOR`. `--web` serves the same model to a browser (see the web board below). |
 | `drove down [--run ID]` | human, planner | Saves every session id, quits the agents, closes the panes and marks the run `down`. |
 | `drove up [--run ID] [--seat SEAT]` | human | Reopens the worker tab and resumes each worker by session id, then `exec`s the planner with its resume argument in the current pane. With `--seat`, it relaunches only that one `gone` or `down` seat. Each relaunch records a `seat.relaunch` event (§9). |
 | `drove budget <n>` | human only | Raises the pane budget for the current run. The guard denies it to every agent, so it is the human's OK for a 6th pane when the client cannot show a dialog (§3). |
@@ -516,6 +516,13 @@ This is the plan as it was cut on 2026-10-09; all five pieces are built and merg
 - **Consumes:** P1, plus P3's `detect`.
 - **Acceptance:** golden frames at widths 80 and 140; the attention list is shown first; `mod.ts` exports exactly the documented names (a test pins the list).
 - **Human-run:** `drove board` in a herdr pane during a real run.
+
+**The web board (DROVE-79).** `drove board --web [--port N]` serves the board to a browser. It is `src/web.ts` and `src/web/page.ts`.
+- **Data.** It reads the run with `boardSource` and builds the model with `modelOf`, the same as the terminal board, at 400 columns and 1000 rows so nothing is clipped. The page draws the model's rows and cells itself, with the `TONE_COLOR` palette, and wraps long cells. Nothing in `buildBoard` is copied.
+- **Updates.** Server-Sent Events. One loop polls the run every `POLL_MS` and pushes a new model only when its JSON changes. The browser reconnects by itself, and the page shows "disconnected" while it cannot. Polling would have made each tab call the loader, and `boardSource` keeps a read cursor, so one shared loop is simpler.
+- **Routes.** `/` is the page, `/api/board` is the current model as JSON, `/events` is the stream. Only GET and HEAD are answered; anything else is 405. No route changes state.
+- **Access.** It binds `127.0.0.1` only. A request is refused with 403 unless its `Host` is `127.0.0.1:<port>` or `localhost:<port>` (DNS rebinding) and its `t` query parameter equals a token made at each start. No CORS header is ever sent, and the page's CSP allows no outside origin.
+- **Life.** No daemon: it runs in the foreground until Ctrl-C or SIGTERM, then ends the open streams and closes the port.
 
 **Order:** P1 and P2 start at once. P3, P4 and P5 also start at once against the stubs, and rebase onto P1 when it merges (P1 is small and should land first).
 

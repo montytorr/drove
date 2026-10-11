@@ -4,6 +4,7 @@ import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
 import { runBoard } from './board.ts'
+import { runWeb } from './web.ts'
 import * as commands from './commands.ts'
 import { HOOK_EVENTS, runHook } from './hooks.ts'
 import { isPidAlive } from './git.ts'
@@ -211,13 +212,20 @@ export const COMMANDS: Record<string, Spec> = {
       print(await commands.close(commands.defaultDeps(), commands.identityOrPlanner(), need(positionals[0], '<seat>'), values['remove-worktree'] === true), io),
   },
   board: {
-    usage: 'drove board [--once] [--run ID]',
-    why: 'live board for a herdr pane (plain when piped or NO_COLOR)',
-    options: { once: { type: 'boolean' }, run: { type: 'string' } },
+    usage: 'drove board [--once] [--web [--port N]] [--run ID]',
+    why: 'live board for a herdr pane (plain when piped or NO_COLOR), or read-only in a browser with --web',
+    options: { once: { type: 'boolean' }, web: { type: 'boolean' }, port: { type: 'string' }, run: { type: 'string' } },
     run: async (values, _positionals, io) => {
       const deps = commands.defaultDeps()
       const located = await commands.boardRun(deps, { run: str(values, 'run') ?? (process.env[ENV.run] || undefined), repo: process.cwd() })
       if ('error' in located) return print(located.error, io)
+      if (values.web === true) {
+        const port = str(values, 'port') === undefined ? 0 : Number(str(values, 'port'))
+        if (!Number.isInteger(port) || port < 0 || port > 65535) throw new UsageError('--port must be a port number (0 to 65535)')
+        await runWeb(deps, located.run, { port, write: text => void process.stdout.write(text) })
+        return 0
+      }
+      if (str(values, 'port') !== undefined) throw new UsageError('--port needs --web')
       await runBoard(deps, located.run, values.once === true)
       return 0
     },
