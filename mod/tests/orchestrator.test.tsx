@@ -473,6 +473,24 @@ describe('orchestrator session', () => {
     expect(sections[1]?.text).toContain('the human switched this session into orchestrator mode')
     expect(sections[1]?.text).toContain('A wake shows one line per worker report')
     expect(sections[1]?.text).toContain('call mcp__orchestrator__read_reports for the full text')
+    expect(sections[1]?.text).toContain('integrate it with mcp__orchestrator__merge_worker (`drove merge <seat>`), never a plain `git merge`')
+    expect(sections[1]?.text).toContain('pass `pr: true` (`drove merge <seat> --pr`')
+  })
+
+  test('merge_worker is drove merge: local by default, --pr and --squash on request, never --no-checks, with a long timeout', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    expect(world.registeredTools).toContain('merge_worker')
+    expect(denial((await callTool($, 'merge_worker', { name: 'w-auth' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'merge')[0]?.args).toEqual(['merge', 'w-auth'])
+    await callTool($, 'merge_worker', { name: 'w-auth', pr: true, squash: true, message: 'feat: auth (DROVE-9)', noChecks: true })
+    expect(droveCalls(world, 'merge')[1]?.args).toEqual(['merge', 'w-auth', '--pr', '--squash', '-m', 'feat: auth (DROVE-9)'])
+    expect(droveCalls(world, 'merge').every(({ args }) => !args.includes('--no-checks'))).toBe(true)
+    expect(denial((await callTool($, 'merge_worker', { name: 'W Bad' })) as never)).toContain('Worker names must match')
+    expect(droveCalls(world, 'merge')).toHaveLength(2)
   })
 
   test("read_reports returns the workers' full reports through drove reports, for one worker or all of them", async ($, on) => {

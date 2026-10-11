@@ -49,6 +49,8 @@ export type Attention = {
   at: string
 }
 
+export type MergeGate = { result: 'passed' | 'refused' | 'pending'; at: string; detail: string }
+
 export type Seat = {
   name: string
   kind: AgentKind
@@ -74,6 +76,7 @@ export type Seat = {
   lastWorkingAt?: string
   lastReport?: LastReport
   lastSentAt?: string
+  gate?: MergeGate
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
@@ -107,6 +110,9 @@ export type DroveEventType =
   | 'control.failed'
   | 'attention'
   | 'guard.deny'
+  | 'merge.passed'
+  | 'merge.refused'
+  | 'merge.pending'
 
 export type DroveEvent = {
   at: string

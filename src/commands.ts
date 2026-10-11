@@ -16,7 +16,7 @@ import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
-  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, MigrateRequest, PromoteRequest, Report, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
+  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, MergeGate, MergeRequest, MigrateRequest, PromoteRequest, Report, RunMeta, Seat, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
 export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string }
@@ -1402,6 +1402,231 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
     }
   }
   return ok(notes.join(' '))
+}
+
+// ---------- merge: the gate between a worker's branch and the base ----------
+
+const REMOTE = 'origin'
+const CHECK_TIMEOUT_MS = 15 * 60_000
+const GH_TIMEOUT_MS = 60_000
+const TAIL_LINES = 40
+const TAIL_CHARS = 4_000
+// How long a PR in a repo with workflows may show no checks before it counts as a repo whose CI did not trigger.
+export const CI_GRACE_MS = 10 * 60_000
+// The checks run for the planner's repo, not as the planner: Drove's own identity must not leak into a test run.
+const NO_IDENTITY_ENV = { DROVE_RUN: '', DROVE_ROLE: '', DROVE_SEAT: '', DROVE_TOKEN: '', DROVE_OWNS: '' }
+
+const tailOf = (text: string): string => {
+  const lines = text.split('\n').map(line => line.trimEnd())
+  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+  return lines.slice(-TAIL_LINES).join('\n').slice(-TAIL_CHARS)
+}
+
+// The base is the source of truth for what the checks are, so a branch cannot loosen its own gate by editing them:
+// `checks` in the repo's .drove.json (an empty list declares there are none), else the detected typecheck, lint and test.
+export const checksOf = async (repo: string): Promise<{ commands: string[]; source: string }> => {
+  const configured = await readJson<{ checks?: unknown }>(join(repo, '.drove.json')).catch(() => undefined)
+  if (Array.isArray(configured?.checks)) return { commands: configured.checks.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== ''), source: '.drove.json' }
+  return { commands: await repoVerifyCommands(repo), source: 'package.json scripts or Makefile targets' }
+}
+
+type CheckRun = { ok: true } | { ok: false; command: string; code: number; output: string }
+
+const runChecks = async (deps: Deps, worktree: string, commands: readonly string[]): Promise<CheckRun> => {
+  for (const command of commands) {
+    const ran = await deps.exec(['sh', '-c', command], { cwd: worktree, timeoutMs: CHECK_TIMEOUT_MS, env: NO_IDENTITY_ENV })
+    if (ran.code !== 0) return { ok: false, command, code: ran.code, output: tailOf(`${ran.stdout}\n${ran.stderr}`) }
+  }
+  return { ok: true }
+}
+
+type GhPr = { number: number; url: string; state: string; createdAt: string; mergeable: string; reviewDecision: string }
+type GhCheck = { name: string; bucket: string; link: string }
+
+const gh = (deps: Deps, repo: string, args: readonly string[]): Promise<ExecResult> => deps.exec(['gh', ...args], { cwd: repo, timeoutMs: GH_TIMEOUT_MS })
+
+const ghJson = <T>(result: ExecResult): T | undefined => {
+  try {
+    return JSON.parse(result.stdout) as T
+  } catch {
+    return undefined
+  }
+}
+
+const viewPr = async (deps: Deps, repo: string, branch: string): Promise<GhPr | undefined> => {
+  const viewed = await gh(deps, repo, ['pr', 'view', branch, '--json', 'number,url,state,createdAt,mergeable,reviewDecision'])
+  const pr = viewed.code === 0 ? ghJson<Partial<GhPr>>(viewed) : undefined
+  if (!pr || typeof pr.number !== 'number' || typeof pr.url !== 'string') return undefined
+  return { number: pr.number, url: pr.url, state: pr.state ?? '', createdAt: pr.createdAt ?? '', mergeable: pr.mergeable ?? '', reviewDecision: pr.reviewDecision ?? '' }
+}
+
+// Only a PR's own checks are read: `gh pr checks` exits 1 for failed ones and 8 for pending, so its JSON is read whatever the code.
+const prChecks = async (deps: Deps, repo: string, number: number): Promise<GhCheck[] | { error: string }> => {
+  const ran = await gh(deps, repo, ['pr', 'checks', String(number), '--json', 'name,bucket,link'])
+  const parsed = ghJson<GhCheck[]>(ran)
+  if (Array.isArray(parsed)) return parsed
+  if (/no checks reported/i.test(`${ran.stderr}\n${ran.stdout}`)) return []
+  return { error: clip(ran.stderr || ran.stdout || `gh exited ${ran.code}`) }
+}
+
+const hasWorkflows = async (...dirs: string[]): Promise<boolean> => {
+  for (const dir of dirs) {
+    const files = await readdir(join(dir, '.github', 'workflows')).catch(() => [] as string[])
+    if (files.some(file => /\.ya?ml$/.test(file))) return true
+  }
+  return false
+}
+
+const gateText = (checks: readonly string[], source: string): string => (checks.length > 0 ? `checks passed: ${checks.join(', ')}` : `no local checks (${source})`)
+
+export const merge = async (deps: Deps, identity: Identity, ref: RunRef, request: MergeRequest): Promise<CommandResult> => {
+  const denied = requirePlanner(identity)
+  if (denied) return denied
+  if (request.noChecks && identity.run) return failed('forbidden', '--no-checks is for the human: run drove merge --no-checks from your own terminal (pass --run ID), not from a Drove session')
+  if (request.squash && !request.pr) return failed('usage', '--squash applies to --pr only: a local merge is always a merge commit')
+  const located = await locateRun(deps, { run: ref.run ?? (identity.run || undefined), repo: ref.repo }, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
+  if (!seat) return failed('no-seat', `no seat named ${request.seat}`)
+
+  const mode = request.pr ? 'pr' : 'local'
+  const base = run.base.replace(/^origin\//, '')
+  const settle = async (event: 'merge.passed' | 'merge.refused' | 'merge.pending', detail: string, data: Record<string, unknown> = {}): Promise<void> => {
+    const at = deps.clock.now().toISOString()
+    await updateRoster(deps.home, run.id, current => ({
+      ...current,
+      seats: current.seats.map(entry => (entry.name === seat.name ? { ...entry, gate: { result: event.slice('merge.'.length) as MergeGate['result'], at, detail: clip(detail, 160) } } : entry)),
+    }))
+    await recordEvent(deps, run.id, { type: event, seat: seat.name, data: { mode, branch: seat.branch, base, detail: clip(detail, 300), ...data } })
+  }
+  const refuse = async (code: string, text: string, data: Record<string, unknown> = {}): Promise<CommandResult> => {
+    await settle('merge.refused', text, { code, ...data })
+    return failed(code, text)
+  }
+
+  if (seat.branch === base || seat.branch === git.PROTECTED_BRANCH) return refuse('bad-branch', `${seat.name}'s branch ${seat.branch} is the base or a protected branch, so there is nothing to merge`)
+  if (!(await git.refExists(deps.exec, run.repo, `refs/heads/${seat.branch}`))) return refuse('no-branch', `branch ${seat.branch} does not exist in ${run.repo}`)
+  if (!existsSync(seat.worktree)) return refuse('no-worktree', `${seat.name}'s worktree ${seat.worktree} is gone, so its checks cannot run`)
+  if (await git.isMerged(deps.exec, run.repo, seat.branch, base)) return ok(`${seat.branch} is already merged into ${base}; nothing to do. Close ${seat.name} with drove close.`, { status: 'merged', mode })
+  const unsaved = await git.dirtyLines(deps.exec, seat.worktree)
+  if (unsaved.length > 0) return refuse('dirty-worktree', `${seat.name}'s worktree has uncommitted changes, which the merge would not carry and the checks would run on: ${unsaved.slice(0, 5).join('; ')}. Have the worker commit or discard them.`)
+
+  const plan = request.noChecks ? { commands: [] as string[], source: '--no-checks' } : await checksOf(run.repo)
+  if (!request.noChecks && plan.commands.length === 0 && plan.source !== '.drove.json') {
+    return refuse('no-checks', `no checks are defined for ${run.repo}: add a "checks" list to its .drove.json (an empty list says there are none), or a typecheck, lint or test script. The human can pass --no-checks.`)
+  }
+  const check = async (): Promise<CommandResult | undefined> => {
+    const result = await runChecks(deps, seat.worktree, plan.commands)
+    if (result.ok) return undefined
+    return refuse('checks-failed', `merge refused: "${result.command}" failed (exit ${result.code}) in ${seat.worktree}. Last output:\n${result.output || '(no output)'}`, { check: result.command, exitCode: result.code })
+  }
+
+  if (!request.pr) return mergeLocal(deps, run, seat, base, request, plan, check, settle, refuse)
+  return mergePr(deps, run, seat, base, request, plan, check, settle, refuse)
+}
+
+type Gate = {
+  settle: (event: 'merge.passed' | 'merge.refused' | 'merge.pending', detail: string, data?: Record<string, unknown>) => Promise<void>
+  refuse: (code: string, text: string, data?: Record<string, unknown>) => Promise<CommandResult>
+}
+
+const mergeLocal = async (
+  deps: Deps, run: RunMeta, seat: Seat, base: string, request: MergeRequest, plan: { commands: string[]; source: string },
+  check: () => Promise<CommandResult | undefined>, settle: Gate['settle'], refuse: Gate['refuse'],
+): Promise<CommandResult> => {
+  const head = await git.headBranch(deps.exec, run.repo)
+  if (head !== base) return refuse('wrong-branch', `the main checkout ${run.repo} is on ${head ?? 'no branch'}, not ${base}: switch it to ${base} first (git switch ${base}), then run drove merge again`)
+  const unsaved = await git.dirtyLines(deps.exec, run.repo)
+  if (unsaved.length > 0) return refuse('dirty-checkout', `the main checkout ${run.repo} has uncommitted changes (${unsaved.slice(0, 5).join('; ')}): commit or stash them, then run drove merge again`)
+  const failure = await check()
+  if (failure) return failure
+  const message = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, seat.branch)}`
+  const merged = await git.mergeNoFf(deps.exec, run.repo, seat.branch, message)
+  if (!merged.ok) return refuse('merge-conflict', `merge refused: ${seat.branch} does not merge cleanly into ${base} (the merge was aborted, ${base} is untouched): ${clip(merged.output, 400)}. Have the worker merge ${base} into its branch and resolve the conflicts.`)
+  const detail = gateText(plan.commands, plan.source)
+  await settle('merge.passed', `merged at ${merged.sha}; ${detail}`, { sha: merged.sha, checks: plan.commands, message })
+  return ok(`Merged ${seat.branch} into ${base} at ${merged.sha} (--no-ff: "${message}"); ${detail}. ${base} is local and not pushed. Close ${seat.name} with drove close ${seat.name} --remove-worktree.`, { status: 'merged', mode: 'local', sha: merged.sha })
+}
+
+const prBody = (run: RunMeta, seat: Seat, subjects: readonly string[]): string =>
+  [`## Commits`, ...subjects.map(subject => `- ${subject}`), '', ...(seat.cairn ? [`Cairn: ${seat.cairn}`] : []), `Drove run ${run.id}, seat ${seat.name} (${seat.branch}).`].join('\n')
+
+const mergePr = async (
+  deps: Deps, run: RunMeta, seat: Seat, base: string, request: MergeRequest, plan: { commands: string[]; source: string },
+  check: () => Promise<CommandResult | undefined>, settle: Gate['settle'], refuse: Gate['refuse'],
+): Promise<CommandResult> => {
+  if (!(await git.hasRemote(deps.exec, run.repo))) return refuse('no-remote', `${run.repo} has no remote, so there is no pull request to open: use drove merge ${seat.name} without --pr`)
+  const hasCi = await hasWorkflows(run.repo, seat.worktree)
+  let isChecked = false
+  if (!hasCi) {
+    const failure = await check()
+    if (failure) return failure
+    isChecked = true
+  }
+
+  const pushed = await git.pushBranch(deps.exec, run.repo, REMOTE, seat.branch)
+  if (pushed.code !== 0) return refuse('push-failed', `could not push ${seat.branch} to ${REMOTE}: ${clip(pushed.stderr || pushed.stdout)}`)
+
+  let pr = await viewPr(deps, run.repo, seat.branch)
+  if (!pr) {
+    const subjects = await git.commitSubjects(deps.exec, run.repo, (await git.freshestBase(deps.exec, run.repo, run.base)).ref, seat.branch)
+    const last = subjects.at(-1) ?? seat.branch
+    const title = seat.cairn && !last.includes(seat.cairn) ? `${last} (${seat.cairn})` : last
+    const created = await gh(deps, run.repo, ['pr', 'create', '--head', seat.branch, '--base', base, '--title', title, '--body', prBody(run, seat, subjects)])
+    if (created.code !== 0) return refuse('pr-failed', `gh pr create failed: ${clip(created.stderr || created.stdout)}`)
+    pr = await viewPr(deps, run.repo, seat.branch)
+    if (!pr) return refuse('pr-failed', `gh pr create ran, but the pull request for ${seat.branch} cannot be read back: ${clip(created.stdout)}`)
+  }
+  const at = { url: pr.url, pr: pr.number }
+
+  if (pr.state === 'CLOSED') return refuse('pr-closed', `${pr.url} is closed without merging: reopen it on GitHub, or close ${seat.name}`, at)
+  if (pr.state !== 'MERGED') {
+    if (pr.mergeable === 'CONFLICTING') return refuse('pr-conflicts', `${pr.url} has conflicts with ${base}: have the worker merge ${base} into its branch, then run drove merge ${seat.name} --pr again`, at)
+    if (pr.reviewDecision === 'CHANGES_REQUESTED') return refuse('pr-changes-requested', `${pr.url} has changes requested on GitHub: address them, then run drove merge ${seat.name} --pr again`, at)
+    const checks = await prChecks(deps, run.repo, pr.number)
+    if ('error' in checks) return refuse('checks-unreadable', `could not read the checks of ${pr.url}: ${checks.error}`, at)
+    const failing = checks.filter(entry => entry.bucket === 'fail' || entry.bucket === 'cancel')
+    if (failing.length > 0) return refuse('checks-failed', `merge refused: ${failing.length} check${failing.length === 1 ? '' : 's'} failed on ${pr.url}:\n${failing.map(entry => `- ${entry.name}${entry.link ? ` ${entry.link}` : ''}`).join('\n')}`, { ...at, failing: failing.map(entry => entry.name) })
+    const waiting = checks.filter(entry => entry.bucket === 'pending')
+    const pending = async (why: string): Promise<CommandResult> => {
+      await settle('merge.pending', why, at)
+      return ok(`pending: ${why} on ${pr.url}. Run drove merge ${seat.name} --pr again later.`, { status: 'pending', mode: 'pr', ...at })
+    }
+    if (waiting.length > 0) return pending(`${waiting.length} check${waiting.length === 1 ? ' is' : 's are'} still running (${waiting.map(entry => entry.name).join(', ')})`)
+    if (checks.length === 0) {
+      const age = deps.clock.now().getTime() - (Date.parse(pr.createdAt) || 0)
+      if (hasCi && age < CI_GRACE_MS) return pending('no checks have reported yet')
+      if (!isChecked) {
+        const failure = await check()
+        if (failure) return failure
+        isChecked = true
+      }
+    }
+    if (pr.reviewDecision === 'REVIEW_REQUIRED') return pending('a review is required on GitHub')
+    const subject = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, seat.branch)}`
+    const merged = await gh(deps, run.repo, ['pr', 'merge', String(pr.number), request.squash ? '--squash' : '--merge', '--subject', subject])
+    if (merged.code !== 0) return refuse('pr-merge-failed', `gh pr merge refused ${pr.url}: ${clip(merged.stderr || merged.stdout)}`, at)
+    const after = await viewPr(deps, run.repo, seat.branch)
+    if (after?.state !== 'MERGED') return refuse('pr-merge-failed', `gh pr merge ran but ${pr.url} is ${after?.state ?? 'unreadable'}, not MERGED`, at)
+  }
+
+  const notes: string[] = []
+  const removed = await git.deleteRemoteBranch(deps.exec, run.repo, REMOTE, seat.branch)
+  if (removed.code !== 0) notes.push(`The remote branch ${seat.branch} was not deleted (${clip(removed.stderr || removed.stdout, 160)}).`)
+  const head = await git.headBranch(deps.exec, run.repo)
+  const unsaved = head === base ? await git.dirtyLines(deps.exec, run.repo) : []
+  let sha: string | undefined
+  if (head !== base) notes.push(`The main checkout is on ${head ?? 'no branch'}, not ${base}, so local ${base} was not updated: git switch ${base} and pull.`)
+  else if (unsaved.length > 0) notes.push(`The main checkout has uncommitted changes, so local ${base} was not updated: commit or stash them, then git pull --ff-only.`)
+  else {
+    const forwarded = await git.fastForwardFromRemote(deps.exec, run.repo, REMOTE, base)
+    if (forwarded.ok) sha = forwarded.sha
+    else notes.push(`Local ${base} could not be fast-forwarded from ${REMOTE}/${base}: ${forwarded.error}`)
+  }
+  const gated = isChecked ? gateText(plan.commands, plan.source) : 'GitHub checks green'
+  await settle('merge.passed', `${request.squash ? 'squash-merged' : 'merged'} ${pr.url}${sha ? `, local ${base} at ${sha}` : ''}; ${gated}`, { ...at, ...(sha ? { sha } : {}), squash: request.squash === true, checks: isChecked ? plan.commands : [] })
+  return ok([`Merged ${pr.url} (${request.squash ? 'squash' : 'merge commit'}); ${gated}.`, ...notes, `Close ${seat.name} with drove close ${seat.name} --remove-worktree.`].join(' '), { status: 'merged', mode: 'pr', ...at, ...(sha ? { sha } : {}) })
 }
 
 // ---------- down / up ----------

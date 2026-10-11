@@ -14,6 +14,13 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 - The brief footer gives a worker its ports and the files copied for it, only when set.
 - DESIGN has an "Isolation" section: what a worktree isolates, what these keys add, and when a container or VM per seat is worth it (not built).
 
+### The merge gate (DROVE-92, DROVE-105)
+- New `drove merge <seat> [--pr] [--squash] [-m MSG] [--run ID]`, the planner's `merge` tool and the mod's `merge_worker`: a worker's branch is merged only after the repo's checks pass. Locally, Drove runs them in the seat's worktree (the `checks` list in the repo's `.drove.json`, else the `typecheck`, `lint` and `test` scripts or Makefile targets) and merges `--no-ff` into the base in the main checkout, which must be on the base and clean; a failure is refused with the failing check's output tail.
+- `--pr` pushes the seat's branch to `origin` (never `production`), opens a PR with `gh pr create` from the commits and the seat's Cairn ref, and reads `gh pr checks`: pending returns the PR URL to call again, failed checks are refused by name, and green runs `gh pr merge` (`--squash` or a merge commit), deletes the remote branch and fast-forwards the local base. A repo with no CI counts as green only after the local checks pass.
+- `merge.passed`, `merge.refused` and `merge.pending` events, and the last gate result on the seat's board line.
+- The guard denies the planner a `git merge` of a seat branch (`worktree-*`, `drove/*`) with "use drove merge <seat>: it runs the checks first", and denies `drove merge --no-checks` to the planner; `--no-checks` is for the human.
+- The planner's role text, in both planners, says to integrate with `drove merge <seat>` (`--pr` when the repo has a remote with CI), never a plain `git merge`.
+
 ## [0.3.0] - 2026-10-11
 
 Leaner workers the planner trims per spawn, a more reliable `/orchestrate`, and `drove init` for starting a goal in a new repo.

@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'roster', 'capture', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -196,7 +196,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
     ),
     defineTool(
       'verdict',
-      'Give a verdict on a worker\'s done report, after you reviewed its diff yourself (git diff main... in its worktree) and checked its test output. approve tells the worker to commit only its own paths and confirm with a done report whose expects is none; then merge its branch and close the seat. changes sends the worker back to fix the notes you give and report done again, so notes are required for changes. Never approve unseen work.',
+      'Give a verdict on a worker\'s done report, after you reviewed its diff yourself (git diff main... in its worktree) and checked its test output. approve tells the worker to commit only its own paths and confirm with a done report whose expects is none; then integrate its branch with the merge tool (never a plain git merge) and close the seat. changes sends the worker back to fix the notes you give and report done again, so notes are required for changes. Never approve unseen work.',
       {
         seat: seatProp,
         verdict: { type: 'string', enum: VERDICTS, description: 'approve | changes' },
@@ -249,6 +249,19 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       { seat: seatProp, removeWorktree: { type: 'boolean', description: 'Also remove the worktree (only allowed when the branch is merged).' } },
       ['seat'],
       async (args) => asResult(await cmd.close(deps, identity, seatName(args), flag(args, 'removeWorktree'))),
+    ),
+    defineTool(
+      'merge',
+      'Integrate an approved worker\'s branch behind the repo\'s checks; use this, never a plain git merge (the guard denies that). Local (default): Drove runs the repo\'s checks (typecheck, lint, test, or the checks list in .drove.json) in the seat\'s worktree, and only when they pass merges the branch --no-ff into the run\'s base in the main checkout (which must be on the base and clean). A failure is refused with the failing check\'s output tail. With pr: Drove pushes the branch to origin, opens a pull request, reads its checks and, once green, merges it with gh and fast-forwards the local base. The result may be "pending" with the PR URL (checks still running or a review required): call merge again later, and do not poll. Afterwards close the seat.',
+      {
+        seat: seatProp,
+        pr: { type: 'boolean', description: 'Go through a GitHub pull request (the repo needs a remote). Default: a local merge.' },
+        squash: { type: 'boolean', description: 'With pr: squash-merge the PR instead of a merge commit.' },
+        message: { type: 'string', description: 'The merge commit message. Default: "merge: <the branch\'s last commit subject>".' },
+      },
+      ['seat'],
+      async (args) =>
+        asResult(await cmd.merge(deps, identity, await ref(), { seat: seatName(args), pr: flag(args, 'pr'), squash: flag(args, 'squash'), message: text(args, 'message', false) })),
     ),
     defineTool(
       'roster',

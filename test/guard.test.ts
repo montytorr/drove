@@ -47,7 +47,9 @@ test('planner: reading is allowed (ported from the mod)', () => {
     'git commit -m wip',
     'git -C ../api push origin HEAD',
     'git switch -c feature --no-track origin/main',
-    'git merge --no-ff worktree-w-slug',
+    'git merge --no-ff main',
+    'git merge origin/main',
+    'git merge --abort',
     'git worktree remove --force .claude/worktrees/w-slug',
     'git stash',
     'git push origin main',
@@ -269,7 +271,7 @@ test('workers may do anything but push, drive panes or start sessions (ported fr
 })
 
 test('drove subcommands are allowed or denied per role', () => {
-  for (const sub of ['spawn w-x', 'send w-x hi', 'prompt w-x hi', 'promote w-x', 'roster --json', 'capture w-x', 'close w-x', 'board --once', 'down']) {
+  for (const sub of ['spawn w-x', 'send w-x hi', 'prompt w-x hi', 'promote w-x', 'merge w-x', 'merge w-x --pr --squash -m "merge: x"', 'roster --json', 'capture w-x', 'close w-x', 'board --once', 'down']) {
     assert.equal(planner(`drove ${sub}`), undefined, sub)
   }
   for (const sub of ['budget 6', 'plan', 'up', 'guard pre-tool-use', 'mcp', 'board', 'nonsense', '']) {
@@ -279,7 +281,38 @@ test('drove subcommands are allowed or denied per role', () => {
   assert.match(planner('drove budget 6') ?? '', /ask the human/)
   assert.equal(worker('drove roster'), undefined)
   assert.equal(worker('drove capture w-api --lines 5'), undefined)
-  for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once']) assert.ok(worker(`drove ${sub}`), sub)
+  for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once', 'merge w-x']) assert.ok(worker(`drove ${sub}`), sub)
+})
+
+test('planner: a git merge of a seat branch is denied and points at drove merge, in any spelling', () => {
+  for (const command of [
+    'git merge worktree-w-gate',
+    'git merge --no-ff worktree-w-slug',
+    'git merge --no-ff -m "merge: x" drove/w-cx',
+    'git merge origin/worktree-w-api',
+    'git merge refs/heads/drove/w-api~1',
+    'git -C ../repo merge -s ours worktree-w-api',
+    'git merge main worktree-w-api',
+    'git merge --squash drove/w-api && git commit -m x',
+    'echo $(git merge worktree-w-api)',
+  ]) {
+    assert.match(planner(command) ?? '', /use drove merge w-[a-z]+: it runs the checks first/, command)
+  }
+  assert.match(planner('git merge --no-ff worktree-w-slug') ?? '', /use drove merge w-slug: it runs the checks first/)
+  assert.match(planner('git merge drove/w-cx') ?? '', /use drove merge w-cx: it runs the checks first/)
+  assert.equal(worker('git merge worktree-w-api'), undefined)
+  assert.equal(planner('git merge --no-ff -m "merge worktree-w-api notes" main'), undefined)
+  assert.equal(planner('git log worktree-w-api..main'), undefined)
+  const denied = call('planner', 'Bash', { command: 'git merge worktree-w-gate' })
+  assert.equal(denied.allow, false)
+})
+
+test('drove merge --no-checks is for the human: denied to the planner and the worker', () => {
+  for (const command of ['drove merge w-x --no-checks', 'drove merge --no-checks w-x --pr', 'drove merge w-x --no-checks=true']) {
+    assert.match(planner(command) ?? '', /--no-checks .* for the human/, command)
+    assert.ok(worker(command), command)
+  }
+  assert.equal(planner('drove merge w-x --pr'), undefined)
 })
 
 test('planner may write inside a Claude session scratchpad and nowhere else', () => {

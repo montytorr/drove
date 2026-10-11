@@ -48,6 +48,7 @@ const FULL_MAX = 4000
 const BOARD_BG = '#1e1e2e'
 const FRAME_MS = 250
 const SPAWN_TIMEOUT_MS = 300_000
+const MERGE_TIMEOUT_MS = 600_000
 const COMMAND_TIMEOUT_MS = 120_000
 const GUARD_TIMEOUT_MS = 15_000
 
@@ -373,6 +374,21 @@ const ORCHESTRATOR_TOOLS = [
     inputSchema: { type: 'object', properties: { name: { type: 'string' }, remove_worktree: { type: 'boolean' } }, required: ['name'] },
   },
   {
+    name: 'merge_worker',
+    description:
+      'Orchestrator mode: integrate an approved worker’s branch behind the repo’s checks. Use this, never a plain git merge (the guard denies that). Local (default): Drove runs the repo’s checks (typecheck, lint, test, or the checks list in .drove.json) in the worker’s worktree and, only when they pass, merges the branch --no-ff into the base in the main checkout (it must be on the base and clean); a failure is refused with the failing check’s output. pr: true pushes the branch, opens a pull request, reads its checks and, once green, merges it with gh and fast-forwards the local base; the answer may be "pending" with the PR URL (checks running or a review required): call again later, do not poll. Close the worker afterwards.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        pr: { type: 'boolean', description: 'go through a GitHub pull request (the repo needs a remote); default is a local merge' },
+        squash: { type: 'boolean', description: 'with pr: squash-merge the pull request instead of a merge commit' },
+        message: { type: 'string', description: 'the merge commit message; default "merge: <the branch’s last commit subject>"' },
+      },
+      required: ['name'],
+    },
+  },
+  {
     name: 'roster',
     description: 'Orchestrator mode: list the workers, their state, model, effort, last report and what you owe them.',
     inputSchema: { type: 'object', properties: {} },
@@ -419,6 +435,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__demote_worker: input => `moving ${String(input.name ?? '')} back down`,
   mcp__orchestrator__migrate_worker: input => `moving ${String(input.name ?? '')} to ${String(input.kind ?? '')}`,
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
+  mcp__orchestrator__merge_worker: input => `merging ${String(input.name ?? '')}`,
   mcp__orchestrator__roster: () => 'checking the roster',
   Bash: input => `running ${oneLine(String(input.command ?? ''), 60)}`,
   Read: input => `reading ${String(input.file_path ?? '').split('/').pop() ?? ''}`,
@@ -554,6 +571,13 @@ const migrateWorker = async ($: EngineInterface, input: Record<string, unknown>)
 
 const closeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> =>
   answerOf(await plannerRun($, drove.closeArgs(String(input.name ?? '').trim(), input.remove_worktree === true)))
+
+const mergeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
+  const message = typeof input.message === 'string' && input.message.trim() ? input.message.trim() : undefined
+  return answerOf(await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS }))
+}
 
 const rosterTool = async ($: EngineInterface): Promise<ToolAnswer> => {
   const orchestrator = await read($, orchestratorAtom)
@@ -1330,6 +1354,9 @@ export const register: Register = (on, options) => {
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__close_worker' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? closeWorker($, e as Record<string, unknown>) : { deny: OFF },
+  ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__merge_worker' as never }, async ($, e): Promise<ToolAnswer> =>
+    (await read($, orchestratorAtom)) ? mergeWorker($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__read_reports' as never }, async ($, e): Promise<ToolAnswer> => readReportsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({
