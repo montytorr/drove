@@ -22,6 +22,7 @@ const fakeDeps = () => {
     append: async (path, value) => void written.push({ path, value: value as Record<string, unknown> }),
     openIds: async () => [],
     seatToken: async () => undefined,
+    adoptGoal: async () => undefined,
   }
   return { deps, written }
 }
