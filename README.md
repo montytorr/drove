@@ -18,6 +18,16 @@ There is no daemon. The planner's own MCP server (or, for a Claude planner with 
 
 [DESIGN.md](DESIGN.md) has the protocol, launch specs, guard rules and the reasons behind them.
 
+## Watching a run
+
+The same board, in three places. It lists each seat with its kind, model, state and what needs a human, and a timeline of the briefs, reports and verdicts between the planner and its workers.
+
+- **In a spare pane:** `drove board` is a live, coloured board that uses your terminal's own background. Piped, or with `--once`, it prints one frame.
+- **Inside Claude:** with the mod loaded, the planner session shows the same board, with pills and toasts, and the dialogs that need your answer.
+- **In a browser:** `drove board --web` serves a read-only page on `127.0.0.1`, behind a token made at each start. It opens on a graph of the lead and its workers, with a dot labelled brief, report or verdict travelling along the edge when one arrives. A Graph | Board switch goes to the rows, a click on a seat opens its state, branch, worktree and the tail of its pane, and the timeline has chips to show only what needs you, only reports, or everything. It runs only while the command does: Drove has no daemon.
+
+The [commands section](#commands) has the full reference for `drove board --web`.
+
 ## Requirements
 
 - Node 22.18 or newer. Drove runs its TypeScript directly, so there is no build step.
