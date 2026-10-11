@@ -377,6 +377,42 @@ export type SeatSignals = {
 
 export type Derived = { state: SeatState; attention: Attention[] }
 
+// DROVE-96: one thing in a run that waits on a person. `id` is stable for as long as the item is open and is never
+// reused by a later episode; `kind` is an Attention reason, the kind of a report addressed to the human, `asking` or
+// `pane-budget`.
+export type AttentionKind = Attention['reason'] | 'question' | 'blocked' | 'promote' | 'asking' | 'pane-budget'
+
+export type AttentionAnswer =
+  | { type: 'command'; command: string; note?: string }
+  | { type: 'pane'; pane?: string; inspect?: string; note: string }
+  | { type: 'planner'; note: string; command?: string }
+
+export type AttentionItem = {
+  id: string
+  run: string
+  seat: string
+  kind: AttentionKind
+  text: string
+  since: string
+  answer: AttentionAnswer
+}
+
+export type PlannerState = HerdrStatus | 'gone' | 'unreachable' | 'down'
+
+// What drove plan --detached and drove up --detached return with --json (DROVE-95).
+export type DetachedStart = {
+  run: string
+  repo: string
+  status: RunMeta['status']
+  workspace: string
+  tab?: string
+  planner: { kind: AgentKind; pane: string; name: string; model: string; effort: Effort; state: SeatState; sessionId?: string; attention?: { reason: Attention['reason']; detail: string } }
+  goal?: string
+  cairn?: string
+  resumed?: string[]
+  lost?: string[]
+}
+
 export type McpTool = {
   name: string
   description: string

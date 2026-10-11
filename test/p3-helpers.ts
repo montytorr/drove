@@ -74,6 +74,8 @@ export class FakeHerdr {
     if (bin === 'git') return nodeExec(argv)
     if (bin === 'codex' && group === 'queue') return this.codexQueue(argv)
     if (bin !== 'herdr') return result('', 127, `unexpected ${bin}`)
+    if (this.serverDown) return result('', 1, 'herdr: cannot reach the server (connect ENOENT /tmp/herdr.sock): server is not running')
+    if (group === 'workspace') return this.workspace(action, argv)
     if (group === 'tab') return this.tab(action, argv)
     if (group === 'pane') return this.pane(action, argv)
     if (group === 'agent') return this.agent(action, argv)
@@ -91,6 +93,30 @@ export class FakeHerdr {
   }
 
   private json = (value: unknown): ExecResult => result(JSON.stringify(value))
+
+  // A herdr whose server is not running: every call fails the way the CLI does when it cannot reach the socket.
+  serverDown = false
+  workspaces = new Set<string>()
+
+  private workspace(action: string | undefined, argv: readonly string[]): ExecResult {
+    if (action === 'list') return this.json({ result: { workspaces: [...this.workspaces].map(workspace_id => ({ workspace_id })) } })
+    if (action === 'create') {
+      const id = ++this.counter
+      const workspace = `w${this.workspaces.size + 2}`
+      const tabId = `${workspace}:t${id}`
+      this.workspaces.add(workspace)
+      this.tabs.add(tabId)
+      this.paneCwds.set(`${workspace}:p${id}`, argv[argv.indexOf('--cwd') + 1] ?? '')
+      return this.json({ result: { workspace: { workspace_id: workspace }, tab: { tab_id: tabId }, root_pane: { pane_id: `${workspace}:p${id}` } } })
+    }
+    if (action === 'close') {
+      const workspace = argv[3] ?? ''
+      this.workspaces.delete(workspace)
+      for (const [name, agent] of this.agents) if (agent.paneId.startsWith(`${workspace}:`)) this.agents.delete(name)
+      return this.json({ result: {} })
+    }
+    return herdrFail('unknown_command')
+  }
 
   private tab(action: string | undefined, argv: readonly string[]): ExecResult {
     if (action === 'create') {

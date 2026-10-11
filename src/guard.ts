@@ -98,7 +98,7 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'capture', 'close', 'down'])
+const PLANNER_DROVE = new Set(['init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'attention', 'capture', 'close', 'down'])
 const WORKER_DROVE = new Set(['roster', 'capture'])
 
 const WORKER_PUSH = 'workers never push; report done and let the planner and the human decide'

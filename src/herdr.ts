@@ -59,6 +59,13 @@ export const paneReadArgv = (paneId: string, lines: number, source: ReadSource =
   'herdr', 'pane', 'read', paneId, '--source', source, '--lines', String(lines),
 ]
 
+// DROVE-95: a run started with --detached gets a workspace of its own, so it needs no pane to stand beside.
+export const workspaceCreateArgv = (cwd: string, label: string, env: Record<string, string>): string[] => [
+  'herdr', 'workspace', 'create', '--cwd', cwd, '--label', label, '--no-focus', ...envFlags(env),
+]
+export const workspaceListArgv = (): string[] => ['herdr', 'workspace', 'list']
+export const workspaceCloseArgv = (workspaceId: string): string[] => ['herdr', 'workspace', 'close', workspaceId]
+
 export const agentListArgv =(): string[] => ['herdr', 'agent', 'list']
 export const agentGetArgv = (target: string): string[] => ['herdr', 'agent', 'get', target]
 export const agentExplainArgv = (target: string): string[] => ['herdr', 'agent', 'explain', target, '--json']
@@ -123,6 +130,22 @@ export const parseNewPane = (stdout: string): { paneId: string; tabId?: string }
   return { paneId: pane.pane_id, ...(typeof tab?.tab_id === 'string' ? { tabId: tab.tab_id } : {}) }
 }
 
+export type NewWorkspace = { workspaceId: string; paneId: string; tabId?: string }
+
+// `workspace create` answers with .result.workspace, .result.tab and .result.root_pane. A pane id is `<workspace>:<pane>`,
+// so a reply that leaves the workspace object out still names it.
+export const parseNewWorkspace = (stdout: string): NewWorkspace | undefined => {
+  const result = asRecord(asRecord(parseJson(stdout))?.result)
+  const pane = asRecord(result?.root_pane) ?? asRecord(result?.pane)
+  const tab = asRecord(result?.tab)
+  const workspace = asRecord(result?.workspace)
+  if (typeof pane?.pane_id !== 'string') return undefined
+  const named = typeof workspace?.workspace_id === 'string' ? workspace.workspace_id : typeof workspace?.id === 'string' ? workspace.id : undefined
+  const workspaceId = named ?? pane.pane_id.split(':')[0]
+  if (!workspaceId) return undefined
+  return { workspaceId, paneId: pane.pane_id, ...(typeof tab?.tab_id === 'string' ? { tabId: tab.tab_id } : {}) }
+}
+
 const outputOf = (result: ExecResult): string => [result.stdout, result.stderr].filter(Boolean).join('\n')
 
 export const run = async (exec: Exec, argv: readonly string[], timeoutMs = 20_000): Promise<HerdrResult<string>> => {
@@ -131,6 +154,15 @@ export const run = async (exec: Exec, argv: readonly string[], timeoutMs = 20_00
   const code = herdrError(output)
   if (result.code === 0 && code === undefined) return { ok: true, value: result.stdout }
   return { ok: false, code: code ?? `exit_${result.code}`, output }
+}
+
+// A listing changes nothing, so it is the probe for "is a herdr server there to talk to". Drove never starts one.
+export const probeServer = async (exec: Exec): Promise<HerdrResult<string>> => {
+  try {
+    return await run(exec, workspaceListArgv(), 10_000)
+  } catch (error) {
+    return { ok: false, code: 'unreachable', output: error instanceof Error ? error.message : String(error) }
+  }
 }
 
 export const listAgents = async (exec: Exec): Promise<HerdrResult<ListedAgent[]>> => {

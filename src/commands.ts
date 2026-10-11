@@ -4,22 +4,24 @@ import { existsSync } from 'node:fs'
 import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { OrchModStatus } from '../mod/types/index.d.ts'
+import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
 import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './isolation.ts'
 import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeMcp, readClaudePlugins, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
-import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
+import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, approvedText, briefFooter, cairnGoalPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
-  AgentKind, CommandResult, Control, Deps, DroveConfig, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, MergeGate, MergeRequest, MigrateRequest, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
+  AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
-export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string }
+export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string; detached?: boolean; json?: boolean }
 export type RunRef = { run?: string; repo: string }
 export type ProcessPlan = { argv: string[]; env: Record<string, string>; cwd: string }
 
@@ -529,11 +531,92 @@ const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[]
   }
 }
 
+// ---------- detached start (DROVE-95) ----------
+
+type Failed = Extract<CommandResult, { ok: false }>
+type OpenedWorkspace = herdr.NewWorkspace
+type DetachedPlanner = { state: Seat['state']; name: string; sessionId?: string; attention?: Attention; notes: string[] }
+
+// --detached talks to a herdr server that is already running and never starts one: a server comes with a person's
+// session, and its panes are the person's to lose.
+const requireHerdrServer = async (deps: Deps): Promise<Failed | undefined> => {
+  const probe = await herdr.probeServer(deps.exec)
+  if (probe.ok) return undefined
+  const why = clip(probe.output) || probe.code
+  return failed('herdr-down', `herdr is not reachable (${why}). --detached opens a workspace in a running herdr server and does not start one: start herdr first (HERDR_SOCKET_PATH names its socket when it is not at the default path), then run this again.`) as Failed
+}
+
+const openDetachedWorkspace = async (deps: Deps, run: RunMeta, env: Record<string, string>): Promise<OpenedWorkspace | Failed> => {
+  const label = `drove · ${basename(run.repo)} · ${herdr.runTag(run.id)}`
+  const made = await herdr.run(deps.exec, herdr.workspaceCreateArgv(run.repo, label, { ...env, ...PANE_ENV }))
+  const opened = made.ok ? herdr.parseNewWorkspace(made.value) : undefined
+  return opened ?? (failed('herdr', `herdr could not open a workspace for run ${run.id}: ${clip(made.ok ? made.value : made.output)}`) as Failed)
+}
+
+// The planner is started the way a worker is: into the root pane of the workspace, as a named herdr agent, so the
+// watcher, the wake and the board reach it by the pane id the run records.
+const startDetachedPlanner = async (deps: Deps, run: RunMeta, spec: LaunchSpec, paneId: string, typedPrompt: string | undefined): Promise<DetachedPlanner | Failed> => {
+  const kind = run.planner.kind
+  const name = herdr.agentName(run.id, PLANNER_SEAT)
+  await awaitShellPrompt(deps, paneId)
+  const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(name, kind, paneId, spec.argv), BUSY_RETRY_MS)
+  if (!started.ok && started.code === 'agent_not_ready') {
+    const screen = await herdr.readScreen(deps.exec, paneId, 40, 'visible')
+    const dialog = screen.ok ? matchDialog(PLANNER_SEAT, screen.value, deps.clock.now()) : undefined
+    const attention: Attention = dialog ?? { seat: PLANNER_SEAT, reason: 'dialog', detail: 'The planner stopped on a startup dialog; answer it in the pane. Drove will not.', at: deps.clock.now().toISOString() }
+    await recordEvent(deps, run.id, { type: 'attention', seat: PLANNER_SEAT, data: { reason: attention.reason, detail: attention.detail } })
+    return { state: 'blocked', name, attention, notes: typedPrompt ? ['The goal was not typed: the planner is at a dialog. Answer it, then give the planner its goal in the pane.'] : [] }
+  }
+  const adopted = started.ok ? undefined : await adoptFailedStart(deps, name, kind, paneId)
+  if (!started.ok && !adopted) return failed('herdr', `herdr could not start the ${kind} planner in pane ${paneId}: ${clip(started.output)}`) as Failed
+  const live = started.ok ? await herdr.getAgent(deps.exec, paneId) : undefined
+  const sessionId = (live?.ok ? live.value.sessionId : undefined) ?? adopted?.sessionId
+  const notes: string[] = []
+  if (typedPrompt) {
+    const typed = await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, typedPrompt, 15_000), BUSY_RETRY_MS)
+    if (!typed.ok && !herdr.isPromptUnconfirmed(typed.output)) notes.push(`The goal was not delivered (${clip(typed.output, 160)}); give the planner its goal in the pane.`)
+  }
+  return { state: adopted ? adopted.state : live?.ok ? stateOfHerdr(live.value.status) : 'working', name, ...(sessionId ? { sessionId } : {}), notes }
+}
+
+// A detached start that did not come up leaves nothing half-open: the workspace Drove made is closed, and the run is
+// put back as it was (a new run is marked down, so drove up --detached can try it again).
+const abandonDetached = async (deps: Deps, run: RunMeta, previous: RunMeta | undefined, failure: Failed, workspaceId?: string): Promise<CommandResult> => {
+  if (workspaceId) await herdr.run(deps.exec, herdr.workspaceCloseArgv(workspaceId))
+  await saveRun(deps.home, previous ?? { ...run, status: 'down' })
+  if (!previous) await recordEvent(deps, run.id, { type: 'run.down', data: { reason: 'detached-start-failed', code: failure.code } })
+  return failed(failure.code, `${failure.text}${previous ? '' : ` Run ${run.id} was left down; drove up --run ${run.id} --detached tries it again.`}`)
+}
+
+const detachedResult = (run: RunMeta, opened: OpenedWorkspace, started: DetachedPlanner, asJson: boolean, summary: string, extra: Pick<DetachedStart, 'resumed' | 'lost'> = {}): CommandResult => {
+  const { kind, model, effort } = run.planner
+  const sessionId = started.sessionId ?? run.planner.sessionId
+  const data: DetachedStart = {
+    run: run.id,
+    repo: run.repo,
+    status: run.status,
+    workspace: opened.workspaceId,
+    ...(opened.tabId ? { tab: opened.tabId } : {}),
+    planner: { kind, pane: opened.paneId, name: started.name, model, effort, state: started.state, ...(sessionId ? { sessionId } : {}), ...(started.attention ? { attention: { reason: started.attention.reason, detail: started.attention.detail } } : {}) },
+    ...(run.goal ? { goal: run.goal } : {}),
+    ...(run.cairn ? { cairn: run.cairn } : {}),
+    ...extra,
+  }
+  const blocked = started.attention ? ` The planner is waiting at a dialog (${started.attention.reason}): answer it in pane ${opened.paneId}.` : ''
+  const text = `${summary}${blocked}${started.notes.map(note => ` ${note}`).join('')} Poll it with \`drove attention --run ${run.id} --json\` and \`drove roster --run ${run.id} --json\`.`
+  return ok(asJson ? JSON.stringify(data, null, 2) : text, data)
+}
+
 // ---------- plan ----------
 
 export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandResult> => {
-  const paneId = process.env.HERDR_PANE_ID
-  if (!paneId) return failed('not-in-herdr', 'drove plan must run inside a herdr pane (HERDR_PANE_ID is unset)')
+  const isDetached = request.detached === true
+  const paneId = isDetached ? undefined : process.env.HERDR_PANE_ID
+  if (!isDetached && !paneId) return failed('not-in-herdr', 'drove plan must run inside a herdr pane (HERDR_PANE_ID is unset); --detached opens a workspace of its own instead')
+  if (isDetached) {
+    const unreachable = await requireHerdrServer(deps)
+    if (unreachable) return unreachable
+  }
   const repo = await git.toplevel(deps.exec, request.repo)
   if (!repo) return failed('not-a-repo', `${request.repo} is not inside a git repository`)
   const config = await loadConfig(deps.home)
@@ -549,9 +632,11 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const goal = goalTask?.goal ?? request.goal
 
   let run: RunMeta
+  let previous: RunMeta | undefined
   if (request.run) {
     const existing = await loadRun(deps.home, request.run)
     if (!existing) return failed('no-run', `no run named ${request.run}`)
+    previous = existing
     run = { ...existing, goal: goal ?? existing.goal, cairn: goalTask?.ref ?? existing.cairn, planner: { ...existing.planner, kind, paneId, model, effort, ...(sessionId ? { sessionId } : { sessionId: undefined }) } }
   } else {
     const base = await git.baseRef(deps.exec, repo).catch(() => undefined)
@@ -572,21 +657,35 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   }
   await saveRun(deps.home, run)
   await updateRoster(deps.home, run.id, roster => roster)
-  await recordEvent(deps, run.id, { type: 'run.up', data: { planner: kind, pane: paneId, attached: Boolean(request.run) } })
+  if (!isDetached) await recordEvent(deps, run.id, { type: 'run.up', data: { planner: kind, pane: paneId, attached: Boolean(request.run) } })
 
   const identity: Identity = { home: deps.home, run: run.id, role: 'planner', seat: PLANNER_SEAT }
+  const prompt = goalTask?.prompt ?? request.goal ?? (kind === 'codex' ? SESSIONLESS_PROMPT : undefined)
+  // herdr types a launch line into a shell, so a goal with a newline cannot ride in it: it is typed once the planner is up.
+  const typedPrompt = isDetached && prompt !== undefined && !isShellSafeArg(prompt) ? prompt : undefined
   const launch = launchRequest(
     deps,
     {
       identity, kind, repo, cwd: repo, model, effort,
       roleText: plannerRole(run, config, kind, await availableTrimsOf(deps, run)),
-      initialPrompt: goalTask?.prompt ?? request.goal ?? (kind === 'codex' ? SESSIONLESS_PROMPT : undefined),
+      initialPrompt: typedPrompt === undefined ? prompt : undefined,
       channel: kind === 'claude' && config.claudeChannel,
       ...(sessionId ? { sessionId } : {}),
     },
     config,
   )
   const spec = specFor(launch)
+  if (isDetached) {
+    const opened = await openDetachedWorkspace(deps, run, spec.env)
+    if ('code' in opened) return abandonDetached(deps, run, previous, opened)
+    run = { ...run, planner: { ...run.planner, paneId: opened.paneId } }
+    await saveRun(deps.home, run)
+    await recordEvent(deps, run.id, { type: 'run.up', data: { planner: kind, pane: opened.paneId, workspace: opened.workspaceId, detached: true, attached: Boolean(request.run) } })
+    await writeLaunchFiles(spec)
+    const started = await startDetachedPlanner(deps, run, spec, opened.paneId, typedPrompt)
+    if ('code' in started) return abandonDetached(deps, run, previous, started, opened.workspaceId)
+    return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on Cairn task ${goalTask.ref}` : ''}.`)
+  }
   await writeLaunchFiles(spec)
   return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on Cairn task ${goalTask.ref}` : ''}.`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
 }
@@ -763,7 +862,13 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     })
   } catch (error) {
     if (error instanceof SeatTaken) return failed('seat-taken', error.message)
-    if (error instanceof OverBudget) return failed('over-budget', error.message)
+    if (error instanceof OverBudget) {
+      // DROVE-96: a request for a pane over the budget is the human's to grant; `drove attention` lists it until then.
+      const open = openSeats(await loadRoster(deps.home, run.id)).length
+      const wanted = run.budget + 1
+      await recordEvent(deps, run.id, { type: 'attention', seat: seat.name, data: { reason: PANE_BUDGET_REASON, open, budget: run.budget, wanted, kind, detail: `${seat.name} (${kind}) needs pane ${wanted}, over the pane budget of ${run.budget}` } })
+      return failed('over-budget', error.message)
+    }
     throw error
   }
 
@@ -1323,11 +1428,125 @@ export const roster = async (deps: Deps, ref: RunRef, asJson: boolean): Promise<
   if (run.status === 'up') await refreshRoster(deps, run).catch(() => undefined)
   const current = await loadRoster(deps.home, run.id)
   const attention = attentionOf(current)
-  if (asJson) return ok(JSON.stringify({ run, seats: current.seats, attention }, null, 2), { run, roster: current, attention })
+  if (asJson) {
+    // DROVE-95: what a poller outside the run needs besides the seats: whether the planner's pane is alive, and the
+    // latest report any seat sent (each seat's own is in seats[].lastReport).
+    const planner = { ...run.planner, ...(await plannerStateOf(deps, run)) }
+    const lastReport = current.seats.flatMap(seat => (seat.lastReport ? [{ seat: seat.name, ...seat.lastReport }] : [])).sort((a, b) => a.at.localeCompare(b.at)).at(-1) ?? null
+    const body = { run, seats: current.seats, attention, planner, lastReport, updatedAt: current.updatedAt }
+    return ok(JSON.stringify(body, null, 2), { ...body, roster: current })
+  }
   const lines = [`run ${run.id} · ${basename(run.repo)} · ${run.status} · budget ${run.budget}`, ...rosterLines(current, deps.clock.now())]
   if (attention.length > 0) lines.push('', 'needs attention:', ...attention.map(item => `- ${item.seat}: ${item.reason} · ${item.detail}`))
   return ok(lines.join('\n'), { run, roster: current, attention })
 }
+
+const plannerStateOf = async (deps: Deps, run: RunMeta): Promise<{ state: PlannerState; detail?: string }> => {
+  if (run.status === 'down') return { state: 'down' }
+  const pane = run.planner.paneId
+  if (!pane) return { state: 'gone' }
+  const live = await herdr.getAgent(deps.exec, pane)
+  if (live.ok) return { state: live.value.status }
+  return isPaneMissing(live) ? { state: 'gone' } : { state: 'unreachable', detail: clip(live.output || live.code, 160) }
+}
+
+// ---------- attention (DROVE-96) ----------
+
+export type AttentionRequest = { run?: string; all?: boolean; repo: string }
+
+// The roster is kept fresh by the planner's watcher; one that nobody has written lately is refreshed from herdr here.
+const ROSTER_FRESH_MS = 10_000
+
+const readEvents = async (deps: Deps, run: string): Promise<DroveEvent[]> =>
+  (await readJsonlFrom<DroveEvent>(join(runDir(deps.home, run), 'events.jsonl'), { offset: 0 }).catch(() => ({ items: [] as DroveEvent[] }))).items
+
+const gatherAttention = async (deps: Deps, run: RunMeta): Promise<AttentionItem[]> => {
+  const now = deps.clock.now()
+  let current = await loadRoster(deps.home, run.id)
+  if (run.status === 'up' && now.getTime() - Date.parse(current.updatedAt) > ROSTER_FRESH_MS) {
+    await refreshRoster(deps, run).catch(() => undefined)
+    current = await loadRoster(deps.home, run.id)
+  }
+  const owing = current.seats.filter(seat => seat.state !== 'closed' && seat.owes !== 'none')
+  const reports = (await Promise.all(owing.map(seat => seatReports(deps, run, seat.name)))).flatMap(list => list.at(-1) ?? [])
+  const statuses = await Promise.all(openSeats(current).map(async seat => [seat.name, await readJson<OrchModStatus>(join(seatDir(deps.home, run.id, seat.name), 'mod.json')).catch(() => undefined)] as const))
+  const status = Object.fromEntries(statuses.filter((entry): entry is readonly [string, OrchModStatus] => entry[1] !== undefined))
+  const probed = run.status === 'up' ? await plannerStateOf(deps, run) : undefined
+  let planner: Parameters<typeof attentionCandidates>[0]['planner']
+  if (probed && probed.state !== 'unreachable') {
+    planner = { state: probed.state }
+    if (probed.state === 'blocked' && run.planner.paneId) {
+      const screen = await herdr.readPane(deps.exec, run.planner.paneId, 40, 'visible')
+      const dialog = screen.ok ? matchDialog(PLANNER_SEAT, screen.value, now) : undefined
+      if (dialog) planner = { state: 'blocked', detail: dialog.detail, reason: dialog.reason }
+    }
+  }
+  const candidates = attentionCandidates({ run, roster: current, reports, status, events: await readEvents(deps, run.id), ...(planner ? { planner } : {}), at: now.toISOString() })
+  return settleItems(deps.home, run.id, candidates)
+}
+
+const attentionRuns = async (deps: Deps, request: AttentionRequest): Promise<RunMeta[] | Failed> => {
+  if (request.run && request.all) return failed('usage', '--run and --all are exclusive') as Failed
+  if (request.all) {
+    const names = await readdir(join(deps.home, 'runs')).catch(() => [] as string[])
+    const runs = await Promise.all(names.map(name => loadRun(deps.home, name).catch(() => undefined)))
+    return runs.filter((meta): meta is RunMeta => meta?.status === 'up').sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+  }
+  const located = await locateRun(deps, { run: request.run, repo: request.repo }, 'up')
+  return 'error' in located ? (located.error as Failed) : [located.run]
+}
+
+type AttentionSnapshot = { v: 1; at: string; runs: string[]; items: AttentionItem[] }
+
+const snapshotAttention = async (deps: Deps, request: AttentionRequest): Promise<AttentionSnapshot | Failed> => {
+  const runs = await attentionRuns(deps, request)
+  if (!Array.isArray(runs)) return runs
+  const items = (await Promise.all(runs.map(run => gatherAttention(deps, run)))).flat()
+  return { v: 1, at: deps.clock.now().toISOString(), runs: runs.map(run => run.id), items }
+}
+
+export const attention = async (deps: Deps, request: AttentionRequest, asJson: boolean): Promise<CommandResult> => {
+  const snapshot = await snapshotAttention(deps, request)
+  if ('code' in snapshot) return snapshot
+  if (asJson) return ok(JSON.stringify(snapshot, null, 2), snapshot)
+  const text = snapshot.items.length > 0 ? snapshot.items.map(attentionLine).join('\n') : `Nothing waits on a person${snapshot.runs.length === 0 ? ' (no run is up)' : ''}.`
+  return ok(text, snapshot)
+}
+
+export type FollowOptions = { pollMs?: number; signal?: AbortSignal; sleep?: (ms: number, signal: AbortSignal | undefined) => Promise<void> }
+
+const abortableSleep = (ms: number, signal: AbortSignal | undefined): Promise<void> =>
+  new Promise(resolve => {
+    if (signal?.aborted) return resolve()
+    const done = () => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', done)
+      resolve()
+    }
+    const timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', done, { once: true })
+  })
+
+// One delta per item that appeared or went away since the last poll; a restarted follower starts from nothing, so it
+// prints every open item as new once (ids are stable across processes, so a poller dedupes on them).
+export const followAttention = async (deps: Deps, request: AttentionRequest, write: (delta: AttentionDelta) => void, options: FollowOptions = {}): Promise<CommandResult> => {
+  const first = await snapshotAttention(deps, request)
+  if ('code' in first) return first
+  const wait = options.sleep ?? abortableSleep
+  let known = new Map<string, AttentionItem>()
+  let snapshot: AttentionSnapshot = first
+  for (;;) {
+    for (const delta of diffItems(known, snapshot.items, deps.clock.now().toISOString())) write(delta)
+    known = new Map(snapshot.items.map(item => [item.id, item]))
+    if (options.signal?.aborted) return ok('stopped')
+    await wait(options.pollMs ?? FOLLOW_POLL_MS, options.signal)
+    if (options.signal?.aborted) return ok('stopped')
+    const next = await snapshotAttention(deps, request).catch(() => undefined)
+    if (next && !('code' in next)) snapshot = next
+  }
+}
+
+const FOLLOW_POLL_MS = 3_000
 
 export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: number): Promise<CommandResult> => {
   const located = await locateRun(deps, ref, 'up')
@@ -1804,7 +2023,11 @@ const probeCrashedRun = async (deps: Deps, run: RunMeta): Promise<{ seats: Seat[
   return { seats }
 }
 
-export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<CommandResult> => {
+export type UpOptions = { detached?: boolean; json?: boolean }
+
+export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: UpOptions = {}): Promise<CommandResult> => {
+  const isDetached = options.detached === true
+  if (isDetached && seatName) return failed('usage', '--detached starts the whole run in a workspace of its own; it does not combine with --seat')
   const located = seatName ? await locateRun(deps, ref, 'up') : await locateRun(deps, ref, 'down')
   if ('error' in located) return located.error
   let { run } = located
@@ -1825,8 +2048,12 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
     return 'error' in relaunched ? failed('relaunch', relaunched.error) : ok(`Relaunched ${seatName} in pane ${relaunched.seat.paneId} with resume.${relaunched.note ? ` Note: ${relaunched.note}.` : ''}`,{ paneId: relaunched.seat.paneId })
   }
 
-  const paneId = process.env.HERDR_PANE_ID
-  if (!paneId) return failed('not-in-herdr', 'drove up must run inside a herdr pane (HERDR_PANE_ID is unset); the planner resumes in this pane')
+  const hostPane = process.env.HERDR_PANE_ID
+  if (!isDetached && !hostPane) return failed('not-in-herdr', 'drove up must run inside a herdr pane (HERDR_PANE_ID is unset); the planner resumes in this pane. --detached opens a workspace of its own instead')
+  if (isDetached) {
+    const unreachable = await requireHerdrServer(deps)
+    if (unreachable) return unreachable
+  }
   let recovered: Seat[] | undefined
   if (run.status === 'up') {
     const crashed = await probeCrashedRun(deps, run)
@@ -1834,8 +2061,22 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
     recovered = await Promise.all(crashed.seats.map(seat => adoptAsDown(deps, run, seat)))
     const plannerId = run.planner.sessionId ?? (await plannerSessionId(deps, run))
     run = { ...run, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } }
-    await recordEvent(deps, run.id, { type: 'run.recovered', data: { seats: recovered.map(seat => seat.name), unsaved: recovered.filter(seat => !seat.sessionId).map(seat => seat.name), plannerPane: run.planner.paneId, pane: paneId } })
+    await recordEvent(deps, run.id, { type: 'run.recovered', data: { seats: recovered.map(seat => seat.name), unsaved: recovered.filter(seat => !seat.sessionId).map(seat => seat.name), plannerPane: run.planner.paneId, ...(hostPane ? { pane: hostPane } : { detached: true }) } })
   }
+  const identity: Identity = { home: deps.home, run: run.id, role: 'planner', seat: PLANNER_SEAT }
+  const planner = run.planner
+  const sessionId = planner.kind === 'claude' ? planner.sessionId ?? randomUUID() : undefined
+  const resumeId = planner.sessionId
+  const spec = specFor(
+    launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: plannerRole(run, config, planner.kind, await availableTrimsOf(deps, run)), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
+  )
+  let opened: OpenedWorkspace | undefined
+  if (isDetached) {
+    const made = await openDetachedWorkspace(deps, run, spec.env)
+    if ('code' in made) return made
+    opened = made
+  }
+  const paneId = opened?.paneId ?? hostPane ?? ''
   run = { ...run, status: 'up', tabId: undefined, planner: { ...run.planner, paneId } }
   await saveRun(deps.home, run)
   const seats = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state === 'down').sort(SPAWNED_ORDER)
@@ -1852,17 +2093,15 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string): Promise<Co
     resumed.push(seat.name)
   }
   await saveRun(deps.home, run)
-  await recordEvent(deps, run.id, { type: 'run.up', data: { resumed, lost, pane: paneId } })
+  await recordEvent(deps, run.id, { type: 'run.up', data: { resumed, lost, pane: paneId, ...(opened ? { workspace: opened.workspaceId, detached: true } : {}) } })
 
-  const identity: Identity = { home: deps.home, run: run.id, role: 'planner', seat: PLANNER_SEAT }
-  const planner = run.planner
-  const sessionId = planner.kind === 'claude' ? planner.sessionId ?? randomUUID() : undefined
-  const resumeId = planner.sessionId
-  const spec = specFor(
-    launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: plannerRole(run, config, planner.kind, await availableTrimsOf(deps, run)), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
-  )
   await writeLaunchFiles(spec)
   const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}`
+  if (opened) {
+    const started = await startDetachedPlanner(deps, run, spec, opened.paneId, undefined)
+    if ('code' in started) return failed(started.code, `${started.text} The seats were resumed in workspace ${opened.workspaceId} and pane ${opened.paneId} is left open for you; close it with drove down --run ${run.id} and try again.`)
+    return detachedResult(run, opened, started, options.json === true, `${summary.replace(/ is up/, ` is up in its own herdr workspace ${opened.workspaceId}`)} The ${planner.kind} planner is ${started.state}.`, { resumed, lost })
+  }
   return ok(summary, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
 }
 

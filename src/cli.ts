@@ -3,6 +3,7 @@ import { spawn } from 'node:child_process'
 import { realpathSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { parseArgs, type ParseArgsConfig } from 'node:util'
+import { attentionLine } from './attention.ts'
 import { runBoard } from './board.ts'
 import { runWeb } from './web.ts'
 import * as commands from './commands.ts'
@@ -15,7 +16,7 @@ import { CONTROL_KINDS } from './protocol.ts'
 import type { AgentKind, CommandResult, Effort, HookEventName, Role, SeatRole, SendRequest, SpawnRequest } from './types.ts'
 
 type Values = Record<string, string | boolean | undefined>
-type Io = { out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number> }
+type Io = { out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number>; signal?: AbortSignal; pollMs?: number }
 type Handler = (values: Values, positionals: string[], io: Io) => Promise<number>
 type Spec = { usage: string; why: string; options?: ParseArgsConfig['options']; run: Handler }
 
@@ -84,6 +85,14 @@ const print = (result: CommandResult, io: Io): number => {
   return 1
 }
 
+// The commands a script calls (--detached, attention): with --json a failure is one JSON object on stderr, so the
+// caller reads a code instead of scraping a sentence. Exit status is 0 on success, 1 on a failure, 2 on bad usage.
+const printMachine = (result: CommandResult, io: Io, asJson: boolean): number => {
+  if (result.ok || !asJson) return print(result, io)
+  io.err(JSON.stringify({ ok: false, code: result.code, error: result.text }))
+  return 1
+}
+
 const launchProcess = (plan: commands.ProcessPlan): Promise<number> =>
   new Promise(resolve => {
     const [command = '', ...args] = plan.argv
@@ -112,23 +121,26 @@ const textArg = async (positionals: string[], from: number, io: Io): Promise<str
 
 export const COMMANDS: Record<string, Spec> = {
   plan: {
-    usage: 'drove plan [--kind claude|codex] [--model M] [--effort E] [--goal TEXT | --from-cairn REF | --next PROJECT] [--run ID]',
-    why: "start a planner in this pane; --from-cairn makes a Cairn task the run's goal, --next picks the top task of a Cairn project",
-    options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, goal: { type: 'string' }, run: { type: 'string' }, 'from-cairn': { type: 'string' }, next: { type: 'string' } },
-    run: async (values, _positionals, io) =>
-      printThenLaunch(
-        await commands.plan(commands.defaultDeps(), {
-          repo: process.cwd(),
-          kind: (str(values, 'kind') ?? 'claude') as AgentKind,
-          model: str(values, 'model'),
-          effort: str(values, 'effort') as Effort | undefined,
-          goal: str(values, 'goal'),
-          run: str(values, 'run'),
-          cairn: str(values, 'from-cairn'),
-          next: str(values, 'next'),
-        }),
-        io,
-      ),
+    usage: 'drove plan [--kind claude|codex] [--model M] [--effort E] [--goal TEXT | --from-cairn REF | --next PROJECT] [--run ID] [--detached [--json]]',
+    why: "start a planner in this pane; --from-cairn makes a Cairn task the run's goal, --next picks the top task of a Cairn project; --detached opens a herdr workspace of its own and returns at once (no pane needed)",
+    options: { kind: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, goal: { type: 'string' }, run: { type: 'string' }, 'from-cairn': { type: 'string' }, next: { type: 'string' }, detached: { type: 'boolean' }, json: { type: 'boolean' } },
+    run: async (values, _positionals, io) => {
+      const isDetached = values.detached === true
+      if (values.json === true && !isDetached) throw new UsageError('--json needs --detached: an in-pane plan hands the pane to the planner')
+      const result = await commands.plan(commands.defaultDeps(), {
+        repo: process.cwd(),
+        kind: (str(values, 'kind') ?? 'claude') as AgentKind,
+        model: str(values, 'model'),
+        effort: str(values, 'effort') as Effort | undefined,
+        goal: str(values, 'goal'),
+        run: str(values, 'run'),
+        cairn: str(values, 'from-cairn'),
+        next: str(values, 'next'),
+        detached: isDetached,
+        json: values.json === true,
+      })
+      return isDetached ? printMachine(result, io, values.json === true) : printThenLaunch(result, io)
+    },
   },
   init: {
     usage: 'drove init <dir> [--json]',
@@ -147,14 +159,15 @@ export const COMMANDS: Record<string, Spec> = {
     },
   },
   send: {
-    usage: 'drove send <seat> --kind message|answer|verdict [--verdict approve|changes] [--expects review|answer|none] TEXT|-',
-    why: 'send one enveloped control message through the best transport',
-    options: { kind: { type: 'string' }, verdict: { type: 'string' }, expects: { type: 'string' } },
+    usage: 'drove send <seat> --kind message|answer|verdict [--verdict approve|changes] [--expects review|answer|none] [--run ID] TEXT|-',
+    why: 'send one enveloped control message through the best transport; --run names the run when the human sends from outside it',
+    options: { kind: { type: 'string' }, verdict: { type: 'string' }, expects: { type: 'string' }, run: { type: 'string' } },
     run: async (values, positionals, io) => {
       const kind = str(values, 'kind') ?? 'message'
       if (!CONTROL_KINDS.includes(kind as never) || ['brief', 'promote', 'demote'].includes(kind)) throw new UsageError(`--kind ${kind} is not sendable`)
+      const identity = commands.identityOrPlanner()
       return print(
-        await commands.send(commands.defaultDeps(), commands.identityOrPlanner(), {
+        await commands.send(commands.defaultDeps(), identity.run ? identity : { ...identity, run: str(values, 'run') ?? '' }, {
           seat: need(positionals[0], '<seat>'),
           kind: kind as SendRequest['kind'],
           verdict: str(values, 'verdict') as SendRequest['verdict'],
@@ -271,10 +284,45 @@ export const COMMANDS: Record<string, Spec> = {
     run: async (values, _positionals, io) => print(await commands.down(commands.defaultDeps(), runRef(values)), io),
   },
   up: {
-    usage: 'drove up [--run ID] [--seat SEAT]',
-    why: 'resume a stopped run (or one dead seat)',
-    options: { run: { type: 'string' }, seat: { type: 'string' } },
-    run: async (values, _positionals, io) => printThenLaunch(await commands.up(commands.defaultDeps(), runRef(values), str(values, 'seat')), io),
+    usage: 'drove up [--run ID] [--seat SEAT] [--detached [--json]]',
+    why: 'resume a stopped run (or one dead seat; the run may be given as a bare argument); --detached resumes the whole run in a herdr workspace of its own and returns at once (no pane needed)',
+    options: { run: { type: 'string' }, seat: { type: 'string' }, detached: { type: 'boolean' }, json: { type: 'boolean' } },
+    run: async (values, positionals, io) => {
+      const isDetached = values.detached === true
+      if (values.json === true && !isDetached) throw new UsageError('--json needs --detached: an in-pane up hands the pane to the planner')
+      if (positionals[0] !== undefined && str(values, 'run') !== undefined && positionals[0] !== str(values, 'run')) throw new UsageError(`the run is given twice: ${positionals[0]} and --run ${str(values, 'run')}`)
+      const run = positionals[0] ?? str(values, 'run')
+      const result = await commands.up(commands.defaultDeps(), { run, repo: process.cwd() }, str(values, 'seat'), { detached: isDetached, json: values.json === true })
+      return isDetached ? printMachine(result, io, values.json === true) : printThenLaunch(result, io)
+    },
+  },
+  attention: {
+    usage: 'drove attention [--run ID | --all] [--json] [--follow]',
+    why: 'what waits on a person: worker dialogs and approvals, questions and blocked reports for the human, pane-budget requests, gone seats; --follow prints new and resolved items as JSON lines',
+    options: { run: { type: 'string' }, all: { type: 'boolean' }, json: { type: 'boolean' }, follow: { type: 'boolean' } },
+    run: async (values, _positionals, io) => {
+      const request = { run: str(values, 'run') ?? (process.env[ENV.run] || undefined), all: values.all === true, repo: process.cwd() }
+      if (values.all === true && str(values, 'run') !== undefined) throw new UsageError('--run and --all are exclusive')
+      const asJson = values.json === true
+      if (values.follow !== true) return printMachine(await commands.attention(commands.defaultDeps(), values.all === true ? { ...request, run: undefined } : request, asJson), io, asJson)
+      const controller = new AbortController()
+      const stop = () => controller.abort()
+      process.once('SIGINT', stop)
+      process.once('SIGTERM', stop)
+      const signal = io.signal === undefined ? controller.signal : AbortSignal.any([controller.signal, io.signal])
+      try {
+        const followed = await commands.followAttention(
+          commands.defaultDeps(),
+          values.all === true ? { ...request, run: undefined } : request,
+          delta => io.out(asJson ? JSON.stringify(delta) : `${delta.event === 'new' ? '+' : '-'} ${attentionLine(delta.item)}`),
+          { signal, ...(io.pollMs === undefined ? {} : { pollMs: io.pollMs }) },
+        )
+        return followed.ok ? 0 : printMachine(followed, io, asJson)
+      } finally {
+        process.off('SIGINT', stop)
+        process.off('SIGTERM', stop)
+      }
+    },
   },
   budget: {
     usage: 'drove budget <n> [--run ID]',
