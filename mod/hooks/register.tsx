@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { AgentKind, Effort, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat } from '../types'
+import type { AgentKind, Effort, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat, SeatRole } from '../types'
 import { BOARD_ID, EXPAND_INDENT, buildBoard, needsAnimation, timelineRoom } from './board'
 import type { BoardRow, Cell, Tone } from './board'
 import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeHeadlines } from './bridge'
@@ -297,7 +297,9 @@ const ORCHESTRATOR_TOOLS = [
         mcp: { type: 'array', items: { type: 'string' }, description: 'optional: the user MCP servers this worker needs, by name; [] for Drove’s alone. Left out, Drove’s workerMcp setting decides' },
         plugins: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: the user plugins this worker needs, by name; [] for Drove’s mod alone. Left out, Drove’s workerPlugins setting decides (every enabled plugin when unset)' },
         userMemory: { type: 'boolean', description: 'optional, Claude workers: true loads your own CLAUDE.md files, false leaves them out. Left out, Drove’s workerUserMemory setting decides (loaded by default). Codex workers follow the setting alone' },
-        owns: { type: 'array', items: { type: 'string' }, description: 'optional: globs, relative to the worktree, of the files this worker may change; Drove’s guard refuses its edits elsewhere. Left out, it may edit anywhere' },
+        role: { type: 'string', enum: ['implementer', 'reviewer', 'tester'], description: 'optional, default implementer. reviewer: read-only, reads the target’s diff and brief and reports a recommendation, findings and check results (needs target). tester: branches from the target’s branch head and writes tests only, owns defaulting to the usual test globs (needs target)' },
+        target: { type: 'string', description: 'the worker a reviewer reviews or a tester tests; required for those roles' },
+        owns: { type: 'array', items: { type: 'string' }, description: 'optional: globs, relative to the worktree, of the files this worker may change; Drove’s guard refuses its edits elsewhere. Left out, it may edit anywhere (a tester: the usual test globs)' },
         maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
         maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
       },
@@ -470,9 +472,14 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const plugins = Array.isArray(input.plugins) ? input.plugins.filter((entry): entry is string => typeof entry === 'string') : undefined
   const userMemory = typeof input.userMemory === 'boolean' ? input.userMemory : undefined
   const owns = Array.isArray(input.owns) ? input.owns.filter((entry): entry is string => typeof entry === 'string') : undefined
+  if (input.role !== undefined && input.role !== 'implementer' && input.role !== 'reviewer' && input.role !== 'tester') return { deny: 'role must be implementer, reviewer or tester.' }
+  const role: SeatRole = input.role === 'reviewer' || input.role === 'tester' ? input.role : 'implementer'
+  const target = typeof input.target === 'string' ? input.target.trim() : ''
+  if (role !== 'implementer' && !target) return { deny: `A ${role} needs target: the worker it ${role === 'reviewer' ? 'reviews' : 'tests'}.` }
+  if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })

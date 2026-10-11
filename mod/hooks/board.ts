@@ -1,4 +1,4 @@
-import type { Effort, OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus, OrchOrchestrator, Seat, SeatState } from '../types/index.d.ts'
+import type { Effort, OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus, OrchOrchestrator, Seat, SeatRole, SeatState } from '../types/index.d.ts'
 import { HUMAN, shortModel } from './protocol.ts'
 import { isAsking, openSeats, spawnedMs, statusGlyph } from './roster.ts'
 
@@ -23,6 +23,8 @@ export type BoardModel = {
 export const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 export const PULSE_MS = 6_000
 const GAUGE = { full: '▰', empty: '▱' }
+// A reviewer or a tester wears a letter beside its name; an implementer none (DROVE-91).
+const ROLE_TAG: Record<SeatRole, string> = { implementer: ' ', reviewer: 'R', tester: 'T' }
 
 export const STATUS_TONE: Record<SeatState, Tone> = {
   starting: 'muted',
@@ -207,6 +209,7 @@ export const buildBoard = (input: {
     ],
   }
 
+  const hasRoles = open.some(seat => seat.role === 'reviewer' || seat.role === 'tester')
   const workerRows: BoardRow[] = open.map((seat, index) => {
     const mine = status[seat.name]
     const asking = isAsking(seat, mine)
@@ -221,6 +224,7 @@ export const buildBoard = (input: {
         { text: '▌', tone: stripeTone, width: 1 },
         { text: asking ? '?' : statusGlyph(seat.state), tone: asking ? 'alert' : STATUS_TONE[seat.state], width: 2 },
         { text: seat.name, tone: STATUS_TONE[seat.state], width: nameWidth, isBold: true },
+        ...(hasRoles ? [{ text: ROLE_TAG[seat.role ?? 'implementer'], tone: 'muted' as const, width: 1 }] : []),
         ...(isWide ? [{ text: clip(`${model}·${effortShort(seat.effort)}`, 9), tone: 'muted' as const, width: 9 }] : []),
         ...(isWide && seat.cairn ? [{ text: seat.cairn, tone: 'dim' as const, width: 8 }] : []),
         seatDoing(seat, mine, spin),

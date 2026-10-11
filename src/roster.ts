@@ -77,7 +77,8 @@ export const rosterLines = (roster: Roster, now: Date): string[] => {
     const owes = seat.owes === 'none' ? '' : ` · owes ${seat.owes}`
     const attention = seat.attention.length > 0 ? ` · attention: ${seat.attention.map(item => item.reason).join(', ')}` : ''
     const cairn = seat.cairn ? ` · ${seat.cairn}` : ''
-    return `- ${seat.name} [${seat.state}] ${seat.kind} ${shortModel(seat.model)} ${seat.effort}${cairn} · pane ${seat.paneId ?? '?'} · up ${minutesSince(seat.spawnedAt, now)}m${report}${owes}${attention}`
+    const role = seat.role && seat.role !== 'implementer' ? ` · ${seat.role} of ${seat.target ?? '?'}` : ''
+    return `- ${seat.name} [${seat.state}] ${seat.kind} ${shortModel(seat.model)} ${seat.effort}${cairn}${role} · pane ${seat.paneId ?? '?'} · up ${minutesSince(seat.spawnedAt, now)}m${report}${owes}${attention}`
   })
 }
 

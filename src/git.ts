@@ -30,6 +30,14 @@ export const addWorktree = async (exec: Exec, repo: string, path: string, branch
   await must(exec, repo, isExisting ? ['worktree', 'add', path, branch] : ['worktree', 'add', '--no-track', '-b', branch, path, from])
 }
 
+export const branchExists = (exec: Exec, repo: string, branch: string): Promise<boolean> => refExists(exec, repo, `refs/heads/${branch}`)
+
+// A worktree holding changes that are not committed: the work of a seat that has not been approved yet.
+export const hasUncommitted = async (exec: Exec, worktree: string): Promise<boolean> => {
+  const status = await git(exec, worktree, ['status', '--porcelain'])
+  return status.code === 0 && status.stdout.trim().length > 0
+}
+
 export const deleteBranch = async (exec: Exec, repo: string, branch: string): Promise<boolean> => (await git(exec, repo, ['branch', '-d', branch])).code === 0
 
 export const toplevel = async (exec: Exec, dir: string): Promise<string | undefined> => {

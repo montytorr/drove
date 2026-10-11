@@ -125,6 +125,7 @@ const guardInput = async (identity: Identity, input: HookInput, deps: HookDeps):
     writableRoots: isPlanner ? ['/tmp', '/private/tmp', join(home, '.claude', 'plans'), deps.scratchRoot(identity)] : [],
     openSeats: isPlanner && mentionsSessions(input) ? await deps.openIds(identity) : [],
     ...(!isPlanner && identity.owns ? { owns: identity.owns } : {}),
+    ...(!isPlanner && identity.seatRole ? { seatRole: identity.seatRole } : {}),
   }
 }
 

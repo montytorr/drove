@@ -8,8 +8,9 @@ import type { GuardDecision, GuardInput, Role } from './types.ts'
 export const EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch'])
 export const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'shell', 'exec_command'])
 
-type Context = Pick<GuardInput, 'writableRoots' | 'openSeats' | 'owns'> & { cwd?: string }
-type Scope = { role: Role; roots: readonly string[]; seats: readonly string[]; cwd: string; owns?: readonly string[] }
+type Context = Pick<GuardInput, 'writableRoots' | 'openSeats' | 'owns'> & { cwd?: string; readOnly?: boolean }
+// readOnly is a reviewer seat (DROVE-91): a worker whose Bash gets the planner's rules, with the repo's checks allowed.
+type Scope = { role: Role; roots: readonly string[]; seats: readonly string[]; cwd: string; owns?: readonly string[]; readOnly?: boolean }
 
 const MAX_NESTING = 6
 const HARMLESS_TARGETS = new Set(['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'])
@@ -72,6 +73,19 @@ const GH_HUMAN_ONLY: Record<string, ReadonlySet<string>> = {
   variable: new Set(['set', 'delete', 'remove']),
 }
 
+// What a reviewer may ask GitHub (DROVE-91): reads only, whatever the planner is allowed to write above.
+const GH_READS: Record<string, ReadonlySet<string>> = {
+  pr: new Set(['view', 'list', 'diff', 'checks', 'status']),
+  issue: new Set(['view', 'list', 'status']),
+  release: new Set(['view', 'list']),
+  run: new Set(['view', 'list']),
+  workflow: new Set(['view', 'list']),
+  repo: new Set(['view', 'list']),
+  label: new Set(['list']),
+  auth: new Set(['status']),
+}
+const GH_READ_GROUPS = new Set(['search', 'status', 'help', 'version'])
+
 const GH_OPTIONS_WITH_VALUE = new Set(['-R', '--repo', '--hostname'])
 const GH_BRANCH_OPTIONS = new Set(['--base', '-B', '--target', '--ref', '-r', '--head', '-H'])
 
@@ -88,6 +102,39 @@ const PLANNER_DROVE = new Set(['init', 'spawn', 'send', 'prompt', 'promote', 'me
 const WORKER_DROVE = new Set(['roster', 'capture'])
 
 const WORKER_PUSH = 'workers never push; report done and let the planner and the human decide'
+
+// What a reviewer may run besides reading (DROVE-91): the repo's test, lint and typecheck scripts and the usual checkers,
+// without their flags that rewrite files. Like the rest of this guard it reads arguments and is not a sandbox: a test
+// still runs the repo's code.
+const CHECK_SCRIPT = /^(?:test|tests|lint|typecheck|type-check|check|tsc)(?::[\w-]+)*$/
+const CHECK_SCRIPT_WRITES = /(?:^|:)(?:fix|write|format|update|snapshot|clean)(?::|$)/
+const CHECK_WRITE_FLAG = /^(?:--fix(?:-.+)?|--write|--apply(?:-unsafe)?|-u|--update(?:-snapshots?)?|--updateSnapshot|--output(?:=.*)?|-o)$/
+const SCRIPT_RUNNERS = new Set(['npm', 'pnpm', 'yarn', 'bun'])
+const PACKAGE_EXECUTORS = new Set(['npx', 'pnpx', 'bunx'])
+const CHECKERS = new Set(['eslint', 'jest', 'vitest', 'mocha', 'pytest', 'ruff'])
+const CARGO_CHECKS = new Set(['test', 'check', 'clippy'])
+const GO_CHECKS = new Set(['test', 'vet'])
+const TMP_ROOTS = ['/tmp', '/private/tmp', tmpdir()]
+
+// Reading git, for a reviewer: the history and the diffs of the work under review, never a command that moves HEAD or a ref.
+const GIT_READ_ONLY = new Set([
+  'diff', 'log', 'show', 'status', 'blame', 'grep', 'ls-files', 'ls-tree', 'cat-file', 'rev-parse', 'rev-list', 'merge-base', 'shortlog',
+  'describe', 'show-ref', 'for-each-ref', 'name-rev', 'diff-tree', 'diff-files', 'diff-index', 'whatchanged', 'cherry', 'range-diff',
+  'check-attr', 'check-ignore', 'count-objects', 'version', 'help', 'var', 'verify-commit', 'verify-tag',
+])
+const GIT_LISTING: Record<string, ReadonlySet<string>> = {
+  remote: new Set(['-v', '--verbose', 'show', 'get-url']),
+  worktree: new Set(['list']),
+  stash: new Set(['list', 'show']),
+  config: new Set(['--get', '--get-all', '--get-regexp', '--list', '-l']),
+  submodule: new Set(['status']),
+  reflog: new Set(['show']),
+}
+// branch and tag list with no argument and write with a flag or a name; -a lists for a branch and annotates for a tag.
+const GIT_REF_WRITE_FLAG: Record<string, RegExp> = {
+  branch: /^(?:-[a-zA-Z]*[dDmMcCfu]|--(?:delete|move|copy|force|set-upstream-to|unset-upstream|edit-description))/,
+  tag: /^(?:-[a-zA-Z]*[dasSufFme]|--(?:delete|annotate|sign|local-user|force|file|message|edit))/,
+}
 
 export const denyText = (role: Role, reason: string): string =>
   role === 'planner'
@@ -339,9 +386,23 @@ const mergeReason = (words: readonly string[], mergeAt: number): string | undefi
   return undefined
 }
 
+const gitReadReason = (words: readonly string[], at: number): string | undefined => {
+  const sub = words[at] ?? ''
+  const rest = words.slice(at + 1)
+  const reason = `git ${sub || '<nothing>'} can change the repository; a reviewer reads only (git diff, log, show, status and the like)`
+  if (rest.some(word => word === '--output' || word.startsWith('--output='))) return reason
+  if (GIT_READ_ONLY.has(sub)) return undefined
+  const listing = GIT_LISTING[sub]
+  if (listing) return (sub === 'remote' && rest.length === 0) || (rest[0] !== undefined && listing.has(rest[0])) ? undefined : reason
+  const writeFlag = GIT_REF_WRITE_FLAG[sub]
+  if (writeFlag) return rest.some(word => writeFlag.test(word)) || (!rest.some(word => word.startsWith('-')) && rest.length > 0) ? reason : undefined
+  return reason
+}
+
 const gitReason = (words: readonly string[], scope: Scope): string | undefined => {
   const at = firstPositional(words, 1, GIT_OPTIONS_WITH_VALUE)
   if (words[at] === 'merge' && scope.role === 'planner') return mergeReason(words, at)
+  if (scope.readOnly && words[at] !== 'push') return gitReadReason(words, at)
   if (words[at] !== 'push') return undefined
   if (scope.role === 'worker') return WORKER_PUSH
   if (words.some(word => PUSH_FLAGS_FOR_ALL.has(word))) return 'git push --all or --mirror would also push production, which nobody pushes to'
@@ -354,6 +415,25 @@ const namesProduction = (words: readonly string[]): boolean =>
     if (!GH_BRANCH_OPTIONS.has(name)) return false
     return (inline ?? words[i + 1] ?? '').replace(/^[^:]*:/, '') === 'production'
   })
+
+// gh api reads with GET and writes with another method or with fields, in the separate and the joined spellings.
+const ghApiWrites = (words: readonly string[]): boolean =>
+  words.some((word, i) => {
+    const joined = /^(?:-X|--method=)(.+)$/.exec(word)?.[1]
+    const method = word === '-X' || word === '--method' ? words[i + 1] : joined
+    if (method !== undefined && !/^get$/i.test(method)) return true
+    return /^(?:-f|-F|--field|--raw-field|--input)(?:=.*)?$/.test(word) || /^-[fF]./.test(word)
+  })
+
+const ghReadOnlyReason = (words: readonly string[]): string | undefined => {
+  if (isHelpOrVersion(words)) return undefined
+  const at = firstPositional(words, 1, GH_OPTIONS_WITH_VALUE)
+  const group = words[at] ?? ''
+  const action = words[firstPositional(words, at + 1, GH_OPTIONS_WITH_VALUE)] ?? ''
+  if (group === 'api') return ghApiWrites(words) ? 'gh api with a method or fields writes to GitHub; a reviewer reads only' : undefined
+  if (GH_READ_GROUPS.has(group) || GH_READS[group]?.has(action)) return undefined
+  return `gh ${group}${action ? ` ${action}` : ''} can change GitHub or the checkout; a reviewer reads only (gh pr view, list, diff, checks and the like, and gh api GETs)`
+}
 
 const ghReason = (words: readonly string[]): string | undefined => {
   const at = firstPositional(words, 1, GH_OPTIONS_WITH_VALUE)
@@ -433,9 +513,17 @@ const packageReason = (head: string, words: readonly string[]): string | undefin
 const patchPaths = (text: string): string[] =>
   [...text.matchAll(/^\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+?)\s*$/gm)].map(match => match[1] ?? '')
 
+// A reviewer's scratch: the temp directories, but never its own worktree even when the repo itself lives under one.
+const isReviewerScratch = (path: string, cwd: string): boolean => {
+  if (/[$`]/.test(path)) return false
+  const target = canonical(path, cwd)
+  const relation = relative(canonical(worktreeRoot(cwd), cwd), target)
+  return (relation === '..' || relation.startsWith('../')) && isScratch(target)
+}
+
 const patchReason = (text: string, scope: Scope): string | undefined => {
   const paths = patchPaths(text)
-  const outside = paths.find(path => !isInside(path, scope.roots, scope.cwd))
+  const outside = paths.find(path => !(scope.readOnly ? isReviewerScratch(path, scope.cwd) : isInside(path, scope.roots, scope.cwd)))
   if (paths.length === 0) return 'apply_patch changes files and no path could be read from it'
   return outside === undefined ? undefined : `apply_patch on ${outside} changes code`
 }
@@ -443,7 +531,35 @@ const patchReason = (text: string, scope: Scope): string | undefined => {
 const redirectReason = (target: string, scope: Scope): string | undefined => {
   if (HARMLESS_TARGETS.has(target)) return undefined
   if (/[$`]/.test(target)) return `redirecting output into ${target} writes to a path that cannot be checked`
-  return isInside(target, scope.roots, scope.cwd) || isPlannerScratchpad(target, scope.cwd) ? undefined : `redirecting output into ${target} writes a file`
+  const isAllowed = scope.readOnly ? isReviewerScratch(target, scope.cwd) : isInside(target, scope.roots, scope.cwd) || isPlannerScratchpad(target, scope.cwd)
+  return isAllowed ? undefined : `redirecting output into ${target} writes a file`
+}
+
+// Where a planner or a reviewer may write with a file command: the planner's session scratchpad, a reviewer's temp directories.
+const isScratchTarget = (target: string, scope: Scope): boolean =>
+  scope.readOnly ? isReviewerScratch(target, scope.cwd) : isPlannerScratchpad(target, scope.cwd)
+
+const isCheckCommand = (head: string, words: readonly string[]): boolean => {
+  const args = words.slice(1)
+  if (args.some(word => CHECK_WRITE_FLAG.test(word))) return false
+  const first = args[0] ?? ''
+  if (SCRIPT_RUNNERS.has(head)) {
+    const script = first === 'run' || first === 'run-script' || first === 'exec' ? args[1] : first
+    return first === 't' || (script !== undefined && CHECK_SCRIPT.test(script) && !CHECK_SCRIPT_WRITES.test(script))
+  }
+  if (PACKAGE_EXECUTORS.has(head)) {
+    const at = firstPositional(words, 1)
+    return at < words.length && isCheckCommand(baseName(words[at] ?? ''), words.slice(at))
+  }
+  if (head === 'make') return args.length > 0 && args.every(word => word.startsWith('-') || (CHECK_SCRIPT.test(word) && !CHECK_SCRIPT_WRITES.test(word)))
+  if (head === 'cargo') return CARGO_CHECKS.has(first)
+  if (head === 'go') return GO_CHECKS.has(first)
+  if (head === 'tsc') return args.includes('--noEmit') && !args.includes('-b') && !args.includes('--build')
+  if (head === 'prettier') return args.some(word => word === '--check' || word === '-c' || word === '--list-different' || word === '-l')
+  if (head === 'biome') return ['check', 'lint', 'ci'].includes(first)
+  if (head === 'node') return args.includes('--test')
+  if (head === 'python' || head === 'python3') return first === '-m' && ['pytest', 'unittest'].includes(args[1] ?? '')
+  return CHECKERS.has(head)
 }
 
 const plannerReason = (words: readonly string[], scope: Scope): string | undefined => {
@@ -454,20 +570,22 @@ const plannerReason = (words: readonly string[], scope: Scope): string | undefin
   if (/^(\.{1,2}|~)\//.test(first) || (first.includes('/') && isInside(first, scope.roots, scope.cwd))) return `running ${first} executes a script`
   if (FILE_WRITERS.has(head)) {
     const targets = SCRATCHPAD_WRITERS.has(head) ? writeTargets(head, words) : []
-    if (targets.length > 0 && targets.every(target => isPlannerScratchpad(target, scope.cwd))) return undefined
+    if (targets.length > 0 && targets.every(target => isScratchTarget(target, scope))) return undefined
     return `${head} changes files or processes`
   }
   if ((head === 'sed' || head === 'perl') && words.some(word => /^-[a-zA-Z]*i/.test(word) || word.startsWith('--in-place'))) return `${head} -i edits files in place`
   if (head === 'find' && words.some(word => FIND_ACTIONS.has(word))) return 'find with an action runs commands or deletes files'
+  if (scope.readOnly && isCheckCommand(head, words)) return undefined
   if (head === 'perl' || RUNTIMES.has(head)) return `${head} runs code`
-  if (head === 'gh') return ghReason(words)
+  if (head === 'gh') return scope.readOnly ? ghReadOnlyReason(words) : ghReason(words)
   if (head === 'curl' || head === 'wget') return curlReason(head, words)
   if (PACKAGE_TOOLS.has(head)) return packageReason(head, words)
   return undefined
 }
 
 const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
-  if (scope.role === 'planner' && segment.stdoutFile !== undefined) {
+  const isStrict = scope.role === 'planner' || scope.readOnly === true
+  if (isStrict && segment.stdoutFile !== undefined) {
     const reason = redirectReason(segment.stdoutFile, scope)
     if (reason) return reason
   }
@@ -484,16 +602,16 @@ const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
     if (reason) return reason
     if (head === 'apply_patch') return patchPaths(segment.stdin.join('\n')).map(path => ownsReason(path, scope)).find(Boolean)
   }
-  if (head === 'apply_patch' && scope.role === 'planner') return patchReason(segment.stdin.join('\n'), scope)
+  if (head === 'apply_patch' && isStrict) return patchReason(segment.stdin.join('\n'), scope)
   if (head === 'git') return gitReason(words, scope)
   if (head === 'herdr') return herdrReason(words, scope)
   if (head === 'claude' || head === 'codex') return sessionReason(head, words, scope)
   if (head === 'drove') return droveReason(words, scope)
-  return scope.role === 'planner' ? plannerReason(words, scope) : undefined
+  return isStrict ? plannerReason(words, scope) : undefined
 }
 
 const commandReason = (command: string, scope: Scope, depth: number): string | undefined => {
-  if (depth > MAX_NESTING) return scope.role === 'planner' ? 'the command nests substitutions too deeply to check' : undefined
+  if (depth > MAX_NESTING) return scope.role === 'planner' || scope.readOnly ? 'the command nests substitutions too deeply to check' : undefined
   for (const pipeline of parseShell(command)) {
     for (const segment of pipeline) {
       const reason = segmentReason(segment, scope)
@@ -508,7 +626,7 @@ const commandReason = (command: string, scope: Scope, depth: number): string | u
 }
 
 export const bashReason = (command: string, role: Role, context: Context): string | undefined =>
-  commandReason(command, { role, roots: context.writableRoots, seats: context.openSeats, cwd: context.cwd ?? process.cwd(), ...(context.owns && context.owns.length > 0 ? { owns: context.owns } : {}) }, 0)
+  commandReason(command, { role, roots: context.writableRoots, seats: context.openSeats, cwd: context.cwd ?? process.cwd(), ...(context.owns && context.owns.length > 0 ? { owns: context.owns } : {}), ...(context.readOnly ? { readOnly: true } : {}) }, 0)
 
 const quoteWord = (word: string): string => (/^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", `'\\''`)}'`)
 
@@ -540,6 +658,13 @@ const workdirOf = (input: GuardInput): string => (typeof input.input.workdir ===
 
 export const decide = (input: GuardInput): GuardDecision => {
   const { role, tool } = input
+  const isReviewer = role === 'worker' && input.seatRole === 'reviewer'
+  if (EDIT_TOOLS.has(tool) && isReviewer) {
+    const paths = editPathsOf(tool, input.input)
+    if (paths.length === 0) return denied(role, `${tool} changes code and no path could be read from it`)
+    const outside = paths.find(path => !isReviewerScratch(path, input.cwd))
+    return outside === undefined ? ALLOW : denied(role, `${tool} on ${outside}: a reviewer seat is read-only and writes only scratch files under /tmp; put what you found in your report`)
+  }
   if (EDIT_TOOLS.has(tool)) {
     const owns = role === 'worker' && input.owns && input.owns.length > 0 ? input.owns : undefined
     if (role === 'worker' && !owns) return ALLOW
@@ -554,7 +679,13 @@ export const decide = (input: GuardInput): GuardDecision => {
   }
   if (!SHELL_TOOLS.has(tool)) return ALLOW
   const command = commandOf(input.input)
-  if (command === undefined) return role === 'planner' ? denied(role, 'there is no command text to check') : ALLOW
-  const reason = bashReason(command, role, { writableRoots: input.writableRoots, openSeats: input.openSeats, cwd: workdirOf(input), ...(input.owns ? { owns: input.owns } : {}) })
+  if (command === undefined) return role === 'planner' || isReviewer ? denied(role, 'there is no command text to check') : ALLOW
+  const reason = bashReason(command, role, {
+    writableRoots: isReviewer ? TMP_ROOTS : input.writableRoots,
+    openSeats: input.openSeats,
+    cwd: workdirOf(input),
+    ...(input.owns ? { owns: input.owns } : {}),
+    ...(isReviewer ? { readOnly: true } : {}),
+  })
   return reason ? denied(role, reason) : ALLOW
 }

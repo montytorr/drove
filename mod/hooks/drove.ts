@@ -1,4 +1,4 @@
-import type { AgentKind, Effort, Expects, RunMeta } from '../types'
+import type { AgentKind, Effort, Expects, RunMeta, SeatRole } from '../types'
 
 // The mod reaches Drove only through its CLI (`node <drove>/src/cli.ts ...`): the plugin runtime has no Node.
 
@@ -25,13 +25,15 @@ export const attachArgs = (input: { sessionId: string; paneId?: string; goal?: s
 
 export const bridgeArgs = (run: string, sessionId: string): string[] => ['mod', 'bridge', '--run', run, '--session', sessionId]
 
-export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; userMemory?: boolean; owns?: readonly string[]; maxTurns?: number; maxTokens?: number }): string[] => [
+export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; userMemory?: boolean; role?: SeatRole; target?: string; owns?: readonly string[]; maxTurns?: number; maxTokens?: number }): string[] => [
   'spawn', input.name, '--kind', input.kind, '--brief', '-', '--effort', input.effort,
   ...(input.model ? ['--model', input.model] : []),
   ...(input.cairn ? ['--cairn', input.cairn] : []),
   ...(input.mcp ? ['--mcp', input.mcp.join(',')] : []),
   ...(input.plugins ? ['--plugins', input.plugins.join(',')] : []),
   ...(input.userMemory !== undefined ? ['--user-memory', input.userMemory ? 'on' : 'off'] : []),
+  ...(input.role && input.role !== 'implementer' ? ['--role', input.role] : []),
+  ...(input.target ? ['--target', input.target] : []),
   ...(input.owns && input.owns.length > 0 ? ['--owns', input.owns.join(',')] : []),
   ...(input.maxTurns ? ['--max-turns', String(input.maxTurns)] : []),
   ...(input.maxTokens ? ['--max-tokens', String(input.maxTokens)] : []),

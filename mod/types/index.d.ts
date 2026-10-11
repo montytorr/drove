@@ -3,6 +3,7 @@
 // ---- copied from src/types.ts ----
 export type AgentKind = 'claude' | 'codex'
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+export type SeatRole = 'implementer' | 'reviewer' | 'tester'
 
 export type ReportKind = 'done' | 'question' | 'blocked' | 'progress' | 'promote'
 export type Expects = 'review' | 'answer' | 'none'
@@ -63,6 +64,8 @@ export type Seat = {
   mcp?: string[]
   plugins?: string[]
   userMemory?: boolean
+  role?: SeatRole
+  target?: string
   owns?: string[]
   maxTurns?: number
   maxTokens?: number

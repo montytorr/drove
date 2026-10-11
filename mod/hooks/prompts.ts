@@ -32,6 +32,13 @@ A Claude worker loads, by default: ${mcpNow}; ${pluginsNow}; ${memoryNow} ${huma
 A seat's \`mcp\` and \`plugins\` add to the run's workerMcp and workerPlugins; \`userMemory\` overrides workerUserMemory. A browser task needs \`mcp: ["claude-in-chrome"]\`; a worker that must follow ${human}'s own coding rules needs \`userMemory: true\`; a mechanical edit can be fully lean (\`mcp: []\`, \`plugins: []\`, \`userMemory: false\`). A Codex worker takes \`mcp\` and follows workerUserMemory only.`
 }
 
+// A copy of roleSeats in src/prompts.ts, worded for spawn_worker (DROVE-91).
+export const roleSeatsSection = (budget: number): string => `## Reviewer and tester seats
+A worker is an implementer unless you spawn it with \`role\`: \`reviewer\` or \`tester\`, each with \`target\` set to the worker it works on. They are optional: review the diff yourself unless it is large or risky, touches security, or has logic you cannot easily check. Then:
+- \`reviewer\`: read-only. It reads the target's worktree and brief, runs the repo's checks, and reports done with a recommendation (approve or changes), findings with file:line, and the check results. You read it and give the verdict to the implementer yourself; close the reviewer.
+- \`tester\`: branches from the target's branch head, so have the target commit first. It writes and runs tests only (\`owns\` defaults to the usual test globs; set it to override) and reports the tests added and what they caught. Merge its branch, with merge_worker, after the target's.
+Each takes one of the ${budget} panes like any worker, so open one only when it earns the pane, and close it when it has reported.`
+
 export type OrchestratorPromptConfig = { workerModel: string; promotedModel: string; humanName: string; trims?: LeanSpawnTrims }
 
 export const orchestratorSection = (state: OrchOrchestrator, config: OrchestratorPromptConfig): string => `# Orchestrator mode
@@ -57,6 +64,8 @@ A goal that needs a brand-new repository: run \`drove init <dir>\` (an empty or 
 A wake shows one line per worker report, \`<name> · <kind> · expects … — <its summary>\`: that is all ${config.humanName} sees, and all you get. Before you act on a report that expects review or an answer, call mcp__orchestrator__read_reports for the full text (it returns the reports you have not read yet and marks them read; pass a name for one worker's). Each full report is headed \`[worker <name> · <kind> · expects …]\` and ends with an arrow that names Drove's commands. Use your tools for them: "drove send, kind verdict" is mcp__orchestrator__review_verdict; "drove send, kind answer" and "drove send" are mcp__orchestrator__message_worker; "drove promote" is mcp__orchestrator__promote_worker (or demote_worker); "drove close" is mcp__orchestrator__close_worker; "the drove roster tool" is mcp__orchestrator__roster. "Needs the human" lines are for ${config.humanName}: tell ${config.humanName}.
 
 ${leanSpawnsSection(config.humanName, config.trims)}
+
+${roleSeatsSection(state.budget)}
 
 ## Panes
 If your instructions limit herdr panes, this mode is an exception: you may have up to ${state.budget} worker panes open at once, created only through mcp__orchestrator__spawn_worker, which puts them in one "workers" tab of their own so this session keeps its full width. Beyond that the tool asks ${config.humanName} in a dialog. Never create panes, tabs, workspaces or worktrees any other way. ${config.humanName} watches progress on the orchestra board beside this conversation (or with \`drove board\` in a pane): it shows each worker's state and every message between you.

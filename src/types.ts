@@ -1,5 +1,7 @@
 export type AgentKind = 'claude' | 'codex'
 export type Role = 'planner' | 'worker'
+// What a worker seat is for (DROVE-91): absent means an implementer. A reviewer reads another seat's work and reports; a tester writes tests only.
+export type SeatRole = 'implementer' | 'reviewer' | 'tester'
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
 export type ReportKind = 'done' | 'question' | 'blocked' | 'progress' | 'promote'
@@ -17,6 +19,7 @@ export type Identity = {
   seat: string
   token?: string
   owns?: string[]
+  seatRole?: SeatRole
 }
 
 export type DroveConfig = {
@@ -94,6 +97,8 @@ export type Seat = {
   mcp?: string[]
   plugins?: string[]
   userMemory?: boolean
+  role?: SeatRole
+  target?: string
   owns?: string[]
   maxTurns?: number
   maxTokens?: number
@@ -226,6 +231,7 @@ export type GuardInput = {
   writableRoots: readonly string[]
   openSeats: readonly string[]
   owns?: readonly string[]
+  seatRole?: SeatRole
 }
 
 export type GuardDecision = { allow: true } | { allow: false; reason: string }
@@ -322,6 +328,8 @@ export type SpawnRequest = {
   mcp?: string[]
   plugins?: string[]
   userMemory?: boolean
+  role?: SeatRole
+  target?: string
   owns?: string[]
   maxTurns?: number
   maxTokens?: number
