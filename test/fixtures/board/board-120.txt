@@ -2,7 +2,7 @@
 
 ⌘  lead          Opus 5.5 · h  waiting · owes 1 review                                                             41m
 ├─ ▌ ✓  w-core     Sonnet·m  DROVE-3  waiting for the planner · P1 core state and protocol finished, 48 tests gre… 7m
-├─ ▌ ⛔ w-guard    codex gp… DROVE-4  a trust dialog waits in its pane                                             40m
+├─ ▌ ⛔ w-guard    gpt-5.5-… DROVE-4  a trust dialog waits in its pane                                             40m
 ├─ ▌ ⚙  w-runtime  Sonnet·m  DROVE-5  ⠋ editing src/herdr.ts                                             ▰▱▱▱ 31%  39m
 ├─ ▌ ·  w-store    Sonnet·m  DROVE-6  store written                                                                22m
 └─ ▌ ?  w-board    Sonnet·m  DROVE-7  Which width is the minimum?                                                  37m

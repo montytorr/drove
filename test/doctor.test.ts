@@ -96,6 +96,18 @@ test('claude too old fails; one agent missing warns; both missing fails', async 
   assert.equal(statusOf(none.checks, 'codex'), 'fail')
 })
 
+test('a CLI that exits successfully with an unreadable version is on PATH in doctor diagnostics', async () => {
+  for (const kind of ['claude', 'codex'] as const) {
+    const calls: string[] = []
+    const base = depsWith({ [`${kind} --version`]: OK('version unavailable') })
+    const report = await runDoctor({ ...base, exec: async (argv, options) => { calls.push(argv.join(' ')); return base.exec(argv, options) } })
+    const check = report.checks.find(item => item.id === kind)
+    assert.equal(check?.detail, `${kind} is on PATH but its version could not be read`)
+    assert.equal(calls.filter(call => call === `${kind} --version`).length, 1)
+    assert.equal(check?.status, kind === 'claude' ? 'fail' : 'warn')
+  }
+})
+
 test('gh missing or signed out warns, never fails', async () => {
   assert.equal(statusOf((await runDoctor(depsWith({ 'gh --version': MISSING }))).checks, 'gh'), 'warn')
   const out = await runDoctor(depsWith({ 'gh auth status': FAIL('not logged in') }))

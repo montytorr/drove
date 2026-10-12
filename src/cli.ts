@@ -53,7 +53,7 @@ const onOff = (values: Values, key: string): boolean | undefined => {
 const nameList = (values: Values, key: string): string[] | undefined => str(values, key)?.split(',').map(name => name.trim()).filter(Boolean)
 export const spawnRequestOf = (values: Values, positionals: readonly string[], brief: string): SpawnRequest => ({
   seat: need(positionals[0], '<seat>'),
-  kind: need(str(values, 'kind'), '--kind') as AgentKind,
+  kind: str(values, 'kind') as AgentKind | undefined,
   cairn: str(values, 'cairn'),
   brief,
   model: str(values, 'model'),
@@ -159,7 +159,7 @@ export const COMMANDS: Record<string, Spec> = {
       print(await commands.initRepo(commands.defaultDeps(), need(positionals[0], '<dir>'), process.cwd(), values.json === true), io),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on|off] [--user-hooks on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--acceptance TEXT ...] [--max-turns N] [--max-tokens N] [--max-minutes N] [--max-cost USD]',
+    usage: 'drove spawn <seat> [--kind claude|codex] --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on|off] [--user-hooks on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--acceptance TEXT ...] [--max-turns N] [--max-tokens N] [--max-minutes N] [--max-cost USD]',
     why: 'open a worker in its own worktree and pane, and brief it',
     options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, skills: { type: 'string' }, agents: { type: 'string' }, 'user-memory': { type: 'string' }, 'user-hooks': { type: 'string' }, role: { type: 'string' }, target: { type: 'string' }, owns: { type: 'string' }, acceptance: { type: 'string', multiple: true }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' }, 'max-minutes': { type: 'string' }, 'max-cost': { type: 'string' } },
     run: async (values, positionals, io) => {
