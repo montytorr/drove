@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { detectAgents, modelLabelOf, nodeAgentDeps } from './agents.ts'
+import { detectRunAgents, modelLabelOf } from './agents.ts'
 import { EFFORTS, loadConfig } from './commands.ts'
 import { recordEvent } from './deliver.ts'
 import * as git from './git.ts'
@@ -66,7 +66,7 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
   const model = request.model ?? config.plannerModel.claude
   const effort = request.effort ?? config.plannerEffort
   const planner = { kind: 'claude' as const, paneId, sessionId: request.sessionId, model, effort, viaMod: true }
-  const agents = await detectAgents(nodeAgentDeps(deps.exec, deps.codexUserHome, deps.clock.now))
+  const agents = await detectRunAgents(deps)
 
   let existing: RunMeta | undefined
   if (request.run) {

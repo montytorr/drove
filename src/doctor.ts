@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { probeServer } from './herdr.ts'
 import { detectAgents, nodeAgentDeps } from './agents.ts'
+import { userCodexHome } from './paths.ts'
 import type { Exec, ExecResult } from './types.ts'
 
 export type CheckStatus = 'ok' | 'warn' | 'fail'
@@ -88,7 +89,13 @@ const checkHerdr = async (deps: DoctorDeps): Promise<Check[]> => {
 }
 
 const checkAgents = async (deps: DoctorDeps): Promise<Check[]> => {
-  const { claude, codex } = await detectAgents({ ...nodeAgentDeps(deps.exec), readText: deps.readText })
+  const onPath = new Set<string>()
+  const exec: Exec = async (argv, options) => {
+    const result = await deps.exec(argv, options)
+    if (result.code === 0 && argv[0]) onPath.add(argv[0])
+    return result
+  }
+  const { claude, codex } = await detectAgents({ ...nodeAgentDeps(exec, userCodexHome(deps.home)), readText: deps.readText })
   const hasClaude = claude !== undefined
   const hasCodex = codex !== undefined
   const checks: Check[] = []
@@ -99,10 +106,13 @@ const checkAgents = async (deps: DoctorDeps): Promise<Check[]> => {
         ? check('claude', 'ok', `claude ${version}`)
         : check('claude', 'fail', `claude ${version} is older than ${CLAUDE_MIN} (Drove's launch flags need it)`, 'update Claude Code (claude update)'),
     )
+  } else if (onPath.has('claude')) {
+    checks.push(check('claude', 'fail', 'claude is on PATH but its version could not be read', 'run claude --version; update Claude Code if needed (claude update)'))
   } else {
     checks.push(hasCodex ? check('claude', 'warn', 'claude is not on PATH (Claude workers and a Claude planner are unavailable)', 'install Claude Code, or run Codex only') : check('claude', 'fail', 'claude is not on PATH and neither is codex', 'install Claude Code or Codex and sign in'))
   }
   if (hasCodex) checks.push(check('codex', 'ok', `codex-cli ${codex.version}${codex.model ? ` · ${codex.model}` : ''}${codex.effort ? ` · ${codex.effort} effort` : ''}`))
+  else if (onPath.has('codex')) checks.push(check('codex', hasClaude ? 'warn' : 'fail', 'codex is on PATH but its version could not be read', 'run codex --version; update Codex if needed'))
   else checks.push(hasClaude ? check('codex', 'warn', 'codex is not on PATH (Codex workers are unavailable)', 'install Codex if you want Codex seats') : check('codex', 'fail', 'codex is not on PATH and neither is claude', 'install Claude Code or Codex and sign in'))
   return checks
 }

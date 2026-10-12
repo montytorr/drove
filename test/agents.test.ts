@@ -54,12 +54,31 @@ test('missing, unreadable and model-free config keep Codex present without inven
   assert.deepEqual((await detectAgents(depsWith('model_reasoning_effort = "high"'))).codex, { version: '0.162.0', effort: 'high' })
 })
 
-test('CODEX_HOME and an injected Codex home select the config path', async () => {
-  for (const [codexHome, expected] of [[undefined, '/custom/config.toml'], ['/injected', '/injected/config.toml']] as const) {
+test('CODEX_HOME and an injected Codex home select the config path, and empty CODEX_HOME uses the default', async () => {
+  for (const [codexHome, envHome, expected] of [[undefined, '/custom', '/custom/config.toml'], ['/injected', '/custom', '/injected/config.toml'], [undefined, '', '/user/.codex/config.toml']] as const) {
     const reads: string[] = []
-    await detectAgents({ ...depsWith(), env: { CODEX_HOME: '/custom' }, codexHome, readText: async path => { reads.push(path); return 'model = "custom"' } })
+    await detectAgents({ ...depsWith(), env: { CODEX_HOME: envHome }, codexHome, readText: async path => { reads.push(path); return 'model = "custom"' } })
     assert.deepEqual(reads, [expected])
   }
+})
+
+test('the selected Codex profile overrides model and effort independently, with root defaults for missing keys', async () => {
+  const root = 'profile = "work"\nmodel = "root-model"\nmodel_reasoning_effort = "medium"\n'
+  for (const [profile, expected] of [
+    ['model = "profile-model"\nmodel_reasoning_effort = "high"', { model: 'profile-model', effort: 'high' }],
+    ['model = \'profile-model\'', { model: 'profile-model', effort: 'medium' }],
+    ['model_reasoning_effort = "low"', { model: 'root-model', effort: 'low' }],
+    ['', { model: 'root-model', effort: 'medium' }],
+  ] as const) {
+    const config = `${root}[profiles.other]\nmodel = "ignored"\n[profiles.work]\n${profile}\n[mcp_servers.other]\nmodel = "ignored-again"\n`
+    assert.deepEqual((await detectAgents(depsWith(config))).codex, { version: '0.162.0', ...expected })
+  }
+  assert.deepEqual((await detectAgents(depsWith(`${root}[profiles.other]\nmodel = "ignored"`))).codex, { version: '0.162.0', model: 'root-model', effort: 'medium' })
+})
+
+test('profile headers can quote names, and nested or unrelated tables do not override them', async () => {
+  const config = 'profile = "work.fast"\nmodel = "root"\n[ profiles . "work.fast" ] # selected\nmodel = "selected"\n[profiles."work.fast".nested]\nmodel = "nested"\n[profiles.work]\nmodel = "other"\n'
+  assert.deepEqual((await detectAgents(depsWith(config))).codex, { version: '0.162.0', model: 'selected' })
 })
 
 test('modelLabelOf falls back only for a default Codex model, keeping legacy labels and explicit overrides', () => {

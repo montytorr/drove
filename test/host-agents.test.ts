@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict'
-import { writeFile } from 'node:fs/promises'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { beforeEach, test } from 'node:test'
 import * as commands from '../src/commands.ts'
+import { detectAgents, nodeAgentDeps } from '../src/agents.ts'
 import { spawnRequestOf } from '../src/cli.ts'
 import * as deliver from '../src/deliver.ts'
 import { attach } from '../src/modhost.ts'
 import { loadRoster, loadRun, rosterLines, saveRun, updateRoster } from '../src/roster.ts'
-import type { Deps, HostAgents, Identity } from '../src/types.ts'
+import type { AgentKind, Deps, HostAgents, Identity } from '../src/types.ts'
 import { FakeHerdr, makeDeps, makeRepo, RUN, seedRun } from './p3-helpers.ts'
 
 beforeEach(() => {
@@ -29,15 +31,53 @@ const setup = async (detected: HostAgents | undefined = agents) => {
 }
 const starts = (fake: FakeHerdr) => fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')
 
-test('spawn and migrate refuse either absent kind before touching panes or worktrees', async () => {
+test('spawn and migrate refuse an absent kind other than the planner before touching panes or worktrees', async () => {
   for (const kind of ['claude', 'codex'] as const) {
-    const { fake, deps, identity } = await setup({ at: agents.at })
+    const other = kind === 'claude' ? 'codex' : 'claude'
+    const { fake, deps, identity, run } = await setup({ at: agents.at, [other]: agents[other] })
+    await saveRun(deps.home, { ...run, planner: { ...run.planner, kind: other } })
     const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind, brief })
     assert.deepEqual(spawned, { ok: false, code: 'agent-unavailable', text: `${kind} is not on this host (drove doctor)` })
     const migrated = await commands.migrate(deps, identity, { seat: 'w-api', kind })
     assert.deepEqual(migrated, spawned)
     assert.deepEqual(fake.calls, [])
     assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
+  }
+})
+
+test('the planner kind remains usable for spawn and migrate when its own probe failed', async () => {
+  for (const kind of ['claude', 'codex'] as const) {
+    const other = kind === 'claude' ? 'codex' : 'claude'
+    const { deps, identity, run } = await setup({ at: agents.at, [other]: agents[other] })
+    await saveRun(deps.home, { ...run, planner: { ...run.planner, kind } })
+    const spawned = await commands.spawn(deps, identity, { seat: 'w-planner-kind', kind, brief })
+    assert.equal(spawned.ok, true, spawned.text)
+    const otherSeat = await commands.spawn(deps, identity, { seat: 'w-other-kind', kind: other, brief })
+    assert.equal(otherSeat.ok, true, otherSeat.text)
+    const migrated = await commands.migrate(deps, identity, { seat: 'w-other-kind', kind })
+    assert.equal(migrated.ok, true, migrated.text)
+    assert.equal((await loadRoster(deps.home, RUN)).seats.find(seat => seat.name === 'w-other-kind')?.kind, kind)
+  }
+})
+
+test('no agents are saved when both probes fail at plan, attach, and resume; workers retain legacy availability', async () => {
+  const { fake, deps, identity, repo, run } = await setup()
+  const failed: Deps = { ...deps, exec: (argv, options) => argv[1] === '--version' && (argv[0] === 'claude' || argv[0] === 'codex')
+    ? Promise.resolve({ code: 124, stdout: '', stderr: 'timeout' })
+    : fake.exec(argv, options) }
+  const planned = await commands.plan(failed, { repo, kind: 'codex', run: RUN })
+  assert.equal(planned.ok, true, planned.text)
+  assert.equal((await loadRun(deps.home, RUN))?.agents, undefined)
+  const attached = await attach(failed, { repo, run: RUN, sessionId: 'planner', paneId: 'w1:p0' })
+  assert.equal(attached.ok, true, attached.text)
+  assert.equal((await loadRun(deps.home, RUN))?.agents, undefined)
+  await saveRun(deps.home, { ...run, status: 'down' })
+  const resumed = await commands.up(failed, { run: RUN, repo })
+  assert.equal(resumed.ok, true, resumed.text)
+  assert.equal((await loadRun(deps.home, RUN))?.agents, undefined)
+  for (const kind of ['claude', 'codex'] as const) {
+    const spawned = await commands.spawn(failed, identity, { seat: `w-${kind}`, kind, brief })
+    assert.equal(spawned.ok, true, spawned.text)
   }
 })
 
@@ -74,6 +114,51 @@ test('a forced workerKind is still subject to host availability', async () => {
   const result = await commands.spawn(deps, identity, { seat: 'w-auto', brief })
   assert.equal(result.ok, false)
   assert.match(result.text, /codex is not on this host/)
+})
+
+test('workerKind auto chooses Codex on a Codex-only host', async () => {
+  const { deps, identity, run } = await setup({ at: agents.at, codex: agents.codex })
+  await saveRun(deps.home, { ...run, planner: { ...run.planner, kind: 'codex' } })
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-auto', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.kind, 'codex')
+})
+
+test('auto refuses with a doctor hint if the saved run has no usable kind', async () => {
+  const { fake, deps, identity, run } = await setup({ at: agents.at })
+  await saveRun(deps.home, { ...run, planner: { ...run.planner, kind: 'unknown' as AgentKind } })
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-auto', brief })
+  assert.equal(spawned.ok, false)
+  assert.match(spawned.text, /neither claude nor codex is on this host \(drove doctor\)/)
+  assert.deepEqual(fake.calls, [])
+})
+
+test('plan, attach, and resume ignore a Drove-generated or empty CODEX_HOME', async () => {
+  const { fake, deps, repo, run } = await setup()
+  const generatedHome = join(deps.home, 'runs', 'other-run', 'codex-home')
+  await mkdir(generatedHome, { recursive: true })
+  await writeFile(join(generatedHome, 'config.toml'), 'model = "generated-model-that-must-not-be-detected"\n')
+  const expected = await detectAgents(nodeAgentDeps(fake.exec, join(homedir(), '.codex'), deps.clock.now))
+  const withoutInjectedHome: Deps = { ...deps, codexUserHome: undefined }
+  const originalHome = process.env.CODEX_HOME
+  try {
+    for (const codexHome of [generatedHome, '']) {
+      process.env.CODEX_HOME = codexHome
+      const planned = await commands.plan(withoutInjectedHome, { repo, run: RUN, kind: 'codex' })
+      assert.equal(planned.ok, true, planned.text)
+      assert.deepEqual((await loadRun(deps.home, RUN))?.agents, expected)
+      const attached = await attach(withoutInjectedHome, { repo, run: RUN, sessionId: 'planner', paneId: 'w1:p0' })
+      assert.equal(attached.ok, true, attached.text)
+      assert.deepEqual((await loadRun(deps.home, RUN))?.agents, expected)
+      await saveRun(deps.home, { ...run, status: 'down' })
+      const resumed = await commands.up(withoutInjectedHome, { run: RUN, repo })
+      assert.equal(resumed.ok, true, resumed.text)
+      assert.deepEqual((await loadRun(deps.home, RUN))?.agents, expected)
+    }
+  } finally {
+    if (originalHome === undefined) delete process.env.CODEX_HOME
+    else process.env.CODEX_HOME = originalHome
+  }
 })
 
 test('Codex defaults label results and roster payloads but do not add -m on spawn, promote or resume', async () => {

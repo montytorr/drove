@@ -5,7 +5,7 @@ import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
-import { detectAgents, modelLabelOf, nodeAgentDeps } from './agents.ts'
+import { detectRunAgents, modelLabelOf } from './agents.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, shouldReadScreen } from './detect.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
@@ -151,8 +151,11 @@ const resolveModel = (kind: AgentKind, value: string | undefined, config: DroveC
   return requested
 }
 
+const hasAgent = (run: RunMeta, kind: AgentKind): boolean =>
+  run.agents === undefined || run.planner.kind === kind || run.agents[kind] !== undefined
+
 const requireAgent = (run: RunMeta, kind: AgentKind): CommandResult | undefined =>
-  run.agents && !run.agents[kind] ? failed('agent-unavailable', `${kind} is not on this host (drove doctor)`) : undefined
+  hasAgent(run, kind) ? undefined : failed('agent-unavailable', `${kind} is not on this host (drove doctor)`)
 
 const newControlId = (now: Date): string => `c-${now.getTime().toString(36)}-${randomBytes(2).toString('hex')}`
 
@@ -705,7 +708,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const goalTask = await resolveGoalTask(deps, request, config.labInstance)
   if (goalTask && 'error' in goalTask) return goalTask.error
   const goal = goalTask?.goal ?? request.goal
-  const agents = await detectAgents(nodeAgentDeps(deps.exec, deps.codexUserHome, deps.clock.now))
+  const agents = await detectRunAgents(deps)
 
   let run: RunMeta
   let previous: RunMeta | undefined
@@ -904,7 +907,10 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const { run } = located
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
   const config = await loadConfig(deps.home)
-  const kind = request.kind ?? (config.workerKind === 'codex' ? 'codex' : 'claude')
+  const kind = request.kind ?? (config.workerKind === 'claude' || config.workerKind === 'codex'
+    ? config.workerKind
+    : hasAgent(run, 'claude') ? 'claude' : hasAgent(run, 'codex') ? 'codex' : undefined)
+  if (!kind) return failed('agent-unavailable', 'neither claude nor codex is on this host (drove doctor)')
   const unavailable = requireAgent(run, kind)
   if (unavailable) return unavailable
   const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn) : {}
@@ -2138,7 +2144,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
   if ('error' in located) return located.error
   let { run } = located
   const config = await loadConfig(deps.home)
-  run = { ...run, agents: await detectAgents(nodeAgentDeps(deps.exec, deps.codexUserHome, deps.clock.now)) }
+  run = { ...run, agents: await detectRunAgents(deps) }
   await saveRun(deps.home, run)
 
   if (seatName) {
