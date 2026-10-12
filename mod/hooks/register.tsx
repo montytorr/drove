@@ -334,6 +334,7 @@ const ORCHESTRATOR_TOOLS = [
         target: { type: 'string', description: 'the worker a reviewer reviews or a tester tests; required for those roles' },
         userHooks: { type: 'boolean', description: 'optional, Claude workers: false leaves out the hooks in your own settings.json, and with them your own skills, agents and commands, which Claude reads from the same source; Drove’s hooks stay. Left out, Drove’s workerUserHooks setting decides (kept by default). Codex workers follow the setting alone' },
         owns: { type: 'array', items: { type: 'string' }, description: 'optional: globs, relative to the worktree, of the files this worker may change; Drove’s guard refuses its edits elsewhere. Left out, it may edit anywhere (a tester: the usual test globs)' },
+        acceptance: { type: 'array', items: { type: 'string' }, description: 'optional: the acceptance criteria, one testable statement each, ideally Given-When-Then, taken from the Cairn task body. Drove numbers them AC1…ACn and writes them into the worker’s brief as ## Acceptance (a reviewer or tester of it sees them too, unless you give it its own); the worker answers each in its done report. An empty statement is refused' },
         maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
         maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
       },
@@ -538,9 +539,11 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const target = typeof input.target === 'string' ? input.target.trim() : ''
   if (role !== 'implementer' && !target) return { deny: `A ${role} needs target: the worker it ${role === 'reviewer' ? 'reviews' : 'tests'}.` }
   if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
+  if (input.acceptance !== undefined && (!Array.isArray(input.acceptance) || input.acceptance.some(entry => typeof entry !== 'string' || !entry.trim()))) return { deny: '--acceptance takes non-empty statements, one per criterion' }
+  const acceptance = input.acceptance as string[] | undefined
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })

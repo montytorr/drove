@@ -71,6 +71,7 @@ export type Seat = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
   budgetNoticed?: boolean

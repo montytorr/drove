@@ -13,7 +13,7 @@ import * as herdr from './herdr.ts'
 import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './isolation.ts'
 import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeAgents, readClaudeMcp, readClaudePlugins, readClaudeSettings, readClaudeSkills, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
-import { type AvailableTrims, LAB_RE, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
+import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
@@ -893,6 +893,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (badBudget) return failed('usage', `${badBudget[0]} must be a whole number of at least 1`)
   const brief = request.brief.trim()
   if (!brief) return failed('usage', 'a worker needs a brief')
+  if (request.acceptance?.some(item => typeof item !== 'string' || !item.trim())) return failed('usage', '--acceptance takes non-empty statements, one per criterion')
+  const given = request.acceptance?.map(item => item.trim()).filter(Boolean)
   const located = await locateFor(deps, identity, 'up')
   if ('error' in located) return located.error
   const { run } = located
@@ -904,6 +906,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (targetSeat?.role === 'reviewer') return failed('usage', `--target ${targetSeat.name} is a reviewer, which changes nothing: target the seat it reviewed`)
   if (role === 'tester' && targetSeat && !(await git.branchExists(deps.exec, run.repo, targetSeat.branch))) return failed('git', `--target ${targetSeat.name}: its branch ${targetSeat.branch} does not exist, so a tester has nothing to branch from`)
 
+  // A reviewer or tester sees its target's criteria unless the planner gave it its own (DROVE-123).
+  const acceptance = given && given.length > 0 ? given : isReview ? targetSeat?.acceptance : undefined
   const config = await loadConfig(deps.home)
   const now = deps.clock.now()
   const iso = now.toISOString()
@@ -921,7 +925,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     ...(isReview && request.target ? { role, target: request.target } : {}),
     ...(request.skills ? { skills: [...new Set(request.skills)] } : {}), ...(request.agents ? { agents: [...new Set(request.agents)] } : {}),
     ...(request.userHooks !== undefined ? { userHooks: request.userHooks } : {}),
-    ...(owns ? { owns } : {}), model, effort, worktree, branch,
+    ...(owns ? { owns } : {}), ...(acceptance ? { acceptance } : {}), model, effort, worktree, branch,
     ...(request.maxTurns ?? config.maxTurns ? { maxTurns: request.maxTurns ?? config.maxTurns } : {}), ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
     ...(isClaude ? {} : { codexHome: codexHomeDir(deps.home, run.id) }),
@@ -1008,7 +1012,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const token = mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
   const workerIdentity = identityOfSeat(deps, run, seat, token)
-  const isBriefInline = isShellSafeArg(brief.trim())
+  const briefBody = acceptance ? `${brief}\n\n${acceptanceSection(acceptance, given && given.length > 0 ? undefined : targetSeat ? { seat: targetSeat.name, role } : undefined)}` : brief
+  const isBriefInline = isShellSafeArg(briefBody)
   const footerTarget = targetSeat
     ? { seat: targetSeat.name, branch: targetSeat.branch, worktree: targetSeat.worktree, base: baseUsed ?? run.base, briefFile: join(seatDir(deps.home, run.id, targetSeat.name), 'brief.md') }
     : undefined
@@ -1019,7 +1024,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     ...(config.workerPorts && ports.PORT ? { ports: { port: Number(ports.PORT), count: config.workerPorts.stride } } : {}),
     ...(copyPlan && copyPlan.files.length > 0 ? { copied: copyPlan.files } : {}),
   })
-  const briefText = isBriefInline ? `${brief.trim()} ${footerText.trimStart()}` : `${brief}${footerText}`
+  const briefText = isBriefInline ? `${briefBody} ${footerText.trimStart()}` : `${briefBody}${footerText}`
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
   await saveBrief(deps, run.id, seat.name, briefText)

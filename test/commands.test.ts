@@ -527,7 +527,7 @@ test('a codex worker role goes in its CODEX_HOME config.toml as developer_instru
   const start = fake.find('herdr', 'agent', 'start') ?? []
   assert.ok(!start.some(arg => arg.startsWith('developer_instructions') || arg.includes('# Worker mode')))
   const config = await readFile(join(deps.home, 'runs', RUN, 'codex-home', 'config.toml'), 'utf8')
-  assert.match(config, /^developer_instructions = "# Worker mode\\n\\nYou are a worker of Drove run /m)
+  assert.match(config, /^developer_instructions = "# Worker mode\\n\\n## Overview\\nYou are a worker of Drove run /m)
 })
 
 test('the brief footer carries the repo verify commands from package.json', async () => {
