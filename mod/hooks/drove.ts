@@ -25,7 +25,7 @@ export const attachArgs = (input: { sessionId: string; paneId?: string; goal?: s
 
 export const bridgeArgs = (run: string, sessionId: string): string[] => ['mod', 'bridge', '--run', run, '--session', sessionId]
 
-export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; skills?: readonly string[]; agents?: readonly string[]; userMemory?: boolean; userHooks?: boolean; role?: SeatRole; target?: string; owns?: readonly string[]; acceptance?: readonly string[]; maxTurns?: number; maxTokens?: number }): string[] => [
+export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; skills?: readonly string[]; agents?: readonly string[]; userMemory?: boolean; userHooks?: boolean; role?: SeatRole; target?: string; owns?: readonly string[]; acceptance?: readonly string[]; maxTurns?: number; maxTokens?: number; maxMinutes?: number; maxCost?: number }): string[] => [
   'spawn', input.name, '--kind', input.kind, '--brief', '-', '--effort', input.effort,
   ...(input.model ? ['--model', input.model] : []),
   ...(input.cairn ? ['--cairn', input.cairn] : []),
@@ -41,6 +41,8 @@ export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort
   ...(input.acceptance ?? []).map(item => `--acceptance=${item}`),
   ...(input.maxTurns ? ['--max-turns', String(input.maxTurns)] : []),
   ...(input.maxTokens ? ['--max-tokens', String(input.maxTokens)] : []),
+  ...(input.maxMinutes !== undefined ? ['--max-minutes', String(input.maxMinutes)] : []),
+  ...(input.maxCost !== undefined ? ['--max-cost', String(input.maxCost)] : []),
 ]
 
 export const messageArgs = (name: string, expects: Expects): string[] => ['send', name, '--kind', 'message', '--expects', expects, '-']
@@ -59,12 +61,15 @@ export const migrateArgs = (input: { name: string; kind: AgentKind; model?: stri
 export const closeArgs = (name: string, removeWorktree: boolean): string[] => ['close', name, ...(removeWorktree ? ['--remove-worktree'] : [])]
 
 // --no-checks is the human's, so no builder here can produce it.
-export const mergeArgs = (input: { name: string; pr?: boolean; squash?: boolean; message?: string }): string[] => [
+export const mergeArgs = (input: { name: string; pr?: boolean; squash?: boolean; fresh?: boolean; message?: string }): string[] => [
   'merge', input.name,
   ...(input.pr ? ['--pr'] : []),
   ...(input.squash ? ['--squash'] : []),
+  ...(input.fresh ? ['--fresh'] : []),
   ...(input.message ? ['-m', input.message] : []),
 ]
+
+export const checksArgs = (name: string, fresh?: boolean): string[] => ['checks', name, ...(fresh ? ['--fresh'] : [])]
 
 export const rosterArgs = (run: string): string[] => ['roster', '--run', run]
 
@@ -122,6 +127,17 @@ export type GuardVerdict = { allow: true } | { allow: false; reason: string }
 
 export const brokenGuard = (detail: string, entry: string): string =>
   `Orchestrator mode: Drove's guard could not run, so this call is refused (fail closed). ${detail.trim().slice(0, 300)} — check that node 22.18 or newer is on PATH and that ${entry} exists (the mod's droveEntry setting), then retry.`
+
+// A spawn inherits the session's directory; once that is a removed worktree the failure reads like a missing node.
+export const isSpawnCwdGone = (ran: Ran): boolean => ran.exitCode === -1 && /ENOENT/.test(ran.stderr)
+
+export const missingCwdReason = (cwd: string, repo: string): string =>
+  `Orchestrator mode: the session's working directory ${cwd} no longer exists (a removed worktree?): cd back to the repo (${repo}), then retry.`
+
+export const isInsideDir = (path: string, dir: string): boolean => dir !== '' && (path === dir || path.startsWith(`${dir.replace(/\/+$/, '')}/`))
+
+export const cwdInWorktreeReason = (name: string, worktree: string, cwd: string, repo: string): string =>
+  `Orchestrator mode: your working directory ${cwd} is inside ${name}'s worktree ${worktree}, which remove_worktree would delete: cd to the repo (${repo}) first, then close it.`
 
 export const guardVerdictOf = (ran: Ran, entry: string): GuardVerdict => {
   if (ran.exitCode === 0) return { allow: true }

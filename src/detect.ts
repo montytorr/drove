@@ -212,16 +212,21 @@ export const deriveState = (seat: Seat, signals: TurnSignals, now: Date): Derive
   return { state, attention }
 }
 
-export type SeatUsage = { turns: number; tokens?: number }
+export type SeatUsage = { turns: number; tokens?: number; minutes?: number; cost?: number }
 
 const COUNT = new Intl.NumberFormat('en-US')
 
 // A seat reaches its budget at maxTurns Stop records or maxTokens tokens, whichever comes first (DROVE-71).
-export const budgetDetail = (seat: Pick<Seat, 'maxTurns' | 'maxTokens'>, usage: SeatUsage): string | undefined => {
+export const budgetDetail = (seat: Pick<Seat, 'maxTurns' | 'maxTokens' | 'maxMinutes' | 'maxCost'>, usage: SeatUsage): string | undefined => {
   if (seat.maxTurns !== undefined && usage.turns >= seat.maxTurns) return `used ${usage.turns} of its ${seat.maxTurns} turns`
   if (seat.maxTokens !== undefined && usage.tokens !== undefined && usage.tokens >= seat.maxTokens) return `used ${COUNT.format(usage.tokens)} of its ${COUNT.format(seat.maxTokens)} tokens`
+  if (seat.maxMinutes !== undefined && usage.minutes !== undefined && usage.minutes >= seat.maxMinutes) return `used ${COUNT.format(usage.minutes)} of its ${seat.maxMinutes} minutes`
+  if (seat.maxCost !== undefined && usage.cost !== undefined && usage.cost >= seat.maxCost) return `used $${usage.cost.toFixed(2)} of its $${seat.maxCost.toFixed(2)} budget`
   return undefined
 }
+
+export const reviewLoopText = (seat: string, changes: number): string =>
+  `${seat} has had ${changes} rounds of changes: re-scope it, promote it, or take it over`
 
 export const budgetNoticeText = (detail: string): string =>
   `Budget reached: you have ${detail}. Do not start new work. Send a progress report with the drove report tool (what is done, what is left), or a promote report if you need more room, and stop.`

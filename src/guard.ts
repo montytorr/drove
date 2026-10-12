@@ -103,7 +103,7 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'attention', 'capture', 'close', 'down', 'doctor', 'owns'])
+const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'checks', 'roster', 'attention', 'capture', 'close', 'down', 'doctor', 'owns'])
 const WORKER_DROVE = new Set(['roster', 'capture', 'doctor'])
 
 // A worker's Bash may read Drove's run state (roster, events, its own brief) but not write it: the roster holds the seat's

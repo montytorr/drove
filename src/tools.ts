@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'set_goal', 'set_owns', 'run_report', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'roster', 'capture', 'set_goal', 'set_owns', 'run_report', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'setOwns' | 'runReport'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'checks' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'setOwns' | 'runReport'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -94,6 +94,12 @@ const bool = (args: Args, key: string): boolean => {
   return value
 }
 
+const positive = (args: Args, key: string): number => {
+  const value = args[key]
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) throw new ArgError(`${key} must be a positive finite number`)
+  return value
+}
+
 const count = (args: Args, key: string, fallback: number): number => {
   const value = args[key]
   if (value === undefined) return fallback
@@ -164,6 +170,8 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         acceptance: { type: 'array', items: { type: 'string' }, description: 'Optional: the acceptance criteria, one testable statement each, ideally Given-When-Then. Drove numbers them AC1…ACn, writes them into the worker\'s brief as ## Acceptance (a reviewer or tester of the seat sees them too, unless you give it its own), and the worker answers each in its done report. Take them from the Cairn task body. An empty statement is refused.' },
         maxTurns: { type: 'integer', minimum: 1, description: 'Optional: how many turns (stops) the worker may take. At the limit you get a budget attention and the worker is told once to report progress or promote and stop; it is not killed. Left out, the configured maxTurns applies, or none.' },
         maxTokens: { type: 'integer', minimum: 1, description: 'Optional: how many tokens (input, cached input and output, read from the agent\'s own transcript) the worker may use. Same effect at the limit as maxTurns.' },
+        maxMinutes: { type: 'number', exclusiveMinimum: 0, description: 'Optional: wall clock minutes since spawn before a budget attention and one notice to report progress or promote and stop; never kills the worker.' },
+        maxCost: { type: 'number', exclusiveMinimum: 0, description: 'Optional: USD budget from transcript usage and the run report price table. Unpriced models never trip it.' },
       },
       ['seat', 'kind', 'brief'],
       async (args) => {
@@ -191,6 +199,8 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
             ...(args.acceptance != null ? { acceptance: statements(args, 'acceptance') } : {}),
             ...(args.maxTurns != null ? { maxTurns: count(args, 'maxTurns', 1) } : {}),
             ...(args.maxTokens != null ? { maxTokens: count(args, 'maxTokens', 1) } : {}),
+            ...(args.maxMinutes != null ? { maxMinutes: positive(args, 'maxMinutes') } : {}),
+            ...(args.maxCost != null ? { maxCost: positive(args, 'maxCost') } : {}),
           }),
         )
       },
@@ -279,10 +289,21 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         pr: { type: 'boolean', description: 'Go through a GitHub pull request (the repo needs a remote). Default: a local merge.' },
         squash: { type: 'boolean', description: 'With pr: squash-merge the PR instead of a merge commit.' },
         message: { type: 'string', description: 'The merge commit message. Default: "merge: <the branch\'s last commit subject>".' },
+        fresh: { type: 'boolean', description: 'Run the checks again even when the run_checks ledger holds a passing record of them at the worker\'s current commit on a clean tree (which the merge reuses otherwise).' },
       },
       ['seat'],
       async (args) =>
-        asResult(await cmd.merge(deps, identity, await ref(), { seat: seatName(args), pr: flag(args, 'pr'), squash: flag(args, 'squash'), message: text(args, 'message', false) })),
+        asResult(await cmd.merge(deps, identity, await ref(), { seat: seatName(args), pr: flag(args, 'pr'), squash: flag(args, 'squash'), message: text(args, 'message', false), ...(flag(args, 'fresh') ? { fresh: true } : {}) })),
+    ),
+    defineTool(
+      'run_checks',
+      'Verify a worker\'s done report yourself: runs the repo\'s checks (the merge plan: the checks list in .drove.json, else typecheck, lint, test) in the worker\'s worktree and records each run by commit, so the merge reuses a pass instead of running them again. Returns pass or fail per command, the failing command\'s exit code and output tail, the commit and whether the tree was clean (only a clean tree is evidence). A passing record at the worker\'s current commit is reused unless fresh. Never writes to the repo. Send a failure back to the worker with send, or verdict changes.',
+      {
+        seat: seatProp,
+        fresh: { type: 'boolean', description: 'Run the checks again even when a passing record exists for the worker\'s current commit.' },
+      },
+      ['seat'],
+      async (args) => asResult(await cmd.checks(deps, identity, await ref(), { seat: seatName(args), fresh: flag(args, 'fresh') })),
     ),
     defineTool(
       'roster',

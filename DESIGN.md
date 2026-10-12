@@ -34,7 +34,8 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove promote <seat> [--model M] --effort E [--reason TEXT]` | planner | Changes a worker's model or effort (§8). `--model` is optional: a Codex seat is promoted by effort alone and keeps its model (or Codex's default when none is recorded). It is a separate command because it can restart the agent; demote is the same command with a lower setting. |
 | `drove migrate <seat> --kind claude\|codex [--model M] [--effort E] [--reason TEXT]` | planner | Moves a worker to the other agent kind in the same worktree, with a handoff brief and no resume (§8, Migrate). Also the `migrate` MCP tool and the mod's `migrate_worker`. |
 | `drove init <dir> [--json]` | planner, human | Makes a new git repo (`main`, one empty commit) in an empty or missing directory; see §6. |
-| `drove merge <seat> [--pr] [--squash] [-m MSG] [--no-checks] [--run ID]` | planner, human | Integrates a seat's branch behind the repo's checks (§6, Merge gate). Also the `merge` MCP tool and the mod's `merge_worker`; neither can pass `--no-checks`, which is the human's. |
+| `drove checks <seat> [--fresh] [--run ID]` | planner, human | Runs the merge plan's checks in a seat's worktree, or reuses a passing record at its HEAD, and records them (§6, Check evidence). Also the `run_checks` MCP tool and the mod's `run_checks`. |
+| `drove merge <seat> [--pr] [--squash] [--fresh] [-m MSG] [--no-checks] [--run ID]` | planner, human | Integrates a seat's branch behind the repo's checks (§6, Merge gate). Also the `merge` MCP tool and the mod's `merge_worker`; neither can pass `--no-checks`, which is the human's. |
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove attention [--run ID \| --all] [--json] [--follow]` | human, a poller | The things that wait on a person, as data: a dialog or approval, a report for the human, a refused 6th pane, a gone seat. One snapshot, or JSON lines of new and resolved items with `--follow` (§14). |
 | `drove report [<run>] [--json]` | anyone | Read-only run report (DROVE-106): per seat and in total, tokens (input, cache read, cache write, output) from the agent's own transcript, cost from a price table, wall time (spawn to close), time waiting on the human, rework (verdicts with changes, promotions, demotions, migrations, restarts) and guard denials (`deny`: per seat, in total and by rule, from the `guard.denied` events, §6). Also the `run_report` MCP tool, and the totals and per-seat lines `drove down` adds to the goal task's summary note. |
@@ -62,6 +63,7 @@ $DROVE_HOME (default ~/.drove), mode 700
     roster.json         # Roster. Atomic: write tmp + fsync + rename, under roster.lock
     roster.lock/        # mkdir lock (stale after 10 s, then stolen)
     events.jsonl        # append-only DroveEvent log, one write() per line, lines capped at 8 KiB
+    checks.jsonl        # the check ledger (DROVE-122): one line per command run, with the worktree HEAD it ran at
     codex-home/         # the run's Drove-owned CODEX_HOME for Codex workers (§5)
     planner/
       pending.jsonl     # reports a wake transport could not deliver yet (piggyback source)
@@ -424,6 +426,16 @@ Until this, the planner merged after reading the diff and Drove had no say. Now 
 
 **Record.** `merge.passed`, `merge.refused` (with a `code`: `checks-failed`, `dirty-checkout`, `wrong-branch`, `merge-conflict`, `no-checks`, `pr-conflicts` and so on) and `merge.pending` are appended to the run's events with the seat, branch, mode and detail, and the last result is kept on the seat as `gate` for the board line (it is hidden once the seat reports again). Refusals before a seat is found (no such seat, not the planner) record nothing.
 
+**Check evidence (DROVE-122).** The check runner lives in `src/checks.ts` (`runChecks(deps, run, seat, { fresh?, plan? })`), apart from the merge: the gate, `drove checks` and the planner's `run_checks` tool all call it. Each command it runs appends one line to `<run>/checks.jsonl`: `{ seat, command, cwd, sha, clean, exit, durationMs, at, tail }`. `sha` is the worktree's HEAD, `clean` is true when `git status --porcelain` showed nothing before the command and after it (as in the gate, untracked files under `.claude/` do not count), so a check that edits files (`lint --fix`, snapshots, codegen) records `clean: false` and so does every later command of that run, and `tail` is the last 40 lines and 2 KiB of output with colour codes removed (cut further when its escaped JSON would pass the 8 KiB line cap). The commands run in order and the first failure stops the rest, which get no record. Each run also emits a `checks.ran` event (`sha`, `clean`, `passed`, `commands`, `ran`, `durationMs`, and `failed` and `exit` on a failure), and sets the seat's `checks` on the roster for the boards.
+
+*The reuse rule.* A run is skipped when the ledger is intact (every line parses and ends in a newline: a torn or hand-edited line means no reuse, because a newer failing record that cannot be read must not let an older pass win) and, for every command of the plan, the newest record for this seat, command, worktree and HEAD has `exit` 0 and `clean` true, and the worktree is clean now. A new commit, a dirty tree (now, or when the record was made), a missing or failing record, a changed plan, or `fresh` means the whole plan runs again; evidence is all-or-nothing, never mixed with new runs. The merge gate then reports `checks reused: passed at <sha7> <time>` in the `merge.passed` detail and sets `checksReused` on the event; `--pr` in a repo without CI takes the same path through the same closure, and the PR path is otherwise unchanged. Evidence is a statement about the branch tip, not about the merge result, exactly as before.
+
+*Pinned to the checked commit.* After the checks pass, or are reused, the gate reads `refs/heads/<branch>` and refuses with `head-moved` unless it is the sha the checks ran at (a worker that committed since, switched branches or detached HEAD in its worktree would otherwise have an unchecked commit merged). The local merge then merges that sha, not the branch name (`merge.passed` carries `checkedSha`), and `--pr` pushes `<sha>:refs/heads/<branch>`; a late local check on the PR path must match the sha already pushed. `--no-checks` has nothing checked to pin and merges the branch as before.
+
+*The planner tool.* `run_checks` (`drove checks`) answers per command: passed, FAILED with its exit code and output tail, or skipped; the commit; whether the tree was clean; and whether it reused evidence. A failing check is a result, not a tool error. A dirty tree runs and records, but the answer says it is not evidence a merge reuses. The tool runs the commands the worktree's own scripts define, as the merge gate does; Drove itself writes nothing to the repo, only `~/.drove`. A worker cannot call it.
+
+*Showing it.* `Seat.checks` is `{ result, sha, clean, at, failed?, stale? }`. The watcher reads each such seat's worktree HEAD on its poll and sets `stale` while it differs from `sha`. The roster line reads `checks passed at <sha7>`, `checks failed: <command> at <sha7>` or `checks stale: ..., HEAD has moved`; the terminal and mod boards show `chk✓`, `chk✗` or `chk~` in a column that appears once any open seat has run its checks; the web panel has a `checks` field. `drove report` adds a `chk run/fail` column from the `checks.ran` events.
+
 **`--no-checks`** skips the local checks (GitHub's checks still apply under `--pr`). It is the human's: the guard denies it to the planner, and the command refuses it when it runs inside a Drove session (`DROVE_RUN` set), so the human runs it from their own terminal with `--run ID`.
 
 Stricter planner denials added in P2:
@@ -464,7 +476,11 @@ Signals, by freshness:
 - a stalled prompt;
 - idle without a report;
 - a gone pane;
-- a budget request.
+- a budget request;
+- a seat with `reviewLoopLimit` changes verdicts (default 3): `review-loop`, cleared by approval, promotion, migration or closing;
+- a run above optional `runMaxCost`: one durable `run-budget` item for the human.
+
+Seat budgets add `maxMinutes` (wall time since `spawnedAt`, including time the seat was down) and `maxCost` (USD transcript cost from the report price table) beside `maxTurns` and `maxTokens`. Both are spawn CLI flags and planner tool fields, stored in the roster and preserved across promote, up and migrate. The existing watcher poll checks them and sends the same one-time budget notice; it never kills a seat. Unknown model prices do not trip a cost bound. The run-cost warning is recorded as an attention event, so watcher restarts cannot repeat it.
 
 **Dialog detection.** When `agent start` returns `agent_not_ready`, when a seat turns `blocked`, or when a seat is not `working` and no `session-start` or `user-prompt-submit` hook has fired yet (the Codex hook-review dialog shows as `idle`, not `blocked`), Drove reads `herdr agent read <seat> --source visible --lines 40` and matches a regex table. The visible screen is used because Codex draws on the alternate screen, which never reaches the scrollback sources:
 

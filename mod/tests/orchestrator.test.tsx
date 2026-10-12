@@ -196,6 +196,26 @@ describe('board model', () => {
     expect(roles.workers[0]?.cells).toHaveLength((plain.workers[0]?.cells.length ?? 0) + 1)
   })
 
+  test('a seat\'s last check result shows as a short marker: passed, failed, or stale once HEAD moved; the column only exists once a seat has one', () => {
+    const run = { sha: 'a'.repeat(40), clean: true, at: '2026-10-09T10:00:00.000Z' }
+    const none = buildBoard({ ...base, frame: 0, seats: [seat(), seat({ name: 'w-b' })] })
+    const marked = buildBoard({
+      ...base,
+      frame: 0,
+      seats: [seat({ checks: { ...run, result: 'passed' } }), seat({ name: 'w-b', checks: { ...run, result: 'failed', failed: 'npm test' } }), seat({ name: 'w-c', checks: { ...run, result: 'passed', stale: true } }), seat({ name: 'w-d' })],
+    })
+    const cells = (row: number) => marked.workers[row]?.cells ?? []
+    expect(cells(0).map(({ text }) => text)).toContain('chk✓')
+    expect(cells(1).map(({ text }) => text)).toContain('chk✗')
+    expect(cells(2).map(({ text }) => text)).toContain('chk~')
+    expect(cells(0).find(({ text }) => text === 'chk✓')?.tone).toBe('good')
+    expect(cells(1).find(({ text }) => text === 'chk✗')?.tone).toBe('alert')
+    expect(cells(3).map(({ text }) => text)).not.toContain('chk✓')
+    expect(cells(3)).toHaveLength(cells(0).length)
+    expect(cells(0)).toHaveLength((none.workers[0]?.cells.length ?? 0) + 1)
+    expect(cells(0).filter(({ width }) => width === undefined)).toHaveLength(1)
+  })
+
   test('an asking seat pulses for a few seconds, then stays red; a bridge problem shows on the lead row', () => {
     const asking = { status: { 'w-auth': { asking: 'asking in its pane: Which table?' } }, asksAt: { 'w-auth': NOW + 59_000 }, seats: [seat()] }
     const on = buildBoard({ ...base, ...asking, frame: 0 }).workers[0]?.cells[1]?.tone
@@ -250,6 +270,7 @@ type World = {
   isOverBudget: boolean
   runGoal?: string
   isGuardBroken: boolean
+  isSpawnCwdGone?: boolean
   bridge: { push: (text: string | null) => void }
   bridgeCode: number
   store: Map<string, unknown>
@@ -305,6 +326,7 @@ const fakeDrove = (world: World, call: Call) => {
   if (command === 'mod' && action === 'report') return ok(JSON.stringify({ ok: true, text: 'report r-1 recorded (done, expects review).' }))
   if (command === 'guard') {
     if (world.isGuardBroken) return ok('', 127, 'env: node: No such file or directory')
+    if (world.isSpawnCwdGone) return ok('', -1, "drove-unavailable: $.process.run(node) failed to start: ENOENT posix_spawn 'node'")
     const input = JSON.parse(call.stdin ?? '{}') as { tool_name?: string; tool_input?: { command?: string; file_path?: string } }
     const command = input.tool_input?.command ?? ''
     const path = input.tool_input?.file_path ?? ''
@@ -499,6 +521,8 @@ describe('orchestrator session', () => {
     expect(sections[1]?.text).toContain('A wake shows one line per worker report')
     expect(sections[1]?.text).toContain('call mcp__orchestrator__read_reports for the full text')
     expect(sections[1]?.text).toContain('integrate it with mcp__orchestrator__merge_worker (`drove merge <seat>`), never a plain `git merge`')
+    expect(sections[1]?.text).toContain('Verify its test claims with mcp__orchestrator__run_checks (`drove checks <seat>`)')
+    expect(sections[1]?.text).toContain("reuses a passing run_checks record at the worker's current commit instead (`fresh: true` runs them again)")
     expect(sections[1]?.text).toContain('pass `pr: true` (`drove merge <seat> --pr`')
   })
 
@@ -516,6 +540,25 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'merge').every(({ args }) => !args.includes('--no-checks'))).toBe(true)
     expect(denial((await callTool($, 'merge_worker', { name: 'W Bad' })) as never)).toContain('Worker names must match')
     expect(droveCalls(world, 'merge')).toHaveLength(2)
+    await callTool($, 'merge_worker', { name: 'w-auth', fresh: true })
+    expect(droveCalls(world, 'merge')[2]?.args).toEqual(['merge', 'w-auth', '--fresh'])
+  })
+
+  test('run_checks is drove checks: the worker, and --fresh on request, with a long timeout and nothing that writes', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    expect(denial((await callTool($, 'run_checks', { name: 'w-auth' })) as never)).toContain('Orchestrator mode is off')
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    expect(world.registeredTools).toContain('run_checks')
+    expect((world.toolSchemas.run_checks as { description: string }).description).toMatch(/done report/)
+    expect(denial((await callTool($, 'run_checks', { name: 'w-auth' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'checks')[0]?.args).toEqual(['checks', 'w-auth'])
+    await callTool($, 'run_checks', { name: 'w-auth', fresh: true })
+    expect(droveCalls(world, 'checks')[1]?.args).toEqual(['checks', 'w-auth', '--fresh'])
+    expect(denial((await callTool($, 'run_checks', { name: 'W Bad' })) as never)).toContain('Worker names must match')
+    expect(droveCalls(world, 'checks')).toHaveLength(2)
   })
 
   test("read_reports returns the workers' full reports through drove reports, for one worker or all of them", async ($, on) => {
@@ -564,8 +607,8 @@ describe('orchestrator session', () => {
     expect(denial((await callTool($, 'spawn_worker', { name: 'Bad Name', brief: 'x' })) as never)).toContain('must match')
     expect(denial((await callTool($, 'spawn_worker', { name: 'w-z', brief: 'x', kind: 'gemini' })) as never)).toContain('claude or codex')
     expect(droveCalls(world, 'spawn')).toHaveLength(2)
-    await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many' })
-    expect(droveCalls(world, 'spawn')[2]?.args.slice(-4)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20'])
+    await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many', maxMinutes: 1.5, maxCost: 2.25 })
+    expect(droveCalls(world, 'spawn')[2]?.args.slice(-8)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20', '--max-minutes', '1.5', '--max-cost', '2.25'])
   })
 
   test('spawn_worker passes role and target to drove spawn, and refuses a role without its target', async ($, on) => {
@@ -710,6 +753,39 @@ describe('orchestrator session', () => {
     await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })
     expect(droveCalls(world, 'close')[0]?.args).toEqual(['close', 'w-auth', '--remove-worktree'])
     expect(String((await callTool($, 'roster', {})).result)).toContain('w-auth working')
+  })
+
+  test('close_worker with remove_worktree refuses while the planner stands inside that worktree', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    world.cwd = '/work/repo/.claude/worktrees/w-auth/src'
+    const refused = denial((await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })) as never)
+    expect(refused).toContain('cd to the repo (/work/repo)')
+    expect(droveCalls(world, 'close')).toHaveLength(0)
+    expect(denial((await callTool($, 'close_worker', { name: 'w-auth' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'close')[0]?.args).toEqual(['close', 'w-auth'])
+    world.cwd = '/work/repo/.claude/worktrees/w-auth-2'
+    expect(denial((await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'close')[1]?.args).toEqual(['close', 'w-auth', '--remove-worktree'])
+  })
+
+  test('the guard spawns in the repo when the session cwd is gone, and names the missing directory when even that fails', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    world.cwd = '/work/repo/.claude/worktrees/w-gone'
+    expect(denial(await $.tool.call({ tool: 'Bash', command: 'npm test' } as never))).toContain('npm test')
+    expect(denial(await $.tool.call({ tool: 'Bash', command: 'ls' } as never))).toBeUndefined()
+    const guard = droveCalls(world, 'guard').at(-1)
+    expect(guard?.cwd).toBe('/work/repo')
+    expect(JSON.parse(guard?.stdin ?? '{}')).toMatchObject({ cwd: '/work/repo/.claude/worktrees/w-gone' })
+    world.isSpawnCwdGone = true
+    const gone = denial(await $.tool.call({ tool: 'Bash', command: 'ls' } as never))
+    expect(gone).toContain('/work/repo/.claude/worktrees/w-gone no longer exists')
+    expect(gone).toContain('cd back to the repo (/work/repo)')
   })
 
   test('migrate_worker is drove migrate to the other kind, and refuses the same kind', async ($, on) => {

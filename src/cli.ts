@@ -71,6 +71,8 @@ export const spawnRequestOf = (values: Values, positionals: readonly string[], b
   ...(Array.isArray(values.acceptance) ? { acceptance: values.acceptance } : {}),
   maxTurns: count(values, 'max-turns'),
   maxTokens: count(values, 'max-tokens'),
+  maxMinutes: count(values, 'max-minutes'),
+  maxCost: count(values, 'max-cost'),
 })
 
 const count = (values: Values, key: string): number | undefined => (str(values, key) === undefined ? undefined : Number(str(values, key)))
@@ -157,9 +159,9 @@ export const COMMANDS: Record<string, Spec> = {
       print(await commands.initRepo(commands.defaultDeps(), need(positionals[0], '<dir>'), process.cwd(), values.json === true), io),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on|off] [--user-hooks on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--acceptance TEXT ...] [--max-turns N] [--max-tokens N]',
+    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on|off] [--user-hooks on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--acceptance TEXT ...] [--max-turns N] [--max-tokens N] [--max-minutes N] [--max-cost USD]',
     why: 'open a worker in its own worktree and pane, and brief it',
-    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, skills: { type: 'string' }, agents: { type: 'string' }, 'user-memory': { type: 'string' }, 'user-hooks': { type: 'string' }, role: { type: 'string' }, target: { type: 'string' }, owns: { type: 'string' }, acceptance: { type: 'string', multiple: true }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
+    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, skills: { type: 'string' }, agents: { type: 'string' }, 'user-memory': { type: 'string' }, 'user-hooks': { type: 'string' }, role: { type: 'string' }, target: { type: 'string' }, owns: { type: 'string' }, acceptance: { type: 'string', multiple: true }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' }, 'max-minutes': { type: 'string' }, 'max-cost': { type: 'string' } },
     run: async (values, positionals, io) => {
       const brief = need(str(values, 'brief'), '--brief')
       return print(await commands.spawn(commands.defaultDeps(), commands.identityOrPlanner(), spawnRequestOf(values, positionals, brief === '-' ? await io.stdin() : brief)), io)
@@ -272,12 +274,12 @@ export const COMMANDS: Record<string, Spec> = {
     why: 'quit a worker and close its pane',
     options: { 'remove-worktree': { type: 'boolean' } },
     run: async (values, positionals, io) =>
-      print(await commands.close(commands.defaultDeps(), commands.identityOrPlanner(), need(positionals[0], '<seat>'), values['remove-worktree'] === true), io),
+      print(await commands.close(commands.defaultDeps(), commands.identityOrPlanner(), need(positionals[0], '<seat>'), values['remove-worktree'] === true, process.cwd()), io),
   },
   merge: {
-    usage: 'drove merge <seat> [--pr] [--squash] [-m MSG] [--run ID]',
-    why: "integrate a worker's branch behind the repo's checks: local runs them in the seat's worktree then merges --no-ff into the base; --pr pushes, opens a PR, reads its checks and gh pr merges when green (pending returns the PR URL: run it again)",
-    options: { pr: { type: 'boolean' }, squash: { type: 'boolean' }, message: { type: 'string', short: 'm' }, 'no-checks': { type: 'boolean' }, run: { type: 'string' } },
+    usage: 'drove merge <seat> [--pr] [--squash] [-m MSG] [--fresh] [--run ID]',
+    why: "integrate a worker's branch behind the repo's checks: local runs them in the seat's worktree then merges --no-ff into the base; --pr pushes, opens a PR, reads its checks and gh pr merges when green (pending returns the PR URL: run it again); a passing record of the checks at the seat's HEAD is reused unless --fresh",
+    options: { pr: { type: 'boolean' }, squash: { type: 'boolean' }, message: { type: 'string', short: 'm' }, 'no-checks': { type: 'boolean' }, fresh: { type: 'boolean' }, run: { type: 'string' } },
     run: async (values, positionals, io) =>
       print(
         await commands.merge(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), {
@@ -286,9 +288,17 @@ export const COMMANDS: Record<string, Spec> = {
           squash: values.squash === true,
           message: str(values, 'message'),
           noChecks: values['no-checks'] === true,
+          fresh: values.fresh === true,
         }),
         io,
       ),
+  },
+  checks: {
+    usage: 'drove checks <seat> [--fresh] [--run ID]',
+    why: "run the merge plan's checks in a seat's worktree (or reuse a passing record at its HEAD), record them, and print pass or fail per command with the failing tail; never writes to the repo",
+    options: { fresh: { type: 'boolean' }, run: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(await commands.checks(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { seat: need(positionals[0], '<seat>'), fresh: values.fresh === true }), io),
   },
   board: {
     usage: 'drove board [--once] [--web [--port N]] [--run ID]',

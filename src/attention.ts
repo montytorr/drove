@@ -35,6 +35,7 @@ const clipText = (text: string, max = TEXT_MAX): string => {
 const PANE_ANSWERS: ReadonlySet<Attention['reason']> = new Set(['dialog', 'permission', 'trust', 'hook-trust', 'channel-confirm', 'codex-version-mismatch'])
 
 const seatAnswer = (run: string, seat: Seat, reason: Attention['reason']): AttentionAnswer => {
+  if (reason === 'review-loop') return { type: 'pane', ...(seat.paneId ? { pane: seat.paneId } : {}), inspect: `drove capture ${seat.name} --run ${run}`, note: 'Re-scope the seat, promote it, or take it over with the planner.' }
   if (reason === 'gone') return { type: 'command', command: `drove up --run ${run} --seat ${seat.name}`, note: 'Relaunches the seat with resume.' }
   if (PANE_ANSWERS.has(reason)) {
     return { type: 'pane', ...(seat.paneId ? { pane: seat.paneId } : {}), inspect: `drove capture ${seat.name} --run ${run}`, note: 'Answer it in the pane. Drove never answers a dialog or an approval.' }
@@ -161,7 +162,12 @@ const plannerCandidates = (input: AttentionInput): AttentionCandidate[] => {
 
 export const attentionCandidates = (input: AttentionInput): AttentionCandidate[] => {
   const asking = askingCandidates(input)
-  return [...plannerCandidates(input), ...asking, ...seatCandidates(input, new Set(asking.map(item => item.seat))), ...forHumanCandidates(input), ...budgetCandidates(input)]
+  const runBudget = input.events.find(event => event.type === 'attention' && event.data?.reason === 'run-budget')
+  const runCandidates: AttentionCandidate[] = runBudget ? [{
+    key: 'run-budget', seat: 'planner', kind: 'run-budget', text: clipText(String(runBudget.data?.detail ?? 'Run cost budget exceeded')), since: runBudget.at,
+    answer: { type: 'pane', ...(input.run.planner.paneId ? { pane: input.run.planner.paneId } : {}), note: 'Re-scope the run or take it over with the planner.' },
+  }] : []
+  return [...runCandidates, ...plannerCandidates(input), ...asking, ...seatCandidates(input, new Set(asking.map(item => item.seat))), ...forHumanCandidates(input), ...budgetCandidates(input)]
 }
 
 // ---------- ids ----------

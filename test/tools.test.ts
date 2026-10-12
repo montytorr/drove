@@ -28,6 +28,7 @@ const fakeCommands = () => {
     capture: record('capture'),
     close: record('close', 2),
     merge: record('merge', 2),
+    checks: record('checks', 2),
     down: record('down'),
     raiseBudget: record('raiseBudget'),
     setGoal: record('setGoal'),
@@ -168,13 +169,14 @@ test('planner tools map their arguments onto the commands', async () => {
 
 test('the spawn tool passes owns, maxTurns and maxTokens through, and checks their shape', async () => {
   const { fake, tool } = await plannerWith()
-  await tool('spawn').call({ seat: 'w-ui', kind: 'claude', brief: 'x', owns: ['src/ui/**', ' ', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000 })
+  await tool('spawn').call({ seat: 'w-ui', kind: 'claude', brief: 'x', owns: ['src/ui/**', ' ', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000, maxMinutes: 1.5, maxCost: 2.25 })
   assert.deepEqual(fake.calls, [
-    { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, owns: ['src/ui/**', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000 }] },
+    { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, owns: ['src/ui/**', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000, maxMinutes: 1.5, maxCost: 2.25 }] },
   ])
   const schema = tool('spawn').inputSchema as { properties: Record<string, { type: string }> }
   assert.deepEqual([schema.properties.owns?.type, schema.properties.maxTurns?.type, schema.properties.maxTokens?.type], ['array', 'integer', 'integer'])
-  for (const args of [{ owns: 'src/**' }, { owns: [1] }, { maxTurns: 0 }, { maxTurns: '5' }, { maxTokens: 1.5 }]) {
+  assert.deepEqual([schema.properties.maxMinutes?.type, schema.properties.maxCost?.type], ['number', 'number'])
+  for (const args of [{ owns: 'src/**' }, { owns: [1] }, { maxTurns: 0 }, { maxTurns: '5' }, { maxTokens: 1.5 }, { maxMinutes: 0 }, { maxCost: '1' }, { maxCost: Infinity }]) {
     assert.equal((await tool('spawn').call({ seat: 'w-db', kind: 'claude', brief: 'x', ...args })).isError, true, JSON.stringify(args))
   }
   assert.equal(fake.calls.length, 1)
@@ -209,11 +211,29 @@ test('the merge tool is drove merge: local by default, pr and squash on request,
   ])
   const schema = tool('merge').inputSchema as { properties: Record<string, unknown> }
   assert.equal('noChecks' in schema.properties, false)
+  assert.equal('fresh' in schema.properties, true)
   assert.match(tool('merge').description, /never a plain git merge/)
   assert.match(tool('merge').description, /pending/)
   for (const args of [{ seat: 'W Bad' }, { seat: 'w-ui', pr: 'yes' }, { seat: 'w-ui', message: 4 }, {}]) {
     assert.equal((await tool('merge').call(args)).isError, true, JSON.stringify(args))
   }
+  assert.equal(fake.calls.length, 2)
+  await tool('merge').call({ seat: 'w-ui', fresh: true })
+  assert.deepEqual(fake.calls[2], { name: 'merge', args: [ref, { seat: 'w-ui', pr: false, squash: false, message: undefined, fresh: true }] })
+})
+
+test('the run_checks tool is drove checks: the seat and fresh, never anything that writes', async () => {
+  const { ctx, fake, tool } = await plannerWith()
+  await tool('run_checks').call({ seat: 'w-ui' })
+  await tool('run_checks').call({ seat: 'w-ui', fresh: true })
+  const ref = { run: ctx.run.id, repo: ctx.run.repo }
+  assert.deepEqual(fake.calls, [
+    { name: 'checks', args: [ref, { seat: 'w-ui', fresh: false }] },
+    { name: 'checks', args: [ref, { seat: 'w-ui', fresh: true }] },
+  ])
+  assert.match(tool('run_checks').description, /done report/)
+  assert.match(tool('run_checks').description, /never writes to the repo/i)
+  for (const args of [{}, { seat: 'W Bad' }, { seat: 'w-ui', fresh: 'yes' }]) assert.equal((await tool('run_checks').call(args)).isError, true, JSON.stringify(args))
   assert.equal(fake.calls.length, 2)
 })
 
