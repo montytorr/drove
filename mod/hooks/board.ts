@@ -153,6 +153,9 @@ const seatDoing = (seat: Seat, status: OrchModStatus | undefined, spin: string, 
   if (seat.state === 'needs-input') return { text: 'needs an approval in its pane', tone: 'alert' }
   if (seat.state === 'blocked') return { text: seat.attention[0]?.detail ?? 'waiting on a dialog in its pane', tone: 'alert' }
   if (seat.state === 'starting') return { text: `${spin} starting`, tone: 'muted' }
+  // The guard keeps refusing the seat the same thing: the planner's to act on, so not an alert (DROVE-121).
+  const thrash = seat.attention.find(item => item.reason === 'guard-thrash')
+  if (thrash) return { text: thrash.detail, tone: 'warn' }
   if (seat.owes !== 'none' && seat.lastReport) return { text: waitingText(seat, viewer), tone: 'warn' }
   if (seat.gate && Date.parse(seat.gate.at) >= (Date.parse(seat.lastReport?.at ?? '') || 0)) return { text: `${seat.gate.result === 'passed' ? 'merged' : `merge ${seat.gate.result}`} · ${seat.gate.detail}`, tone: seat.gate.result === 'passed' ? 'good' : seat.gate.result === 'pending' ? 'warn' : 'alert' }
   if (seat.state === 'done' && seat.lastReport) return { text: seat.lastReport.summary, tone: 'text' }

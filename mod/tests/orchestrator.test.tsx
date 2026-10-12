@@ -135,7 +135,7 @@ describe('bridge stream', () => {
     expect(feedOf({ at: ISO, type: 'report.delivered', seat: 'w-auth' }, bodies)).toBeUndefined()
     expect(feedOf({ at: ISO, type: 'goal.set', data: { goal: 'Release 0.3.0' } }, bodies)).toMatchObject({ from: '⌘', kind: 'goal', summary: 'goal: Release 0.3.0' })
     expect(feedOf({ at: ISO, type: 'attention', seat: 'w-auth', data: { reason: 'dialog', detail: 'trust this folder' } }, bodies)).toMatchObject({ from: 'w-auth', to: 'Human', kind: 'attention', summary: 'dialog: trust this folder' })
-    for (const reason of ['idle-without-report', 'stalled', 'budget', 'pending-delivery']) {
+    for (const reason of ['idle-without-report', 'stalled', 'budget', 'pending-delivery', 'guard-thrash']) {
       expect(feedOf({ at: ISO, type: 'attention', seat: 'w-auth', data: { reason, detail: 'x' } }, bodies)).toMatchObject({ from: 'w-auth', to: '⌘', kind: 'notice', summary: `${reason}: x` })
     }
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: true, resumed: true, pane: 'w1:p2' } }, bodies)).toMatchObject({ kind: 'relaunch', to: 'w-auth', summary: 'relaunched (resumed) in pane w1:p2' })
@@ -636,6 +636,24 @@ describe('orchestrator session', () => {
     expect(text).toContain('`role`: `reviewer` or `tester`')
     expect(text).toContain('large or risky, touches security')
     expect(text).toMatch(/Each takes one of the \d+ panes like any worker/)
+  })
+
+  test('spawn_worker passes acceptance as one --acceptance per criterion, and the section tells the planner to write and review against it', async ($, on) => {
+    const { world } = engine(on)
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await callTool($, 'spawn_worker', { name: 'w-ac', brief: 'Do it', acceptance: ['Given a, when b, then c', 'Given x, then y'] })
+    expect(droveCalls(world, 'spawn')[0]?.args.slice(-2)).toEqual(['--acceptance=Given a, when b, then c', '--acceptance=Given x, then y'])
+    for (const acceptance of [['fine', ' '], ['fine', 4], 'one']) {
+      expect(denial((await callTool($, 'spawn_worker', { name: 'w-bad', brief: 'x', acceptance })) as never)).toBe('--acceptance takes non-empty statements, one per criterion')
+    }
+    expect(droveCalls(world, 'spawn')).toHaveLength(1)
+    const { inputSchema } = world.toolSchemas.spawn_worker as { inputSchema: { properties: Record<string, { type: string }> } }
+    expect(inputSchema.properties.acceptance?.type).toBe('array')
+    const text = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections[1]?.text ?? ''
+    expect(text).toContain('Given-When-Then statements in the task body and pass them as `acceptance`')
+    expect(text).toContain('check it against the brief and each acceptance criterion')
   })
 
   test('spawn_worker passes plugins and userMemory to drove spawn, and its schema says what they default to', async ($, on) => {

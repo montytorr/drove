@@ -38,7 +38,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove merge <seat> [--pr] [--squash] [--fresh] [-m MSG] [--no-checks] [--run ID]` | planner, human | Integrates a seat's branch behind the repo's checks (§6, Merge gate). Also the `merge` MCP tool and the mod's `merge_worker`; neither can pass `--no-checks`, which is the human's. |
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove attention [--run ID \| --all] [--json] [--follow]` | human, a poller | The things that wait on a person, as data: a dialog or approval, a report for the human, a refused 6th pane, a gone seat. One snapshot, or JSON lines of new and resolved items with `--follow` (§14). |
-| `drove report [<run>] [--json]` | anyone | Read-only run report (DROVE-106): per seat and in total, tokens (input, cache read, cache write, output) from the agent's own transcript, cost from a price table, wall time (spawn to close), time waiting on the human, and rework (verdicts with changes, promotions, demotions, migrations, restarts). Also the `run_report` MCP tool, and the totals and per-seat lines `drove down` adds to the goal task's summary note. |
+| `drove report [<run>] [--json]` | anyone | Read-only run report (DROVE-106): per seat and in total, tokens (input, cache read, cache write, output) from the agent's own transcript, cost from a price table, wall time (spawn to close), time waiting on the human, rework (verdicts with changes, promotions, demotions, migrations, restarts) and guard denials (`deny`: per seat, in total and by rule, from the `guard.denied` events, §6). Also the `run_report` MCP tool, and the totals and per-seat lines `drove down` adds to the goal task's summary note. |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
 | `drove board [--once] [--web [--port N]]` | human | A live coloured board for a herdr pane, drawn from the orchestrator mod's board model (`mod/hooks/board.ts`) on the terminal's own background: the lead and what it owes, seats with state stripes, gauges and a spinner, and the timeline. It uses the alternate screen, redraws in place only while something moves, and fits the pane. `--once` or a non-TTY stdout prints a single frame; it has no colour escapes when piped or under `NO_COLOR`. `--web` serves the same model to a browser (see the web board below). |
@@ -108,6 +108,12 @@ $DROVE_HOME (default ~/.drove), mode 700
 The token is not a security boundary against the worker itself: its shell can read its own env. It does three jobs. It rejects a stale worker's reports after a respawn under the same name (a new token is minted each time). It rejects text that only looks like a Drove envelope, such as a pasted report. And it keys the message MAC (§3). The real boundary is file permissions: `$DROVE_HOME` is 700 and token files are 600.
 
 ## 3. Protocol
+
+### Acceptance and criteria (DROVE-123)
+
+A spawn takes `acceptance`, a list of testable statements (Given-When-Then or any other); the CLI repeats `--acceptance`. Drove numbers them AC1…ACn and writes them into the seat's `brief.md` as an `## Acceptance` section ahead of the footer, and keeps the list on the seat, so `up`, `promote` and `migrate` carry them (the handoff quotes the saved brief). An empty statement is refused by `drove spawn`, the spawn tool and the mod alike, with one message. A reviewer or tester with a `--target` and no criteria of its own gets its target's, under the same heading; one given its own sees only those. The three worker role texts are short SOPs after Strands' Agent SOPs: Overview, Steps, and Constraints under `### MUST`, `### MUST NOT`, `### SHOULD` and `### MAY`; the rules are the old ones plus two: a worker MUST NOT report `done` while the repo's checks fail (it reports `blocked` or a `question`, naming what fails; a reviewer's failing check on the target is a finding, a tester's failing test of a defect is a result), and MUST address every acceptance criterion in its done report.
+
+A `done` report takes an optional `criteria: [{ "id": "AC1", "met": true, "evidence": "…" }]` (only on `done`; at most 40, each id once, evidence at most 1000 characters). When the report is stamped, Drove adds `acceptance: <n>`, the number of criteria its seat has. `drove reports` (and the wake text) lists `Criteria: k of n met` with each id as met or UNMET with its evidence, and adds a `Drove:` line when a `done` that expects a review has no criteria, or leaves some ids unanswered. Neither field changes the kinds or the envelope.
 
 ### Reports (worker to planner)
 
@@ -310,7 +316,7 @@ One module, `src/guard.ts`, with the shell parser in `src/shell.ts`, ported from
 2. Codex PreToolUse, through the same command [verify the input shape; the adapter accepts `tool_name` of `Bash`, `shell`, `exec_command` or `apply_patch`, and a `tool_input.command` given as a string or as an argv array].
 3. The mod's `tool.call`, by importing `decide` directly (no subprocess).
 
-Output: exit code 2 with the reason on stderr, which both clients document as "block" [Claude: docs; Codex: verify]. Claude also gets the `hookSpecificOutput.permissionDecision: "deny"` JSON on stdout. On an internal error, the planner fails closed (deny) and a worker fails open, as in the mod.
+Output: exit code 2 with the reason on stderr, which both clients document as "block" [Claude: docs; Codex: verify]. Claude also gets the `hookSpecificOutput.permissionDecision: "deny"` JSON on stdout. When the guard itself fails, see *Fail mode* below: the planner and a reviewer seat fail closed, every other seat fails open.
 
 ### Shell parser fix (CCS-50)
 
@@ -359,6 +365,52 @@ The writable roots (`isInside`) are resolved after `realpath`, so `/tmp/../repo`
 **Planner scratchpad** (DROVE-101). A planner in a Claude Code session may write in that session's scratchpad: a path under `/tmp`, `/private/tmp` or `tmpdir()` shaped `claude-<uid>/<project>/<session>/…/scratchpad`, checked after `realpath` so `..` and symlinks do not count. Every write target of the command must be inside one; a glob or variable before the `scratchpad` segment, a plain `/tmp` path and a mix of targets are denied. Interpreters, `chmod` and the rest of the file writers stay denied, and the worker rules are unchanged.
 
 **`drove init <dir>`** (DROVE-101) makes a new repo for a goal that needs one: it creates `<dir>` (with parents) if missing or empty, runs `git init -b main` and makes one empty commit, `chore: initial empty commit`. It refuses a non-empty directory, an existing repo and a directory inside a repo. `--json` prints `{path, branch, commit}`. The planner then attaches the run there (`/orchestrate --repo <dir>` in the mod, `drove plan` from the directory otherwise), because a run is bound to the repo of the session's cwd.
+
+### Ledger, next steps and thrash (DROVE-121)
+
+Strands Agents' interventions return a typed action, record it and escalate; the guard now does the same for a denial.
+
+**Rules.** A denying `GuardDecision` carries a stable `rule`, so a denial can be counted and grouped:
+
+| Rule | What it covers |
+|---|---|
+| `owns` | an edit, write or redirect outside a worker's `owns` |
+| `reviewer-readonly` | a reviewer seat's edit, writer, runtime, `git` or `gh` write |
+| `planner-edit` | the planner's Edit, Write, MultiEdit, NotebookEdit or `apply_patch` outside the writable roots |
+| `planner-shell` | the planner's file writers, runtimes, package tools, `curl`/`wget` writes and redirects |
+| `push` | a worker's `git push` |
+| `production` | a push or a `gh` call that names the `production` branch |
+| `herdr` | a `herdr` write |
+| `merge-gate` | a seat branch merged by hand, `gh pr merge`, `drove merge --no-checks` |
+| `agent-launch` | `claude` or `codex` started from a session |
+| `drove-cli` | a `drove` subcommand the role does not have |
+| `github` | a `gh` call that is the human's (deletions, settings, a public repo, `gh api` writes) |
+| `run-state` | a worker's write into Drove's run state (`~/.drove`, `$DROVE_HOME`), where its own `owns` live (DROVE-119) |
+| `unreadable` | a call the guard cannot read: no command text, no path, a command name or a path that is a variable, nesting too deep |
+| `guard-error` | the guard itself failed (below) |
+
+**Ledger.** Every denial is one `guard.denied` event in the run's `events.jsonl` (the earlier `guard.deny`, which had no rule, is read as a denial of rule `unknown`): `seat` (`planner` for the planner), and `data` with `tool`, `rule`, the clipped `command` or `path`, and the clipped `reason` (the refusal without its role note and next step), each part at most 200 characters, so a line is far below the 8 KiB cap. Allows are never written, and a denial stands when the log cannot be written. The ledger costs one appended line on a denial and nothing on an allow.
+
+**Next step.** Every denial text ends with `Next step: <one concrete thing to do>`, chosen by the rule and the role (a worker's `push`: "commit your work on your branch and report done; the planner merges and pushes"; a reviewer's: "put what you found in your report"; the merge gate: "merge it with the drove merge tool"). Where a call has a more specific step (`gh pr merge`, `git merge <seat branch>`) the call supplies it. The `owns` text is the exception: it already ends with its own step (send a question report asking the planner to add the path to its owns with the set_owns tool).
+
+**Thrash.** A seat that keeps meeting one rule is stuck, and nothing else shows it. When a worker's denial is the `count`th of one rule within `minutes` and no report from that seat came between them, the hook raises an attention item with reason `guard-thrash`: a line in the seat's `attention` list (kept across the watcher's polls, like `pending-delivery`) and an `attention` event with `data.rule`, `data.detail` and `data.count`. Its text names the rule and the last refusal: `w-api hit the guard's owns rule 3 times in 10 minutes and has not reported since; last refusal: …`. Limits are `guardThrash: { "count": 3, "minutes": 10 }` in `~/.drove/config.json` (a part that is not a whole number of at least 1 keeps its default).
+
+- *The planner's, not the human's.* `guard-thrash` is a planner item like `stalled` and `budget` (`isForHuman` is false): it is not "needs you" on any board and not in `drove attention`. It is the seat row's text on the terminal, web and mod boards (all three read the same `buildBoard`), a notice to the planner in the timeline (`feedOf`), and a "For you to act on" line in the next wake.
+- *Once per seat and rule.* The count and the "already raised" check read the ledger, from the last 512 KiB of `events.jsonl`, and the seat's roster entry (an item it still holds is raised, whatever the ledger tail shows; a report the roster already holds ends the count before its event is written). They run under a per-seat lock, so two hooks of one seat that deny at once raise one item; a lock that stays busy for 250 ms skips the escalation (a stale one is stolen after 2 s), because a denial must never be slow and the next denial counts again. Different rules raise their own items. The planner is not escalated about itself.
+- *Announced once.* The next wake carries each item once; a watcher that starts later (a restart) treats items older than itself as announced.
+- *Cleared by a report.* The watcher drops a seat's `guard-thrash` items when it ingests any report from that seat, a progress report included; a report also starts a new count (denials before it no longer add up).
+- *Cost.* Nothing is read on an allow. A denial of a worker reads a bounded tail of the ledger once.
+
+**Fail mode.** What the hook does when the guard itself fails (it throws, the roster it needs is unreadable, or the hook's stdin is not a JSON object):
+
+| Seat | `pre-tool-use` | other events |
+|---|---|---|
+| planner | refused, exit 2, rule `guard-error`: "the guard could not check this call (…), so it is refused" | the record is skipped and the call goes on |
+| reviewer seat (`DROVE_SEAT_ROLE=reviewer`) | refused, as the planner | as the planner |
+| any other worker (implementer, tester) | allowed, as before: a broken guard must not stop an implementer, and only its `owns` check is lost | as the planner |
+| no Drove identity in the env | allowed: not a Drove session | allowed |
+
+`failsClosed` in `src/hooks.ts` is the one place that says which. A worker whose `DROVE_OWNS` cannot be parsed has no `owns`, as before. The refusal itself is written to the ledger as `guard-error`.
 
 ### Merge gate (DROVE-92, DROVE-105)
 
@@ -477,7 +529,7 @@ A seat has an optional `role` (`reviewer` or `tester`; absent is an implementer,
 
 - **Reviewer worktree: the run base, plus a pointer.** The two options were a worktree at the target's branch head, or the target's diff against the run base read from where it lives. The first sees nothing at review time: a worker commits only after approval, so the target's branch head is still the base. The second works for committed and uncommitted work, needs no second worktree path and reuses the normal spawn, so a reviewer starts like any seat and its brief's last line names the target's worktree, branch and brief file (`seats/<target>/brief.md`, the stored brief) and the commands: `git -C <worktree> diff <base>` and `git -C <worktree> status --short` for the work in the tree, `git diff <base>...<branch>` for what is committed. The checks run in the target's worktree.
 - **Tester worktree.** Branches from the head of the target's branch: a Claude seat takes `claudeBase = <target branch>` in `alignClaudeWorktree` (a fast-forward, since Claude created it from an ancestor), a Codex seat `git worktree add -b drove/<seat> <path> <target branch>`. `--base` is ignored with a note. The target's branch must exist, and the spawn result warns when its worktree has uncommitted changes. The planner merges the tester's branch after the target's.
-- **Role text.** `workerRole(run, config, role)` has one text per role: `# Worker mode` (unchanged byte for byte, pinned by `test/fixtures/worker-role.implementer.txt`), `# Reviewer mode` and `# Tester mode`. None names a seat; the footer of the brief does, so every seat of a role shares one cached prefix (DROVE-72). The reviewer text says to review the target's diff against the target's brief and to report `done` with `expects: review`, a recommendation, findings with file:line and the check results; it says the target's Cairn task is its implementer's and must not be claimed. The tester text says to write tests only, to report a failing test rather than weaken it, and to report the tests added and what they caught.
+- **Role text.** `workerRole(run, config, role)` has one text per role: `# Worker mode` (pinned by `test/fixtures/worker-role.implementer.txt`), `# Reviewer mode` and `# Tester mode`. None names a seat; the footer of the brief does, so every seat of a role shares one cached prefix (DROVE-72). The reviewer text says to review the target's diff against the target's brief and to report `done` with `expects: review`, a recommendation, findings with file:line and the check results; it says the target's Cairn task is its implementer's and must not be claimed. The tester text says to write tests only, to report a failing test rather than weaken it, and to report the tests added and what they caught.
 - **Planner text.** `plannerRole` (`src/prompts.ts`) and `orchestratorSection` (`mod/hooks/prompts.ts`) have a short "Reviewer and tester seats" paragraph: when to use them, how each reports, and that each takes a pane of the budget.
 - **Board.** A seat with a role gets `R` or `T` in a one-column cell after its name, only when the run has such a seat, and `drove roster` prints `reviewer of <target>`.
 
@@ -665,7 +717,7 @@ What it needs on the host: a running herdr server on the default socket or `HERD
 
 | Source | Where it is read | Item kind |
 |---|---|---|
-| each seat's `attention` list in the roster (`detect.ts` derives it) | `roster.json` | the `Attention` reasons: `dialog`, `permission`, `trust`, `hook-trust`, `channel-confirm`, `codex-version-mismatch`, `usage-limit`, `stalled`, `idle-without-report`, `gone`, `budget`, `pending-delivery` |
+| each seat's `attention` list in the roster (`detect.ts` derives it) | `roster.json` | the `Attention` reasons: `dialog`, `permission`, `trust`, `hook-trust`, `channel-confirm`, `codex-version-mismatch`, `usage-limit`, `stalled`, `idle-without-report`, `gone`, `budget`, `pending-delivery`, `guard-thrash` (the planner's, never the human's: §6) |
 | a worker's question in its pane (`asking`) | `seats/<seat>/mod.json`, the same `isAsking` the board uses | `asking`, which replaces the generic `permission` line for that seat |
 | each owing seat's latest report that is `for: human` | `outbox.jsonl` (token-checked, as `drove reports`); open while the seat's `owes` is not `none` | `question`, `blocked`, `promote` |
 | a spawn refused by the pane budget | an `attention` event with `reason: pane-budget`, written by `spawn` | `pane-budget`, open until the budget is raised, a slot frees or the seat starts |

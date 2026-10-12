@@ -45,6 +45,8 @@ export type DroveConfig = {
   workerUserMemory?: boolean
   workerUserHooks?: boolean
   maxTurns?: number
+  // One seat's denials of one rule that make the planner hear of it (defaults 3 in 10 minutes).
+  guardThrash?: { count: number; minutes: number }
 }
 
 export type PlannerMeta = {
@@ -82,7 +84,7 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery' | 'guard-thrash'
   detail: string
   at: string
 }
@@ -111,6 +113,7 @@ export type Seat = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
   budgetNoticed?: boolean
@@ -151,8 +154,14 @@ export type Report = {
   for?: 'human'
   summary: string
   details?: string
+  criteria?: Criterion[]
+  acceptance?: number
   at: string
 }
+
+// One acceptance criterion of a seat, as the worker's done report answers it (DROVE-123). `acceptance` on a Report is the
+// number of criteria Drove had written into the seat's brief when the report was stamped.
+export type Criterion = { id: string; met: boolean; evidence: string }
 
 export type ReportInput = {
   kind: ReportKind
@@ -160,6 +169,7 @@ export type ReportInput = {
   for?: 'human'
   summary: string
   details?: string
+  criteria?: Criterion[]
 }
 
 export type Control = {
@@ -201,7 +211,7 @@ export type DroveEventType =
   | 'control.sent'
   | 'control.failed'
   | 'attention'
-  | 'guard.deny'
+  | 'guard.denied'
   | 'merge.passed'
   | 'merge.refused'
   | 'merge.pending'
@@ -249,7 +259,24 @@ export type GuardInput = {
   seatRole?: SeatRole
 }
 
-export type GuardDecision = { allow: true } | { allow: false; reason: string }
+// Why the guard said no, as a stable id: the ledger (`guard.denied`), the thrash escalation and the run report group by it.
+export type GuardRule =
+  | 'owns'
+  | 'reviewer-readonly'
+  | 'planner-edit'
+  | 'planner-shell'
+  | 'push'
+  | 'production'
+  | 'herdr'
+  | 'merge-gate'
+  | 'agent-launch'
+  | 'drove-cli'
+  | 'github'
+  | 'run-state'
+  | 'unreadable'
+  | 'guard-error'
+
+export type GuardDecision = { allow: true } | { allow: false; reason: string; rule: GuardRule }
 
 export type ExecResult = { code: number; stdout: string; stderr: string }
 export type ExecOptions = { timeoutMs?: number; input?: string; env?: Record<string, string>; cwd?: string }
@@ -355,6 +382,7 @@ export type SpawnRequest = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
 }
