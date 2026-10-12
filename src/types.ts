@@ -45,6 +45,8 @@ export type DroveConfig = {
   workerUserMemory?: boolean
   workerUserHooks?: boolean
   maxTurns?: number
+  reviewLoopLimit?: number
+  runMaxCost?: number
 }
 
 export type PlannerMeta = {
@@ -82,7 +84,7 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'review-loop' | 'run-budget' | 'pending-delivery'
   detail: string
   at: string
 }
@@ -109,7 +111,10 @@ export type Seat = {
   owns?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
   budgetNoticed?: boolean
+  reviewChanges?: number
   slot?: number
   worktree: string
   branch: string
@@ -350,6 +355,8 @@ export type SpawnRequest = {
   owns?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
 }
 
 export type SendRequest = {

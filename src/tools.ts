@@ -86,6 +86,12 @@ const bool = (args: Args, key: string): boolean => {
   return value
 }
 
+const positive = (args: Args, key: string): number => {
+  const value = args[key]
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) throw new ArgError(`${key} must be a positive finite number`)
+  return value
+}
+
 const count = (args: Args, key: string, fallback: number): number => {
   const value = args[key]
   if (value === undefined) return fallback
@@ -155,6 +161,8 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         owns: { type: 'array', items: { type: 'string' }, description: 'Optional: globs, relative to the worker\'s worktree, of the files it may change (e.g. ["src/guard.ts", "test/**"]). Given, Drove\'s guard refuses the worker\'s edits to any other file and tells it to ask you. Left out, the worker may edit anywhere.' },
         maxTurns: { type: 'integer', minimum: 1, description: 'Optional: how many turns (stops) the worker may take. At the limit you get a budget attention and the worker is told once to report progress or promote and stop; it is not killed. Left out, the configured maxTurns applies, or none.' },
         maxTokens: { type: 'integer', minimum: 1, description: 'Optional: how many tokens (input, cached input and output, read from the agent\'s own transcript) the worker may use. Same effect at the limit as maxTurns.' },
+        maxMinutes: { type: 'number', exclusiveMinimum: 0, description: 'Optional: wall clock minutes since spawn before a budget attention and one notice to report progress or promote and stop; never kills the worker.' },
+        maxCost: { type: 'number', exclusiveMinimum: 0, description: 'Optional: USD budget from transcript usage and the run report price table. Unpriced models never trip it.' },
       },
       ['seat', 'kind', 'brief'],
       async (args) => {
@@ -181,6 +189,8 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
             ...(args.owns != null ? { owns: names(args, 'owns') } : {}),
             ...(args.maxTurns != null ? { maxTurns: count(args, 'maxTurns', 1) } : {}),
             ...(args.maxTokens != null ? { maxTokens: count(args, 'maxTokens', 1) } : {}),
+            ...(args.maxMinutes != null ? { maxMinutes: positive(args, 'maxMinutes') } : {}),
+            ...(args.maxCost != null ? { maxCost: positive(args, 'maxCost') } : {}),
           }),
         )
       },

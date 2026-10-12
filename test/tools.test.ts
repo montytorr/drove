@@ -155,13 +155,14 @@ test('planner tools map their arguments onto the commands', async () => {
 
 test('the spawn tool passes owns, maxTurns and maxTokens through, and checks their shape', async () => {
   const { fake, tool } = await plannerWith()
-  await tool('spawn').call({ seat: 'w-ui', kind: 'claude', brief: 'x', owns: ['src/ui/**', ' ', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000 })
+  await tool('spawn').call({ seat: 'w-ui', kind: 'claude', brief: 'x', owns: ['src/ui/**', ' ', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000, maxMinutes: 1.5, maxCost: 2.25 })
   assert.deepEqual(fake.calls, [
-    { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, owns: ['src/ui/**', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000 }] },
+    { name: 'spawn', args: [{ seat: 'w-ui', kind: 'claude', brief: 'x', cairn: undefined, model: undefined, effort: undefined, base: undefined, owns: ['src/ui/**', '{README,DESIGN}.md'], maxTurns: 30, maxTokens: 2_000_000, maxMinutes: 1.5, maxCost: 2.25 }] },
   ])
   const schema = tool('spawn').inputSchema as { properties: Record<string, { type: string }> }
   assert.deepEqual([schema.properties.owns?.type, schema.properties.maxTurns?.type, schema.properties.maxTokens?.type], ['array', 'integer', 'integer'])
-  for (const args of [{ owns: 'src/**' }, { owns: [1] }, { maxTurns: 0 }, { maxTurns: '5' }, { maxTokens: 1.5 }]) {
+  assert.deepEqual([schema.properties.maxMinutes?.type, schema.properties.maxCost?.type], ['number', 'number'])
+  for (const args of [{ owns: 'src/**' }, { owns: [1] }, { maxTurns: 0 }, { maxTurns: '5' }, { maxTokens: 1.5 }, { maxMinutes: 0 }, { maxCost: '1' }, { maxCost: Infinity }]) {
     assert.equal((await tool('spawn').call({ seat: 'w-db', kind: 'claude', brief: 'x', ...args })).isError, true, JSON.stringify(args))
   }
   assert.equal(fake.calls.length, 1)

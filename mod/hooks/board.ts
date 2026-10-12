@@ -143,6 +143,8 @@ const waitingText = (seat: Seat, viewer: Viewer): string => {
 }
 
 const seatDoing = (seat: Seat, status: OrchModStatus | undefined, spin: string, viewer: Viewer): Cell => {
+  const loop = seat.attention.find(item => item.reason === 'review-loop')
+  if (loop) return { text: loop.detail, tone: 'alert' }
   if (status?.asking) return { text: status.asking, tone: 'alert' }
   if (seat.state === 'needs-input') return { text: 'needs an approval in its pane', tone: 'alert' }
   if (seat.state === 'blocked') return { text: seat.attention[0]?.detail ?? 'waiting on a dialog in its pane', tone: 'alert' }
