@@ -4,7 +4,7 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
-- The planner's tool calls keep the run's Cairn claim alive: any planner tool beats `run.cairn` (`cairn beat`, `--instance <labInstance>` for a LAB ref) at most once every 10 minutes, so Cairn's 2h reaper no longer releases a planner's task mid-run. Best effort, alongside the tool with a 5s timeout; a failed beat never changes the tool's answer, and worker tasks are not beaten (DROVE-143).
+- The planner's tool calls keep the run's Cairn claim alive: any planner tool beats `run.cairn` (`cairn beat`) at most once every 10 minutes, so Cairn's 2h reaper no longer releases a planner's task mid-run. Best effort, alongside the tool with a 5s timeout; a failed beat never changes the tool's answer, and neither worker tasks nor a LAB subject (which holds no claim) are beaten (DROVE-143).
 - Ctrl-C, SIGTERM and SIGHUP clean up running commands' process groups before the CLI exits, including descendants that ignore SIGTERM; long-lived processes retain control through their own signal handlers (DROVE-145).
 - Carry Cairn `kind:codex` / `kind:claude` labels into planner goals with host availability hints; name `workerKind` when its configured agent is absent, and show the detected Codex model in CLI planner tool descriptions (DROVE-129).
 

@@ -138,12 +138,12 @@ const claimBeater = (deps: Deps, identity: Identity, ports: ToolPorts) => {
       const previous = last
       last = now
       const run = await ports.loadRun(deps.home, identity.run)
-      if (!run?.cairn) {
+      // A Lab subject is not a claim target (DROVE-94), so a LAB run has nothing to beat.
+      if (!run?.cairn || LAB_RE.test(run.cairn)) {
         last = previous
         return
       }
-      const argv = LAB_RE.test(run.cairn) ? ['cairn', '--instance', (await commands.loadConfig(deps.home)).labInstance, 'beat', run.cairn] : ['cairn', 'beat', run.cairn]
-      await deps.exec(argv, { timeoutMs: CLAIM_BEAT_TIMEOUT_MS })
+      await deps.exec(['cairn', 'beat', run.cairn], { timeoutMs: CLAIM_BEAT_TIMEOUT_MS })
     } catch {}
   }
 }

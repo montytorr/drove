@@ -1,6 +1,4 @@
 import assert from 'node:assert/strict'
-import { writeFile } from 'node:fs/promises'
-import { join } from 'node:path'
 import { test } from 'node:test'
 import { saveRun } from '../src/roster.ts'
 import { CLAIM_BEAT_EVERY_MS, defaultToolPorts, plannerTools } from '../src/tools.ts'
@@ -63,9 +61,10 @@ test('a run with no Cairn ref sends no beat', async () => {
   assert.deepEqual(beats(), [])
 })
 
-test('a Lab ref is beaten on the configured Lab instance', async () => {
+test('a Lab ref sends no beat: a subject holds no claim', async () => {
   const { ctx, roster, beats } = await plannerWith('LAB-21')
-  await writeFile(join(ctx.home, 'config.json'), JSON.stringify({ labInstance: 'lab-two' }))
   await roster.call({})
-  assert.deepEqual(beats(), [['cairn', '--instance', 'lab-two', 'beat', 'LAB-21']])
+  ctx.clock.advance(CLAIM_BEAT_EVERY_MS)
+  await roster.call({})
+  assert.deepEqual(beats(), [])
 })
