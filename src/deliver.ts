@@ -1,11 +1,11 @@
-import { rename, writeFile } from 'node:fs/promises'
+import { chmod, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { agentPromptArgv, agentSendKeysArgv, getAgent, readPane, readScreen, retryWhileBusy, run as runHerdr } from './herdr.ts'
 import { formatControl, renderReports } from './protocol.ts'
 import { PLANNER_SEAT, plannerDir, runDir, seatDir } from './paths.ts'
 import { findSeat, loadRoster, updateRoster } from './roster.ts'
 import { appendJsonl, readJsonlFrom, readToken, withLock } from './store.ts'
-import type { Attention, Control, Delivery, DeliveryAdapter, Deps, DroveEvent, HookRecord, Report, RunMeta, Seat, Transport } from './types.ts'
+import type { AgentKind, Attention, Control, Delivery, DeliveryAdapter, Deps, DroveEvent, HookRecord, Report, RunMeta, Seat, Transport } from './types.ts'
 
 export const RETRY_MS = 3_000
 export const BUSY_RETRY_MS = 45_000
@@ -79,11 +79,13 @@ export const unsubmittedInput = (screen: string, text: string): boolean => {
 const STALLED_REASON = 'agent_prompt_stalled: herdr typed the text but saw no activity; it may still have landed, so check the pane before sending it again'
 
 // herdr's `agent prompt` pastes the text and presses Enter; a long paste can swallow that Enter and leave `[Pasted text #1 +70 lines]`
-// in the input of an idle agent. That is the one stall Drove can repair: press Enter once, then wait for the agent to show activity.
+// in the input of an idle agent. That is the stall Drove repairs by pressing Enter once, then waiting for the agent to show activity.
+// A paste that was lost altogether leaves the input empty (DROVE-136): that is marked `stalled: 'empty'`, and `attempt` sends it again once.
 const submitStalled = async (deps: Deps, seat: Seat, target: string, text: string): Promise<Delivery | UnconfirmedDelivery | SubmittedDelivery | undefined> => {
   const byAgent = await readScreen(deps.exec, target, INPUT_LINES)
   const screen = byAgent.ok || !seat.paneId ? byAgent : await readPane(deps.exec, seat.paneId, INPUT_LINES)
-  if (!screen.ok || !unsubmittedInput(screen.value, text)) return undefined
+  if (!screen.ok) return undefined
+  if (!unsubmittedInput(screen.value, text)) return { ok: false, queued: false, reason: STALLED_REASON, stalled: 'empty' }
   const pressed = await runHerdr(deps.exec, agentSendKeysArgv(target, ['Enter']), 10_000)
   if (!pressed.ok) return { ok: false, queued: false, reason: `${STALLED_REASON}; the text sits unsubmitted in ${seat.name}'s input and herdr would not press Enter (${pressed.code})` }
   for (let waited = 0; ; waited += confirmTiming.pollMs) {
@@ -167,6 +169,40 @@ export const isDeliverable = async (deps: Deps, seat: Seat): Promise<{ ok: true 
   return { ok: true }
 }
 
+// DROVE-136: a long paste into a freshly started Claude Code is unreliable (herdr's Enter or the whole paste is lost), and the full
+// text of a brief is already in the seat's brief.md. So a long brief goes as a short signed pointer to that file, and a brief whose
+// paste was lost is sent again once as one.
+export const POINTER_LINES = 40
+const POINTER_RE = /^Your brief is in `[^`\n]+` \(\d+ lines?\): /
+
+export const pointerText = (file: string, lines: number, kind: AgentKind): string =>
+  `Your brief is in \`${file}\` (${lines} line${lines === 1 ? '' : 's'}): read it with ${kind === 'codex' ? '`cat`' : 'the Read tool'}, then start.`
+
+export const isPointer = (body: string): boolean => POINTER_RE.test(body)
+
+const lineCount = (text: string): number => text.trim().split('\n').length
+
+// The file holds the control's full text before the pointer goes out: brief.md when it is that text already (a spawn), and
+// handoff.md otherwise (a migration's handoff, which must not replace the brief the seat was given).
+const pointerControl = async (deps: Deps, run: string, seat: Pick<Seat, 'name' | 'kind'>, control: Control): Promise<Control> => {
+  const dir = seatDir(deps.home, run, seat.name)
+  const body = control.body.trim()
+  let file = join(dir, 'brief.md')
+  if ((await readFile(file, 'utf8').catch(() => '')).trim() !== body) {
+    file = join(dir, 'handoff.md')
+    await writeFile(file, `${body}\n`, { mode: 0o600 })
+    await chmod(file, 0o600)
+  }
+  return { ...control, body: pointerText(file, lineCount(body), seat.kind) }
+}
+
+// A brief longer than `limit` lines goes out as its pointer from the start; anything else is returned as it is.
+export const briefForSend = async (deps: Deps, run: RunMeta, control: Control, limit = POINTER_LINES): Promise<Control> => {
+  if (control.kind !== 'brief' || isPointer(control.body) || lineCount(control.body) <= limit) return control
+  const seat = findSeat(await loadRoster(deps.home, run.id), control.to)
+  return pointerControl(deps, run.id, seat ?? { name: control.to, kind: 'claude' }, control)
+}
+
 const sentFile = (deps: Deps, run: string, seat: string): string => join(seatDir(deps.home, run, seat), 'sent.jsonl')
 const pendingFile = (deps: Deps, run: string, seat: string): string => join(seatDir(deps.home, run, seat), 'pending.jsonl')
 const pendingLock = (deps: Deps, run: string, seat: string): string => join(seatDir(deps.home, run, seat), 'pending.lock')
@@ -226,8 +262,17 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
   if (!token) return { ok: false, queued: false, reason: `no token for ${seat.name}` }
   const adapter = chooseAdapter(seat, adaptersFor(deps))
   if (!adapter) return { ok: false, queued: false, reason: `no transport can reach ${seat.name} yet (no pane or thread)` }
-  const typedAt = deps.clock.now().getTime()
-  const typed = await adapter.deliver(seat, formatControl(control, token))
+  let typedAt = deps.clock.now().getTime()
+  let typed = await adapter.deliver(seat, formatControl(control, token))
+  // The paste never reached the input of an idle agent: send it once more, a brief as a pointer to its brief.md, anything else as it was.
+  let again: Control | undefined
+  if (!typed.ok && typed.stalled === 'empty') {
+    again = control.kind === 'brief' && !isPointer(control.body) ? await pointerControl(deps, run, seat, control) : control
+    typedAt = deps.clock.now().getTime()
+    typed = await adapter.deliver(seat, formatControl(again, token))
+    if (!typed.ok) typed = { ...typed, reason: `${typed.reason}; it was sent again once${isPointer(again.body) ? ' as a pointer to the brief file' : ''} and stalled again` }
+  }
+  const isPointed = isPointer((again ?? control).body) && control.kind === 'brief'
   const isSubmitted = typed.ok && 'submitted' in typed && Boolean(typed.submitted)
   const isHookConfirmed = typed.ok && 'unconfirmed' in typed && typed.unconfirmed && (await confirmedByHook(deps, run, seat, typedAt))
   const delivery: Delivery | UnconfirmedDelivery | SubmittedDelivery = typed.ok && isHookConfirmed ? { ok: true, via: typed.via, ...(isSubmitted ? { submitted: true as const } : {}) } : typed
@@ -237,7 +282,7 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
     const isReply = isReplyToOpenAsk(seat, control)
     if (control.expects !== 'none' || isReply || clearsOwed(control)) await updateRoster(deps.home, run, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? settleSent(entry, seat, control, isReply, sentAt) : entry)) }))
     const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
-    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(control.verdict === 'changes' ? { notes: clip(control.body.split('\n').find(row => row.trim()) ?? '', 160) } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(isSubmitted ? { submitted: true } : {}) } })
+    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(control.verdict === 'changes' ? { notes: clip(control.body.split('\n').find(row => row.trim()) ?? '', 160) } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(isSubmitted ? { submitted: true } : {}), ...(isPointed ? { pointer: true } : {}), ...(again ? { resent: true } : {}) } })
     attempts.delete(control.id)
   }
   return delivery

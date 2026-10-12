@@ -9,7 +9,7 @@ import { detectRunAgents, modelLabelOf } from './agents.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
 import { type CheckPlan, checksOf, renderOutcome, repoVerifyCommands, reusedText, runChecks } from './checks.ts'
-import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
+import { BUSY_RETRY_MS, POINTER_LINES, briefForSend, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
 import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './isolation.ts'
@@ -58,6 +58,7 @@ export const DEFAULT_CONFIG: DroveConfig = {
   codexWorkerSandbox: 'bypass',
   claudeChannel: false,
   briefVia: 'prompt',
+  briefPointerLines: POINTER_LINES,
   labInstance: 'croft',
   workerEnv: {},
 }
@@ -1124,7 +1125,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     const attention = dialog ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at: iso }
     await updateRoster(deps.home, run.id, current => upsertSeat(current, { ...seat, paneId, state: 'blocked', attention: [attention] }))
     await recordEvent(deps, run.id, { type: 'attention', seat: seat.name, data: { reason: attention.reason } })
-    if (isViaPrompt) await queueBrief(deps, run, seat.name, briefText)
+    if (isViaPrompt) await queueBrief(deps, run, seat.name, briefText, config)
     return ok(`Worker ${seat.name} started in pane ${paneId} but stopped on a dialog (${attention.reason}): ${attention.detail} ${isViaPrompt ? 'The brief is queued.' : 'The brief is part of its launch and runs once the dialog is answered.'}`, { state: 'blocked', paneId })
   }
   if (!started.ok && !adopted) {
@@ -1153,7 +1154,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     seat: seat.name,
     data: { kind, model, effort, pane: paneId, worktree, branch, cairn: request.cairn, ...(isReview ? { role, target: request.target } : {}), ...(adopted && !started.ok ? { ...(started.code === 'timeout' ? { startTimeout: true } : { startError: started.code }) } : {}), ...(baseNotes.length > 0 ? { notes: baseNotes } : {}) },
   })
-  const via = isViaPrompt ? await queueBrief(deps, run, seat.name, briefText) : 'launch-arg'
+  const via = isViaPrompt ? await queueBrief(deps, run, seat.name, briefText, config) : 'launch-arg'
   if (!isViaPrompt) await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, data: { kind: 'brief', via: 'launch-arg' } })
   return ok(`${isReview ? `${role === 'reviewer' ? 'Reviewer' : 'Tester'}` : 'Worker'} ${seat.name} (${kind}${modelLabel ? ` ${modelLabel}` : ''} ${effort}${isReview ? `, ${role === 'reviewer' ? 'reviewing' : 'testing'} ${request.target}` : ''}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${startNote ? ` Note: ${startNote}` : ''}${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch, model: modelLabel })
 }
@@ -1171,9 +1172,11 @@ const alignClaudeWorktree = async (deps: Deps, worktree: string, branch: string,
   }
 }
 
-const queueBrief = async (deps: Deps, run: RunMeta, seat: string, text: string): Promise<string> => {
+// DROVE-136: a brief longer than briefPointerLines goes as a pointer to the brief.md that already holds it (spawn saves it first).
+const queueBrief = async (deps: Deps, run: RunMeta, seat: string, text: string, config: DroveConfig): Promise<string> => {
   const control: Control = { v: 1, id: newControlId(deps.clock.now()), run: run.id, from: 'planner', to: seat, kind: 'brief', expects: 'review', body: text, at: deps.clock.now().toISOString() }
-  const delivery = await deliverControl(deps, run, control)
+  const limit = isWhole(config.briefPointerLines) ? config.briefPointerLines : POINTER_LINES
+  const delivery = await deliverControl(deps, run, await briefForSend(deps, run, control, limit))
   if (!delivery.ok) return delivery.queued ? `queued (${delivery.reason})` : `not delivered (${delivery.reason})`
   const iso = deps.clock.now().toISOString()
   await updateRoster(deps.home, run.id, current => {
@@ -1583,7 +1586,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
       const attention = (screen.ok ? matchDialog(seat.name, screen.value, deps.clock.now()) : undefined) ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at }
       await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...migrated, paneId, state: 'blocked', stateAt: at, attention: [attention] }))
       await recordEvent(deps, run.id, { type: 'seat.migrate', seat: seat.name, data: { ...event, blocked: attention.reason } })
-      await queueBrief(deps, run, seat.name, briefText)
+      await queueBrief(deps, run, seat.name, briefText, config)
       return ok(`${seat.name} moved from ${seat.kind} to ${kind} in pane ${paneId}, but the new agent stopped on a dialog (${attention.reason}): ${attention.detail} The handoff brief is queued.${notes.map(note => ` ${note}`).join('')}`, { state: 'blocked', paneId })
     }
     if (!started.ok && !adopted) {
@@ -1599,7 +1602,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
       upsertSeat(roster, { ...migrated, paneId, state: adopted ? adopted.state : 'idle', stateAt: deps.clock.now().toISOString(), ...(liveSession && !sessionId ? { sessionId: liveSession } : {}) }),
     )
     await recordEvent(deps, run.id, { type: 'seat.migrate', seat: seat.name, data: event })
-    const via = await queueBrief(deps, run, seat.name, briefText)
+    const via = await queueBrief(deps, run, seat.name, briefText, config)
     return ok(`${seat.name} moved from ${seat.kind} to ${kind}${modelLabel ? ` ${modelLabel}` : ''} ${effort} in pane ${paneId}, worktree ${seat.worktree} on branch ${seat.branch}. Handoff brief: ${via}.${notes.map(note => ` ${note}`).join('')}`, { paneId, kind, branch: seat.branch, model: modelLabel })
   } finally {
     await clearRestarting(deps, run.id, seat.name)

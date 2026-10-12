@@ -34,7 +34,7 @@ const UNSAFE_AGENT_ARG = /[\u0000-\u001f\u007f]/
 
 export type FakeAgent = { name: string; paneId: string; tabId: string; status: HerdrStatus; sessionId?: string; kind?: string }
 
-export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean | string; paneReadFails?: string; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number; startLeavesAgent?: boolean; promptTimesOut?: boolean; promptStalls?: 'pasted' | 'empty' }
+export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean | string; paneReadFails?: string; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number; startLeavesAgent?: boolean; promptTimesOut?: boolean; promptStalls?: 'pasted' | 'empty'; stallsFor?: number }
 
 export class FakeHerdr {
   calls: string[][] = []
@@ -51,6 +51,8 @@ export class FakeHerdr {
   promptTimesOut = false
   // herdr typed the text and answered agent_prompt_stalled: the input holds a paste placeholder ('pasted') or nothing ('empty'), and the agent stays as it was.
   promptStalls: 'pasted' | 'empty' | undefined
+  // How many prompts stall (the rest are taken); all of them when unset.
+  stallsFor = Infinity
   keys: { target: string; keys: string[] }[] = []
   sendKeysFails = ''
   enterSubmits = true
@@ -72,6 +74,7 @@ export class FakeHerdr {
     this.startLeavesAgent = options.startLeavesAgent ?? false
     this.promptTimesOut = options.promptTimesOut ?? false
     this.promptStalls = options.promptStalls
+    this.stallsFor = options.stallsFor ?? Infinity
     this.agentReadFails = options.agentReadFails ?? false
     this.paneReadFails = options.paneReadFails ?? ''
   }
@@ -196,7 +199,8 @@ export class FakeHerdr {
       if (agent.status === 'blocked') return herdrFail('agent_blocked')
       const text = argv[4] ?? ''
       this.prompts.push({ target, text })
-      if (this.promptStalls && text !== '/exit' && text !== '/quit') {
+      if (this.promptStalls && this.stallsFor > 0 && text !== '/exit' && text !== '/quit') {
+        this.stallsFor -= 1
         this.screen = this.promptStalls === 'pasted' ? '● Ready\n\n──────\n❯ [Pasted text #1 +70 lines]\n──────\n  ? for shortcuts' : '● Ready\n\n──────\n❯ \n──────\n  ? for shortcuts'
         return herdrFail('agent_prompt_stalled', 'herdr typed the text but saw no activity')
       }
