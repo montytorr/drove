@@ -337,6 +337,8 @@ const ORCHESTRATOR_TOOLS = [
         acceptance: { type: 'array', items: { type: 'string' }, description: 'optional: the acceptance criteria, one testable statement each, ideally Given-When-Then, taken from the Cairn task body. Drove numbers them AC1…ACn and writes them into the worker’s brief as ## Acceptance (a reviewer or tester of it sees them too, unless you give it its own); the worker answers each in its done report. An empty statement is refused' },
         maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
         maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
+        maxMinutes: { type: 'number', exclusiveMinimum: 0, description: 'Optional: wall clock minutes since spawn before a budget attention and one notice to report progress or promote and stop; never kills the worker.' },
+        maxCost: { type: 'number', exclusiveMinimum: 0, description: 'Optional: USD budget from transcript usage and the run report price table. Unpriced models never trip it.' },
       },
       required: ['name', 'brief'],
     },
@@ -556,9 +558,11 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
   if (input.acceptance !== undefined && (!Array.isArray(input.acceptance) || input.acceptance.some(entry => typeof entry !== 'string' || !entry.trim()))) return { deny: '--acceptance takes non-empty statements, one per criterion' }
   const acceptance = input.acceptance as string[] | undefined
+  const maxMinutes = typeof input.maxMinutes === 'number' ? input.maxMinutes : undefined
+  const maxCost = typeof input.maxCost === 'number' ? input.maxCost : undefined
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}), ...(maxMinutes !== undefined ? { maxMinutes } : {}), ...(maxCost !== undefined ? { maxCost } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })

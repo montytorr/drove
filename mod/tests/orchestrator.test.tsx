@@ -607,8 +607,8 @@ describe('orchestrator session', () => {
     expect(denial((await callTool($, 'spawn_worker', { name: 'Bad Name', brief: 'x' })) as never)).toContain('must match')
     expect(denial((await callTool($, 'spawn_worker', { name: 'w-z', brief: 'x', kind: 'gemini' })) as never)).toContain('claude or codex')
     expect(droveCalls(world, 'spawn')).toHaveLength(2)
-    await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many' })
-    expect(droveCalls(world, 'spawn')[2]?.args.slice(-4)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20'])
+    await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many', maxMinutes: 1.5, maxCost: 2.25 })
+    expect(droveCalls(world, 'spawn')[2]?.args.slice(-8)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20', '--max-minutes', '1.5', '--max-cost', '2.25'])
   })
 
   test('spawn_worker passes role and target to drove spawn, and refuses a role without its target', async ($, on) => {

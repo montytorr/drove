@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
-import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, shouldReadScreen } from './detect.ts'
+import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
 import { type CheckPlan, checksOf, renderOutcome, repoVerifyCommands, reusedText, runChecks } from './checks.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
@@ -46,6 +46,7 @@ export const DEFAULT_CONFIG: DroveConfig = {
   workerEffort: 'medium',
   promotedModel: { claude: 'claude-opus-5-5', codex: '' },
   budget: 5,
+  reviewLoopLimit: 3,
   codexBypassHookTrust: false,
   codexWorkerSandbox: 'bypass',
   claudeChannel: false,
@@ -107,7 +108,7 @@ const portsOf = (value: unknown): DroveConfig['workerPorts'] => {
 }
 
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const { workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, reviewLoopLimit, runMaxCost, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const ports = portsOf(workerPorts)
   const copy = namesOf(workerCopy)
   const mcp = namesOf(workerMcp)
@@ -126,6 +127,8 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
     ...(typeof workerUserMemory === 'boolean' ? { workerUserMemory } : {}),
     ...(typeof workerUserHooks === 'boolean' ? { workerUserHooks } : {}),
     ...(isWhole(maxTurns) ? { maxTurns } : {}),
+    reviewLoopLimit: isWhole(reviewLoopLimit) ? reviewLoopLimit : 3,
+    ...(typeof runMaxCost === 'number' && Number.isFinite(runMaxCost) && runMaxCost > 0 ? { runMaxCost } : {}),
     ...(typeof labInstance === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(labInstance.trim()) ? { labInstance: labInstance.trim() } : {}),
     plannerModel: { ...DEFAULT_CONFIG.plannerModel, ...file.plannerModel },
     workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel },
@@ -879,6 +882,9 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const owns = ownsOf(request.owns) ?? (role === 'tester' ? [...TESTER_OWNS] : undefined)
   const badOwns = owns?.find(isBadOwnsGlob)
   if (badOwns !== undefined) return failed('usage', `--owns takes globs relative to the worktree, without .. or a leading / or ~; got "${badOwns}"`)
+  for (const [flag, value] of [['--max-minutes', request.maxMinutes], ['--max-cost', request.maxCost]] as const) {
+    if (value !== undefined && (!Number.isFinite(value) || value <= 0)) return failed('usage', `${flag} must be a positive finite number`)
+  }
   const badBudget = [['--max-turns', request.maxTurns], ['--max-tokens', request.maxTokens]].find(([, value]) => value !== undefined && !isWhole(value))
   if (badBudget) return failed('usage', `${badBudget[0]} must be a whole number of at least 1`)
   const brief = request.brief.trim()
@@ -917,6 +923,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     ...(request.userHooks !== undefined ? { userHooks: request.userHooks } : {}),
     ...(owns ? { owns } : {}), ...(acceptance ? { acceptance } : {}), model, effort, worktree, branch,
     ...(request.maxTurns ?? config.maxTurns ? { maxTurns: request.maxTurns ?? config.maxTurns } : {}), ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
+    ...(request.maxMinutes !== undefined ? { maxMinutes: request.maxMinutes } : {}), ...(request.maxCost !== undefined ? { maxCost: request.maxCost } : {}),
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
     ...(isClaude ? {} : { codexHome: codexHomeDir(deps.home, run.id) }),
   }
@@ -1135,7 +1142,15 @@ export const send = async (deps: Deps, identity: Identity, request: SendRequest)
   const delivery = await deliverControl(deps, run, control)
   if (!delivery.ok && !delivery.queued) return failed('delivery', `not delivered to ${seat.name}: ${delivery.reason}`)
   if (request.kind === 'verdict' || request.kind === 'answer') {
-    await updateRoster(deps.home, run.id, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? { ...entry, owes: 'none' } : entry)) }))
+    const config = request.kind === 'verdict' ? await loadConfig(deps.home) : undefined
+    await updateRoster(deps.home, run.id, roster => ({ ...roster, seats: roster.seats.map(entry => {
+      if (entry.name !== seat.name) return entry
+      if (request.kind !== 'verdict') return { ...entry, owes: 'none' }
+      const changes = request.verdict === 'approve' ? 0 : (entry.reviewChanges ?? 0) + 1
+      const attention = entry.attention.filter(item => item.reason !== 'review-loop')
+      if (changes >= (config?.reviewLoopLimit ?? 3)) attention.push({ seat: entry.name, reason: 'review-loop', detail: reviewLoopText(entry.name, changes), at: control.at })
+      return { ...entry, owes: 'none', reviewChanges: changes, attention }
+    }) }))
   }
   const label = request.kind === 'verdict' ? `verdict ${request.verdict}` : request.kind
   return delivery.ok
@@ -1252,7 +1267,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   }
 
   if (seat.kind === 'claude' && run.planner.viaMod) {
-    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...seat, ...change, owes: 'none' }))
+    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...seat, ...change, reviewChanges: 0, attention: seat.attention.filter(item => item.reason !== 'review-loop'), owes: 'none' }))
     const delivery = await deliverControl(deps, run, control)
     return delivery.ok || delivery.queued
       ? ok(`${seat.name} now runs on ${model} at ${request.effort} effort from its next request.`)
@@ -1278,7 +1293,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     }
     const lockNote = seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined
 
-    const updated: Seat = { ...seat, ...change, sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
+    const updated: Seat = { ...seat, ...change, reviewChanges: 0, attention: seat.attention.filter(item => item.reason !== 'review-loop'), sessionId, state: 'starting', stateAt: deps.clock.now().toISOString(), pendingPromote: undefined }
     const controlText = formatControl(control, token)
     const isInline = resolveBriefVia(config) === 'launch-arg' && isShellSafeArg(controlText)
     const spec = specFor(
@@ -1442,7 +1457,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
     const { sessionId: _session, codexHome: _home, pendingPromote: _pending, restartingSince: _since, ...kept } = seat
     const sessionId = kind === 'claude' ? randomUUID() : undefined
     const migrated: Seat = {
-      ...kept, kind, model, effort, state: 'starting', stateAt: iso, owes: 'none', hasNudged: false, attention: [],
+      ...kept, kind, model, effort, reviewChanges: 0, state: 'starting', stateAt: iso, owes: 'none', hasNudged: false, attention: [],
       ...(sessionId ? { sessionId } : {}),
       ...(kind === 'codex' ? { codexHome: codexHomeDir(deps.home, run.id) } : {}),
       migratedFrom: { kind: seat.kind, ...(oldSession ? { sessionId: oldSession } : {}), model: seat.model, at: iso, ...(request.reason ? { reason: request.reason } : {}) },

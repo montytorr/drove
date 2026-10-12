@@ -11,6 +11,8 @@ import * as protocol from './protocol.ts'
 import * as roster from './roster.ts'
 import * as store from './store.ts'
 import * as usage from './usage.ts'
+import { buildReport, claudeTranscriptPath, seatCost } from './report.ts'
+import { userClaudeDir } from './launch.ts'
 import type { Attention, Control, Delivery, Deps, DroveConfig, DroveEvent, DroveEventType, HerdrAgent, HookRecord, Report, RunMeta, Seat } from './types.ts'
 
 export const TICK_MS = 3_000
@@ -19,6 +21,7 @@ export const BATCH_MS = 2_000
 export const IDLE_WAKE_MS = 5_000
 export const WAKE_RETRY_MS = 15_000
 export const LOOP_MS = 1_000
+export const COST_CHECK_MS = 60_000
 const HOOK_WINDOW = 50
 const WAIT = 'wait: '
 // What a poll leaves alone: raised by someone other than the poll (a failed delivery, the guard hook) and cleared by its own event.
@@ -50,6 +53,10 @@ export type WatchPorts = {
   nudgeText: typeof prompts.nudgeText
   advanceTokens: typeof usage.advanceTokens
   findRollout: typeof usage.findRollout
+  seatCost: typeof seatCost
+  buildReport: typeof buildReport
+  userClaudeDir: typeof userClaudeDir
+  transcriptStamp: (path: string) => Promise<string | undefined>
   modifiedAt: (path: string) => Promise<number | undefined>
 }
 
@@ -79,6 +86,13 @@ export const defaultWatchPorts: WatchPorts = {
   nudgeText: prompts.nudgeText,
   advanceTokens: usage.advanceTokens,
   findRollout: usage.findRollout,
+  seatCost,
+  buildReport,
+  userClaudeDir,
+  transcriptStamp: async path => {
+    const file = await stat(path).catch(() => undefined)
+    return file ? `${file.size}:${file.mtimeMs}` : undefined
+  },
   modifiedAt: async path => (await stat(path).catch(() => undefined))?.mtimeMs,
 }
 
@@ -230,6 +244,10 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   let freshAttention: Attention[] = []
   const hookWindows = new Map<string, { cursor: store.Cursor; records: HookRecord[]; turns: number; transcript?: string }>()
   const tokenCounters = new Map<string, usage.TokenCounter>()
+  const transcriptPaths = new Map<string, Set<string>>()
+  const transcriptSessions = new Map<string, Map<string, HookRecord['agent']>>()
+  const costChecks = new Map<string, { at: number; signature: string; cost?: number }>()
+  let runBudgetRaised: boolean | undefined
   let humanName: string | undefined
   const plannerHooks: { cursor: store.Cursor; sessionId?: string } = { cursor: { offset: 0 } }
   let plannerAgentSession: string | undefined
@@ -404,6 +422,14 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     // A turn ends at a Stop hook. The window forgets old records, so the count is kept apart (it rebuilds from the file's start).
     window.turns += read.items.filter((record) => record.event === 'stop').length
     window.transcript = read.items.findLast((record) => record.transcript)?.transcript ?? window.transcript
+    const paths = transcriptPaths.get(seat) ?? new Set<string>()
+    const sessions = transcriptSessions.get(seat) ?? new Map<string, HookRecord['agent']>()
+    for (const record of read.items) {
+      if (record.transcript) paths.add(record.transcript)
+      if (record.sessionId) sessions.set(record.sessionId, record.agent)
+    }
+    transcriptPaths.set(seat, paths)
+    transcriptSessions.set(seat, sessions)
     hookWindows.set(seat, window)
     return window.records
   }
@@ -417,6 +443,48 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     return counter.total
   }
 
+  // Stat transcripts only on a cost-check interval; unchanged files keep their last price without a full read.
+  const costSignature = async (run: RunMeta, seats: readonly Seat[], includePlanner: boolean): Promise<string> => {
+    const claudeDir = deps.claudeUserDir ?? ports.userClaudeDir()
+    const files = new Set<string>()
+    for (const seat of seats) {
+      for (const path of transcriptPaths.get(seat.name) ?? []) files.add(path)
+      const sessions = new Map(transcriptSessions.get(seat.name))
+      if (seat.sessionId) sessions.set(seat.sessionId, seat.kind)
+      for (const [session, kind] of sessions) {
+        if (kind === 'claude') files.add(claudeTranscriptPath(claudeDir, seat.worktree, session))
+        else {
+          const path = await ports.findRollout(seat.codexHome ?? paths.codexHomeDir(deps.home, run.id), session)
+          if (path) files.add(path)
+        }
+      }
+    }
+    const plannerSession = run.planner.sessionId ?? plannerAgentSession ?? plannerHooks.sessionId
+    if (includePlanner && plannerSession) {
+      if (run.planner.kind === 'claude') files.add(claudeTranscriptPath(claudeDir, run.repo, plannerSession))
+      else {
+        const path = await ports.findRollout(paths.codexHomeDir(deps.home, run.id), plannerSession)
+        if (path) files.add(path)
+      }
+    }
+    const stamps = await Promise.all([...files].sort().map(async path => `${path}:${await ports.transcriptStamp(path) ?? 'missing'}`))
+    return stamps.join('|')
+  }
+
+  const checkedCost = async (key: string, run: RunMeta, seats: readonly Seat[], includePlanner: boolean, read: () => Promise<number | undefined>): Promise<number | undefined> => {
+    const now = deps.clock.now().getTime()
+    const previous = costChecks.get(key)
+    if (previous && now - previous.at < COST_CHECK_MS) return previous.cost
+    const signature = await costSignature(run, seats, includePlanner)
+    if (previous?.signature === signature) {
+      costChecks.set(key, { ...previous, at: now })
+      return previous.cost
+    }
+    const cost = await read().catch(() => undefined)
+    costChecks.set(key, { at: now, signature, ...(cost !== undefined ? { cost } : {}) })
+    return cost
+  }
+
   const poll = async (run: RunMeta) => {
     const now = deps.clock.now()
     const listed = await ports.listAgents(deps.exec)
@@ -425,6 +493,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     if (planner) plannerStatus = plannerStatus?.status === planner.status ? plannerStatus : { status: planner.status, since: now.getTime() }
     else plannerStatus = undefined
     plannerAgentSession = planner?.sessionId ?? plannerAgentSession
+    const config = await ports.readJson<Partial<DroveConfig>>(join(deps.home, 'config.json'))
+    const reviewLoopLimit = typeof config?.reviewLoopLimit === 'number' && Number.isInteger(config.reviewLoopLimit) && config.reviewLoopLimit > 0 ? config.reviewLoopLimit : 3
     const current = await ports.loadRoster(deps.home, run.id)
     const derived = new Map<string, { state: Seat['state']; attention: Attention[]; sessionId?: string }>()
     for (const seat of ports.openSeats(current).filter((open) => open.state !== 'closing')) {
@@ -440,13 +510,28 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       const transcript = agent?.status === 'working' ? undefined : hookWindows.get(seat.name)?.transcript
       const transcriptAt = transcript ? await ports.modifiedAt(transcript) : undefined
       const result = ports.deriveState(seat, { herdr: agent, hooks, lastReport: seat.lastReport, screen, ...(transcriptAt !== undefined ? { transcriptAt } : {}) }, now)
-      if (result.state !== 'gone' && (seat.maxTurns !== undefined || seat.maxTokens !== undefined)) {
+      if (result.state !== 'gone' && (seat.maxTurns !== undefined || seat.maxTokens !== undefined || seat.maxMinutes !== undefined || seat.maxCost !== undefined)) {
         const tokens = await tokensOf(seat).catch(() => undefined)
-        const detail = detect.budgetDetail(seat, { turns: hookWindows.get(seat.name)?.turns ?? 0, ...(tokens !== undefined ? { tokens } : {}) })
-        if (detail) result.attention = [...result.attention, { seat: seat.name, reason: 'budget', detail, at: now.toISOString() }]
+        const cost = seat.maxCost !== undefined && !seat.budgetNoticed ? await checkedCost(`seat:${seat.name}`, run, [seat], false, () => ports.seatCost(deps, run, seat, deps.claudeUserDir ?? ports.userClaudeDir())) : undefined
+        const detail = detect.budgetDetail(seat, { minutes: Math.max(0, now.getTime() - Date.parse(seat.spawnedAt)) / 60_000, ...(cost !== undefined ? { cost } : {}), turns: hookWindows.get(seat.name)?.turns ?? 0, ...(tokens !== undefined ? { tokens } : {}) })
+        const noticed = seat.budgetNoticed ? seat.attention.find(item => item.reason === 'budget') ?? (seat.maxCost !== undefined ? { seat: seat.name, reason: 'budget' as const, detail: 'reached its budget (worker already notified)', at: seat.stateAt } : undefined) : undefined
+        if (detail || noticed) result.attention = [...result.attention, detail ? { seat: seat.name, reason: 'budget', detail, at: now.toISOString() } : noticed as Attention]
       }
       const sessionId = seat.sessionId ? undefined : (hooks.findLast((record) => record.event === 'session-start' && record.sessionId) ?? hooks.findLast((record) => record.sessionId))?.sessionId
       derived.set(seat.name, { ...result, ...(sessionId ? { sessionId } : {}) })
+    }
+    if (runBudgetRaised === undefined) {
+      const events = (await readFrom<DroveEvent>(ports, join(ports.runDir(deps.home, run.id), 'events.jsonl'), { offset: 0 })).items
+      runBudgetRaised = events.some(event => event.type === 'attention' && event.data?.reason === 'run-budget')
+    }
+    if (!runBudgetRaised && typeof config?.runMaxCost === 'number' && Number.isFinite(config.runMaxCost) && config.runMaxCost > 0) {
+      const cost = await checkedCost('run', run, current.seats, true, async () => (await ports.buildReport(deps, run.id, deps.claudeUserDir ?? ports.userClaudeDir()))?.totals.cost)
+      if (cost !== undefined && cost > config.runMaxCost) {
+        const item: Attention = { seat: 'planner', reason: 'run-budget', detail: `Run ${run.id} has used $${cost.toFixed(2)}, over its $${config.runMaxCost.toFixed(2)} budget: re-scope it or take it over`, at: now.toISOString() }
+        await emit('attention', item.seat, undefined, { reason: item.reason, detail: item.detail })
+        runBudgetRaised = true
+        freshAttention.push(item)
+      }
     }
     if (derived.size === 0) return
     // A seat's last check run goes stale once its worktree's HEAD has moved past the commit it ran at (DROVE-122).
@@ -477,7 +562,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
           state: result.state,
           stateAt: changed ? at : seat.stateAt,
           ...(result.sessionId && !seat.sessionId ? { sessionId: result.sessionId } : {}),
-          attention: [...seat.attention.filter((item) => KEPT_ATTENTION.includes(item.reason)), ...result.attention],
+          attention: [...seat.attention.filter((item) => KEPT_ATTENTION.includes(item.reason)), ...result.attention,
+            ...((seat.reviewChanges ?? 0) >= reviewLoopLimit ? [{ seat: seat.name, reason: 'review-loop' as const, detail: detect.reviewLoopText(seat.name, seat.reviewChanges ?? 0), at: seat.attention.find(item => item.reason === 'review-loop')?.at ?? at }] : [])],
           ...(result.state === 'working' && !reportedThisEpisode(seat) ? { lastWorkingAt: at } : {}),
           ...(result.state === 'working' && seat.state !== 'working' ? { hasNudged: false } : {}),
         }
@@ -488,7 +574,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     const live = new Set<string>()
     for (const [name, result] of derived) {
       if (restarting.has(name)) continue
-      for (const item of result.attention) {
+      for (const item of [...result.attention, ...(updated.seats.find(seat => seat.name === name)?.attention.filter(item => item.reason === 'review-loop') ?? [])]) {
         const key = `${item.seat}|${item.reason}`
         live.add(key)
         if (knownAttention.has(key)) continue

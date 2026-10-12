@@ -155,3 +155,147 @@ test('budgetDetail, the notice text and the nudge rule', () => {
 })
 
 const appendFileLine = async (path: string, line: string) => (await import('node:fs/promises')).appendFile(path, `${line}\n`)
+
+test('maxMinutes uses wall time since spawn and sends one notice', async () => {
+  const { ctx, controls, poll } = await budgeted({ maxMinutes: 1, spawnedAt: '2026-10-09T10:00:00.000Z' })
+  await poll()
+  assert.equal((await budgetAttention(ctx)).length, 0)
+  ctx.clock.advance(50_000)
+  await poll()
+  await poll()
+  assert.equal((await budgetAttention(ctx)).length, 1)
+  assert.match((await budgetAttention(ctx))[0]?.detail ?? '', /minutes/)
+  assert.equal(controls.length, 1)
+  assert.equal((await rosterOf(ctx)).seats[0]?.budgetNoticed, true)
+})
+
+test('maxCost uses report prices and ignores unpriced transcript models', async () => {
+  const { ctx, controls, poll } = await budgeted({ maxCost: 1 })
+  const transcript = join(ctx.home, 'priced.jsonl')
+  await writeFile(transcript, JSON.stringify({ type: 'assistant', message: { id: 'a', model: 'unpriced', usage: { input_tokens: 1_000_000 } } }) + '\n')
+  await stops(ctx, 1, { transcript })
+  await poll()
+  assert.equal((await budgetAttention(ctx)).length, 0)
+  await appendFileLine(transcript, JSON.stringify({ type: 'assistant', message: { id: 'b', model: 'claude-sonnet-5-5', usage: { input_tokens: 1_000_000 } } }))
+  ctx.clock.advance(60_000)
+  await poll()
+  await poll()
+  assert.equal((await budgetAttention(ctx))[0]?.detail, 'used $2.00 of its $1.00 budget')
+  assert.equal(controls.length, 1)
+})
+
+test('runMaxCost creates exactly one durable run-budget item, including after watcher restart', async () => {
+  const { ctx, ports, poll } = await budgeted({ kind: 'claude' })
+  await writeFile(join(ctx.home, 'config.json'), JSON.stringify({ runMaxCost: 1 }))
+  const transcript = join(ctx.home, 'run-priced.jsonl')
+  await writeFile(transcript, JSON.stringify({ type: 'assistant', message: { id: 'a', model: 'claude-sonnet-5-5', usage: { input_tokens: 1_000_000 } } }) + '\n')
+  await stops(ctx, 1, { transcript })
+  await poll()
+  await poll()
+  const again = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  ctx.clock.advance(5_000)
+  await again.tick()
+  const events = await eventsOf(ctx)
+  assert.equal(events.filter(event => event.type === 'attention' && event.data?.reason === 'run-budget').length, 1)
+  const { attentionCandidates } = await import('../src/attention.ts')
+  const candidates = attentionCandidates({ run: ctx.run, roster: await rosterOf(ctx), reports: [], status: {}, events: events as import('../src/types.ts').DroveEvent[], at: ctx.clock.now().toISOString() })
+  assert.equal(candidates.filter(item => item.kind === 'run-budget').length, 1)
+})
+
+test('review-loop attention survives detection and is visible in the shared board and web payload', async () => {
+  const { ctx, poll } = await budgeted({ reviewChanges: 3 })
+  await poll()
+  const roster = await rosterOf(ctx)
+  assert.equal(roster.seats[0]?.attention.filter(item => item.reason === 'review-loop').length, 1)
+  const { payloadOf } = await import('../src/web.ts')
+  const payload = payloadOf({ run: ctx.run, roster, status: {}, feed: [], bridgeHeld: false }, ctx.clock.now().getTime(), 0)
+  assert.equal(payload.seats[0]?.needsYou, true)
+  assert.match(payload.seats[0]?.activity ?? '', /3 rounds of changes/)
+  assert.equal(payload.model.workers[0]?.cells.some(cell => /3 rounds of changes/.test(cell.text)), true)
+  await updateRoster(ctx.home, ctx.run.id, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, reviewChanges: 0, attention: [] })) }))
+  await poll()
+  assert.equal((await rosterOf(ctx)).seats[0]?.attention.some(item => item.reason === 'review-loop'), false)
+})
+
+test('seat cost reads are throttled, require a transcript change, and stop after the notice', async () => {
+  const { ctx, ports, poll } = await budgeted({ kind: 'claude', maxCost: 3 })
+  const transcript = join(ctx.home, 'cost-throttle.jsonl')
+  const assistant = (id: string) => JSON.stringify({ type: 'assistant', message: { id, model: 'claude-sonnet-5-5', usage: { input_tokens: 1_000_000 } } })
+  await writeFile(transcript, `${assistant('a')}\n`)
+  await stops(ctx, 1, { transcript })
+  const readCost = ports.seatCost
+  let reads = 0
+  ports.seatCost = async (...args) => { reads += 1; return readCost(...args) }
+  await poll()
+  assert.equal(reads, 1)
+  await appendFileLine(transcript, assistant('b'))
+  await poll()
+  assert.equal(reads, 1, 'a changed transcript is not read again within the interval')
+  ctx.clock.advance(60_000)
+  await poll()
+  assert.equal(reads, 2)
+  assert.equal((await rosterOf(ctx)).seats[0]?.budgetNoticed, true)
+  await appendFileLine(transcript, assistant('c'))
+  ctx.clock.advance(60_000)
+  await poll()
+  assert.equal(reads, 2, 'noticed seats are never priced again')
+  assert.equal((await budgetAttention(ctx)).length, 1)
+})
+
+test('unchanged transcripts are not re-read for seat cost after the interval', async () => {
+  const { ctx, ports, poll } = await budgeted({ kind: 'claude', maxCost: 10 })
+  const transcript = join(ctx.home, 'cost-unchanged.jsonl')
+  await writeFile(transcript, '{}\n')
+  await stops(ctx, 1, { transcript })
+  let reads = 0
+  ports.seatCost = async () => { reads += 1; return 0 }
+  await poll()
+  ctx.clock.advance(60_000)
+  await poll()
+  assert.equal(reads, 1)
+  await appendFileLine(transcript, '{}')
+  ctx.clock.advance(60_000)
+  await poll()
+  assert.equal(reads, 2)
+})
+
+test('run cost reads are throttled, require a transcript change, and stop permanently once raised', async () => {
+  const { ctx, ports, poll } = await budgeted({ kind: 'claude' })
+  await writeFile(join(ctx.home, 'config.json'), JSON.stringify({ runMaxCost: 3 }))
+  const transcript = join(ctx.home, 'run-throttle.jsonl')
+  await writeFile(transcript, '{}\n')
+  await stops(ctx, 1, { transcript })
+  const readEvents = ports.readJsonlFrom
+  let eventReads = 0
+  ports.readJsonlFrom = async (...args) => {
+    if (args[0].endsWith('events.jsonl')) eventReads += 1
+    return readEvents(...args)
+  }
+  let reads = 0
+  let cost = 0
+  ports.buildReport = async () => { reads += 1; return { totals: { cost } } as import('../src/report.ts').RunReport }
+  await poll()
+  await poll()
+  assert.equal(reads, 1)
+  assert.equal(eventReads, 1)
+  ctx.clock.advance(60_000)
+  await poll()
+  assert.equal(reads, 1, 'unchanged run transcripts are not re-read')
+  cost = 4
+  await appendFileLine(transcript, '{}')
+  await poll()
+  assert.equal(reads, 1, 'changed transcripts wait for the next interval')
+  ctx.clock.advance(60_000)
+  await poll()
+  assert.equal(reads, 2)
+  await appendFileLine(transcript, '{}')
+  ctx.clock.advance(60_000)
+  await poll()
+  assert.equal(reads, 2, 'a run that raised its warning is never priced again')
+  assert.equal(eventReads, 1, 'events are read only at watcher initialization')
+  const again = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  ctx.clock.advance(5_000)
+  await again.tick()
+  assert.equal(reads, 2, 'restart restores the durable raised flag without pricing')
+  assert.equal(eventReads, 2)
+})
