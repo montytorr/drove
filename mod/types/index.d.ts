@@ -31,6 +31,7 @@ export type RunMeta = {
   goal?: string
   cairn?: string
   tabId?: string
+  workspace?: string
   budget: number
   planner: PlannerMeta
 }
