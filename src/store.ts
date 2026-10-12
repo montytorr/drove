@@ -78,8 +78,16 @@ const stealIfStale = async (lockDir: string, staleMs: number): Promise<void> => 
   await rename(lockDir, aside).then(() => rm(aside, { recursive: true, force: true }), () => undefined)
 }
 
-export const withLock = async <T>(lockDir: string, body: () => Promise<T>, staleMs = 10_000): Promise<T> => {
+export class LockBusy extends Error {
+  constructor(lockDir: string) {
+    super(`${lockDir} is held by someone else`)
+  }
+}
+
+// `giveUpMs` turns the wait into a try: a lock still held after that long throws LockBusy instead of waiting out a steal.
+export const withLock = async <T>(lockDir: string, body: () => Promise<T>, staleMs = 10_000, giveUpMs?: number): Promise<T> => {
   await ensureDir(dirname(lockDir))
+  const started = Date.now()
   for (;;) {
     try {
       await mkdir(lockDir)
@@ -87,6 +95,7 @@ export const withLock = async <T>(lockDir: string, body: () => Promise<T>, stale
     } catch (error) {
       if (codeOf(error) !== 'EEXIST') throw error
       await stealIfStale(lockDir, staleMs)
+      if (giveUpMs !== undefined && Date.now() - started >= giveUpMs) throw new LockBusy(lockDir)
       await sleep(LOCK_POLL_MS)
     }
   }
@@ -143,6 +152,12 @@ export const readJsonlFrom = async <T>(path: string, cursor: Cursor): Promise<{ 
   } finally {
     await handle.close()
   }
+}
+
+// The last `bytes` of a jsonl file, for a reader that needs only what is recent (the line the cut lands in is dropped).
+export const readJsonlTail = async <T>(path: string, bytes: number): Promise<T[]> => {
+  const size = await stat(path).then(info => info.size, () => 0)
+  return (await readJsonlFrom<T>(path, { offset: Math.max(0, size - bytes) })).items
 }
 
 export const mintToken = (): string => randomBytes(32).toString('hex')

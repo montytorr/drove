@@ -21,7 +21,7 @@ export const isAsking = (seat: Seat, status: OrchModStatus | undefined): boolean
 
 // Attention the planner acts on by itself (a nudge to the seat, a retry, a wrap-up): a person is never asked about it, so
 // it is not "needs you" on any board and not an item of `drove attention` (DROVE-108).
-const PLANNER_ATTENTION: ReadonlySet<string> = new Set(['idle-without-report', 'stalled', 'budget', 'pending-delivery'])
+const PLANNER_ATTENTION: ReadonlySet<string> = new Set(['idle-without-report', 'stalled', 'budget', 'pending-delivery', 'guard-thrash'])
 
 export const isForHuman = (item: { reason: string }): boolean => !PLANNER_ATTENTION.has(item.reason)
 
