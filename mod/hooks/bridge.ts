@@ -67,6 +67,9 @@ export const feedOf = (event: DroveEvent, bodies: Map<string, string[]>): FeedDr
       if (BLOCKED[to]) return { at, from: seat, to: HUMAN, kind: 'blocked', summary: BLOCKED[to] ?? to }
       return undefined
     }
+    // R1 is a message to the worker; R2 is a line in the planner's own copy of the report (DROVE-127).
+    case 'steer.nudged':
+      return text(data.rule) === 'R2' ? { at, from: seat, to: '⌘', kind: 'notice', summary: text(data.detail) } : { at, from: '⌘', to: seat, kind: 'steer', summary: text(data.detail) }
     case 'goal.set':
       return { at, from: '⌘', to: HUMAN, kind: 'goal', summary: `goal: ${text(data.goal)}` }
     case 'seat.close':

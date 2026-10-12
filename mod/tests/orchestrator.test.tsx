@@ -138,6 +138,8 @@ describe('bridge stream', () => {
     for (const reason of ['idle-without-report', 'stalled', 'budget', 'pending-delivery', 'guard-thrash']) {
       expect(feedOf({ at: ISO, type: 'attention', seat: 'w-auth', data: { reason, detail: 'x' } }, bodies)).toMatchObject({ from: 'w-auth', to: '⌘', kind: 'notice', summary: `${reason}: x` })
     }
+    expect(feedOf({ at: ISO, type: 'steer.nudged', seat: 'w-auth', data: { rule: 'R1', detail: 'Drove: `npm test` has failed 3 times' } }, bodies)).toMatchObject({ from: '⌘', to: 'w-auth', kind: 'steer', summary: 'Drove: `npm test` has failed 3 times' })
+    expect(feedOf({ at: ISO, type: 'steer.nudged', seat: 'w-auth', data: { rule: 'R2', detail: 'Drove: no check ran after the last edit' } }, bodies)).toMatchObject({ from: 'w-auth', to: '⌘', kind: 'notice' })
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: true, resumed: true, pane: 'w1:p2' } }, bodies)).toMatchObject({ kind: 'relaunch', to: 'w-auth', summary: 'relaunched (resumed) in pane w1:p2' })
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: false, error: 'no pane' } }, bodies)).toMatchObject({ kind: 'failed', summary: 'relaunch failed: no pane' })
   })

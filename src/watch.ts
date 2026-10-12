@@ -9,6 +9,7 @@ import * as paths from './paths.ts'
 import * as prompts from './prompts.ts'
 import * as protocol from './protocol.ts'
 import * as roster from './roster.ts'
+import * as steer from './steer.ts'
 import * as store from './store.ts'
 import * as usage from './usage.ts'
 import { buildReport, claudeTranscriptPath, seatCost } from './report.ts'
@@ -58,6 +59,7 @@ export type WatchPorts = {
   userClaudeDir: typeof userClaudeDir
   transcriptStamp: (path: string) => Promise<string | undefined>
   modifiedAt: (path: string) => Promise<number | undefined>
+  checkPlan: (repo: string) => Promise<string[]>
 }
 
 export const defaultWatchPorts: WatchPorts = {
@@ -94,6 +96,7 @@ export const defaultWatchPorts: WatchPorts = {
     return file ? `${file.size}:${file.mtimeMs}` : undefined
   },
   modifiedAt: async path => (await stat(path).catch(() => undefined))?.mtimeMs,
+  checkPlan: steer.defaultCheckPlan,
 }
 
 export type WatchOptions = {
@@ -247,6 +250,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const transcriptPaths = new Map<string, Set<string>>()
   const transcriptSessions = new Map<string, Map<string, HookRecord['agent']>>()
   const costChecks = new Map<string, { at: number; signature: string; cost?: number }>()
+  const steering = steer.createSteering(deps, ports)
+  const steerOptions = (): steer.TickOptions => ({ claudeDir: deps.claudeUserDir ?? ports.userClaudeDir(), transcriptOf: name => hookWindows.get(name)?.transcript })
   let runBudgetRaised: boolean | undefined
   let humanName: string | undefined
   const plannerHooks: { cursor: store.Cursor; sessionId?: string } = { cursor: { offset: 0 } }
@@ -284,6 +289,19 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     return `${human.length === 0 ? '' : `\n\nNeeds the human:\n${human.map(attentionLine).join('\n')}`}${planner.length === 0 ? '' : `\n\nFor you to act on:\n${planner.map(attentionLine).join('\n')}`}`
   }
 
+  // R2 (DROVE-127): a done report with no check after its worker's last edit carries a line for the planner. The line is
+  // Drove's alone, so one a worker put in its own report is dropped, and steering never holds a report back.
+  const steered = async (run: RunMeta, { steering: _forged, ...report }: Report): Promise<Report> => {
+    try {
+      // The hook window knows the seat's transcript; a report can arrive before any poll has read it.
+      if (report.kind === 'done') await hooksFor(run, report.seat)
+      return await steering.annotate(run, report, steerOptions())
+    } catch (error) {
+      onError(error, 'steer')
+      return report
+    }
+  }
+
   const ingest = async (run: RunMeta) => {
     const scan = await scanOutboxes(deps, run, ports)
     if (scan.reports.length === 0 && scan.rejected.length === 0) return
@@ -309,7 +327,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     for (const report of scan.reports) {
       await emit('report', report.seat, report.id, { kind: report.kind, expects: report.expects, summary: clip(report.summary) })
       if (!shouldWake(report) || seen.has(report.id)) continue
-      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'add', report } satisfies Ledger)
+      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'add', report: await steered(run, report) } satisfies Ledger)
     }
     await scan.commit()
   }
@@ -600,6 +618,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       })
       await ports.updateRoster(deps.home, run.id, (latest) => ({ ...latest, seats: latest.seats.map((item) => (item.name === seat.name ? { ...item, budgetNoticed: true } : item)) }))
     }
+    const steerable = updated.seats.filter(seat => derived.has(seat.name) && !restarting.has(seat.name))
+    await guarded('steer', () => steering.tick(run, steerable, config?.steering, steerOptions()))
     for (const seat of updated.seats) {
       if (!derived.has(seat.name) || !ports.needsNudge(seat, now)) continue
       const control: Control = { v: 1, id: `c-nudge-${seat.name}-${now.getTime()}`, run: run.id, from: 'planner', to: seat.name, kind: 'nudge', expects: 'answer', body: ports.nudgeText(), at }

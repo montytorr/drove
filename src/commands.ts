@@ -18,6 +18,7 @@ import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approv
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
+import { steeringNotes } from './steer.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
   AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
@@ -1708,7 +1709,10 @@ export const reports = async (deps: Deps, identity: Identity, ref: RunRef, reque
   const roster = await loadRoster(deps.home, run.id)
   if (request.seat && !findSeat(roster, request.seat)) return failed('no-seat', `no seat named ${request.seat}`)
   const seats = request.seat ? [request.seat] : roster.seats.map(seat => seat.name)
-  const all = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().sort((a, b) => a.at.localeCompare(b.at))
+  // The outbox has no steering line (DROVE-127): the watcher recorded it in the event log, by report id.
+  const notes = await steeringNotes(join(runDir(deps.home, run.id), 'events.jsonl'))
+  const filed = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().sort((a, b) => a.at.localeCompare(b.at))
+  const all = filed.map(({ steering: _forged, ...report }): Report => (notes.has(report.id) ? { ...report, steering: notes.get(report.id) as string } : report))
   const read = new Set((await readJson<string[]>(readReportsPath(deps.home, run.id))) ?? [])
   const unread = all.filter(report => !read.has(report.id))
   const picked = request.all ? all : unread.length > 0 || !request.seat ? unread : all.slice(-1)

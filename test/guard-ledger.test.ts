@@ -431,8 +431,8 @@ test('AC4: the run report counts guard denials per seat, by rule, and in the tot
   assert.equal(report.totals.denials, 5)
   assert.deepEqual(report.totals.denialsByRule, { owns: 2, push: 1, herdr: 1, unknown: 1 })
   const text = renderReport(report)
-  assert.match(text, /deny\s+chg\/pro\/dem\/mig\/rst/)
-  assert.match(text, /w-a\s+claude.*\s3\s+0\/0\/0\/0\/0/)
+  assert.match(text, /deny\s+nudge\s+chg\/pro\/dem\/mig\/rst/)
+  assert.match(text, /w-a\s+claude.*\s3\s+0\s+0\/0\/0\/0\/0/)
   assert.match(text, /by rule: owns 2, herdr 1, push 1, unknown 1/)
 })
 
