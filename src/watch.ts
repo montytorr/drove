@@ -1,15 +1,18 @@
 import { stat } from 'node:fs/promises'
 import { join } from 'node:path'
 import { isForHuman } from '../mod/hooks/roster.ts'
+import * as autocheck from './autocheck.ts'
 import * as commands from './commands.ts'
 import * as deliver from './deliver.ts'
 import * as detect from './detect.ts'
 import * as herdr from './herdr.ts'
 import * as light from './light.ts'
+import * as pendingLedger from './pending.ts'
 import * as paths from './paths.ts'
 import * as prompts from './prompts.ts'
 import * as protocol from './protocol.ts'
 import * as roster from './roster.ts'
+import * as steer from './steer.ts'
 import * as store from './store.ts'
 import * as usage from './usage.ts'
 import { buildReport, claudeTranscriptPath, seatCost } from './report.ts'
@@ -61,6 +64,7 @@ export type WatchPorts = {
   modifiedAt: (path: string) => Promise<number | undefined>
   paneTty: typeof light.paneTty
   writeTty: typeof light.writeTty
+  checkPlan: (repo: string) => Promise<string[]>
 }
 
 export const defaultWatchPorts: WatchPorts = {
@@ -99,6 +103,7 @@ export const defaultWatchPorts: WatchPorts = {
   modifiedAt: async path => (await stat(path).catch(() => undefined))?.mtimeMs,
   paneTty: light.paneTty,
   writeTty: light.writeTty,
+  checkPlan: steer.defaultCheckPlan,
 }
 
 export type WatchOptions = {
@@ -118,7 +123,7 @@ export type Watcher = {
 }
 
 type Cursors = Record<string, store.Cursor>
-type Ledger = { t: 'add'; report: Report } | { t: 'ack'; ids: string[] }
+type Ledger = pendingLedger.LedgerLine
 
 const isEnoent = (error: unknown): boolean => (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
 
@@ -158,7 +163,8 @@ const scanOutboxes = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promis
       if (!isReportShape(item)) rejected.push({ seat: seat.name, id, why: 'malformed report' })
       else if (item.run !== run.id || item.seat !== seat.name) rejected.push({ seat: seat.name, id, why: 'run or seat does not match the outbox' })
       else if (!token || item.token !== token) rejected.push({ seat: seat.name, id, why: 'token mismatch' })
-      else reports.push(item)
+      // `autocheck` is Drove's own line on a report: a worker's outbox does not get to write it.
+      else reports.push((({ autocheck: _, ...own }) => own)(item))
     }
   }
   const commit = async () => {
@@ -175,18 +181,8 @@ export const readNewReports = async (deps: Deps, run: RunMeta, ports: WatchPorts
 
 export const shouldWake = (report: Report): boolean => report.kind !== 'progress'
 
-const readLedger = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promise<{ open: Report[]; seen: Set<string> }> => {
-  const { items } = await readFrom<Ledger>(ports, ledgerPath(ports, deps, run), { offset: 0 })
-  const open = new Map<string, Report>()
-  const seen = new Set<string>()
-  for (const line of items) {
-    if (line.t === 'add') {
-      open.set(line.report.id, line.report)
-      seen.add(line.report.id)
-    } else for (const id of line.ids) open.delete(id)
-  }
-  return { open: [...open.values()], seen }
-}
+const readLedger = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promise<pendingLedger.Folded> =>
+  pendingLedger.fold((await readFrom<Ledger>(ports, ledgerPath(ports, deps, run), { offset: 0 })).items)
 
 const unackedReports = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promise<Report[]> => (await readLedger(deps, run, ports)).open
 
@@ -252,6 +248,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const transcriptPaths = new Map<string, Set<string>>()
   const transcriptSessions = new Map<string, Map<string, HookRecord['agent']>>()
   const costChecks = new Map<string, { at: number; signature: string; cost?: number }>()
+  const steering = steer.createSteering(deps, ports)
+  const steerOptions = (): steer.TickOptions => ({ claudeDir: deps.claudeUserDir ?? ports.userClaudeDir(), transcriptOf: name => hookWindows.get(name)?.transcript })
   let runBudgetRaised: boolean | undefined
   let humanName: string | undefined
   const plannerHooks: { cursor: store.Cursor; sessionId?: string } = { cursor: { offset: 0 } }
@@ -292,11 +290,24 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     return `${human.length === 0 ? '' : `\n\nNeeds the human:\n${human.map(attentionLine).join('\n')}`}${planner.length === 0 ? '' : `\n\nFor you to act on:\n${planner.map(attentionLine).join('\n')}`}`
   }
 
+  // R2 (DROVE-127): a done report with no check after its worker's last edit carries a line for the planner. The line is
+  // Drove's alone, so one a worker put in its own report is dropped, and steering never holds a report back.
+  const steered = async (run: RunMeta, { steering: _forged, ...report }: Report): Promise<Report> => {
+    try {
+      // The hook window knows the seat's transcript; a report can arrive before any poll has read it.
+      if (report.kind === 'done') await hooksFor(run, report.seat)
+      return await steering.annotate(run, report, steerOptions())
+    } catch (error) {
+      onError(error, 'steer')
+      return report
+    }
+  }
+
   const ingest = async (run: RunMeta) => {
     const scan = await scanOutboxes(deps, run, ports)
     if (scan.reports.length === 0 && scan.rejected.length === 0) return
     for (const item of scan.rejected) await emit('attention', item.seat, item.id, { reason: 'report-rejected', why: item.why })
-    const { seen } = await readLedger(deps, run, ports)
+    const { seen, held: heldNow } = await readLedger(deps, run, ports)
     await ports.updateRoster(deps.home, run.id, (current) => ({
       ...current,
       seats: current.seats.map((seat) => {
@@ -314,12 +325,131 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       }),
       updatedAt: deps.clock.now().toISOString(),
     }))
+    const seats = (await ports.loadRoster(deps.home, run.id)).seats
+    const checked = scan.reports.some(report => report.kind === 'done') ? await autocheck.autoCheckSettings(deps.home, run.repo) : undefined
+    // A seat with a held report holds its later ones too, so the planner never reads a report before the one it follows.
+    const holding = new Set(heldNow.map(report => report.seat))
     for (const report of scan.reports) {
       await emit('report', report.seat, report.id, { kind: report.kind, expects: report.expects, summary: clip(report.summary) })
       if (!shouldWake(report) || seen.has(report.id)) continue
-      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'add', report } satisfies Ledger)
+      // A done report of an implementer is held while Drove runs its checks; the planner is woken by the outcome (DROVE-126).
+      // R2 still fires here, once, at ingest: the steered report is what the ledger holds and later releases.
+      const held = holding.has(report.seat) || (checked !== undefined && autocheck.isCheckable(report, seats.find(seat => seat.name === report.seat)))
+      if (held) holding.add(report.seat)
+      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: held ? 'hold' : 'add', report: await steered(run, report) } satisfies Ledger)
     }
     await scan.commit()
+  }
+
+  // ---------- Drove's own checks of a done report (DROVE-126) ----------
+
+  // One check run per seat and at most MAX_RUNNING in the run, in the background: the tick never waits for one.
+  const checking = new Map<string, Promise<void>>()
+
+  type Noter = (report: Report) => string | undefined
+
+  const release = async (run: RunMeta, reports: readonly Report[], noteOf: Noter = () => undefined) => {
+    for (const report of reports) {
+      const note = noteOf(report)
+      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'add', report: note ? { ...report, autocheck: note } : report } satisfies Ledger)
+    }
+  }
+
+  const heldOf = async (run: RunMeta, seatName: string): Promise<Report[]> => (await readLedger(deps, run, ports)).held.filter(report => report.seat === seatName)
+
+  const seatOf = async (run: RunMeta, seatName: string): Promise<Seat | undefined> => (await ports.loadRoster(deps.home, run.id)).seats.find(seat => seat.name === seatName)
+
+  const withoutAttempts = (run: RunMeta, seatName: string) =>
+    ports.updateRoster(deps.home, run.id, found => ({
+      ...found,
+      seats: found.seats.map(entry => {
+        if (entry.name !== seatName) return entry
+        const { autoCheckAttempts: _, ...rest } = entry
+        return rest
+      }),
+    }))
+
+  // The held reports of one seat, in the order they arrived. Under a lock per seat, because the MCP watcher and the mod's
+  // bridge can both run for one run: the one that finds it taken leaves the seat to the other.
+  const settle = async (run: RunMeta, seatName: string) => {
+    const lock = join(ports.seatDir(deps.home, run.id, seatName), 'autocheck.lock')
+    try {
+      await store.withLock(lock, () => settleLocked(run, seatName), 10_000, 0)
+    } catch (error) {
+      if (!(error instanceof store.LockBusy)) throw error
+    }
+  }
+
+  const settleLocked = async (run: RunMeta, seatName: string) => {
+    const batch = await heldOf(run, seatName)
+    if (batch.length === 0) return
+    const seat = await seatOf(run, seatName)
+    if (!seat || PLANNER_CLOSED.includes(seat.state)) return ackReports(deps, run, ports, batch)
+    // What the checks vouch for are the done reports; the reports held behind them only wait their turn.
+    const checkable = new Set(batch.filter(report => autocheck.isCheckable(report, seat)).map(report => report.id))
+    const noteFor = (note: string): Noter => report => (checkable.has(report.id) ? note : undefined)
+    if (checkable.size === 0) return release(run, batch)
+    if (seat.state === 'gone' || seat.state === 'down') return release(run, batch, noteFor(autocheck.skippedLine(seat.name, seat.state)))
+    const settings = await autocheck.autoCheckSettings(deps.home, run.repo)
+    if (!settings) return release(run, batch)
+    const result = await autocheck.runAutoCheck(deps, run, seat, settings.plan)
+    const stillHeld = new Set((await heldOf(run, seatName)).map(report => report.id))
+    const pending = batch.filter(report => stillHeld.has(report.id))
+    const mine = pending.filter(report => checkable.has(report.id))
+    const last = mine.at(-1)
+    if (!last) return release(run, pending)
+    const current = await seatOf(run, seatName)
+    if (!current || PLANNER_CLOSED.includes(current.state)) return ackReports(deps, run, ports, pending)
+    if (result.status === 'error') {
+      await emit('autocheck.failed', seatName, last.id, { error: result.text })
+      return release(run, pending, noteFor(autocheck.errorLine(result.text)))
+    }
+    const { outcome } = result
+    const base = { sha: outcome.sha, clean: outcome.clean, commands: outcome.commands.map(entry => entry.command), reused: outcome.reused }
+    if (result.status === 'passed') {
+      await emit('autocheck.passed', seatName, last.id, base)
+      if (current.autoCheckAttempts !== undefined) await withoutAttempts(run, seatName)
+      return release(run, pending, noteFor(autocheck.passedLine(outcome)))
+    }
+    const { failed } = result
+    const attempts = (current.autoCheckAttempts ?? 0) + 1
+    const exhausted = attempts >= settings.attempts
+    await emit('autocheck.failed', seatName, last.id, { ...base, attempt: attempts, max: settings.attempts, failed: failed.command, exit: failed.exit, sentBack: !exhausted })
+    if (exhausted) {
+      // The planner has it now: the next failure is the first of a new round, not another "failed 3 times".
+      await withoutAttempts(run, seatName)
+      return release(run, pending, noteFor(autocheck.exhaustedLine(outcome, failed, attempts)))
+    }
+    await ports.updateRoster(deps.home, run.id, found => ({ ...found, seats: found.seats.map(entry => (entry.name === seatName ? { ...entry, autoCheckAttempts: attempts } : entry)) }))
+    const control = autocheck.verdictFor(run, seatName, last, autocheck.failureBody(outcome, failed, attempts, settings.attempts), deps.clock.now().toISOString())
+    const delivery = await ports.deliverControl(deps, run, control)
+    if (!delivery.ok && !delivery.queued) return release(run, pending, noteFor(autocheck.unsentLine(outcome, failed, delivery.reason)))
+    // From here the worker has the verdict: nothing that fails next may hand the planner a report Drove already sent back.
+    try {
+      await ackReports(deps, run, ports, mine)
+      await ports.updateRoster(deps.home, run.id, found => ({ ...found, seats: found.seats.map(entry => (entry.name === seatName && entry.lastReport?.id === last.id ? { ...entry, owes: 'none' as const } : entry)) }))
+      await release(run, pending.filter(report => !checkable.has(report.id)))
+    } catch (error) {
+      onError(error, 'autocheck')
+      await guarded('autocheck-event', () => emit('attention', seatName, last.id, { reason: 'autocheck-error', why: error instanceof Error ? error.message : String(error) }))
+      await guarded('autocheck-ack', () => ackReports(deps, run, ports, mine))
+    }
+  }
+
+  const pump = async (run: RunMeta) => {
+    const seatNames = [...new Set((await readLedger(deps, run, ports)).held.map(report => report.seat))]
+    for (const seatName of seatNames) {
+      if (checking.size >= autocheck.MAX_RUNNING) break
+      if (checking.has(seatName)) continue
+      const job = settle(run, seatName)
+        .catch(async error => {
+          // A check that cannot run must not strand the report: the planner reads it, as it did before.
+          onError(error, 'autocheck')
+          await guarded('autocheck-release', async () => release(run, await heldOf(run, seatName), report => (report.kind === 'done' ? autocheck.errorLine(error instanceof Error ? error.message : String(error)) : undefined)))
+        })
+        .finally(() => checking.delete(seatName))
+      checking.set(seatName, job)
+    }
   }
 
   const plannerThread = async (run: RunMeta): Promise<string | undefined> => {
@@ -649,6 +779,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       })
       await ports.updateRoster(deps.home, run.id, (latest) => ({ ...latest, seats: latest.seats.map((item) => (item.name === seat.name ? { ...item, budgetNoticed: true } : item)) }))
     }
+    const steerable = updated.seats.filter(seat => derived.has(seat.name) && !restarting.has(seat.name))
+    await guarded('steer', () => steering.tick(run, steerable, config?.steering, steerOptions()))
     for (const seat of updated.seats) {
       if (!derived.has(seat.name) || !ports.needsNudge(seat, now)) continue
       const control: Control = { v: 1, id: `c-nudge-${seat.name}-${now.getTime()}`, run: run.id, from: 'planner', to: seat.name, kind: 'nudge', expects: 'answer', body: ports.nudgeText(), at }
@@ -676,6 +808,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     serial(async () => {
       const run = await currentRun()
       await guarded('ingest', () => ingest(run))
+      await guarded('autocheck', () => pump(run))
       if (due(lastPollAt, HERDR_POLL_MS)) {
         lastPollAt = clockMs()
         await guarded('poll', () => poll(run))
@@ -691,6 +824,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     serial(async () => {
       const run = await currentRun()
       await guarded('ingest', () => ingest(run))
+      await guarded('autocheck', () => pump(run))
       const reports = await dropClosed(run, await unackedReports(deps, run, ports))
       await ackReports(deps, run, ports, reports)
       for (const report of reports) await emit('report.delivered', report.seat, report.id, { via: 'piggyback' })

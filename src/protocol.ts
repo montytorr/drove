@@ -238,7 +238,7 @@ export const renderReport = (report: Report, humanName: string): string => {
       ? 'This confirms work you already approved (branch and commit). Nothing to review: close it with drove close unless you have more for it.'
       : NEXT[report.kind]
   const head = `[worker ${report.seat} · ${report.kind}${forHuman ? ` for ${humanName}` : ''} · expects ${report.expects}]`
-  return [head, report.summary, report.details ?? '', criteriaLines(report), next ? `→ ${next}` : ''].filter(Boolean).join('\n')
+  return [head, report.summary, report.details ?? '', criteriaLines(report), report.autocheck ?? '', report.steering ?? '', next ? `→ ${next}` : ''].filter(Boolean).join('\n')
 }
 
 // A compact list of the criteria a done report answers, and a line when the seat had criteria that it left unanswered (DROVE-123).

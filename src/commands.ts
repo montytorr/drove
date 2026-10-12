@@ -17,8 +17,12 @@ import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShel
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
+import { diagnoseRun, renderDiagnosis, reportPointer } from './diagnose.ts'
+import { buildTrace, postTrace, renderTrace } from './trace.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
+import { type Folded, readFolded } from './pending.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
+import { steeringNotes } from './steer.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
   AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
@@ -1169,7 +1173,9 @@ export const send = async (deps: Deps, identity: Identity, request: SendRequest)
       const changes = request.verdict === 'approve' ? 0 : (entry.reviewChanges ?? 0) + 1
       const attention = entry.attention.filter(item => item.reason !== 'review-loop')
       if (changes >= (config?.reviewLoopLimit ?? 3)) attention.push({ seat: entry.name, reason: 'review-loop', detail: reviewLoopText(entry.name, changes), at: control.at })
-      return { ...entry, owes: 'none', reviewChanges: changes, attention }
+      // The planner's verdict starts a new round for Drove's own checks too (DROVE-126).
+      const { autoCheckAttempts: _, ...rest } = entry
+      return { ...rest, owes: 'none', reviewChanges: changes, attention }
     }) }))
   }
   const label = request.kind === 'verdict' ? `verdict ${request.verdict}` : request.kind
@@ -1615,7 +1621,11 @@ const gatherAttention = async (deps: Deps, run: RunMeta): Promise<AttentionItem[
     current = await loadRoster(deps.home, run.id)
   }
   const owing = current.seats.filter(seat => seat.state !== 'closed' && seat.owes !== 'none')
-  const reports = (await Promise.all(owing.map(seat => seatReports(deps, run, seat.name)))).flatMap(list => list.at(-1) ?? [])
+  const folded = await readFolded(deps.home, run.id)
+  const reports = (await Promise.all(owing.map(seat => seatReports(deps, run, seat.name)))).flatMap(list => {
+    const last = list.at(-1)
+    return last && !folded.suppressed.has(last.id) ? [releasedForm(last, folded)] : []
+  })
   const statuses = await Promise.all(openSeats(current).map(async seat => [seat.name, await readJson<OrchModStatus>(join(seatDir(deps.home, run.id, seat.name), 'mod.json')).catch(() => undefined)] as const))
   const status = Object.fromEntries(statuses.filter((entry): entry is readonly [string, OrchModStatus] => entry[1] !== undefined))
   const probed = run.status === 'up' ? await plannerStateOf(deps, run) : undefined
@@ -1718,9 +1728,18 @@ const seatReports = async (deps: Deps, run: RunMeta, seat: string): Promise<Repo
   const token = await readToken(join(dir, 'token'))
   if (!token) return []
   const { items } = await readJsonlFrom<Partial<Report> | null>(join(dir, 'outbox.jsonl'), { offset: 0 })
-  return items.filter((item): item is Report =>
-    item?.v === 1 && item.run === run.id && item.seat === seat && item.token === token && typeof item.id === 'string' && typeof item.summary === 'string' && item.kind !== 'progress' && REPORT_KINDS.includes(item.kind as Report['kind']),
-  )
+  return items
+    .filter((item): item is Report =>
+      item?.v === 1 && item.run === run.id && item.seat === seat && item.token === token && typeof item.id === 'string' && typeof item.summary === 'string' && item.kind !== 'progress' && REPORT_KINDS.includes(item.kind as Report['kind']),
+    )
+    // `autocheck` is Drove's own line: it comes from the ledger (releasedForm), never from the worker's outbox.
+    .map(({ autocheck: _, ...own }) => own)
+}
+
+// A report as the planner may read it (DROVE-126): carrying Drove's line from the ledger when the report was released with one.
+const releasedForm = (report: Report, folded: Folded): Report => {
+  const note = folded.notes.get(report.id)
+  return note ? { ...report, autocheck: note } : report
 }
 
 export const reports = async (deps: Deps, identity: Identity, ref: RunRef, request: ReportsRequest): Promise<CommandResult> => {
@@ -1732,7 +1751,12 @@ export const reports = async (deps: Deps, identity: Identity, ref: RunRef, reque
   const roster = await loadRoster(deps.home, run.id)
   if (request.seat && !findSeat(roster, request.seat)) return failed('no-seat', `no seat named ${request.seat}`)
   const seats = request.seat ? [request.seat] : roster.seats.map(seat => seat.name)
-  const all = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().sort((a, b) => a.at.localeCompare(b.at))
+  // The outbox has no steering line (DROVE-127): the watcher recorded it in the event log, by report id.
+  const notes = await steeringNotes(join(runDir(deps.home, run.id), 'events.jsonl'))
+  // A done report that Drove is still checking, or has sent back to the worker itself, is not the planner's to read (DROVE-126).
+  const folded = await readFolded(deps.home, run.id)
+  const filed = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().filter(report => !folded.suppressed.has(report.id)).sort((a, b) => a.at.localeCompare(b.at))
+  const all = filed.map(({ steering: _forged, ...report }): Report => releasedForm(notes.has(report.id) ? { ...report, steering: notes.get(report.id) as string } : report, folded))
   const read = new Set((await readJson<string[]>(readReportsPath(deps.home, run.id))) ?? [])
   const unread = all.filter(report => !read.has(report.id))
   const picked = request.all ? all : unread.length > 0 || !request.seat ? unread : all.slice(-1)
@@ -2105,7 +2129,32 @@ export const runReport = async (deps: Deps, ref: RunRef, asJson: boolean): Promi
   if ('error' in located) return located.error
   const built = await buildReport(deps, located.run.id, deps.claudeUserDir ?? userClaudeDir())
   if (!built) return failed('no-run', `no run named ${located.run.id}`)
-  return ok(asJson ? JSON.stringify(built, null, 2) : renderReport(built), built)
+  const pointer = asJson ? undefined : await diagnoseRun(deps, located.run.id).then(found => (found ? reportPointer(found) : undefined), () => undefined)
+  return ok(asJson ? JSON.stringify(built, null, 2) : `${renderReport(built)}${pointer ? `\n${pointer}` : ''}`, built)
+}
+
+// DROVE-131: why a run needed rework and where the fix belongs; read only, any status. The summary also goes to stderr (the CLI reads it from data).
+export const diagnose = async (deps: Deps, ref: RunRef, asJson: boolean): Promise<CommandResult> => {
+  const located = await locateRun(deps, ref)
+  if ('error' in located) return located.error
+  const found = await diagnoseRun(deps, located.run.id)
+  if (!found) return failed('no-run', `no run named ${located.run.id}`)
+  return ok(asJson ? JSON.stringify(found.findings, null, 2) : renderDiagnosis(found), found)
+}
+
+export const runTrace = async (deps: Deps, ref: RunRef, request: { asJson?: boolean; otlp?: string }): Promise<CommandResult> => {
+  const located = await locateRun(deps, ref)
+  if ('error' in located) return located.error
+  const trace = await buildTrace(deps, located.run.id, deps.claudeUserDir ?? userClaudeDir())
+  if (!trace) return failed('no-run', `no run named ${located.run.id}`)
+  if (request.otlp) {
+    try {
+      await postTrace(trace, request.otlp)
+    } catch (error) {
+      return failed('otlp-export', String(error))
+    }
+  }
+  return ok(request.asJson ? JSON.stringify(trace, null, 2) : renderTrace(trace), trace)
 }
 
 // ---------- down / up ----------
@@ -2143,6 +2192,14 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
   await saveRun(deps.home, { ...run, status: 'down', tabId: undefined, workspace: undefined, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } })
   if (run.workspace) await herdr.run(deps.exec, herdr.workspaceCloseArgv(run.workspace))
   await recordEvent(deps, run.id, { type: 'run.down', data: { saved, unsaved } })
+  // Export only after down is persisted; a collector failure must never prevent shutdown.
+  try {
+    const endpoint = (await loadConfig(deps.home)).otlpEndpoint
+    if (endpoint) {
+      const trace = await buildTrace(deps, run.id, deps.claudeUserDir ?? userClaudeDir())
+      if (trace) await postTrace(trace, endpoint, 2_000)
+    }
+  } catch { /* best effort */ }
   const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString(), (await loadConfig(deps.home)).labInstance)
   return ok(
     [`Run ${run.id} is down: ${saved.length} seat(s) saved for resume${saved.length ? ` (${saved.join(', ')})` : ''}.`, ...(unsaved.length ? [`No session id for ${unsaved.join(', ')}: they cannot be resumed.`] : []), `Resume with \`drove up --run ${run.id}\`.`, ...(cairnNote ? [cairnNote] : [])].join(' '),

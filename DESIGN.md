@@ -38,7 +38,9 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove merge <seat> [--pr] [--squash] [--fresh] [-m MSG] [--no-checks] [--run ID]` | planner, human | Integrates a seat's branch behind the repo's checks (§6, Merge gate). Also the `merge` MCP tool and the mod's `merge_worker`; neither can pass `--no-checks`, which is the human's. |
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove attention [--run ID \| --all] [--json] [--follow]` | human, a poller | The things that wait on a person, as data: a dialog or approval, a report for the human, a refused 6th pane, a gone seat. One snapshot, or JSON lines of new and resolved items with `--follow` (§14). |
-| `drove report [<run>] [--json]` | anyone | Read-only run report (DROVE-106): per seat and in total, tokens (input, cache read, cache write, output) from the agent's own transcript, cost from a price table, wall time (spawn to close), time waiting on the human, rework (verdicts with changes, promotions, demotions, migrations, restarts) and guard denials (`deny`: per seat, in total and by rule, from the `guard.denied` events, §6). Also the `run_report` MCP tool, and the totals and per-seat lines `drove down` adds to the goal task's summary note. |
+| `drove report [<run>] [--json]` | anyone | Read-only run report (DROVE-106): per seat and in total, tokens (input, cache read, cache write, output) from the agent's own transcript, cost from a price table, wall time (spawn to close), time waiting on the human, rework (verdicts with changes, promotions, demotions, migrations, restarts) and guard denials (`deny`: per seat, in total and by rule, from the `guard.denied` events, §6) and steering nudges (`nudge`: per seat, in total and by rule, from the `steer.nudged` events, §6). Also the `run_report` MCP tool, and the totals and per-seat lines `drove down` adds to the goal task's summary note. |
+| `drove diagnose [<run>] [--json] [--run ID]` | anyone | Read-only (DROVE-131): deterministic detectors over the run's records say why it needed rework and where the fix belongs, one line per finding (§6, Diagnose). `drove report` ends with a pointer to it when a run has findings. |
+| `drove trace [<run>] [--json] [--otlp URL]` | human, CI | Exports a stable OpenTelemetry run → seat → attempt tree from the roster, events, transcripts and check ledger. Checks belong to the active attempt or seat, merge outcomes to the seat, guard/steering/attention items are span events. OTLP/HTTP uses `/v1/traces` and `OTEL_EXPORTER_OTLP_HEADERS`; optional `otlpEndpoint` config exports on `down` with a two-second HTTP bound, ignoring failures. Merge settlement events have no start timestamp, so their spans have zero duration. No planner tool. |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
 | `drove board [--once] [--web [--port N]]` | human | A live coloured board for a herdr pane, drawn from the orchestrator mod's board model (`mod/hooks/board.ts`) on the terminal's own background: the lead and what it owes, seats with state stripes, gauges and a spinner, and the timeline. It uses the alternate screen, redraws in place only while something moves, and fits the pane. `--once` or a non-TTY stdout prints a single frame; it has no colour escapes when piped or under `NO_COLOR`. `--web` serves the same model to a browser (see the web board below). |
@@ -345,6 +347,18 @@ The mod's `bashReason` regex-scans the whole raw command for `$(…)` and backti
 
 The guard cannot see a PR's base when a command names the PR by number (`gh pr view 12`), so the `production` rule covers only the branches named on the command line.
 
+**Stricter planner denials** (P2), beyond the table:
+
+- `eval`, `source` and `.` (they run text the guard cannot see)
+- `find` with `-exec`, `-delete` or `-fprint`
+- `xargs` with an unwrapped command
+- a command name taken from a variable or a substitution
+- an absolute-path script inside a writable root
+- a bare `> file` redirect
+- nesting deeper than 6 levels
+- `apply_patch` heredocs, checked against the writable roots
+- redirect targets containing `$` or a backtick
+
 **Reviewer seats** (DROVE-91). `Identity.seatRole` travels as `DROVE_SEAT_ROLE` (set for a reviewer or tester only; an unknown value is ignored, so a missing one is an implementer) and the hook puts it in `GuardInput.seatRole`. For `role: 'worker'` with `seatRole: 'reviewer'`, `decide` treats the call as read-only:
 
 - Edit tools are denied unless every path is scratch: outside the seat's own worktree and inside the temp directories (or Claude's per-project memory). A worktree that itself lives under `/tmp` is not scratch.
@@ -438,17 +452,49 @@ Until this, the planner merged after reading the diff and Drove had no say. Now 
 
 **`--no-checks`** skips the local checks (GitHub's checks still apply under `--pr`). It is the human's: the guard denies it to the planner, and the command refuses it when it runs inside a Drove session (`DROVE_RUN` set), so the human runs it from their own terminal with `--run ID`.
 
-Stricter planner denials added in P2:
+### Auto-check of a done report (DROVE-126)
 
-- `eval`, `source` and `.` (they run text the guard cannot see)
-- `find` with `-exec`, `-delete` or `-fprint`
-- `xargs` with an unwrapped command
-- a command name taken from a variable or a substitution
-- an absolute-path script inside a writable root
-- a bare `> file` redirect
-- nesting deeper than 6 levels
-- `apply_patch` heredocs, checked against the writable roots
-- redirect targets containing `$` or a backtick
+`src/autocheck.ts` holds the rules, `src/pending.ts` the planner's pending ledger and `src/watch.ts` the plumbing, so the CLI watcher and the mod bridge, which both ingest reports through `createWatcher`, do the same. In `ingest`, a `done` that expects `review` from a seat whose role is `implementer`, while `autoCheckSettings(home, repo)` has commands to run, is written to the pending ledger as `{ t: 'hold', report }` instead of `add`: it is on disk (a watcher that restarts finds it and checks again) and not in what the planner reads. So is every later non-progress report of a seat that has a held one, so the planner never reads a question before the done it follows; they are released after it, in order. `pump` runs after each ingest and starts a background job per seat that has held reports (one job per seat, `MAX_RUNNING` = 2 jobs in a run; the others wait for the next tick), so a tick never waits for a check. The job takes `<seat dir>/autocheck.lock` (`withLock`, giving up at once when it is taken: the MCP watcher and the mod's bridge can both run for one run, and the one that finds the seat taken leaves it to the other), reads the seat's held reports, calls `runChecks` with the auto plan, not `fresh` (a clean tree at a HEAD with passing records reuses them), and then, if the batch is still held:
+
+- *passed*: `autocheck.passed`, the seat's `autoCheckAttempts` cleared, and each held report appended as `add`, the done ones with `autocheck: "Drove ran <commands> at <sha7>: passed (clean|dirty)"`. `renderReport` prints the field after the criteria.
+- *failed, attempts below the limit*: `autoCheckAttempts` is incremented, `autocheck.failed` is recorded with `sentBack: true`, and a verdict `changes` with the failing command, exit code and tail goes through `deliverControl` (its id is `c-autocheck-<report id>`, so a restart does not send it twice). The `control.sent` event is what `drove report` counts as rework; `reviewChanges` (the DROVE-120 review-loop count) is the planner's `send` alone. The bounced reports are acked: the planner never sees them. The reports held behind them are released. The control's `from` stays `planner` (the MAC and the worker's reply line are unchanged); the body says it is Drove's. Once the verdict is out, a later error is recorded as an `attention` event (`reason: autocheck-error`) and never releases the report.
+- *failed at the limit*: `autocheck.failed` with `sentBack: false` and the reports appended as `add` with "Drove's checks failed N times: <command> exited <code> ... Last output:" and the tail. The count is reset, so the report's next failure starts a new round.
+- *could not run* (the worktree is gone, the repository unreadable), a verdict that could not be sent, or a seat that is `gone` or `down` (its last done must reach the planner): the report is released with a line saying so, so a broken check never strands a report. A seat the planner closed (`closing`, `closed`) has its held reports dropped, as an unacked report of a closed seat is.
+
+The count (`autoCheckAttempts`) is cleared by a pass, by the limit, and by the planner's own `send` of a verdict to the seat. A worker's outbox cannot write `autocheck`: the scan and `read_reports` strip it from a report.
+
+*What the planner reads.* The ledger is the single answer: a report is the planner's once it has an `add` line, whichever way it arrives (the wake, the piggyback, `read_reports`). `src/pending.ts` `fold` gives the open, held and suppressed ids (held now, or held and sent back) and Drove's line for each released report, and `commands.reports` lists only what is not suppressed, with the line from the ledger, so a mod planner (whose wake shows the head and summary, and who reads the rest with `read_reports`) sees the same text. The R2 steering line (DROVE-127) is set at ingest, once, on the report that goes into the ledger as `hold` or `add`, so a released done carries it as well as the checks line; `read_reports` takes it from the `steer.nudged` event log by report id, and the checks line from the ledger, so both show. The pending ledger is `src/pending.ts`; `src/ledger.ts` is the seat tool ledger.
+
+### Steering (DROVE-127)
+
+Strands' steering handlers check an agent's tool ledger just in time instead of loading every rule into a long prompt. Drove's ledger is the seat's own transcript, which the watcher already knows the path of (the hook records' `transcript`, else the Claude project file of the seat's session, else the Codex rollout under the seat's `codexHome`).
+
+- **Ledger** (`src/ledger.ts`). One entry per tool call that has an answer: `{ at, tool, command?, paths?, ok }`, in the order the answers came, the last 400 kept. The transcript is read from a byte offset (`advanceLedger`), so a tick costs what the file grew by; a first read of a long transcript starts 4 MiB from its end, and a file that shrank starts over. Claude: an assistant `tool_use` block paired with the user line's `tool_result` (`is_error`); sidechain lines are skipped. Codex: `function_call` and `custom_tool_call` paired with their `*_output` by `call_id`; the exit code is `Process exited with code N` (exec_command), `Exit code: N`, or `metadata.exit_code` in JSON (shell, apply_patch), and a result with no code (still running) is not a failure. Codex's `exec` wrapper script (several tool calls in one) has no one command or exit code, so it is not in the ledger. An edit is `Edit`, `Write`, `MultiEdit`, `NotebookEdit` or `apply_patch` (the guard's `EDIT_TOOLS`).
+- **Cost** (`src/steer.ts`). The watcher's poll calls `steering.tick` for the open seats. Per seat it runs at most every 15 s and, when the transcript's `size:mtime` stamp (one stat, the `transcriptStamp` port) is the one it read last, does nothing else. With `steering.enabled: false` the tick returns before any stat or read, and a done report is not annotated.
+- **R1, repeated failure.** The trailing run of one shell command (`Bash`, `shell`, `exec_command`) failing. Commands are compared after trimming, collapsing whitespace and stripping `env -u NAME`, `env NAME=v` and `NAME=v` prefixes. Reads and other tool calls between two failures do not end the run; a success, a different shell command or an edit does (an edit changes what the next run is a result of). At `repeatFailures` (default 3) the worker is sent one `message` control, "Drove: `<cmd>` has failed N times with the same result. Change approach, or send a blocked or question report.", through the usual delivery (queued when its pane is blocked). Only a seat that is `working` and has not reported since its last failure is sent it, and a failure run is nudged once: another message needs a newer failure.
+- **R2, done without a check.** When a `done` report (expects not `none`, so not the confirmation after an approval) is ingested, the seat's ledger is brought up to date and looked at: the newest successful edit that is not scratch (`/tmp`, `~/.claude/projects`, `~/.drove`, `~/.codex`), and whether a shell command that is a check passed after it. A check command is one of the repo's check plan (`checksOf`, `src/checks.ts`; read once per run from the base repo), one of `steering.checkCommands`, or a usual one (npm/pnpm/yarn/bun `test`, `typecheck`, `lint`, `check`; `tsc`, `eslint`, `vitest`, `jest`, `node --test`, `pytest`, `cargo test`, `go test`, `make test` and so on), in any part of a line split at `&&`, `||`, `;` and `|`. If none passed, the report is stored in the pending ledger with `steering: "Drove: no check ran after the last edit (last edit <time>, last check <time or never>)"`, which `renderReport` prints before the next-step line, so both planners' wakes carry it; nothing is sent to the worker. A report a worker filed with its own `steering` field has it dropped, and `drove reports`, which reads the outbox, gets the line back from the `steer.nudged` event (`id` is the report's).
+- **Records.** Every nudge, R1 or R2, is one `steer.nudged` event: `seat`, `data: { seat, rule, detail }` and, for R2, the report's `id`. R1 nudges a seat at most once in `cooldownMinutes` (10). R2 has no cooldown: its line is evidence for the review of that one report, not a message to the worker, so every such done report carries it (one event each). `drove report` adds `nudges` and `nudgesByRule` per seat and in total. The worker role names the message in one line.
+- No model decides anything here: the rules are the ledger and the config.
+
+### Diagnose (DROVE-131)
+
+`drove diagnose [<run>]` (`src/diagnose.ts`) reads `events.jsonl`, the roster, `checks.jsonl`, each seat's `brief.md` and `outbox.jsonl`, and applies the detectors below. They are deterministic: no model call and no network; the only outside read is `git diff --name-only` on seat branches still present, for `merge-conflict`. It prints one line per finding, `category · seat · confidence · evidence · suggested fix (where: brief | role text | config | repo | planning | Drove)`, then a blank line and a one-line summary. The summary also goes to stderr; a run with no findings prints `no findings` and exits 0. `--json` prints the findings as an array (`category`, `seat`, `confidence`, `evidence`, `fix: { where, text }`, and `with` for the other seats of a conflict). `high` means the evidence is the failure itself (a count of denials, a verdict, a refusal); `medium` means a link in the chain is inferred.
+
+| Category | Evidence | Fix (where) | Confidence |
+|---|---|---|---|
+| `scope-too-narrow` | `guard.denied` with rule `owns`, and a `seat.owns` that widens (`add`, or a `set` that adds globs) | brief: give the mirror paths with the owned file (`mod/types/index.d.ts` with `src/types.ts`) | high with both, medium with one |
+| `checks-failed-at-done` | a `done` report, then a failing `checks.ran`, an `autocheck.failed` or a `merge.refused` with `checks-failed` | config: `autoChecks`, or the role text | high; medium when only a PR refusal shows it |
+| `review-loop` | at least 2 `control.sent` verdicts `changes`, with each verdict's first notes line (kept in the event's `notes` since DROVE-131) | brief: criteria missing or too vague | high |
+| `no-acceptance` | a seat with no criteria (roster, `## Acceptance` in its brief, or a report stamped with a count) and at least 1 `changes` | brief: spawn with `--acceptance` | high |
+| `merge-conflict` | `merge.refused` with `merge-conflict` or `pr-conflicts`, and the other seats whose branch touched the same files (a branch already merged is read from its first-parent merge commit) | planning: split the files between seats | high with an overlapping seat, medium without |
+| `ci-only-failure` | `merge.refused` with `checks-failed` and a PR URL, while the seat's last `checks.ran` (without one, its ledger records at one sha) passed | repo: a test depends on the environment | medium; high when the refusal carries the checked sha |
+| `brief-not-delivered` | `control.failed`, `seat.start_failed`, an `attention` `stalled` for `agent_prompt_stalled` or `pending-delivery`, a spawn with a start timeout, a brief `control.sent` with `unconfirmed` | Drove | high; medium for an unconfirmed send |
+| `budget-hit` | `attention` `budget` or `run-budget` | config: raise the limit or split the task | high |
+| `usage-limit` | `attention` `usage-limit` | config: wait for the reset or migrate | high |
+| `guard-thrash` | `attention` `guard-thrash` | brief: say what the seat may not do | high |
+| `steering` | `steer.nudged` events (DROVE-127), one finding per rule: R1 repeated failure, R2 done without a check | R1: role text or brief; R2: config (`autoChecks`) or role text | high |
+
+A PR refusal that a passing local run explains is `ci-only-failure` and not also `checks-failed-at-done`.
 
 ## 7. State detection
 

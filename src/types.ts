@@ -49,9 +49,17 @@ export type DroveConfig = {
   workerUserHooks?: boolean
   maxTurns?: number
   reviewLoopLimit?: number
+  otlpEndpoint?: string
   runMaxCost?: number
   // One seat's denials of one rule that make the planner hear of it (defaults 3 in 10 minutes).
   guardThrash?: { count: number; minutes: number }
+  // Steering from the seat's tool ledger (DROVE-127): on unless `enabled` is false; `repeatFailures` of one command in a row
+  // (default 3), one R1 message per seat in `cooldownMinutes` (10), and `checkCommands` beyond the repo's own.
+  steering?: { enabled?: boolean; repeatFailures?: number; cooldownMinutes?: number; checkCommands?: string[] }
+  // DROVE-126: false stops Drove checking an implementer's done report before the planner is woken; the failures it sends
+  // back itself before it wakes the planner with them (default 2). `.drove.json` can say both for one repo.
+  autoCheck?: boolean
+  autoCheckAttempts?: number
 }
 
 export type PlannerMeta = {
@@ -138,6 +146,8 @@ export type Seat = {
   lastSentAt?: string
   gate?: MergeGate
   checks?: SeatChecks
+  // Failed auto-checks of its done reports since its last pass (DROVE-126).
+  autoCheckAttempts?: number
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
@@ -166,6 +176,10 @@ export type Report = {
   details?: string
   criteria?: Criterion[]
   acceptance?: number
+  // A line Drove added to the planner's rendering of the report (DROVE-127). Never from the worker: the watcher sets it.
+  steering?: string
+  // Set by Drove, never by a worker (the watcher strips it from an outbox): what its own checks said of this done report.
+  autocheck?: string
   at: string
 }
 
@@ -226,6 +240,9 @@ export type DroveEventType =
   | 'merge.refused'
   | 'merge.pending'
   | 'checks.ran'
+  | 'steer.nudged'
+  | 'autocheck.passed'
+  | 'autocheck.failed'
 
 export type DroveEvent = {
   at: string

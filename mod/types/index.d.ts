@@ -97,6 +97,8 @@ export type Seat = {
   lastSentAt?: string
   gate?: MergeGate
   checks?: SeatChecks
+  // Failed auto-checks of its done reports since its last pass (DROVE-126).
+  autoCheckAttempts?: number
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
@@ -136,6 +138,9 @@ export type DroveEventType =
   | 'merge.refused'
   | 'merge.pending'
   | 'checks.ran'
+  | 'steer.nudged'
+  | 'autocheck.passed'
+  | 'autocheck.failed'
 
 export type DroveEvent = {
   at: string
