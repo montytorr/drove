@@ -241,7 +241,22 @@ const trimsOf = ($: EngineInterface): Promise<LeanSpawnTrims> => {
       mcp, plugins, ...(skills.length > 0 ? { skills } : {}), ...(agents.length > 0 ? { agents } : {}), ...(codexMcp ? { codexMcp } : {}),
     }
   })()
-  return leanTrims
+  return leanTrims.then(async trims => ({ ...trims, ...await freshPolicy($) }))
+}
+
+const freshPolicy = async ($: EngineInterface): Promise<Pick<LeanSpawnTrims, 'spawnPolicy' | 'spawnPolicyText'>> => {
+  const state = await read($, orchestratorAtom)
+  if (!state) return {}
+  try {
+    const ran = await plannerRun($, ['policy', '--run', state.run, '--json'])
+    if (ran.exitCode !== 0) throw new Error(ran.stderr || ran.stdout)
+    const result = JSON.parse(ran.stdout) as { policy?: unknown; text?: unknown }
+    return { spawnPolicy: result.policy, spawnPolicyText: typeof result.text === 'string' ? result.text : 'Spawn policy errors: malformed policy response' }
+  } catch (error) { return { spawnPolicyText: `Spawn policy errors: ${messageOf(error)}` } }
+}
+const policyControls = async ($: EngineInterface, key: string): Promise<boolean> => {
+  const policy = (await freshPolicy($)).spawnPolicy
+  return !!policy && typeof policy === 'object' && key in policy
 }
 
 const entryOf = ($: EngineInterface): string => drove.entryOf($.plugin.root, config.droveEntry)
@@ -549,7 +564,7 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const asked = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
   const shownModel = kind === 'claude' ? resolveModel(input.model, config.workerModel) : modelLabelOf('codex', asked ?? '', lastRun?.agents)
   // With no kind given, drove spawn picks the kind and resolves the model, so only the human-given model goes along.
-  const model = given === undefined ? asked : kind === 'claude' ? shownModel : asked
+  const model = await policyControls($, 'model') ? asked : given === undefined ? asked : kind === 'claude' ? shownModel : asked
   if (!(await herdrPane($))) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
   const mcp = Array.isArray(input.mcp) ? input.mcp.filter((entry): entry is string => typeof entry === 'string') : undefined
   const plugins = Array.isArray(input.plugins) ? input.plugins.filter((entry): entry is string => typeof entry === 'string') : undefined
@@ -561,15 +576,18 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   if (input.role !== undefined && input.role !== 'implementer' && input.role !== 'reviewer' && input.role !== 'tester') return { deny: 'role must be implementer, reviewer or tester.' }
   const role: SeatRole = input.role === 'reviewer' || input.role === 'tester' ? input.role : 'implementer'
   const target = typeof input.target === 'string' ? input.target.trim() : ''
-  if (role !== 'implementer' && !target) return { deny: `A ${role} needs target: the worker it ${role === 'reviewer' ? 'reviews' : 'tests'}.` }
-  if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
+  const rolePolicy = await policyControls($, 'role')
+  if (!rolePolicy && role !== 'implementer' && !target) return { deny: `A ${role} needs target: the worker it ${role === 'reviewer' ? 'reviews' : 'tests'}.` }
+  if (!rolePolicy && role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
   if (input.acceptance !== undefined && (!Array.isArray(input.acceptance) || input.acceptance.some(entry => typeof entry !== 'string' || !entry.trim()))) return { deny: '--acceptance takes non-empty statements, one per criterion' }
   const acceptance = input.acceptance as string[] | undefined
   const maxMinutes = typeof input.maxMinutes === 'number' ? input.maxMinutes : undefined
   const maxCost = typeof input.maxCost === 'number' ? input.maxCost : undefined
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, ...(given ? { kind: given } : {}), effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}), ...(maxMinutes !== undefined ? { maxMinutes } : {}), ...(maxCost !== undefined ? { maxCost } : {}) })
+  const args = drove.spawnArgs({ name, ...(given ? { kind: given } : {}), effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(rolePolicy ? { ...(input.role !== undefined ? { role } : {}), ...(target ? { target } : {}) } : role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}), ...(maxMinutes !== undefined ? { maxMinutes } : {}), ...(maxCost !== undefined ? { maxCost } : {}) })
+  if (rolePolicy && input.role === 'implementer') args.push('--role', 'implementer')
+  if (await policyControls($, 'effort') && input.effort === undefined) args.splice(args.indexOf('--effort'), 2)
   const label = `${kind === 'codex' ? `Codex${shownModel ? ` ${shownModel}` : ''}` : shortModel(shownModel)} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
@@ -631,7 +649,7 @@ const moveWorker = async ($: EngineInterface, input: Record<string, unknown>, di
   const seat = findSeat(await read($, seatsAtom), name)
   if (!seat) return { deny: `No open worker is named ${name}.` }
   const given = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
-  const model = seat.kind === 'claude' ? (direction === 'promote' ? resolveModel(given, config.promotedModel) : config.workerModel) : (given ?? (seat.model || undefined))
+  const model = await policyControls($, 'model') ? given : seat.kind === 'claude' ? (direction === 'promote' ? resolveModel(given, config.promotedModel) : config.workerModel) : (given ?? (seat.model || undefined))
   const modelName = model ? shortModel(model) : 'current model'
   const effort = isEffort(input.effort) ? input.effort : direction === 'promote' ? 'high' : config.workerEffort
   const reason = String(input.reason ?? '').trim()
@@ -653,7 +671,7 @@ const migrateWorker = async ($: EngineInterface, input: Record<string, unknown>)
   if (!kind) return { deny: 'kind must be claude or codex.' }
   if (kind === seat.kind) return { deny: `${name} is already a ${kind} worker; use promote_worker or demote_worker to change its model or effort.` }
   const given = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
-  const model = kind === 'claude' ? resolveModel(given, config.workerModel) : given
+  const model = await policyControls($, 'model') ? given : kind === 'claude' ? resolveModel(given, config.workerModel) : given
   const effort = isEffort(input.effort) ? input.effort : undefined
   const reason = String(input.reason ?? '').trim()
   pushBody(`${name}:migrate`, `${kind}${model ? ` ${shortModel(model)}` : ''}${reason ? `: ${reason}` : ''}`)

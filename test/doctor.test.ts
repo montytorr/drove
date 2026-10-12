@@ -133,7 +133,7 @@ test("the mod's nodePath is checked only when the mod is installed", async () =>
   assert.equal(statusOf((await runDoctor(depsWith())).checks, 'mod-node'), undefined)
   const settings = (nodePath?: string) =>
     JSON.stringify({ enabledPlugins: { 'orchestrator@drove': true }, pluginConfigs: { 'orchestrator@drove': { options: nodePath ? { nodePath } : {} } } })
-  const withMod = (text: string, exec: Record<string, ExecResult>) => runDoctor(depsWith(exec, { claudeSettings: '/s', readText: async () => text }))
+  const withMod = (text: string, exec: Record<string, ExecResult>) => runDoctor(depsWith(exec, { claudeSettings: '/s', readText: async path => path === '/s' ? text : undefined }))
   assert.equal(statusOf((await withMod(settings(), { 'node --version': OK('v22.18.0') })).checks, 'mod-node'), 'ok')
   assert.equal(statusOf((await withMod(settings('/opt/node'), { '/opt/node --version': OK('v20.1.0') })).checks, 'mod-node'), 'fail')
   const broken = await withMod('{not json', {})
@@ -158,4 +158,14 @@ test('drove doctor --json prints one report and exits 1 exactly when it did not 
   const report = JSON.parse(out.join('\n')) as { ok: boolean; checks: unknown[] }
   assert.equal(code, report.ok ? 0 : 1)
   assert.ok(report.checks.length > 0)
+})
+
+test('spawn policy is checked at the git root and rejects empty choices from a subdirectory', async () => {
+  const report = await runDoctor(depsWith({ 'git rev-parse --show-toplevel': OK('/repo\n') }, {
+    cwd: '/repo/subdir',
+    exec: async argv => argv.includes('--show-toplevel') ? OK('/repo\n') : depsWith().exec(argv),
+    readText: async path => path === '/repo/.drove.json' ? JSON.stringify({ spawnPolicy: { model: { choice: [] } } }) : undefined,
+  }))
+  const policy = report.checks.find(item => item.id === 'spawn-policy')
+  assert.equal(policy?.status, 'fail'); assert.match(policy!.detail, /non-empty/)
 })
