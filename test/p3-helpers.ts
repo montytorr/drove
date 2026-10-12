@@ -34,7 +34,7 @@ const UNSAFE_AGENT_ARG = /[\u0000-\u001f\u007f]/
 
 export type FakeAgent = { name: string; paneId: string; tabId: string; status: HerdrStatus; sessionId?: string; kind?: string }
 
-export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number; startLeavesAgent?: boolean; promptTimesOut?: boolean }
+export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean | string; paneReadFails?: string; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number; startLeavesAgent?: boolean; promptTimesOut?: boolean }
 
 export class FakeHerdr {
   calls: string[][] = []
@@ -51,7 +51,8 @@ export class FakeHerdr {
   promptTimesOut = false
   queueFails = false
   onStart: ((name: string) => Promise<void>) | undefined
-  agentReadFails = false
+  agentReadFails: boolean | string = false
+  paneReadFails = ''
   paneCwds = new Map<string, string>()
   claudeWorktrees: { path: string; branch: string }[] = []
   claudeWorktreeFrom = 'HEAD'
@@ -66,6 +67,7 @@ export class FakeHerdr {
     this.startLeavesAgent = options.startLeavesAgent ?? false
     this.promptTimesOut = options.promptTimesOut ?? false
     this.agentReadFails = options.agentReadFails ?? false
+    this.paneReadFails = options.paneReadFails ?? ''
   }
 
   exec: Exec = async argv => {
@@ -147,7 +149,7 @@ export class FakeHerdr {
       for (const [name, agent] of this.agents) if (agent.paneId === paneId) this.agents.delete(name)
       return this.json({ result: {} })
     }
-    if (action === 'read') return this.json({ result: { text: this.screen } })
+    if (action === 'read') return this.paneReadFails ? herdrFail(this.paneReadFails) : this.json({ result: { text: this.screen } })
     return herdrFail('unknown_command')
   }
 
@@ -170,7 +172,7 @@ export class FakeHerdr {
       const agent = this.lookup(target)
       return agent ? this.json({ result: { agent: this.wire(agent) } }) : herdrFail('agent_not_found')
     }
-    if (action === 'read') return this.agentReadFails ? herdrFail('agent_not_found') : this.json({ result: { text: this.screen } })
+    if (action === 'read') return this.agentReadFails ? herdrFail(typeof this.agentReadFails === 'string' ? this.agentReadFails : 'agent_not_found') : this.json({ result: { text: this.screen } })
     if (action === 'start') return this.start(argv)
     if (action === 'prompt') {
       const agent = this.lookup(target)

@@ -1630,7 +1630,9 @@ export const capture = async (deps: Deps, ref: RunRef, seatName: string, lines: 
   if ('error' in located) return located.error
   const seat = findSeat(await loadRoster(deps.home, located.run.id), seatName)
   if (!seat) return failed('no-seat', `no seat named ${seatName}`)
-  const screen = await herdr.readScreen(deps.exec, herdr.agentTarget(located.run.id, seat), Number.isFinite(lines) && lines > 0 ? lines : 80)
+  const count = Number.isFinite(lines) && lines > 0 ? lines : 80
+  const byAgent = await herdr.readScreen(deps.exec, herdr.agentTarget(located.run.id, seat), count)
+  const screen = byAgent.ok || !seat.paneId ? byAgent : await herdr.readPane(deps.exec, seat.paneId, count)
   return screen.ok ? ok(screen.value) : failed('herdr', `could not read ${seat.name}: ${screen.code}`)
 }
 

@@ -1153,6 +1153,33 @@ test('capture reads the seat through herdr', async () => {
   assert.ok(fake.calls.some(call => call[2] === 'read' && call[3] === 'w1:p1'))
 })
 
+test('capture falls back to the pane read while the agent read refuses', async () => {
+  const fake = new FakeHerdr({ screen: 'busy lines', agentReadFails: 'agent_not_idle' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const captured = await commands.capture(deps, { run: RUN, repo: '/nowhere' }, 'w-api', 20)
+  assert.deepEqual([captured.ok, captured.text], [true, 'busy lines'])
+  assert.ok(fake.find('herdr', 'pane', 'read', 'w1:p1'))
+})
+
+test('capture names the pane read code when both reads fail', async () => {
+  const fake = new FakeHerdr({ agentReadFails: 'agent_not_idle', paneReadFails: 'pane_not_found' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const captured = await commands.capture(deps, { run: RUN, repo: '/nowhere' }, 'w-api', 20)
+  assert.equal(captured.ok, false)
+  assert.match(captured.text, /could not read w-api: pane_not_found/)
+})
+
+test('capture does not read the pane when the agent read succeeds', async () => {
+  const fake = new FakeHerdr({ screen: 'fine' })
+  const { deps, identity } = await setup(fake)
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  const before = fake.calls.length
+  await commands.capture(deps, { run: RUN, repo: '/nowhere' }, 'w-api', 20)
+  assert.equal(fake.calls.slice(before).some(call => call[1] === 'pane' && call[2] === 'read'), false)
+})
+
 test('goal sets and replaces the run goal, records goal.set and takes a Cairn ref', async () => {
   const { deps } = await setup()
   const first = await commands.setGoal(deps, { run: RUN, repo: '/x' }, { goal: '  Work\nDROVE-86  ' })
