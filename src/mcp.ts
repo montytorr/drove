@@ -145,8 +145,8 @@ export const serveMcp = async (role: Role, input: NodeJS.ReadableStream = proces
 
   if (role === 'planner') {
     const toolPorts: ToolPorts = { ...defaultToolPorts, ...options.toolPorts, elicit }
-    tools = plannerTools(deps, identity, toolPorts)
     const run = await loadRun(deps.home, identity.run)
+    tools = plannerTools(deps, identity, toolPorts, run?.agents)
     if (!run) onError(new Error(`run ${identity.run} not found under ${deps.home}`), 'startup')
     else {
       const channel = options.channel ?? process.env.DROVE_CHANNEL === '1'

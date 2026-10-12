@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { PassThrough } from 'node:stream'
 import { handleMessage, notify, serveMcp, PROTOCOL_VERSION, SERVER_NAME } from '../src/mcp.ts'
+import { saveRun } from '../src/roster.ts'
 import type { McpTool } from '../src/types.ts'
 import { fakePorts, setup } from './p4-helpers.ts'
 
@@ -81,5 +82,36 @@ test('serveMcp refuses to start without an identity', async () => {
     await assert.rejects(() => serveMcp('worker', new PassThrough(), new PassThrough()), /DROVE_RUN/)
   } finally {
     Object.assign(process.env, saved)
+  }
+})
+
+
+test('CLI planner tools/list names the detected Codex model and retains plain Codex without a run', async () => {
+  for (const found of [true, false]) {
+    const ctx = await setup()
+    await saveRun(ctx.home, { ...ctx.run, agents: { at: ctx.run.createdAt, codex: { version: '1.2.3', model: 'gpt-6.1-sol' } } })
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const chunks: string[] = []
+    const errors: string[] = []
+    output.on('data', chunk => chunks.push(String(chunk)))
+    const served = serveMcp('planner', input, output, {
+      identity: { home: ctx.home, run: found ? ctx.run.id : 'missing', role: 'planner', seat: 'planner' },
+      deps: ctx.deps, watchPorts: fakePorts().ports, loop: false,
+      onError: (error) => errors.push(String(error)),
+    })
+    input.end(`${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' })}\n`)
+    await served
+    const listed = (JSON.parse(chunks.join('')) as { result: { tools: McpTool[] } }).result.tools
+    for (const name of ['spawn', 'migrate']) {
+      const tool = listed.find(tool => tool.name === name)
+      assert.ok(tool)
+      if (found) assert.match(tool.description, /Codex \(gpt-6\.1-sol\)/)
+      else {
+        assert.match(tool.description, /Codex/)
+        assert.doesNotMatch(tool.description, /gpt-6\.1-sol/)
+      }
+    }
+    assert.equal(errors.length, found ? 0 : 1)
   }
 })

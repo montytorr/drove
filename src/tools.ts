@@ -1,10 +1,11 @@
 import { join } from 'node:path'
+import { modelLabelOf } from './agents.ts'
 import * as commands from './commands.ts'
 import * as paths from './paths.ts'
 import * as protocol from './protocol.ts'
 import * as roster from './roster.ts'
 import * as store from './store.ts'
-import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
+import type { AgentKind, CommandResult, Deps, Effort, HostAgents, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
 export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'roster', 'capture', 'set_goal', 'set_owns', 'run_report', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
@@ -125,7 +126,9 @@ const defineTool = (name: string, description: string, properties: Record<string
 const seatProp = { type: 'string', description: 'Seat name, e.g. w-api. Run roster to see the seats of this run.' }
 const expectsProp = { type: 'string', enum: EXPECTS, description: 'What you expect back from the worker: review (a done report with the diff ready), answer (a reply) or none.' }
 
-export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = defaultToolPorts): McpTool[] => {
+export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = defaultToolPorts, agents?: HostAgents): McpTool[] => {
+  const model = modelLabelOf('codex', '', agents)
+  const codex = model ? `Codex (${model})` : 'Codex'
   const cmd = ports.commands
   const ref = async () => {
     const run = await ports.loadRun(deps.home, identity.run)
@@ -149,7 +152,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
   return [
     defineTool(
       'spawn',
-      'Start a worker: a Claude worker gets Claude\'s own worktree (branch worktree-SEAT) and a Codex worker a Drove worktree (branch drove/SEAT); kind is optional, and left out it follows the workerKind setting (see "Claude or Codex for a worker" in your instructions for when to pick which); opens a pane in the run tab and launches the agent with your brief. Give each worker one Cairn ref and a self-contained brief (files it owns, acceptance, what to verify). Returns at once with the seat running. Do NOT wait, poll or sleep afterwards: the worker\'s report is delivered to you as a message (or at the end of your next tool result). Spawn the next independent worker, or end your turn.',
+      `Start a worker: a Claude worker gets Claude's own worktree (branch worktree-SEAT) and a ${codex} worker a Drove worktree (branch drove/SEAT); kind is optional, and left out it follows the workerKind setting (see "Claude or Codex for a worker" in your instructions for when to pick which); opens a pane in the run tab and launches the agent with your brief. Give each worker one Cairn ref and a self-contained brief (files it owns, acceptance, what to verify). Returns at once with the seat running. Do NOT wait, poll or sleep afterwards: the worker's report is delivered to you as a message (or at the end of your next tool result). Spawn the next independent worker, or end your turn.`,
       {
         seat: { type: 'string', description: 'New seat name: lowercase letters, digits, - and _, starting with a letter, up to 32 characters (e.g. w-api).' },
         kind: { type: 'string', enum: KINDS, description: 'Optional: claude or codex. Left out, the workerKind setting decides; the rules for choosing are in your instructions.' },
@@ -262,7 +265,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
     ),
     defineTool(
       'migrate',
-      'Move a worker to the other agent kind (Claude to Codex, or Codex to Claude), usually because it hit its usage limit. The seat keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost. When to move a seat, and to which kind, is in "Claude or Codex for a worker" in your instructions.',
+      `Move a worker to the other agent kind (Claude to ${codex}, or Codex to Claude), usually because it hit its usage limit. The seat keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost. When to move a seat, and to which kind, is in "Claude or Codex for a worker" in your instructions.`,
       {
         seat: seatProp,
         kind: { type: 'string', enum: KINDS, description: 'The kind to move to.' },

@@ -5,6 +5,7 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 ## [Unreleased]
 
 - Ctrl-C, SIGTERM and SIGHUP clean up running commands' process groups before the CLI exits, including descendants that ignore SIGTERM; long-lived processes retain control through their own signal handlers (DROVE-145).
+- Carry Cairn `kind:codex` / `kind:claude` labels into planner goals with host availability hints; name `workerKind` when its configured agent is absent, and show the detected Codex model in CLI planner tool descriptions (DROVE-129).
 
 ## [0.5.0] - 2026-10-12
 
