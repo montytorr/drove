@@ -1,6 +1,8 @@
 import { access, constants, readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { toplevel } from './git.ts'
+import { loadPolicy } from './policy.ts'
 import { probeServer } from './herdr.ts'
 import { detectAgents, nodeAgentDeps } from './agents.ts'
 import { userCodexHome } from './paths.ts'
@@ -177,7 +179,9 @@ export const runDoctor = async (deps: DoctorDeps): Promise<DoctorReport> => {
   const [git, herdr, agents, gh, cairn, home, mod] = await Promise.all([
     checkGit(deps), checkHerdr(deps), checkAgents(deps), checkGh(deps), checkCairn(deps), checkHome(deps), checkMod(deps),
   ])
-  const checks = [checkNode(deps), ...git, ...herdr, ...agents, gh, cairn, home, ...(mod ? [mod] : [])]
+  const root = await toplevel(deps.exec, deps.cwd) ?? deps.cwd
+  const policy = await loadPolicy(deps.home, root, deps.readText)
+  const checks = [check('spawn-policy', policy.errors.length ? 'fail' : 'ok', policy.errors.length ? policy.errors.join('; ') : 'spawn policy valid'), checkNode(deps), ...git, ...herdr, ...agents, gh, cairn, home, ...(mod ? [mod] : [])]
   return { ok: checks.every(item => item.status !== 'fail'), checks }
 }
 

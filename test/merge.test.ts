@@ -479,3 +479,34 @@ test('a merge for a seat that is not in the roster is refused without touching a
   const refused = await w.merge({ seat: 'w-nope' })
   assert.equal(refused.ok === false && refused.code, 'no-seat')
 })
+
+test('local and PR merges refuse branches that change spawnPolicy', async () => {
+  for (const pr of [false, true]) {
+    const w = await world({ remote: pr })
+    await writeFile(join(w.worktree, '.drove.json'), JSON.stringify({ checks: ['test -f feature.txt'], spawnPolicy: { model: { choice: ['opus'] } } }))
+    await git(w.worktree, 'add', '.drove.json'); await git(w.worktree, 'commit', '-qm', 'change policy')
+    const result = await commands.merge(w.deps, w.planner, { run: RUN, repo: w.repo }, { seat: 'w-api', pr })
+    assert.equal(result.ok, false); assert.equal(!result.ok && result.code, 'policy-change'); assert.match(result.text, /human must merge/)
+    assert.equal(w.fake.pushes.length, 0); assert.equal(w.fake.calls.length, 0)
+  }
+})
+
+test('merge rechecks the exact commit if policy changes after preflight', async () => {
+  for (const pr of [false, true]) {
+    const w = await world({ remote: pr, workflows: pr })
+    const exec = w.deps.exec
+    let changed = false
+    w.deps.exec = async (argv, options) => {
+      const result = await exec(argv, options)
+      if (!changed && argv[0] === 'git' && argv.includes('--name-only') && argv.some(arg => arg.endsWith('...worktree-w-api'))) {
+        changed = true
+        await writeFile(join(w.worktree, '.drove.json'), JSON.stringify({ checks: ['test -f feature.txt'], spawnPolicy: { model: { choice: ['opus'] } } }))
+        await git(w.worktree, 'add', '.drove.json'); await git(w.worktree, 'commit', '-qm', 'policy after preflight')
+      }
+      return result
+    }
+    const result = await w.merge({ pr })
+    assert.equal(result.ok, false); assert.equal(!result.ok && result.code, 'policy-change'); assert.match(result.text, /human must merge/)
+    assert.equal(w.fake.pushes.length, 0)
+  }
+})

@@ -24,8 +24,14 @@ export type Identity = {
   seatRole?: SeatRole
 }
 
+export type SpawnPolicyKey = 'kind' | 'model' | 'effort' | 'mcp' | 'plugins' | 'skills' | 'agents' | 'userMemory' | 'userHooks' | 'owns' | 'maxTurns' | 'maxTokens' | 'maxMinutes' | 'maxCost' | 'role' | 'bound'
+export type SpawnPolicyRule = { fixed?: unknown; choice?: unknown[]; required?: true; max?: number }
+export type SpawnPolicy = Partial<Record<SpawnPolicyKey, SpawnPolicyRule>>
+
 export type DroveConfig = {
   humanName: string
+  spawnPolicy?: SpawnPolicy
+  spawnPolicyErrors?: string[]
   plannerModel: Record<AgentKind, string>
   plannerEffort: Effort
   workerModel: Record<AgentKind, string>

@@ -54,6 +54,10 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 
 Not in v1: a queue command (Cairn is the queue), workflows, snapshots beyond session ids, `send-keys`.
 
+### Spawn policy (DROVE-128)
+
+`src/policy.ts` reads `spawnPolicy` from the Drove home’s `config.json` and `.drove.json` at the committed `run.base` (via git). It validates and combines per-setting fixed, choice, required and numeric max rules: choice intersections, smaller maxima, required from either source, and conflicting fixed values rejected. Combined rules retain every constraint. Choices must be non-empty, including intersections. Constraints check effective defaults; fixed values replace defaults while conflicting explicit requests are refused. Claude model aliases are normalized on both sides; Codex policy comparisons remain literal. List choices constrain each entry. The pseudo-setting `bound.required` requires at least one explicit or fixed seat limit. Invalid policies fail closed with code `policy`, and doctor reports their errors. Spawn checks all settings, promote/demote and migrate check model/effort (migrate also kind), and owns checks the resulting list. Once policy names `mcp`, `plugins`, `skills` or `agents`, their effective seat lists replace run-wide trims rather than adding those trims; missing lists use the configured default or none and are checked. `up` preflights stored seats again. Local and PR merges reject a branch diff changing `spawnPolicy` with `policy-change` and direct it to a human. `drove policy --json` supplies both planner texts with the same merged policy and errors from the committed base; the mod refreshes it on each action. Doctor reads the working repo policy at the git root. Policy-controlled Codex skills, memory and hooks also shape its shared `CODEX_HOME`, so restrictive rules apply there as well. Both planner role texts show the constraints before delegation.
+
 ## 2. State layout and identity
 
 ```

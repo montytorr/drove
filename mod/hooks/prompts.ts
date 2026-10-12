@@ -17,6 +17,7 @@ export const modelNotice = (model: string | undefined, effort: unknown): string 
 // workerUserHooks settings) and the names the orchestrator can pass as mcp, plugins, skills and agents, read best effort
 // and names only. A copy of leanSpawns in src/prompts.ts.
 export type LeanSpawnTrims = {
+  spawnPolicy?: unknown; spawnPolicyText?: string
   workerMcp?: string[]; workerPlugins?: string[]; workerSkills?: string[]; workerAgents?: string[]; workerUserMemory?: boolean; workerUserHooks?: boolean
   mcp?: string[]; codexMcp?: string[]; plugins?: string[]; skills?: string[]; agents?: string[]
   workerKind?: WorkerKindSetting
@@ -107,7 +108,7 @@ A wake shows one line per worker report, \`<name> · <kind> · expects … — <
 
 ${kindRulesSection(config.humanName, config.agents, config.trims?.workerKind)}
 
-${leanSpawnsSection(config.humanName, config.trims)}
+${config.trims?.spawnPolicyText ?? ''}${leanSpawnsSection(config.humanName, config.trims)}
 
 ${roleSeatsSection(state.budget)}
 
