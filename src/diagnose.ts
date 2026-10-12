@@ -273,11 +273,11 @@ const delivery = (seat: SeatRecords): Finding[] => {
     if (type === 'control.failed' || type === 'seat.start_failed') return true
     if (type === 'attention') return event.data?.reason === 'pending-delivery' || (event.data?.reason === 'stalled' && reason.includes('prompt_stalled'))
     if (type === 'seat.spawn') return event.data?.startTimeout === true || typeof event.data?.startError === 'string'
-    return type === 'control.sent' && event.data?.kind === 'brief' && event.data?.unconfirmed === true
+    return type === 'control.sent' && event.data?.kind === 'brief' && (event.data?.unconfirmed === true || event.data?.submitted === true)
   })
   if (stalls.length === 0) return []
   const sure = stalls.some(event => kindOf(event) === 'control.failed' || kindOf(event) === 'seat.start_failed' || text(event.data?.detail).includes('prompt_stalled'))
-  const why = uniq(stalls.map(event => firstLine(text(event.data?.reason) || text(event.data?.detail) || text(event.data?.startError) || (kindOf(event) === 'control.sent' ? 'brief sent but not confirmed' : kindOf(event)), 80)))
+  const why = uniq(stalls.map(event => firstLine(text(event.data?.reason) || text(event.data?.detail) || text(event.data?.startError) || (kindOf(event) === 'control.sent' ? (event.data?.submitted === true ? 'brief stalled unsubmitted, Drove pressed Enter' : 'brief sent but not confirmed') : kindOf(event)), 80)))
   return [{
     category: 'brief-not-delivered',
     seat: seat.name,
