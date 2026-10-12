@@ -250,6 +250,7 @@ type World = {
   isOverBudget: boolean
   runGoal?: string
   isGuardBroken: boolean
+  isSpawnCwdGone?: boolean
   bridge: { push: (text: string | null) => void }
   bridgeCode: number
   store: Map<string, unknown>
@@ -305,6 +306,7 @@ const fakeDrove = (world: World, call: Call) => {
   if (command === 'mod' && action === 'report') return ok(JSON.stringify({ ok: true, text: 'report r-1 recorded (done, expects review).' }))
   if (command === 'guard') {
     if (world.isGuardBroken) return ok('', 127, 'env: node: No such file or directory')
+    if (world.isSpawnCwdGone) return ok('', -1, "drove-unavailable: $.process.run(node) failed to start: ENOENT posix_spawn 'node'")
     const input = JSON.parse(call.stdin ?? '{}') as { tool_name?: string; tool_input?: { command?: string; file_path?: string } }
     const command = input.tool_input?.command ?? ''
     const path = input.tool_input?.file_path ?? ''
@@ -710,6 +712,39 @@ describe('orchestrator session', () => {
     await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })
     expect(droveCalls(world, 'close')[0]?.args).toEqual(['close', 'w-auth', '--remove-worktree'])
     expect(String((await callTool($, 'roster', {})).result)).toContain('w-auth working')
+  })
+
+  test('close_worker with remove_worktree refuses while the planner stands inside that worktree', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    world.cwd = '/work/repo/.claude/worktrees/w-auth/src'
+    const refused = denial((await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })) as never)
+    expect(refused).toContain('cd to the repo (/work/repo)')
+    expect(droveCalls(world, 'close')).toHaveLength(0)
+    expect(denial((await callTool($, 'close_worker', { name: 'w-auth' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'close')[0]?.args).toEqual(['close', 'w-auth'])
+    world.cwd = '/work/repo/.claude/worktrees/w-auth-2'
+    expect(denial((await callTool($, 'close_worker', { name: 'w-auth', remove_worktree: true })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'close')[1]?.args).toEqual(['close', 'w-auth', '--remove-worktree'])
+  })
+
+  test('the guard spawns in the repo when the session cwd is gone, and names the missing directory when even that fails', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    world.cwd = '/work/repo/.claude/worktrees/w-gone'
+    expect(denial(await $.tool.call({ tool: 'Bash', command: 'npm test' } as never))).toContain('npm test')
+    expect(denial(await $.tool.call({ tool: 'Bash', command: 'ls' } as never))).toBeUndefined()
+    const guard = droveCalls(world, 'guard').at(-1)
+    expect(guard?.cwd).toBe('/work/repo')
+    expect(JSON.parse(guard?.stdin ?? '{}')).toMatchObject({ cwd: '/work/repo/.claude/worktrees/w-gone' })
+    world.isSpawnCwdGone = true
+    const gone = denial(await $.tool.call({ tool: 'Bash', command: 'ls' } as never))
+    expect(gone).toContain('/work/repo/.claude/worktrees/w-gone no longer exists')
+    expect(gone).toContain('cd back to the repo (/work/repo)')
   })
 
   test('migrate_worker is drove migrate to the other kind, and refuses the same kind', async ($, on) => {

@@ -107,6 +107,22 @@ test('agentName stays within herdr\'s name rule for a long seat and keeps long s
   assert.ok(first.endsWith('-87d7'))
 })
 
+test('close with removeWorktree refuses before closing anything when the caller stands in that worktree', async () => {
+  const fake = new FakeHerdr()
+  const deps = await makeDeps(fake)
+  const seat = makeSeat('w-api', { state: 'working' })
+  await seedRun(deps, await makeRepo(), [seat])
+  fake.agents.set('w-api', { name: 'w-api', paneId: seat.paneId ?? '', tabId: 'w1:t1', status: 'idle' })
+  const identity = plannerOf(deps, RUN)
+  const refused = await commands.close(deps, identity, 'w-api', true, join(seat.worktree, 'src'))
+  assert.equal(!refused.ok && refused.code, 'cwd-in-worktree')
+  assert.match(refused.text, /cd to the repo/)
+  assert.equal(fake.agents.size, 1)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'working')
+  const kept = await commands.close(deps, identity, 'w-api', false, join(seat.worktree, 'src'))
+  assert.equal(kept.ok, true, kept.text)
+})
+
 test('agentTarget uses the pane id when the seat has one, which also reaches a bare-named agent', () => {
   assert.equal(herdr.agentTarget('drove-20261010-1934-87d7', { name: 'w-core', paneId: 'w1:p4' }), 'w1:p4')
   assert.equal(herdr.agentTarget('drove-20261010-1934-87d7', { name: 'w-core' }), 'w-core-87d7')
