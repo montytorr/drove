@@ -39,8 +39,9 @@ test('spawn opens the tab at the repo root, then starts the agent, which creates
   assert.equal(spawned.ok, true, spawned.text)
   const order = fake.calls.map(call => (call[0] === 'git' ? 'git' : call.slice(1, 3).join(' ')))
   assert.ok(order.indexOf('tab create') < order.indexOf('agent start'))
-  assert.ok(order.indexOf('agent start') < order.indexOf('git'))
   const worktree = join(repo, '.claude', 'worktrees', 'w-api')
+  // Committed policy reads precede launch; worktree inspection waits for Claude to create it.
+  assert.ok(fake.calls.findIndex(call => call[0] === 'git' && call.includes(worktree)) > fake.calls.findIndex(call => call[1] === 'agent' && call[2] === 'start'))
   assert.ok(existsSync(worktree))
   assert.equal(await git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD'), 'worktree-w-api')
   assert.equal(await git(repo, 'for-each-ref', '--format=%(upstream:short)', 'refs/heads/worktree-w-api'), '')

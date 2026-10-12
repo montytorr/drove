@@ -396,6 +396,16 @@ export const COMMANDS: Record<string, Spec> = {
       return print(await commands.setGoal(commands.defaultDeps(), ref, { goal, cairn: str(values, 'cairn') }), io)
     },
   },
+  policy: {
+    usage: 'drove policy [--run ID] [--json]',
+    why: 'read the merged spawn policy and its errors from the committed run base',
+    options: { run: { type: 'string' }, json: { type: 'boolean' } },
+    run: async (values, _positionals, io) => {
+      const result = await commands.readSpawnPolicy(commands.defaultDeps(), { run: str(values, 'run') ?? process.env[ENV.run], repo: process.cwd() })
+      if (result.ok && values.json === true) { io.out(JSON.stringify(result.data)); return 0 }
+      return printMachine(result, io, values.json === true)
+    },
+  },
   doctor: {
     usage: 'drove doctor [--json]',
     why: 'check what this machine needs to run Drove (read-only): Node, git, herdr and its server, claude or codex, gh, cairn, DROVE_HOME; exits 1 when a check fails',

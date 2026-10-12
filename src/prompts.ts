@@ -1,3 +1,4 @@
+import { policyText } from './policy.ts'
 import { shortModel } from './roster.ts'
 import type { AgentKind, DroveConfig, HostAgents, RunMeta, SeatRole } from './types.ts'
 
@@ -81,7 +82,7 @@ Give a long or risky seat a bound with \`maxMinutes\` or \`maxCost\`.
 
 ${kindRules({ human, planner: kind, agents: run.agents, workerKind: config.workerKind, spawn: 'the drove spawn tool', migrate: 'the drove migrate tool moves' })}
 
-${leanSpawns(human, config, available)}
+${policyText(config.spawnPolicy, config.spawnPolicyErrors)}${leanSpawns(human, config, available)}
 
 ${roleSeats(run.budget)}
 

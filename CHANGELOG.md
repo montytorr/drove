@@ -4,6 +4,10 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+### Seat limits and policy
+- New `spawnPolicy` in `~/.drove/config.json` and the repo's committed `.drove.json` (DROVE-128): `fixed`, `choice`, `required` and `max` rules limit the settings the planner may give a worker. When both files set a rule, the narrower one wins. Both planners show the merged policy and any policy errors before spawning.
+- The CLI enforces the policy on spawn, promote and demote (`model` and `effort`), migrate (`kind`), `drove owns` and seats relaunched by `drove up`, including the defaults each seat would use. Refusals have code `policy`; local and `--pr` merges that change `spawnPolicy` have code `policy-change` and require a human merge. `drove doctor` checks unknown keys, wrong types, empty choices, fixed values outside choices and maximums on non-number settings.
+
 ## [0.4.0] - 2026-10-12
 
 Drove becomes a small software factory: a merge gate that runs your checks before a worker's branch lands, reviewer and tester seats beside the implementers, and unattended runs that a job such as Bothy can start and watch. Workers also get more isolation (ports, env, copied files), a report of what a run cost, and runs that start from a Lab subject.

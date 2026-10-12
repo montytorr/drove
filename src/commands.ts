@@ -16,6 +16,7 @@ import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './is
 import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeAgents, readClaudeMcp, readClaudePlugins, readClaudeSettings, readClaudeSkills, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
+import { enforcePolicy, loadPolicy, policyChange, policyText } from './policy.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { diagnoseRun, renderDiagnosis, reportPointer } from './diagnose.ts'
 import { buildTrace, postTrace, renderTrace } from './trace.ts'
@@ -113,7 +114,7 @@ const portsOf = (value: unknown): DroveConfig['workerPorts'] => {
   return typeof base === 'number' && typeof stride === 'number' && Number.isInteger(base) && Number.isInteger(stride) && base >= 1 && base <= 65535 && stride >= 1 ? { base, stride } : undefined
 }
 
-export const loadConfig = async (home: string): Promise<DroveConfig> => {
+export const loadConfig = async (home: string, repo?: string, source?: { exec: Exec; base: string }): Promise<DroveConfig> => {
   const { workerKind, workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, reviewLoopLimit, runMaxCost, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const ports = portsOf(workerPorts)
   const copy = namesOf(workerCopy)
@@ -125,6 +126,7 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
     ...DEFAULT_CONFIG,
     ...file,
     workerKind: workerKind === 'claude' || workerKind === 'codex' ? workerKind : 'auto',
+    ...(repo ? await configPolicy(home, repo, source, file) : {}),
     ...(ports ? { workerPorts: ports } : {}),
     ...(copy && copy.length > 0 ? { workerCopy: copy } : {}),
     ...(mcp ? { workerMcp: mcp } : {}),
@@ -144,6 +146,31 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
   }
 }
 
+const configPolicy = async (home: string, repo: string, source: { exec: Exec; base: string } | undefined, file: Partial<DroveConfig>): Promise<Pick<DroveConfig, 'spawnPolicy' | 'spawnPolicyErrors'>> => {
+  const raw = await loadPolicy(home, repo, source)
+  const kind = raw.kind ?? 'claude'
+  const normalize = (key: string, value: unknown): unknown => key === 'model' && typeof value === 'string' ? kind === 'codex' ? value : resolveModel(kind, value, { ...DEFAULT_CONFIG, ...file, workerModel: { ...DEFAULT_CONFIG.workerModel, ...file.workerModel }, promotedModel: { ...DEFAULT_CONFIG.promotedModel, ...file.promotedModel } }) : value
+  const loaded = await loadPolicy(home, repo, { ...source, normalize })
+  return { spawnPolicy: loaded.policy, spawnPolicyErrors: loaded.errors }
+}
+
+const workerDefaults = (config: DroveConfig, kind: AgentKind): Partial<SpawnRequest> => ({
+  kind, model: resolveModel(kind, undefined, config), effort: config.workerEffort, role: 'implementer',
+  maxTurns: config.maxTurns, mcp: config.workerMcp, plugins: config.workerPlugins, skills: config.workerSkills, agents: config.workerAgents,
+  userMemory: config.workerUserMemory ?? true, userHooks: config.workerUserHooks ?? true,
+})
+const workerPolicy = async <T extends object>(deps: Deps, run: RunMeta, config: DroveConfig, kind: AgentKind, request: T, defaults: object, keys?: Parameters<typeof enforcePolicy>[3]): Promise<{ request: T } | { error: CommandResult }> => {
+  const normalize = (key: string, value: unknown): unknown => key === 'model' && typeof value === 'string' ? kind === 'claude' ? resolveModel(kind, value, config) : value || modelLabelOf(kind, '', run.agents) : value
+  return enforcePolicy(deps.home, run.repo, request, keys, { exec: deps.exec, base: run.base, defaults, normalize })
+}
+
+export const readSpawnPolicy = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
+  const located = await locateRun(deps, ref)
+  if ('error' in located) return located.error
+  const config = await loadConfig(deps.home, located.run.repo, { exec: deps.exec, base: located.run.base })
+  return ok(policyText(config.spawnPolicy, config.spawnPolicyErrors), { policy: config.spawnPolicy ?? {}, errors: config.spawnPolicyErrors ?? [], text: policyText(config.spawnPolicy, config.spawnPolicyErrors) })
+}
+
 // Owned globs are relative to the worktree; a leading ./ and duplicates mean nothing, and none at all means no limit.
 const ownsOf = (value: readonly string[] | undefined): string[] | undefined => {
   const globs = [...new Set((value ?? []).map(glob => glob.trim().replace(/^(\.\/)+/, '')).filter(Boolean))]
@@ -155,6 +182,7 @@ const isBadOwnsGlob = (glob: string): boolean => glob.startsWith('/') || glob.st
 const resolveModel = (kind: AgentKind, value: string | undefined, config: DroveConfig): string => {
   const requested = value?.trim()
   if (!requested) return config.workerModel[kind]
+  if (kind === 'codex') return requested
   const alias = requested.toLowerCase()
   if (alias === 'opus') return config.promotedModel[kind]
   if (alias === 'sonnet') return config.workerModel[kind]
@@ -263,20 +291,24 @@ const codexHomeOf = async (deps: Deps, seat: Seat): Promise<Pick<CodexLaunchRequ
   seat.kind === 'codex' && seat.codexHome ? { codexHome: await readCodexHome(seat.codexHome, deps.codexUserHome ?? userCodexHome(deps.home)) } : {}
 
 // No allowlist anywhere keeps the user's whole MCP setup (DROVE-72); workerMcp or a seat's --mcp makes the seat lean:
-// Drove's server plus the union of both lists.
+// Drove's server plus the union of both lists. Policy-controlled lists replace the run defaults.
 const seatMcpAllow = (config: DroveConfig, seat: Pick<Seat, 'mcp'>): string[] | undefined =>
+  config.spawnPolicy?.mcp ? seat.mcp ?? [] :
   config.workerMcp === undefined && seat.mcp === undefined ? undefined : [...new Set([...(config.workerMcp ?? []), ...(seat.mcp ?? [])])]
 
 // The same rule for plugins (DROVE-89): workerPlugins or a seat's --plugins makes a Claude seat plugin-lean, Drove's own
 // mod aside, and the seat's list adds to the run's.
 const seatPluginAllow = (config: DroveConfig, seat: Pick<Seat, 'plugins'>): string[] | undefined =>
+  config.spawnPolicy?.plugins ? seat.plugins ?? [] :
   config.workerPlugins === undefined && seat.plugins === undefined ? undefined : [...new Set([...(config.workerPlugins ?? []), ...(seat.plugins ?? [])])]
 
 // The same rule for skills and agents (DROVE-98): the run's list plus the seat's, a list on the seat alone makes it lean.
 const seatSkillAllow = (config: DroveConfig, seat: Pick<Seat, 'skills'>): string[] | undefined =>
+  config.spawnPolicy?.skills ? seat.skills ?? [] :
   config.workerSkills === undefined && seat.skills === undefined ? undefined : [...new Set([...(config.workerSkills ?? []), ...(seat.skills ?? [])])]
 
 const seatAgentAllow = (config: DroveConfig, seat: Pick<Seat, 'agents'>): string[] | undefined =>
+  config.spawnPolicy?.agents ? seat.agents ?? [] :
   config.workerAgents === undefined && seat.agents === undefined ? undefined : [...new Set([...(config.workerAgents ?? []), ...(seat.agents ?? [])])]
 
 // A seat's own userMemory wins over workerUserMemory; a Codex seat cannot use it (see below).
@@ -289,8 +321,8 @@ type LaunchExtras = { parts: Partial<CodexLaunchRequest>; missing: string[]; unk
 
 // Codex's CODEX_HOME is shared by every seat of a run and Codex reads the user's AGENTS.md from it with no per-launch
 // way to skip it (probed in rust-v0.162.0: project_doc_* only gates the repo's own AGENTS.md). So a Codex seat follows
-// workerUserMemory alone, and a seat's plugins and userMemory options are Claude-only. The same goes for workerUserHooks:
-// the shared home's hooks.json is one file, so a Codex seat follows the run's setting (DROVE-98).
+// workerUserMemory alone unless policy controls it; ordinary seat options remain Claude-only. The same goes for workerUserHooks:
+// the shared home's hooks.json is one file. Policy-controlled skills, memory and hooks shape that home for all Codex seats.
 const trimExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat): Promise<LaunchExtras> => {
   const mcpAllow = seatMcpAllow(config, seat)
   if (seat.kind === 'claude') {
@@ -323,14 +355,17 @@ const trimExtrasOf = async (deps: Deps, run: RunMeta, config: DroveConfig, seat:
   }
   const { codexHome } = await codexHomeOf(deps, seat)
   const known = codexHome ? codexMcpNames(codexHome.userConfig) : []
+  const skillAllow = config.spawnPolicy?.skills ? seat.skills ?? [] : config.workerSkills
+  const memoryOff = config.spawnPolicy?.userMemory ? seat.userMemory === false : config.workerUserMemory === false
+  const hooksOff = config.spawnPolicy?.userHooks ? seat.userHooks === false : config.workerUserHooks === false
   return {
     parts: {
       ...(codexHome ? { codexHome } : {}),
       ...(mcpAllow ? { mcpAllow } : {}),
       ...(config.workerMcp ? { homeMcpAllow: config.workerMcp } : {}),
-      ...(config.workerSkills ? { skillAllow: config.workerSkills } : {}),
-      ...(config.workerUserMemory === false ? { userMemory: false } : {}),
-      ...(config.workerUserHooks === false ? { userHooks: false } : {}),
+      ...(skillAllow ? { skillAllow } : {}),
+      ...(memoryOff ? { userMemory: false } : {}),
+      ...(hooksOff ? { userHooks: false } : {}),
     },
     missing: codexHome && mcpAllow ? mcpAllow.filter(name => name !== 'drove' && !known.includes(name)) : [],
     unknownPlugins: [],
@@ -379,11 +414,11 @@ const missingMcpNote = (seat: Seat, missing: readonly string[]): string[] =>
 const unknownPluginsNote = (seat: Seat, unknown: readonly string[]): string[] =>
   unknown.length > 0 ? [`Plugin${unknown.length > 1 ? 's' : ''} ${unknown.join(', ')} ${unknown.length > 1 ? 'are' : 'is'} not enabled in the user's Claude settings, so ${seat.name} runs without ${unknown.length > 1 ? 'them' : 'it'}.`] : []
 
-// plugins, skills, agents, userMemory and userHooks shape a Claude seat's settings only; saying so beats a silent no-op.
-const claudeOnlyNote = (seat: Seat): string[] => {
+// Ordinary per-seat trims are Claude-only; policy controls the supported shared Codex trims too.
+const claudeOnlyNote = (config: DroveConfig, seat: Seat): string[] => {
   const given = [
-    seat.plugins !== undefined ? 'plugins' : '', seat.skills !== undefined ? 'skills' : '', seat.agents !== undefined ? 'agents' : '',
-    seat.userMemory !== undefined ? 'userMemory' : '', seat.userHooks !== undefined ? 'userHooks' : '',
+    seat.plugins !== undefined ? 'plugins' : '', seat.skills !== undefined && !config.spawnPolicy?.skills ? 'skills' : '', seat.agents !== undefined ? 'agents' : '',
+    seat.userMemory !== undefined && !config.spawnPolicy?.userMemory ? 'userMemory' : '', seat.userHooks !== undefined && !config.spawnPolicy?.userHooks ? 'userHooks' : '',
   ].filter(Boolean)
   if (seat.kind !== 'codex' || given.length === 0) return []
   const listed = given.length > 1 ? `${given.slice(0, -1).join(', ')} and ${given.at(-1)}` : given.join('')
@@ -696,7 +731,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   }
   const repo = await git.toplevel(deps.exec, request.repo)
   if (!repo) return failed('not-a-repo', `${request.repo} is not inside a git repository`)
-  const config = await loadConfig(deps.home)
+  const config = await loadConfig(deps.home, repo)
   const now = deps.clock.now()
   const kind = request.kind
   if (kind !== 'claude' && kind !== 'codex') return failed('usage', '--kind must be claude or codex')
@@ -747,7 +782,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     deps,
     {
       identity, kind, repo, cwd: repo, model, effort,
-      roleText: plannerRole(run, config, kind, await availableTrimsOf(deps, run)),
+      roleText: plannerRole(run, await loadConfig(deps.home, repo, { exec: deps.exec, base: run.base }), kind, await availableTrimsOf(deps, run)),
       initialPrompt: typedPrompt === undefined ? prompt : undefined,
       channel: kind === 'claude' && config.claudeChannel,
       ...(sessionId ? { sessionId } : {}),
@@ -873,6 +908,16 @@ const heldByAnotherRun = async (deps: Deps, run: RunMeta, seat: Pick<Seat, 'name
 export const spawn = async (deps: Deps, identity: Identity, request: SpawnRequest): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
   if (denied) return denied
+  const located = await locateFor(deps, identity, 'up')
+  const config = await loadConfig(deps.home)
+  const defaultKind = config.workerKind === 'claude' || config.workerKind === 'codex' ? config.workerKind : 'error' in located || hasAgent(located.run, 'claude') ? 'claude' : 'codex'
+  const declared = 'error' in located ? {} : (await loadPolicy(deps.home, located.run.repo, { exec: deps.exec, base: located.run.base })).policy
+  const fixedKind = declared.kind?.fixed
+  const policyRole = request.role ?? declared.role?.fixed
+  const policyKind = request.kind ?? (fixedKind === 'claude' || fixedKind === 'codex' ? fixedKind : defaultKind)
+  const policy = 'error' in located ? { request } : await workerPolicy(deps, located.run, config, policyKind, request, { ...workerDefaults(config, policyKind), owns: policyRole === 'tester' ? [...TESTER_OWNS] : undefined })
+  if ('error' in policy) return policy.error
+  request = policy.request
   if (!SEAT_RE.test(request.seat) || request.seat === PLANNER_SEAT) return failed('usage', `seat names must match ${SEAT_RE} and not be "planner"; got "${request.seat}"`)
   if (request.kind !== undefined && request.kind !== 'claude' && request.kind !== 'codex') return failed('usage', '--kind must be claude or codex')
   if (request.cairn && !CAIRN_RE.test(request.cairn)) return failed('usage', `--cairn must look like DROVE-5; got "${request.cairn}"`)
@@ -894,7 +939,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (!isReview && request.target) return failed('usage', '--target applies to a reviewer or tester seat; give --role reviewer or --role tester')
   if (request.target && (!SEAT_RE.test(request.target) || request.target === PLANNER_SEAT || request.target === request.seat)) return failed('usage', `--target must name another seat of this run; got "${request.target}"`)
   if (role === 'reviewer' && ownsOf(request.owns)) return failed('usage', 'a reviewer is read-only, so --owns does not apply to it')
-  const owns = ownsOf(request.owns) ?? (role === 'tester' ? [...TESTER_OWNS] : undefined)
+  const owns = ownsOf(request.owns) ?? (role === 'tester' && !declared.owns ? [...TESTER_OWNS] : undefined)
   const badOwns = owns?.find(isBadOwnsGlob)
   if (badOwns !== undefined) return failed('usage', `--owns takes globs relative to the worktree, without .. or a leading / or ~; got "${badOwns}"`)
   for (const [flag, value] of [['--max-minutes', request.maxMinutes], ['--max-cost', request.maxCost]] as const) {
@@ -906,11 +951,10 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (!brief) return failed('usage', 'a worker needs a brief')
   if (request.acceptance?.some(item => typeof item !== 'string' || !item.trim())) return failed('usage', '--acceptance takes non-empty statements, one per criterion')
   const given = request.acceptance?.map(item => item.trim()).filter(Boolean)
-  const located = await locateFor(deps, identity, 'up')
   if ('error' in located) return located.error
   const { run } = located
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
-  const config = await loadConfig(deps.home)
+  Object.assign(config, await configPolicy(deps.home, run.repo, { exec: deps.exec, base: run.base }, config))
   const kind = request.kind ?? (config.workerKind === 'claude' || config.workerKind === 'codex'
     ? config.workerKind
     : hasAgent(run, 'claude') ? 'claude' : hasAgent(run, 'codex') ? 'codex' : undefined)
@@ -1048,7 +1092,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   await saveBrief(deps, run.id, seat.name, briefText)
   const extras = await launchExtrasOf(deps, run, config, seat)
   if (extras.unknownPlaceholders.length > 0) baseNotes.push(`workerEnv has placeholders Drove does not know, left as written: ${extras.unknownPlaceholders.join(', ')}. Known: {seat}, {run}, {slot}${config.workerPorts ? ', {port}' : ' and {port} (set workerPorts)'}.`)
-  baseNotes.push(...missingMcpNote(seat, extras.missing), ...unknownPluginsNote(seat, extras.unknownPlugins), ...claudeOnlyNote(seat), ...userHooksNote(config, seat))
+  baseNotes.push(...missingMcpNote(seat, extras.missing), ...unknownPluginsNote(seat, extras.unknownPlugins), ...claudeOnlyNote(config, seat), ...userHooksNote(config, seat))
   const spec = specFor(
     launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: launchCwd, model, effort, roleText: seatRoleText(run, config, seat), initialPrompt, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
   )
@@ -1221,6 +1265,8 @@ export const setOwns = async (deps: Deps, identity: Identity, request: OwnsReque
   if (request.add && !seat.owns) return failed('usage', `${seat.name} has no owns, so it may already edit anywhere; use --set to limit it`)
   const previous = seat.owns
   const owns = request.add ? [...new Set([...(previous ?? []), ...globs])] : globs
+  const policy = await enforcePolicy(deps.home, run.repo, { owns }, ['owns'], { exec: deps.exec, base: run.base })
+  if ('error' in policy) return policy.error
   await updateRoster(deps.home, run.id, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? { ...entry, owns } : entry)) }))
   await recordEvent(deps, run.id, { type: 'seat.owns', seat: seat.name, data: { owns, ...(previous ? { previous } : {}), mode: request.add ? 'add' : 'set' } })
   const body = request.add
@@ -1282,9 +1328,12 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   const located = await locateFor(deps, identity)
   if ('error' in located) return located.error
   const { run } = located
-  const config = await loadConfig(deps.home)
+  const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
   const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
   if (!seat || ['closed', 'gone', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
+  const policy = await workerPolicy(deps, run, config, seat.kind, request, { model: !request.model?.trim() && seat.kind === 'codex' ? seat.model : resolveModel(seat.kind, undefined, config), effort: config.workerEffort }, ['model', 'effort'])
+  if ('error' in policy) return policy.error
+  request = policy.request
   const model = !request.model?.trim() && seat.kind === 'codex' ? seat.model : resolveModel(seat.kind, request.model, config)
   const change = { model, effort: request.effort }
   const control: Control = {
@@ -1447,11 +1496,14 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
   if ('error' in located) return located.error
   const { run } = located
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
-  const unavailable = requireAgent(run, request.kind)
-  if (unavailable) return unavailable
-  const config = await loadConfig(deps.home)
+  const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
   const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
   if (!seat || ['closed', 'closing', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
+  const policy = await workerPolicy(deps, run, config, request.kind, request, { model: resolveModel(request.kind, undefined, config), effort: seat.effort }, ['kind', 'model', 'effort'])
+  if ('error' in policy) return policy.error
+  request = policy.request
+  const unavailable = requireAgent(run, request.kind)
+  if (unavailable) return unavailable
   if (seat.kind === request.kind) return failed('usage', `${seat.name} is already a ${seat.kind} worker; use promote to change its model or effort`)
   if (!existsSync(seat.worktree)) return failed('no-worktree', `${seat.name}'s worktree ${seat.worktree} is missing, so there is nothing to hand over; close the seat and spawn a new worker`)
   const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
@@ -1493,7 +1545,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
     }
     const workerIdentity = identityOfSeat(deps, run, migrated, token)
     const extras = await launchExtrasOf(deps, run, config, migrated)
-    notes.push(...missingMcpNote(migrated, extras.missing), ...unknownPluginsNote(migrated, extras.unknownPlugins), ...claudeOnlyNote(migrated))
+    notes.push(...missingMcpNote(migrated, extras.missing), ...unknownPluginsNote(migrated, extras.unknownPlugins), ...claudeOnlyNote(config, migrated))
     const spec = specFor(
       launchRequest(deps, { identity: workerIdentity, kind, repo: run.repo, cwd: seat.worktree, model, effort, roleText: seatRoleText(run, config, migrated), inWorktree: true, ...(sessionId ? { sessionId } : {}), ...extras.parts }, config),
     )
@@ -1936,6 +1988,8 @@ export const merge = async (deps: Deps, identity: Identity, ref: RunRef, request
 
   if (seat.branch === base || seat.branch === git.PROTECTED_BRANCH) return refuse('bad-branch', `${seat.name}'s branch ${seat.branch} is the base or a protected branch, so there is nothing to merge`)
   if (!(await git.refExists(deps.exec, run.repo, `refs/heads/${seat.branch}`))) return refuse('no-branch', `branch ${seat.branch} does not exist in ${run.repo}`)
+  const changedPolicy = await policyChange(deps.exec, run.repo, run.base, seat.branch)
+  if (changedPolicy) return refuse('policy-change', changedPolicy)
   if (!existsSync(seat.worktree)) return refuse('no-worktree', `${seat.name}'s worktree ${seat.worktree} is gone, so its checks cannot run`)
   if (await git.isMerged(deps.exec, run.repo, seat.branch, base)) return ok(`${seat.branch} is already merged into ${base}; nothing to do. Close ${seat.name} with drove close.`, { status: 'merged', mode })
   const unsaved = await git.dirtyLines(deps.exec, seat.worktree)
@@ -1986,6 +2040,8 @@ const mergeLocal = async (
   if (failure) return failure
   // Merge the exact commit the checks vouched for (no checks, no pin: the human's --no-checks merges the branch).
   const target = plan.sha ?? seat.branch
+  const changedPolicy = await policyChange(deps.exec, run.repo, run.base, target)
+  if (changedPolicy) return refuse('policy-change', changedPolicy)
   const message = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, target)}`
   const merged = await git.mergeNoFf(deps.exec, run.repo, target, message)
   if (!merged.ok) return refuse('merge-conflict', `merge refused: ${seat.branch} does not merge cleanly into ${base} (the merge was aborted, ${base} is untouched): ${clip(merged.output, 400)}. Have the worker merge ${base} into its branch and resolve the conflicts.`)
@@ -2019,6 +2075,8 @@ const mergePr = async (
 
     // The pull request holds one exact commit: the one the checks ran at, else the branch's tip as it is now.
     pushedSha = plan.sha ?? (await git.branchTip(deps.exec, run.repo, seat.branch))
+    const changedPolicy = await policyChange(deps.exec, run.repo, run.base, pushedSha ?? seat.branch)
+    if (changedPolicy) return refuse('policy-change', changedPolicy)
     const pushed = await git.pushBranch(deps.exec, run.repo, REMOTE, seat.branch, pushedSha)
     if (pushed.code !== 0) return refuse('push-failed', `could not push ${seat.branch} to ${REMOTE}: ${clip(pushed.stderr || pushed.stdout)}`)
 
@@ -2315,8 +2373,16 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
   const located = seatName ? await locateRun(deps, ref, 'up') : await locateRun(deps, ref, 'down')
   if ('error' in located) return located.error
   let { run } = located
-  const config = await loadConfig(deps.home)
+  const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
   run = { ...run, agents: await detectRunAgents(deps) }
+  const checkedSeats: Seat[] = []
+  const stored = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state !== 'closed' && (!seatName || seat.name === seatName))
+  for (const seat of stored) {
+    const checked = await workerPolicy(deps, run, config, seat.kind, seat, workerDefaults(config, seat.kind))
+    if ('error' in checked) return failed('policy', `cannot relaunch ${seat.name}: ${checked.error.text}`)
+    checkedSeats.push(checked.request)
+  }
+  for (const seat of checkedSeats) await updateRoster(deps.home, run.id, roster => upsertSeat(roster, seat))
   await saveRun(deps.home, run)
 
   if (seatName) {

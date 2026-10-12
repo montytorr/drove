@@ -319,6 +319,13 @@ const ok = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, 
 
 const fakeDrove = (world: World, call: Call) => {
   const [command, action] = call.args
+  if (command === 'policy') {
+    const user = JSON.parse(world.files['/Users/test/.drove/config.json'] ?? '{}').spawnPolicy ?? {}
+    const repo = JSON.parse(world.files[`${call.cwd ?? '/work/repo'}/.drove.json`] ?? '{}').spawnPolicy ?? {}
+    const policy = { ...user, ...repo }
+    const text = Object.keys(policy).length ? `Spawn policy (enforced by Drove; user and committed repo constraints both apply):\n${JSON.stringify(policy)}\nChoices and maxima check effective defaults; fixed settings replace defaults. Required settings must be supplied. Refusals have code policy.\n` : ''
+    return ok(JSON.stringify({ policy, errors: [], text }))
+  }
   if (command === 'mod' && action === 'attach') {
     const at = call.args.indexOf('--goal')
     const budget = call.args.indexOf('--budget')
@@ -805,6 +812,45 @@ describe('orchestrator session', () => {
     expect(text).toContain('Agent types: ui-ux-designer, debugger.')
     expect(text).toContain('`userHooks: false`')
     expect(text).toContain('`mcp: ["claude-in-chrome"]`')
+  })
+
+  test('planner role shows spawn policy from user and repo configs', async ($, on) => {
+    const { world } = engine(on)
+    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ spawnPolicy: { model: { choice: ['sonnet'] } } })
+    world.files['/work/repo/.drove.json'] = JSON.stringify({ spawnPolicy: { mcp: { fixed: [] }, bound: { required: true } } })
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    const text = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections[1]?.text ?? ''
+    expect(text).toContain('Spawn policy')
+    expect(text).toContain('"model":{"choice":["sonnet"]}')
+    expect(text).toContain('"mcp":{"fixed":[]},"bound":{"required":true}')
+    expect(text).toContain('code policy')
+    await callTool($, 'spawn_worker', { name: 'w-policy', brief: 'Policy test', model: 'sonnet' })
+    const spawnCall = droveCalls(world, 'spawn').find(call => call.args.includes('w-policy'))
+    expect(spawnCall?.args).toContain('sonnet')
+    expect(spawnCall?.args).not.toContain('claude-sonnet-5-5')
+    world.files['/Users/test/.drove/config.json'] = '{}'
+    await callTool($, 'spawn_worker', { name: 'w-policy-fresh', kind: 'claude', brief: 'Fresh policy', model: 'sonnet' })
+    const fresh = droveCalls(world, 'spawn').find(call => call.args.includes('w-policy-fresh'))
+    expect(fresh?.args).toContain('claude-sonnet-5-5')
+  })
+
+  test('policy-controlled role and effort reach the CLI before mod defaults', async ($, on) => {
+    const { world } = engine(on)
+    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ spawnPolicy: { role: { fixed: 'reviewer' }, effort: { required: true } } })
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await callTool($, 'spawn_worker', { name: 'w-role-policy', brief: 'Review', target: 'w-auth' })
+    const args = droveCalls(world, 'spawn').find(call => call.args.includes('w-role-policy'))?.args ?? []
+    expect(args).toContain('--target')
+    expect(args).not.toContain('--role')
+    expect(args).not.toContain('--effort')
+    await callTool($, 'spawn_worker', { name: 'w-explicit-role', brief: 'Implement', role: 'implementer', effort: 'medium' })
+    const explicit = droveCalls(world, 'spawn').find(call => call.args.includes('w-explicit-role'))?.args ?? []
+    expect(explicit).toContain('--role')
+    expect(explicit).toContain('implementer')
+    expect(explicit).toContain('--effort')
   })
 
   test('a full pane budget asks the human; yes raises the budget by one and spawns, no refuses', async ($, on) => {
