@@ -129,7 +129,8 @@ test('drove guard with no Drove identity allows silently', async () => {
 test('drove plan prints the run line and hands the exec plan to the launcher, returning its exit code', async () => {
   process.env.HERDR_PANE_ID = 'w1:p5'
   const { out, launched, io } = capture()
-  assert.equal(await main(['plan', '--kind', 'codex', '--goal', 'Do the goal'], io), 7)
+  // In a repo of its own with a main branch: a CI checkout of a feature branch has no main, and drove plan needs a base.
+  assert.equal(await inDir(await makeRepo('plan-repo'), () => main(['plan', '--kind', 'codex', '--goal', 'Do the goal'], io)), 7)
   assert.match(out.join('\n'), /^Run .* is up; starting the codex planner\./)
   assert.equal(launched.length, 1)
   assert.equal(launched[0]?.argv[0], 'codex')
