@@ -16,7 +16,7 @@ import { ENV, identityFromEnv } from './paths.ts'
 import { CONTROL_KINDS } from './protocol.ts'
 import type { AgentKind, CommandResult, Effort, HookEventName, Role, SeatRole, SendRequest, SpawnRequest } from './types.ts'
 
-type Values = Record<string, string | boolean | undefined>
+type Values = Record<string, string | string[] | boolean | undefined>
 type Io = { out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number>; signal?: AbortSignal; pollMs?: number }
 type Handler = (values: Values, positionals: string[], io: Io) => Promise<number>
 type Spec = { usage: string; why: string; options?: ParseArgsConfig['options']; run: Handler }
@@ -68,6 +68,7 @@ export const spawnRequestOf = (values: Values, positionals: readonly string[], b
   target: str(values, 'target'),
   userHooks: onOff(values, 'user-hooks'),
   owns: str(values, 'owns') === undefined ? undefined : splitGlobs(str(values, 'owns') as string),
+  ...(Array.isArray(values.acceptance) ? { acceptance: values.acceptance } : {}),
   maxTurns: count(values, 'max-turns'),
   maxTokens: count(values, 'max-tokens'),
 })
@@ -156,9 +157,9 @@ export const COMMANDS: Record<string, Spec> = {
       print(await commands.initRepo(commands.defaultDeps(), need(positionals[0], '<dir>'), process.cwd(), values.json === true), io),
   },
   spawn: {
-    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on|off] [--user-hooks on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--max-turns N] [--max-tokens N]',
+    usage: 'drove spawn <seat> --kind claude|codex --cairn REF --brief TEXT|- [--model M] [--effort E] [--base BRANCH] [--mcp NAME,NAME] [--plugins NAME,NAME] [--skills NAME,NAME] [--agents NAME,NAME] [--user-memory on|off] [--user-hooks on|off] [--role implementer|reviewer|tester --target SEAT] [--owns GLOB,GLOB] [--acceptance TEXT ...] [--max-turns N] [--max-tokens N]',
     why: 'open a worker in its own worktree and pane, and brief it',
-    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, skills: { type: 'string' }, agents: { type: 'string' }, 'user-memory': { type: 'string' }, 'user-hooks': { type: 'string' }, role: { type: 'string' }, target: { type: 'string' }, owns: { type: 'string' }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
+    options: { kind: { type: 'string' }, cairn: { type: 'string' }, brief: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, base: { type: 'string' }, mcp: { type: 'string' }, plugins: { type: 'string' }, skills: { type: 'string' }, agents: { type: 'string' }, 'user-memory': { type: 'string' }, 'user-hooks': { type: 'string' }, role: { type: 'string' }, target: { type: 'string' }, owns: { type: 'string' }, acceptance: { type: 'string', multiple: true }, 'max-turns': { type: 'string' }, 'max-tokens': { type: 'string' } },
     run: async (values, positionals, io) => {
       const brief = need(str(values, 'brief'), '--brief')
       return print(await commands.spawn(commands.defaultDeps(), commands.identityOrPlanner(), spawnRequestOf(values, positionals, brief === '-' ? await io.stdin() : brief)), io)

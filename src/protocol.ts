@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
-import type { Control, ControlKind, Envelope, Expects, Report, ReportInput, ReportKind } from './types.ts'
+import type { Control, ControlKind, Criterion, Envelope, Expects, Report, ReportInput, ReportKind } from './types.ts'
 
 export const REPORT_KINDS: readonly ReportKind[] = ['done', 'question', 'blocked', 'progress', 'promote']
 export const EXPECTS: readonly Expects[] = ['review', 'answer', 'none']
@@ -8,6 +8,8 @@ export const ENVELOPE_OPEN = '⟦drove v1'
 export const ENVELOPE_CLOSE = '⟧'
 export const SUMMARY_MAX = 500
 export const DETAILS_MAX = 6000
+export const CRITERIA_MAX = 40
+export const EVIDENCE_MAX = 1000
 
 const HEADER_RE = /^⟦drove v1((?: [a-z]+=[^\s⟧]*)*)⟧\n?([\s\S]*)$/
 const REPLY_RE = /\n?↩ Reply [^\n]*$/
@@ -27,7 +29,7 @@ type Validation = { ok: true; value: ReportInput } | { ok: false; error: string 
 
 export const validateReport = (input: unknown): Validation => {
   if (typeof input !== 'object' || input === null || Array.isArray(input)) return { ok: false, error: 'report must be an object' }
-  const { kind, expects, for: forWho, summary, details } = input as Record<string, unknown>
+  const { kind, expects, for: forWho, summary, details, criteria } = input as Record<string, unknown>
   if (typeof kind !== 'string' || !(REPORT_KINDS as readonly string[]).includes(kind)) {
     return { ok: false, error: `kind must be one of ${REPORT_KINDS.join(', ')}` }
   }
@@ -43,6 +45,9 @@ export const validateReport = (input: unknown): Validation => {
   if (typeof details === 'string' && details.length > DETAILS_MAX) {
     return { ok: false, error: `details is ${details.length} characters, the cap is ${DETAILS_MAX}` }
   }
+  const checkedCriteria = criteria === undefined ? undefined : validateCriteria(criteria)
+  if (typeof checkedCriteria === 'string') return { ok: false, error: checkedCriteria }
+  if (checkedCriteria && checkedCriteria.length > 0 && reportKind !== 'done') return { ok: false, error: 'criteria go on a done report' }
   return {
     ok: true,
     value: {
@@ -51,11 +56,31 @@ export const validateReport = (input: unknown): Validation => {
       ...(forWho ? { for: 'human' as const } : {}),
       summary: oneLine,
       ...(typeof details === 'string' && details.trim() ? { details: details.trim() } : {}),
+      ...(checkedCriteria && checkedCriteria.length > 0 ? { criteria: checkedCriteria } : {}),
     },
   }
 }
 
-export const stampReport = (input: ReportInput, meta: { id: string; run: string; seat: string; token: string; at: string }): Report => ({
+// The answer to a seat's acceptance criteria (DROVE-123): ids as Drove numbered them (AC1…), met or not, with the evidence.
+const validateCriteria = (input: unknown): Criterion[] | string => {
+  if (!Array.isArray(input)) return 'criteria must be an array of { id, met, evidence }'
+  if (input.length > CRITERIA_MAX) return `criteria has ${input.length} entries, the cap is ${CRITERIA_MAX}`
+  const found: Criterion[] = []
+  const seen = new Set<string>()
+  for (const entry of input) {
+    const { id, met, evidence } = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<string, unknown>
+    if (typeof id !== 'string' || !/^AC\d+$/.test(id.trim())) return 'each criterion needs an id like AC1'
+    if (seen.has(id.trim())) return `criterion ${id.trim()} appears twice`
+    seen.add(id.trim())
+    if (typeof met !== 'boolean') return `criterion ${id} needs met: true or false`
+    if (typeof evidence !== 'string' || !evidence.trim()) return `criterion ${id} needs evidence: the command run and its result, or file:line`
+    if (evidence.length > EVIDENCE_MAX) return `criterion ${id} evidence is ${evidence.length} characters, the cap is ${EVIDENCE_MAX}`
+    found.push({ id: id.trim(), met, evidence: evidence.trim() })
+  }
+  return found
+}
+
+export const stampReport = (input: ReportInput, meta: { id: string; run: string; seat: string; token: string; at: string; acceptance?: number }): Report => ({
   v: 1,
   id: meta.id,
   run: meta.run,
@@ -66,6 +91,8 @@ export const stampReport = (input: ReportInput, meta: { id: string; run: string;
   ...(input.for ? { for: input.for } : {}),
   summary: input.summary,
   ...(input.details ? { details: input.details } : {}),
+  ...(input.criteria && input.criteria.length > 0 ? { criteria: input.criteria } : {}),
+  ...(meta.acceptance ? { acceptance: meta.acceptance } : {}),
   at: meta.at,
 })
 
@@ -211,7 +238,23 @@ export const renderReport = (report: Report, humanName: string): string => {
       ? 'This confirms work you already approved (branch and commit). Nothing to review: close it with drove close unless you have more for it.'
       : NEXT[report.kind]
   const head = `[worker ${report.seat} · ${report.kind}${forHuman ? ` for ${humanName}` : ''} · expects ${report.expects}]`
-  return [head, report.summary, report.details ?? '', next ? `→ ${next}` : ''].filter(Boolean).join('\n')
+  return [head, report.summary, report.details ?? '', criteriaLines(report), next ? `→ ${next}` : ''].filter(Boolean).join('\n')
+}
+
+// A compact list of the criteria a done report answers, and a line when the seat had criteria that it left unanswered (DROVE-123).
+const criteriaLines = (report: Report): string => {
+  const answered = report.criteria ?? []
+  const lines: string[] = []
+  if (answered.length > 0) {
+    lines.push(`Criteria: ${answered.filter(criterion => criterion.met).length} of ${answered.length} met`)
+    lines.push(...answered.map(criterion => `- ${criterion.id} ${criterion.met ? 'met' : 'UNMET'}: ${criterion.evidence}`))
+  }
+  if (report.kind === 'done' && report.expects !== 'none' && report.acceptance) {
+    const missing = Array.from({ length: report.acceptance }, (_, index) => `AC${index + 1}`).filter(id => !answered.some(criterion => criterion.id === id))
+    if (answered.length === 0) lines.push(`Drove: this seat has ${report.acceptance} acceptance criteri${report.acceptance === 1 ? 'on (AC1)' : `a (AC1…AC${report.acceptance})`} and its done report has no criteria. Ask for them (drove send, kind message) before you review.`)
+    else if (missing.length > 0) lines.push(`Drove: the report leaves ${missing.join(', ')} unanswered.`)
+  }
+  return lines.join('\n')
 }
 
 export const renderReports = (reports: readonly Report[], humanName: string): string =>
