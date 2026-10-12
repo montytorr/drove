@@ -420,6 +420,20 @@ const ORCHESTRATOR_TOOLS = [
         pr: { type: 'boolean', description: 'go through a GitHub pull request (the repo needs a remote); default is a local merge' },
         squash: { type: 'boolean', description: 'with pr: squash-merge the pull request instead of a merge commit' },
         message: { type: 'string', description: 'the merge commit message; default "merge: <the branch’s last commit subject>"' },
+        fresh: { type: 'boolean', description: 'run the checks again even when run_checks recorded a pass at the worker’s current commit on a clean tree (the merge reuses it otherwise)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'run_checks',
+    description:
+      'Orchestrator mode: verify a worker’s done report yourself. Runs the repo’s checks (the merge plan: the checks list in .drove.json, else typecheck, lint, test) in the worker’s worktree and records each run by commit, so merge_worker reuses a pass instead of running them again. Returns pass or fail per command, the failing command’s exit code and output tail, the commit and whether the tree was clean (only a clean tree is evidence). A passing record at the worker’s current commit is reused unless fresh: true. It never writes to the repo. Send a failure back with message_worker or review_verdict changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        fresh: { type: 'boolean', description: 'run the checks again even when a passing record exists for the worker’s current commit' },
       },
       required: ['name'],
     },
@@ -481,6 +495,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__migrate_worker: input => `moving ${String(input.name ?? '')} to ${String(input.kind ?? '')}`,
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
   mcp__orchestrator__merge_worker: input => `merging ${String(input.name ?? '')}`,
+  mcp__orchestrator__run_checks: input => `running ${String(input.name ?? '')}’s checks`,
   mcp__orchestrator__set_goal: () => 'setting the goal',
   mcp__orchestrator__roster: () => 'checking the roster',
   Bash: input => `running ${oneLine(String(input.command ?? ''), 60)}`,
@@ -630,7 +645,13 @@ const mergeWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const name = String(input.name ?? '').trim()
   if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
   const message = typeof input.message === 'string' && input.message.trim() ? input.message.trim() : undefined
-  return answerOf(await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS }))
+  return answerOf(await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, fresh: input.fresh === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS }))
+}
+
+const runChecksTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
+  return answerOf(await plannerRun($, drove.checksArgs(name, input.fresh === true), { timeoutMs: MERGE_TIMEOUT_MS }))
 }
 
 const setGoalTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
@@ -1435,6 +1456,9 @@ export const register: Register = (on, options) => {
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__merge_worker' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? mergeWorker($, e as Record<string, unknown>) : { deny: OFF },
+  ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__run_checks' as never }, async ($, e): Promise<ToolAnswer> =>
+    (await read($, orchestratorAtom)) ? runChecksTool($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__set_goal' as never }, async ($, e): Promise<ToolAnswer> => setGoalTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))

@@ -23,7 +23,7 @@ beforeEach(async () => {
 })
 
 test('cli knows the commands from the design', () => {
-  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'init', 'spawn', 'send', 'prompt', 'promote', 'migrate', 'roster', 'reports', 'report', 'capture', 'close', 'merge', 'board', 'down', 'up', 'attention', 'goal', 'doctor', 'budget', 'guard', 'mcp', 'mod'])
+  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'init', 'spawn', 'send', 'prompt', 'promote', 'migrate', 'roster', 'reports', 'report', 'capture', 'close', 'merge', 'checks', 'board', 'down', 'up', 'attention', 'goal', 'doctor', 'budget', 'guard', 'mcp', 'mod'])
 })
 
 test('--owns splits on commas outside braces, and spawn reads --owns, --max-turns and --max-tokens', async () => {
@@ -105,6 +105,18 @@ test('merge takes a seat, --pr, --squash, -m, --no-checks and --run; without a s
   const { err, io } = capture()
   assert.equal(await main(['merge', 'w-api', '--bogus'], io), 2)
   assert.ok(err.join('\n').length > 0)
+})
+
+test('merge takes --fresh, and checks takes a seat and --fresh (DROVE-122)', async () => {
+  assert.match(COMMANDS.merge?.usage ?? '', /\[--fresh\]/)
+  const missing = capture()
+  assert.equal(await main(['checks'], missing.io), 2)
+  assert.match(missing.err.join('\n'), /missing <seat>[\s\S]*drove checks <seat> \[--fresh\]/)
+  for (const argv of [['checks', 'w-api', '--fresh', '--run', 'no-such-run'], ['merge', 'w-api', '--fresh', '--run', 'no-such-run']]) {
+    const { err, io } = capture()
+    assert.equal(await main(argv, io), 1, argv.join(' '))
+    assert.match(err.join('\n'), /^no-run: no run named no-such-run/)
+  }
 })
 
 test('promote accepts a missing --model, so a Codex seat keeps its current one', async () => {

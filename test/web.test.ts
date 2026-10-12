@@ -359,6 +359,27 @@ test('the lead and each seat carry what the graph draws: model label, activity, 
   assert.doesNotMatch(payload.seats.map(item => item.activity).join('\n'), /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]/)
 })
 
+test('DROVE-122: a seat\'s last check run rides on its payload as one line, stale once HEAD has moved, and the board row carries the marker', async () => {
+  const deps = await makeHome()
+  const run = { sha: 'abcdef0123456789', clean: true, at: '2026-10-09T10:40:00.000Z' }
+  const seats = [
+    seat({ name: 'w-ok', checks: { ...run, result: 'passed' } }),
+    seat({ name: 'w-bad', checks: { ...run, result: 'failed', failed: 'npm test' } }),
+    seat({ name: 'w-old', checks: { ...run, result: 'passed', stale: true } }),
+    seat({ name: 'w-none' }),
+  ]
+  await writeJsonAtomic(join(runDir(deps.home, RUN.id), 'roster.json'), { ...ROSTER, seats })
+  const payload = payloadOfRun(await boardSource(deps, RUN.id)())
+  const by = Object.fromEntries(payload.seats.map(item => [item.name, item]))
+  assert.equal(by['w-ok']?.checks, 'passed at abcdef0')
+  assert.equal(by['w-bad']?.checks, 'failed: npm test at abcdef0')
+  assert.equal(by['w-old']?.checks, 'stale: passed at abcdef0, HEAD has moved')
+  assert.equal('checks' in (by['w-none'] ?? {}), false)
+  const marks = payload.model.workers.map(row => row.cells.find(cell => cell.text.startsWith('chk'))?.text)
+  assert.deepEqual(marks.filter(Boolean).sort(), ['chk~', 'chk✓', 'chk✗'])
+  assert.match(pageOf(), /seat\.checks/)
+})
+
 test('the timeline time is HH:MM whole, in the viewer\'s offset, and matches the terminal board\'s', () => {
   const clockText = (0, eval)(CLOCK_SOURCE) as (at: number, offsetMinutes: number) => string
   assert.equal(clockText(Date.parse('2026-10-09T10:42:00.000Z'), 0), '10:42')

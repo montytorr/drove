@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'set_goal', 'run_report', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'roster', 'capture', 'set_goal', 'run_report', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'runReport'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'checks' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'runReport'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -269,10 +269,21 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         pr: { type: 'boolean', description: 'Go through a GitHub pull request (the repo needs a remote). Default: a local merge.' },
         squash: { type: 'boolean', description: 'With pr: squash-merge the PR instead of a merge commit.' },
         message: { type: 'string', description: 'The merge commit message. Default: "merge: <the branch\'s last commit subject>".' },
+        fresh: { type: 'boolean', description: 'Run the checks again even when the run_checks ledger holds a passing record of them at the worker\'s current commit on a clean tree (which the merge reuses otherwise).' },
       },
       ['seat'],
       async (args) =>
-        asResult(await cmd.merge(deps, identity, await ref(), { seat: seatName(args), pr: flag(args, 'pr'), squash: flag(args, 'squash'), message: text(args, 'message', false) })),
+        asResult(await cmd.merge(deps, identity, await ref(), { seat: seatName(args), pr: flag(args, 'pr'), squash: flag(args, 'squash'), message: text(args, 'message', false), ...(flag(args, 'fresh') ? { fresh: true } : {}) })),
+    ),
+    defineTool(
+      'run_checks',
+      'Verify a worker\'s done report yourself: runs the repo\'s checks (the merge plan: the checks list in .drove.json, else typecheck, lint, test) in the worker\'s worktree and records each run by commit, so the merge reuses a pass instead of running them again. Returns pass or fail per command, the failing command\'s exit code and output tail, the commit and whether the tree was clean (only a clean tree is evidence). A passing record at the worker\'s current commit is reused unless fresh. Never writes to the repo. Send a failure back to the worker with send, or verdict changes.',
+      {
+        seat: seatProp,
+        fresh: { type: 'boolean', description: 'Run the checks again even when a passing record exists for the worker\'s current commit.' },
+      },
+      ['seat'],
+      async (args) => asResult(await cmd.checks(deps, identity, await ref(), { seat: seatName(args), fresh: flag(args, 'fresh') })),
     ),
     defineTool(
       'roster',

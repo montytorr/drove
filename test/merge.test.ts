@@ -258,7 +258,7 @@ test('--pr pushes, opens a PR from the commits and the Cairn ref, and returns pe
   assert.match(pending.text, /^pending: 1 check is still running \(test\) on https:\/\/github\.com\/acme\/widget\/pull\/7\. Run drove merge w-api --pr again later\./)
   assert.deepEqual(pending.ok && pending.data, { status: 'pending', mode: 'pr', url: PR_URL, pr: 7 })
   assert.equal(await git(w.remote, 'rev-parse', '--verify', 'refs/heads/worktree-w-api'), await git(w.worktree, 'rev-parse', 'HEAD'))
-  assert.equal(w.fake.pushes[0]?.at(-1), 'refs/heads/worktree-w-api:refs/heads/worktree-w-api')
+  assert.equal(w.fake.pushes[0]?.at(-1), `${await git(w.worktree, 'rev-parse', 'HEAD')}:refs/heads/worktree-w-api`, 'the exact commit is pushed, by sha (DROVE-122)')
   const create = w.fake.calls.find(call => call[1] === 'pr' && call[2] === 'create') ?? []
   assert.equal(create[create.indexOf('--head') + 1], 'worktree-w-api')
   assert.equal(create[create.indexOf('--base') + 1], 'main')

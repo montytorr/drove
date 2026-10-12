@@ -1,6 +1,6 @@
 import type { Effort, OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus, OrchOrchestrator, Seat, SeatRole, SeatState } from '../types/index.d.ts'
 import { HUMAN, shortModel } from './protocol.ts'
-import { isAsking, openSeats, spawnedMs, statusGlyph } from './roster.ts'
+import { type CheckState, checkState, isAsking, openSeats, spawnedMs, statusGlyph } from './roster.ts'
 
 export const BOARD_ID = 'orchestra'
 
@@ -25,6 +25,12 @@ export const PULSE_MS = 6_000
 const GAUGE = { full: '▰', empty: '▱' }
 // A reviewer or a tester wears a letter beside its name; an implementer none (DROVE-91).
 const ROLE_TAG: Record<SeatRole, string> = { implementer: ' ', reviewer: 'R', tester: 'T' }
+// A seat's last check run at its HEAD (DROVE-122): a short marker, shown once any open seat has run its checks.
+const CHECK_MARK: Record<CheckState, { text: string; tone: Tone }> = {
+  passed: { text: 'chk✓', tone: 'good' },
+  failed: { text: 'chk✗', tone: 'alert' },
+  stale: { text: 'chk~', tone: 'muted' },
+}
 
 export const STATUS_TONE: Record<SeatState, Tone> = {
   starting: 'muted',
@@ -154,7 +160,12 @@ const seatDoing = (seat: Seat, status: OrchModStatus | undefined, spin: string, 
   return { text: seat.state === 'working' && doing ? `${spin} ${doing}` : doing, tone: 'text' }
 }
 
-const BRIDGE_NOTE: Record<OrchBridge['state'], string | undefined> = {
+const checkCell = (seat: Seat): { text: string; tone: Tone } => {
+  const state = checkState(seat)
+  return state === undefined ? { text: ' ', tone: 'dim' } : CHECK_MARK[state]
+}
+
+const BRIDGE_NOTE:Record<OrchBridge['state'], string | undefined> = {
   starting: 'connecting to Drove…',
   up: undefined,
   busy: 'another session is this run’s planner; reports go there',
@@ -222,6 +233,7 @@ export const buildBoard = (input: {
   }
 
   const hasRoles = open.some(seat => seat.role === 'reviewer' || seat.role === 'tester')
+  const hasChecks = open.some(seat => seat.checks !== undefined)
   const workerRows: BoardRow[] = open.map((seat, index) => {
     const mine = status[seat.name]
     const asking = isAsking(seat, mine)
@@ -237,6 +249,7 @@ export const buildBoard = (input: {
         { text: asking ? '?' : statusGlyph(seat.state), tone: asking ? 'alert' : STATUS_TONE[seat.state], width: 2 },
         { text: seat.name, tone: STATUS_TONE[seat.state], width: nameWidth, isBold: true },
         ...(hasRoles ? [{ text: ROLE_TAG[seat.role ?? 'implementer'], tone: 'muted' as const, width: 1 }] : []),
+        ...(hasChecks ? [{ ...checkCell(seat), width: 4 }] : []),
         ...(isWide ? [{ text: clip(`${model}·${effortShort(seat.effort)}`, 9), tone: 'muted' as const, width: 9 }] : []),
         ...(isWide && seat.cairn ? [{ text: seat.cairn, tone: 'dim' as const, width: 8 }] : []),
         seatDoing(seat, mine, spin, viewer),
