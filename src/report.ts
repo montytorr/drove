@@ -4,6 +4,7 @@ import { findRollout } from './usage.ts'
 import { codexHomeDir, runDir } from './paths.ts'
 import { loadRoster, loadRun } from './roster.ts'
 import type { AgentKind, Deps, DroveEvent, HookRecord, RunMeta, Seat } from './types.ts'
+import { modelLabelOf } from './agents.ts'
 
 // DROVE-106: what a run cost and how much rework it took, from the agents' own transcripts, the run's events and its roster.
 
@@ -311,7 +312,7 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
     rows.push({
       seat: name,
       kind,
-      model: seat?.model ?? String(spawn?.data?.model ?? ''),
+      model: modelLabelOf(kind, seat?.model ?? String(spawn?.data?.model ?? ''), run.agents),
       ...(seat?.cairn ?? spawn?.data?.cairn ? { cairn: String(seat?.cairn ?? spawn?.data?.cairn) } : {}),
       state: seat?.state ?? 'unknown',
       spawns: own.filter(event => event.type === 'seat.spawn').length,
@@ -335,7 +336,7 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
     rows.unshift({
       seat: 'planner',
       kind: planner.kind,
-      model: planner.model,
+      model: modelLabelOf(planner.kind, planner.model, run.agents),
       state: run.status,
       spawns: 1,
       wallMs: Math.max(0, end - start),
@@ -389,6 +390,19 @@ export const compact = (count: number): string => (count >= 1e9 ? `${(count / 1e
 const dollars = (cost: number | undefined, partial: boolean): string => (cost === undefined ? '-' : `$${cost.toFixed(2)}${partial ? '+' : ''}`)
 const reworkCell = (rework: Rework): string => `${rework.changes}/${rework.promotions}/${rework.demotions}/${rework.migrations}/${rework.restarts}`
 
+export const kindLines = (report: RunReport): string[] => {
+  const kinds: AgentKind[] = ['claude', 'codex']
+  const workers = report.seats.filter(row => row.seat !== 'planner')
+  const counts = kinds.map(kind => `${workers.filter(row => row.kind === kind).length} ${kind}`)
+  const tokens = kinds.map(kind => {
+    const rows = report.seats.filter(row => row.kind === kind)
+    const measured = rows.filter(row => row.tokens)
+    const total = measured.reduce((sum, row) => sum + (row.tokens?.total ?? 0), 0)
+    return `${kind}: ${measured.length ? `${compact(total)}${measured.length < rows.length ? '+' : ''}` : 'n/a'}`
+  })
+  return [`kinds: ${counts.join(' · ')}`, `tokens by kind (including planner): ${tokens.join(' · ')}`]
+}
+
 export const renderReport = (report: RunReport): string => {
   const header = ['seat', 'agent', 'model', 'wall', 'human', 'tokens', 'in/out', 'cost', 'chg/pro/dem/mig/rst']
   const rows = report.seats.map(row => [
@@ -406,7 +420,7 @@ export const renderReport = (report: RunReport): string => {
   rows.push([`total (${t.seats} seats)`, '', '', duration(t.wallMs), duration(t.humanMs), compact(t.tokens.total), `${compact(t.tokens.input + t.tokens.cacheRead + t.tokens.cacheWrite5m + t.tokens.cacheWrite1h)}/${compact(t.tokens.output)}`, dollars(t.cost, t.unpriced.length > 0), reworkCell(t.rework)])
   const widths = header.map((title, column) => Math.max(title.length, ...rows.map(row => (row[column] ?? '').length)))
   const line = (cells: string[]) => cells.map((cell, column) => (column >= 3 ? cell.padStart(widths[column] as number) : cell.padEnd(widths[column] as number))).join('  ').trimEnd()
-  const out = [`run ${report.run} · ${report.status} · started ${report.startedAt} · ${duration(report.elapsedMs)} elapsed${report.cairn ? ` · ${report.cairn}` : ''}`, '', line(header), ...rows.map((row, index) => (index === rows.length - 1 ? `${'-'.repeat(widths.reduce((sum, width) => sum + width + 2, -2))}\n${line(row)}` : line(row)))]
+  const out = [`run ${report.run} · ${report.status} · started ${report.startedAt} · ${duration(report.elapsedMs)} elapsed${report.cairn ? ` · ${report.cairn}` : ''}`, ...kindLines(report), '', line(header), ...rows.map((row, index) => (index === rows.length - 1 ? `${'-'.repeat(widths.reduce((sum, width) => sum + width + 2, -2))}\n${line(row)}` : line(row)))]
   out.push('', `wall = spawn to close, summed over a seat's incarnations; human = time an attention item waited on the human (dialog, permission, trust, usage limit); cache reads and writes are in tokens.`)
   if (t.unpriced.length) out.push(`No price for ${t.unpriced.join(', ')}: those tokens are counted, their cost is not (a + after a cost marks it partial).`)
   const missing = report.seats.filter(row => row.notFound.length > 0)
@@ -420,6 +434,7 @@ export const noteLines = (report: RunReport): string[] => {
   const tokens = (usage: Usage & { total: number }) => `${compact(usage.total)} tokens (${compact(usage.output)} out)`
   return [
     `Cost and rework: ${tokens(t.tokens)}, ${dollars(t.cost, t.unpriced.length > 0)}, ${duration(t.wallMs)} of seat time, ${duration(t.humanMs)} waiting on the human; ${t.rework.changes} change round(s), ${t.rework.promotions} promotion(s), ${t.rework.demotions} demotion(s), ${t.rework.migrations} migration(s), ${t.rework.restarts} restart(s).`,
+    ...kindLines(report),
     ...report.seats.map(row => `- ${row.seat} (${row.kind} ${row.model || '?'}): ${row.tokens ? tokens(row.tokens) : 'no transcript'}, ${dollars(row.cost, row.unpriced.length > 0)}, ${duration(row.wallMs)}, human ${duration(row.humanMs)}, chg/pro/dem/mig/rst ${reworkCell(row.rework)}`),
     ...(t.unpriced.length ? [`No price for ${t.unpriced.join(', ')}: tokens only.`] : []),
     ...(t.notFound.length ? [`No transcript found for ${t.notFound.join(', ')}.`] : []),

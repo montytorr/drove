@@ -151,10 +151,13 @@ test('the table shows every seat and the totals, and says what is missing', asyn
   const text = renderReport(report)
   assert.match(text, /w-a\s+claude\s+claude-sonnet-5-5\s+40m\s+5m\s+1\.4k/)
   assert.match(text, /total \(3 seats\)/)
+  assert.match(text, /kinds: 2 claude · 1 codex/)
+  assert.match(text, /tokens by kind \(including planner\): claude: 1\.4k\+ · codex: 940/)
   assert.match(text, /No transcript found for planner \(1\), w-gone \(1\)/)
   assert.match(text, /No price for .*gpt-6\.1-sol/)
   assert.equal(duration(90 * 60_000), '1h30')
   assert.ok(noteLines(report).some(line => line.startsWith('- w-gone') && line.includes('no transcript')))
+  assert.ok(noteLines(report).includes('kinds: 2 claude · 1 codex'))
 })
 
 test('drove report finds the run, prints JSON on request and fails for an unknown run', async () => {
