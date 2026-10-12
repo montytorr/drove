@@ -20,6 +20,7 @@ import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { diagnoseRun, renderDiagnosis, reportPointer } from './diagnose.ts'
 import { buildTrace, postTrace, renderTrace } from './trace.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
+import { type Folded, readFolded } from './pending.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { steeringNotes } from './steer.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
@@ -1172,7 +1173,9 @@ export const send = async (deps: Deps, identity: Identity, request: SendRequest)
       const changes = request.verdict === 'approve' ? 0 : (entry.reviewChanges ?? 0) + 1
       const attention = entry.attention.filter(item => item.reason !== 'review-loop')
       if (changes >= (config?.reviewLoopLimit ?? 3)) attention.push({ seat: entry.name, reason: 'review-loop', detail: reviewLoopText(entry.name, changes), at: control.at })
-      return { ...entry, owes: 'none', reviewChanges: changes, attention }
+      // The planner's verdict starts a new round for Drove's own checks too (DROVE-126).
+      const { autoCheckAttempts: _, ...rest } = entry
+      return { ...rest, owes: 'none', reviewChanges: changes, attention }
     }) }))
   }
   const label = request.kind === 'verdict' ? `verdict ${request.verdict}` : request.kind
@@ -1618,7 +1621,11 @@ const gatherAttention = async (deps: Deps, run: RunMeta): Promise<AttentionItem[
     current = await loadRoster(deps.home, run.id)
   }
   const owing = current.seats.filter(seat => seat.state !== 'closed' && seat.owes !== 'none')
-  const reports = (await Promise.all(owing.map(seat => seatReports(deps, run, seat.name)))).flatMap(list => list.at(-1) ?? [])
+  const folded = await readFolded(deps.home, run.id)
+  const reports = (await Promise.all(owing.map(seat => seatReports(deps, run, seat.name)))).flatMap(list => {
+    const last = list.at(-1)
+    return last && !folded.suppressed.has(last.id) ? [releasedForm(last, folded)] : []
+  })
   const statuses = await Promise.all(openSeats(current).map(async seat => [seat.name, await readJson<OrchModStatus>(join(seatDir(deps.home, run.id, seat.name), 'mod.json')).catch(() => undefined)] as const))
   const status = Object.fromEntries(statuses.filter((entry): entry is readonly [string, OrchModStatus] => entry[1] !== undefined))
   const probed = run.status === 'up' ? await plannerStateOf(deps, run) : undefined
@@ -1721,9 +1728,18 @@ const seatReports = async (deps: Deps, run: RunMeta, seat: string): Promise<Repo
   const token = await readToken(join(dir, 'token'))
   if (!token) return []
   const { items } = await readJsonlFrom<Partial<Report> | null>(join(dir, 'outbox.jsonl'), { offset: 0 })
-  return items.filter((item): item is Report =>
-    item?.v === 1 && item.run === run.id && item.seat === seat && item.token === token && typeof item.id === 'string' && typeof item.summary === 'string' && item.kind !== 'progress' && REPORT_KINDS.includes(item.kind as Report['kind']),
-  )
+  return items
+    .filter((item): item is Report =>
+      item?.v === 1 && item.run === run.id && item.seat === seat && item.token === token && typeof item.id === 'string' && typeof item.summary === 'string' && item.kind !== 'progress' && REPORT_KINDS.includes(item.kind as Report['kind']),
+    )
+    // `autocheck` is Drove's own line: it comes from the ledger (releasedForm), never from the worker's outbox.
+    .map(({ autocheck: _, ...own }) => own)
+}
+
+// A report as the planner may read it (DROVE-126): carrying Drove's line from the ledger when the report was released with one.
+const releasedForm = (report: Report, folded: Folded): Report => {
+  const note = folded.notes.get(report.id)
+  return note ? { ...report, autocheck: note } : report
 }
 
 export const reports = async (deps: Deps, identity: Identity, ref: RunRef, request: ReportsRequest): Promise<CommandResult> => {
@@ -1737,8 +1753,10 @@ export const reports = async (deps: Deps, identity: Identity, ref: RunRef, reque
   const seats = request.seat ? [request.seat] : roster.seats.map(seat => seat.name)
   // The outbox has no steering line (DROVE-127): the watcher recorded it in the event log, by report id.
   const notes = await steeringNotes(join(runDir(deps.home, run.id), 'events.jsonl'))
-  const filed = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().sort((a, b) => a.at.localeCompare(b.at))
-  const all = filed.map(({ steering: _forged, ...report }): Report => (notes.has(report.id) ? { ...report, steering: notes.get(report.id) as string } : report))
+  // A done report that Drove is still checking, or has sent back to the worker itself, is not the planner's to read (DROVE-126).
+  const folded = await readFolded(deps.home, run.id)
+  const filed = (await Promise.all(seats.map(seat => seatReports(deps, run, seat)))).flat().filter(report => !folded.suppressed.has(report.id)).sort((a, b) => a.at.localeCompare(b.at))
+  const all = filed.map(({ steering: _forged, ...report }): Report => releasedForm(notes.has(report.id) ? { ...report, steering: notes.get(report.id) as string } : report, folded))
   const read = new Set((await readJson<string[]>(readReportsPath(deps.home, run.id))) ?? [])
   const unread = all.filter(report => !read.has(report.id))
   const picked = request.all ? all : unread.length > 0 || !request.seat ? unread : all.slice(-1)
