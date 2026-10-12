@@ -1113,7 +1113,10 @@ const queueBrief = async (deps: Deps, run: RunMeta, seat: string, text: string):
     const entry = findSeat(current, seat)
     return entry && (entry.state === 'idle' || entry.state === 'starting') ? upsertSeat(current, { ...entry, state: 'working', stateAt: iso, lastWorkingAt: iso }) : current
   })
-  return 'unconfirmed' in delivery && delivery.unconfirmed ? `${delivery.via} (typed; herdr did not confirm the agent took it within its wait and no prompt hook record followed, which a long first turn explains)` : delivery.via
+  const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
+  // DROVE-124: herdr typed the brief and stalled; Drove pressed Enter on the pasted text itself.
+  if ('submitted' in delivery && delivery.submitted) return isUnconfirmed ? 'delivered (after submitting the pasted text; the agent has not shown activity yet, check its pane)' : 'delivered (after submitting the pasted text)'
+  return isUnconfirmed ? `${delivery.via} (typed; herdr did not confirm the agent took it within its wait and no prompt hook record followed, which a long first turn explains)` : delivery.via
 }
 
 // ---------- send / prompt ----------
