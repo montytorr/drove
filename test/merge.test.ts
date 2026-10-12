@@ -13,9 +13,16 @@ import { git, makeClock, makeRepo, makeSeat, RUN, seedRun, tmp } from './p3-help
 type FakeCheck = { name: string; bucket: string; link: string }
 type FakeGh = {
   calls: string[][]
-  pr?: { number: number; url: string; state: string; createdAt: string; mergeable: string; reviewDecision: string }
+  pr?: { number: number; url: string; state: string; createdAt: string; mergeable: string; reviewDecision: string; headRefOid?: string }
   checks: FakeCheck[] | 'none'
   mergeFails?: string
+  // `gh pr view <branch>` finds nothing while `gh pr view <number>` and `gh pr list` do.
+  branchViewHidden?: boolean
+  // The next n views after gh pr merge fail like a 502.
+  viewFailures?: number
+  checksError?: string
+  // gh pr checks printed nothing at all, exit 0.
+  checksEmpty?: boolean
   pushes: string[][]
 }
 
@@ -49,14 +56,24 @@ const world = async (options: { remote?: boolean; checks?: string[] | null; work
   const ghExec = async (argv: readonly string[]): Promise<ExecResult> => {
     fake.calls.push([...argv])
     const [, group, action] = argv
+    if (group === 'pr' && action === 'list') {
+      return { code: 0, stdout: JSON.stringify(fake.pr?.state === 'OPEN' ? [{ number: fake.pr.number, url: fake.pr.url }] : []), stderr: '' }
+    }
     if (group === 'pr' && action === 'view') {
+      if (fake.branchViewHidden && argv[3] === 'worktree-w-api') return { code: 1, stdout: '', stderr: 'no pull requests found for branch "worktree-w-api"' }
+      if (fake.viewFailures && fake.pr?.state === 'MERGED') {
+        fake.viewFailures -= 1
+        return { code: 1, stdout: '', stderr: 'HTTP 502: Bad Gateway (https://api.github.com/graphql)' }
+      }
       return fake.pr ? { code: 0, stdout: JSON.stringify(fake.pr), stderr: '' } : { code: 1, stdout: '', stderr: 'no pull requests found for branch "worktree-w-api"' }
     }
     if (group === 'pr' && action === 'create') {
-      fake.pr = { number: 7, url: PR_URL, state: 'OPEN', createdAt: clock.now().toISOString(), mergeable: 'MERGEABLE', reviewDecision: '' }
+      fake.pr = { number: 7, url: PR_URL, state: 'OPEN', createdAt: clock.now().toISOString(), mergeable: 'MERGEABLE', reviewDecision: '', headRefOid: await git(remote, 'rev-parse', 'refs/heads/worktree-w-api') }
       return { code: 0, stdout: `${PR_URL}\n`, stderr: '' }
     }
     if (group === 'pr' && action === 'checks') {
+      if (fake.checksEmpty) return { code: 0, stdout: '', stderr: '' }
+      if (fake.checksError) return { code: 1, stdout: '', stderr: fake.checksError }
       if (fake.checks === 'none') return { code: 1, stdout: '', stderr: "no checks reported on the 'worktree-w-api' branch" }
       const code = fake.checks.some(entry => entry.bucket === 'fail') ? 1 : fake.checks.some(entry => entry.bucket === 'pending') ? 8 : 0
       return { code, stdout: JSON.stringify(fake.checks), stderr: '' }
@@ -77,7 +94,7 @@ const world = async (options: { remote?: boolean; checks?: string[] | null; work
     if (argv[0] === 'git' && argv.includes('push')) fake.pushes.push([...argv])
     return commands.nodeExec(argv, execOptions)
   }
-  const deps: Deps = { exec, clock, home: await tmp('home') }
+  const deps: Deps = { exec, clock, home: await tmp('home'), sleep: async () => {} }
   const seat = makeSeat('w-api', { worktree, branch: 'worktree-w-api', cairn: 'DROVE-9', state: 'done' })
   const overrides: Partial<RunMeta> = { base: options.base ?? (options.remote ? 'origin/main' : 'main'), hasRemote: options.remote === true }
   await seedRun(deps, repo, [seat], overrides)
@@ -258,7 +275,7 @@ test('--pr pushes, opens a PR from the commits and the Cairn ref, and returns pe
   assert.match(pending.text, /^pending: 1 check is still running \(test\) on https:\/\/github\.com\/acme\/widget\/pull\/7\. Run drove merge w-api --pr again later\./)
   assert.deepEqual(pending.ok && pending.data, { status: 'pending', mode: 'pr', url: PR_URL, pr: 7 })
   assert.equal(await git(w.remote, 'rev-parse', '--verify', 'refs/heads/worktree-w-api'), await git(w.worktree, 'rev-parse', 'HEAD'))
-  assert.equal(w.fake.pushes[0]?.at(-1), 'refs/heads/worktree-w-api:refs/heads/worktree-w-api')
+  assert.equal(w.fake.pushes[0]?.at(-1), `${await git(w.worktree, 'rev-parse', 'HEAD')}:refs/heads/worktree-w-api`, 'the exact commit is pushed, by sha (DROVE-122)')
   const create = w.fake.calls.find(call => call[1] === 'pr' && call[2] === 'create') ?? []
   assert.equal(create[create.indexOf('--head') + 1], 'worktree-w-api')
   assert.equal(create[create.indexOf('--base') + 1], 'main')
@@ -278,6 +295,73 @@ test('--pr again after the checks finish merges; a second call does not open a s
   assert.equal(merged.ok, true, merged.text)
   assert.equal(w.fake.calls.filter(call => call[2] === 'create').length, 1)
   assert.match(merged.text, /^Merged https:\/\/github\.com\/acme\/widget\/pull\/7 \(merge commit\); GitHub checks green\./)
+})
+
+test('--pr reuses the open PR of the branch instead of creating one', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.pr = { number: 2, url: 'https://github.com/acme/widget/pull/2', state: 'OPEN', createdAt: w.clock.now().toISOString(), mergeable: 'MERGEABLE', reviewDecision: '' }
+  w.fake.branchViewHidden = true
+  w.fake.checks = [{ name: 'test', bucket: 'pending', link: '' }]
+  const pending = await w.merge({ pr: true })
+  assert.match(pending.text, /^pending: 1 check is still running \(test\) on https:\/\/github\.com\/acme\/widget\/pull\/2\./)
+  assert.equal(w.fake.calls.some(call => call[2] === 'create'), false)
+  assert.ok(w.fake.calls.some(call => call[2] === 'list' && call.includes('--head') && call.includes('--state')))
+  assert.ok(w.fake.calls.some(call => call[2] === 'checks' && call[3] === '2'))
+})
+
+test('--pr settles as merged when the state read after gh pr merge fails at first', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.checks = [{ name: 'test', bucket: 'pass', link: '' }]
+  w.fake.viewFailures = 2
+  const merged = await w.merge({ pr: true })
+  assert.equal(merged.ok, true, merged.text)
+  assert.equal(w.fake.viewFailures, 0)
+  assert.equal((await w.gateOf())?.result, 'passed')
+  assert.ok(existsSync(join(w.repo, 'feature.txt')))
+  assert.equal(await git(w.remote, 'branch', '--list', 'worktree-w-api'), '')
+})
+
+test('--pr answers pending, with the URL, when gh gives a 5xx on the checks read', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.checksError = 'HTTP 502: Bad Gateway (https://api.github.com/graphql)'
+  const pending = await w.merge({ pr: true })
+  assert.equal(pending.ok, true, pending.text)
+  assert.match(pending.text, /^pending: .*502.* on https:\/\/github\.com\/acme\/widget\/pull\/7\./)
+  assert.equal((await w.gateOf())?.result, 'pending')
+  for (const flaky of ['unexpected end of JSON input', '']) {
+    w.fake.checksError = flaky
+    w.fake.checksEmpty = flaky === ''
+    assert.match((await w.merge({ pr: true })).text, /^pending: GitHub did not answer the read of the checks/)
+  }
+  w.fake.checksEmpty = false
+  w.fake.checksError = 'unknown flag'
+  assert.equal((await w.merge({ pr: true })).ok, false)
+})
+
+test('--pr for a PR already MERGED on GitHub settles it: fast-forward, event, branch deleted', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.checks = [{ name: 'test', bucket: 'pass', link: '' }]
+  await w.merge({ pr: true })
+  // Undo the local settle, as if the answer was lost: local main back before the merge, remote branch back.
+  await git(w.repo, 'reset', '-q', '--hard', 'HEAD^1')
+  await git(w.repo, 'push', '-q', 'origin', 'worktree-w-api')
+  assert.equal(w.fake.pr?.state, 'MERGED')
+  const calls = w.fake.calls.length
+  const again = await w.merge({ pr: true })
+  assert.equal(again.ok, true, again.text)
+  assert.equal(w.fake.calls.slice(calls).some(call => call[2] === 'merge' || call[2] === 'create'), false)
+  assert.ok(existsSync(join(w.repo, 'feature.txt')))
+  assert.equal(await git(w.remote, 'branch', '--list', 'worktree-w-api'), '')
+})
+
+test('--pr does not settle on an old MERGED PR of the same branch name: it pushes and opens a new PR', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.pr = { number: 2, url: 'https://github.com/acme/widget/pull/2', state: 'MERGED', createdAt: w.clock.now().toISOString(), mergeable: 'UNKNOWN', reviewDecision: '', headRefOid: '0'.repeat(40) }
+  w.fake.checks = [{ name: 'test', bucket: 'pending', link: '' }]
+  const pending = await w.merge({ pr: true })
+  assert.match(pending.text, /^pending: 1 check is still running \(test\) on https:\/\/github\.com\/acme\/widget\/pull\/7\./)
+  assert.equal(w.fake.pushes.length > 0, true)
+  assert.equal(w.fake.calls.filter(call => call[2] === 'create').length, 1)
 })
 
 test('--pr with a failing check refuses and names the failing checks', async () => {
@@ -323,7 +407,7 @@ test('--pr in a repo with no workflows runs the local checks before anything is 
   const refused = await w.merge({ pr: true })
   assert.equal(refused.ok === false && refused.code, 'checks-failed')
   assert.equal(w.fake.pushes.length, 0)
-  assert.equal(w.fake.calls.length, 0)
+  assert.equal(w.fake.calls.every(call => call[2] === 'view'), true, 'only the PR state is read before the checks')
 })
 
 test('--pr in a repo with no CI counts as green once the local checks pass', async () => {

@@ -12,6 +12,7 @@ test('argv builders match the herdr CLI', () => {
   assert.deepEqual(herdr.agentStartArgv('w-api', 'codex', 'w1:p2', ['-s', 'workspace-write']), ['herdr', 'agent', 'start', 'w-api', '--kind', 'codex', '--pane', 'w1:p2', '--timeout', '60000', '--', '-s', 'workspace-write'])
   assert.deepEqual(herdr.agentPromptArgv('w-api', 'hi', 5000), ['herdr', 'agent', 'prompt', 'w-api', 'hi', '--wait', '--timeout', '5000'])
   assert.deepEqual(herdr.agentTypeArgv('w-api', '/exit'), ['herdr', 'agent', 'prompt', 'w-api', '/exit'])
+  assert.deepEqual(herdr.agentSendKeysArgv('w-api', ['Enter']), ['herdr', 'agent', 'send-keys', 'w-api', 'Enter'])
   assert.deepEqual(herdr.agentReadArgv('w-api', 40, 'detection'), ['herdr', 'agent', 'read', 'w-api', '--source', 'detection', '--lines', '40'])
   assert.deepEqual(herdr.paneCloseArgv('w1:p2'), ['herdr', 'pane', 'close', 'w1:p2'])
   assert.deepEqual(herdr.tabCloseArgv('w1:t1'), ['herdr', 'tab', 'close', 'w1:t1'])

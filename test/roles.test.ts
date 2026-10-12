@@ -64,7 +64,8 @@ test('an implementer is the default: no role is stored and the worker env carrie
   }
 })
 
-test('the implementer role text is byte-identical to the text before roles', () => {
+// DROVE-123 rewrote the three role texts as SOPs; the fixture pins the implementer text, so an edit to it is deliberate.
+test('the implementer role text is the pinned SOP text', () => {
   const run = { id: 'drove-20261009-1042-a3f1' } as RunMeta
   const config = { humanName: 'Sam' } as DroveConfig
   const before = readFileSync(new URL('./fixtures/worker-role.implementer.txt', import.meta.url), 'utf8')
@@ -458,6 +459,7 @@ const hookDeps = (): hooks.HookDeps => ({
   append: async () => undefined,
   openIds: async () => [],
   seatToken: async () => undefined,
+  seatOwns: async () => undefined,
   adoptGoal: async () => undefined,
 })
 

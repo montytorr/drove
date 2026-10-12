@@ -195,6 +195,124 @@ test('a stalled prompt that turned into activity counts as delivered', async () 
   assert.equal((await deliver.deliverControl(deps, run, control('w-ui'))).ok, true)
 })
 
+const stalledSetup = async (promptStalls: 'pasted' | 'empty', status: 'idle' | 'working' = 'idle') => {
+  const fake = new FakeHerdr({ promptStalls })
+  return setup(makeSeat('w-ui'), status, fake)
+}
+
+const sentOf = (deps: Awaited<ReturnType<typeof setup>>['deps'], run: RunMeta) => lines(join(seatDir(deps.home, run.id, 'w-ui'), 'sent.jsonl'))
+
+test('a stalled prompt whose input holds the paste placeholder is submitted with Enter once, and counts as delivered (DROVE-124)', async () => {
+  const { deps, run, fake } = await stalledSetup('pasted')
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+  assert.deepEqual(delivery, { ok: true, via: 'herdr-prompt', submitted: true })
+  assert.deepEqual(fake.keys, [{ target: 'w1:p-w-ui', keys: ['Enter'] }])
+  assert.equal(fake.prompts.length, 1)
+  assert.equal((await sentOf(deps, run)).length, 1)
+  assert.deepEqual((await loadRoster(deps.home, run.id)).seats[0]?.attention, [])
+  const events = await lines(join(deps.home, 'runs', run.id, 'events.jsonl'))
+  assert.deepEqual(events.at(-1)?.data, { kind: 'message', via: 'herdr-prompt', submitted: true })
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
+  assert.equal(fake.keys.length, 1)
+})
+
+test('a stalled prompt whose input starts with the typed text is submitted too', async () => {
+  const fake = new FakeHerdr()
+  const base = fake.exec
+  fake.exec = async argv => {
+    if (argv[2] !== 'prompt') return base(argv)
+    fake.screen = `● Ready\n──────\n❯ ${(argv[4] ?? '').split('\n')[0]}\n  hello there\n──────\n  ? for shortcuts`
+    return herdrFail('agent_prompt_stalled')
+  }
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt', submitted: true })
+  assert.equal(fake.keys.length, 1)
+})
+
+test('a stalled prompt with an empty input and an idle agent is reported not delivered, and nothing is sent twice', async () => {
+  const { deps, run, fake } = await stalledSetup('empty')
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+  assert.equal(!delivery.ok && delivery.queued, false)
+  assert.match(!delivery.ok ? delivery.reason : '', /^agent_prompt_stalled: .*check the pane/)
+  assert.equal(fake.keys.length, 0)
+  assert.equal(fake.prompts.length, 1)
+  assert.equal((await sentOf(deps, run)).length, 0)
+  assert.equal((await loadRoster(deps.home, run.id)).seats[0]?.attention[0]?.reason, 'stalled')
+})
+
+test('a paste placeholder in the transcript, above an empty input, is not submitted', async () => {
+  const { deps, run, fake } = await stalledSetup('empty')
+  const base = fake.exec
+  fake.exec = async argv => {
+    const ran = await base(argv)
+    if (argv[2] === 'prompt') fake.screen = '❯ [Pasted text #1 +70 lines]\n\n● Reading the brief.\n\n──────\n❯ \n──────\n  ? for shortcuts'
+    return ran
+  }
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+  assert.equal(delivery.ok, false)
+  assert.equal(fake.keys.length, 0)
+})
+
+test('a stalled prompt of an agent that is already working is delivered without Enter', async () => {
+  const { deps, run, fake } = await stalledSetup('pasted', 'working')
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
+  assert.equal(fake.keys.length, 0)
+  assert.equal(fake.calls.filter(call => call[2] === 'read').length, 0)
+})
+
+test('a stalled prompt is read from the pane when herdr cannot read the agent', async () => {
+  const { deps, run, fake } = await stalledSetup('pasted')
+  fake.agentReadFails = true
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt', submitted: true })
+  assert.ok(fake.calls.some(call => call[1] === 'pane' && call[2] === 'read'))
+  assert.equal(fake.keys.length, 1)
+})
+
+test('a stalled prompt that cannot be read at all is reported not delivered, as before', async () => {
+  const { deps, run, fake } = await stalledSetup('pasted')
+  fake.agentReadFails = true
+  fake.paneReadFails = 'pane_not_found'
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+  assert.equal(delivery.ok, false)
+  assert.equal(fake.keys.length, 0)
+})
+
+test('a refused Enter is reported not delivered, with the text still in the input', async () => {
+  const { deps, run, fake } = await stalledSetup('pasted')
+  fake.sendKeysFails = 'unknown_command'
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
+  assert.equal(!delivery.ok && delivery.queued, false)
+  assert.match(!delivery.ok ? delivery.reason : '', /agent_prompt_stalled.*unsubmitted.*would not press Enter \(unknown_command\)/)
+  assert.equal((await loadRoster(deps.home, run.id)).seats[0]?.attention[0]?.reason, 'stalled')
+  assert.equal((await sentOf(deps, run)).length, 0)
+})
+
+test('an Enter that shows no activity is delivered-unconfirmed, and a hook record confirms it', async () => {
+  const { deps, run, fake } = await stalledSetup('pasted')
+  fake.enterSubmits = false
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt', unconfirmed: true, submitted: true })
+  assert.equal(fake.keys.length, 1)
+
+  const confirmed = await stalledSetup('pasted')
+  confirmed.fake.enterSubmits = false
+  const hooks = join(seatDir(confirmed.deps.home, confirmed.run.id, 'w-ui'), 'hooks.jsonl')
+  const sentAt = confirmed.deps.clock.now().getTime()
+  setTimeout(() => void appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt + 1_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`), 20)
+  assert.deepEqual(await deliver.deliverControl(confirmed.deps, confirmed.run, control('w-ui')), { ok: true, via: 'herdr-prompt', submitted: true })
+})
+
+test('unsubmittedInput reads the last prompt line only', () => {
+  const text = '⟦drove v1 run=r from=planner to=w-ui id=c-1 kind=brief expects=review mac=ab⟧\nbody'
+  assert.equal(deliver.unsubmittedInput('❯ [Pasted text #1 +3 lines]', text), true)
+  assert.equal(deliver.unsubmittedInput('│ > [Pasted Content 1520 chars]  │', text), true)
+  assert.equal(deliver.unsubmittedInput('› ⟦drove v1 run=r from=planner to=w-ui id=c-1 kind=brief expects=review mac=ab⟧\n  body', text), true)
+  assert.equal(deliver.unsubmittedInput('❯ [Pasted text #1 +3 lines]\n● done\n❯ ', text), false)
+  assert.equal(deliver.unsubmittedInput('❯ ⟦drove v1 run=r from=planner to=w-ui id=c-0 kind=message', text), false)
+  assert.equal(deliver.unsubmittedInput('❯ Try "fix lint errors"', text), false)
+  assert.equal(deliver.unsubmittedInput('no prompt here', text), false)
+  assert.equal(deliver.unsubmittedInput('', text), false)
+})
+
 test('a herdr wait timeout after typing is delivered-unconfirmed: recorded as sent, never queued or retried', async () => {
   const fake = new FakeHerdr()
   const base = fake.exec

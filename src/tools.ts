@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'roster', 'capture', 'set_goal', 'run_report', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'roster', 'capture', 'set_goal', 'set_owns', 'run_report', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'runReport'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'checks' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'setOwns' | 'runReport'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -73,6 +73,14 @@ const names = (args: Args, key: string): string[] | undefined => {
   return (value as string[]).map(name => name.trim()).filter(Boolean)
 }
 
+// Acceptance statements are kept as given, so an empty one is refused (by spawn) and not dropped: the same message as the CLI's.
+const statements = (args: Args, key: string): string[] => {
+  const value = args[key]
+  if (!Array.isArray(value) || value.some(item => typeof item !== 'string')) throw new ArgError(`${key} must be an array of strings`)
+  if (value.some(item => !(item as string).trim())) throw new ArgError('--acceptance takes non-empty statements, one per criterion')
+  return value as string[]
+}
+
 const flag = (args: Args, key: string): boolean => {
   const value = args[key]
   if (value === undefined) return false
@@ -83,6 +91,12 @@ const flag = (args: Args, key: string): boolean => {
 const bool = (args: Args, key: string): boolean => {
   const value = args[key]
   if (typeof value !== 'boolean') throw new ArgError(`${key} must be a boolean`)
+  return value
+}
+
+const positive = (args: Args, key: string): number => {
+  const value = args[key]
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) throw new ArgError(`${key} must be a positive finite number`)
   return value
 }
 
@@ -153,8 +167,11 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         target: { type: 'string', description: 'The seat a reviewer reviews or a tester tests. Required for those roles, not allowed for an implementer.' },
         userHooks: { type: 'boolean', description: 'Optional, Claude workers only: false leaves out the hooks in the user\'s own settings.json (their prompt reminders and session-start blocks); Drove\'s hooks stay. It also leaves out the user\'s own skills, agents and commands, which Claude reads from the same source. Left out, workerUserHooks decides (kept by default). A Codex worker follows workerUserHooks alone.' },
         owns: { type: 'array', items: { type: 'string' }, description: 'Optional: globs, relative to the worker\'s worktree, of the files it may change (e.g. ["src/guard.ts", "test/**"]). Given, Drove\'s guard refuses the worker\'s edits to any other file and tells it to ask you. Left out, the worker may edit anywhere.' },
+        acceptance: { type: 'array', items: { type: 'string' }, description: 'Optional: the acceptance criteria, one testable statement each, ideally Given-When-Then. Drove numbers them AC1…ACn, writes them into the worker\'s brief as ## Acceptance (a reviewer or tester of the seat sees them too, unless you give it its own), and the worker answers each in its done report. Take them from the Cairn task body. An empty statement is refused.' },
         maxTurns: { type: 'integer', minimum: 1, description: 'Optional: how many turns (stops) the worker may take. At the limit you get a budget attention and the worker is told once to report progress or promote and stop; it is not killed. Left out, the configured maxTurns applies, or none.' },
         maxTokens: { type: 'integer', minimum: 1, description: 'Optional: how many tokens (input, cached input and output, read from the agent\'s own transcript) the worker may use. Same effect at the limit as maxTurns.' },
+        maxMinutes: { type: 'number', exclusiveMinimum: 0, description: 'Optional: wall clock minutes since spawn before a budget attention and one notice to report progress or promote and stop; never kills the worker.' },
+        maxCost: { type: 'number', exclusiveMinimum: 0, description: 'Optional: USD budget from transcript usage and the run report price table. Unpriced models never trip it.' },
       },
       ['seat', 'brief'],
       async (args) => {
@@ -179,8 +196,11 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
             ...(text(args, 'target', false) ? { target: text(args, 'target', false) } : {}),
             ...(args.userHooks != null ? { userHooks: bool(args, 'userHooks') } : {}),
             ...(args.owns != null ? { owns: names(args, 'owns') } : {}),
+            ...(args.acceptance != null ? { acceptance: statements(args, 'acceptance') } : {}),
             ...(args.maxTurns != null ? { maxTurns: count(args, 'maxTurns', 1) } : {}),
             ...(args.maxTokens != null ? { maxTokens: count(args, 'maxTokens', 1) } : {}),
+            ...(args.maxMinutes != null ? { maxMinutes: positive(args, 'maxMinutes') } : {}),
+            ...(args.maxCost != null ? { maxCost: positive(args, 'maxCost') } : {}),
           }),
         )
       },
@@ -269,10 +289,21 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         pr: { type: 'boolean', description: 'Go through a GitHub pull request (the repo needs a remote). Default: a local merge.' },
         squash: { type: 'boolean', description: 'With pr: squash-merge the PR instead of a merge commit.' },
         message: { type: 'string', description: 'The merge commit message. Default: "merge: <the branch\'s last commit subject>".' },
+        fresh: { type: 'boolean', description: 'Run the checks again even when the run_checks ledger holds a passing record of them at the worker\'s current commit on a clean tree (which the merge reuses otherwise).' },
       },
       ['seat'],
       async (args) =>
-        asResult(await cmd.merge(deps, identity, await ref(), { seat: seatName(args), pr: flag(args, 'pr'), squash: flag(args, 'squash'), message: text(args, 'message', false) })),
+        asResult(await cmd.merge(deps, identity, await ref(), { seat: seatName(args), pr: flag(args, 'pr'), squash: flag(args, 'squash'), message: text(args, 'message', false), ...(flag(args, 'fresh') ? { fresh: true } : {}) })),
+    ),
+    defineTool(
+      'run_checks',
+      'Verify a worker\'s done report yourself: runs the repo\'s checks (the merge plan: the checks list in .drove.json, else typecheck, lint, test) in the worker\'s worktree and records each run by commit, so the merge reuses a pass instead of running them again. Returns pass or fail per command, the failing command\'s exit code and output tail, the commit and whether the tree was clean (only a clean tree is evidence). A passing record at the worker\'s current commit is reused unless fresh. Never writes to the repo. Send a failure back to the worker with send, or verdict changes.',
+      {
+        seat: seatProp,
+        fresh: { type: 'boolean', description: 'Run the checks again even when a passing record exists for the worker\'s current commit.' },
+      },
+      ['seat'],
+      async (args) => asResult(await cmd.checks(deps, identity, await ref(), { seat: seatName(args), fresh: flag(args, 'fresh') })),
     ),
     defineTool(
       'roster',
@@ -299,8 +330,26 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       async (args) => asResult(await cmd.setGoal(deps, await ref(), { goal: text(args, 'goal') as string, cairn: text(args, 'cairn', false) })),
     ),
     defineTool(
+      'set_owns',
+      'Change the files an open worker may edit, mid-run. Use add when a worker asks (a question report) for one more path, e.g. the mod mirror mod/types/index.d.ts when it changes src/types.ts; set replaces the whole list. The guard takes it at the worker\'s next edit, no restart, and the worker is told. A reviewer seat is read-only and refused; an empty list is refused; a worker spawned without owns has no limit to widen.',
+      {
+        seat: seatProp,
+        add: { type: 'array', items: { type: 'string' }, description: 'Globs, relative to the worker\'s worktree, to allow in addition to its owns.' },
+        set: { type: 'array', items: { type: 'string' }, description: 'Globs that replace its owns. Give add or set, not both.' },
+      },
+      ['seat'],
+      async (args) =>
+        asResult(
+          await cmd.setOwns(deps, identity, {
+            seat: seatName(args),
+            ...(args.add != null ? { add: names(args, 'add') } : {}),
+            ...(args.set != null ? { set: names(args, 'set') } : {}),
+          }),
+        ),
+    ),
+    defineTool(
       'run_report',
-      'Tokens, cost, wall time, time spent waiting on the human and rework (change rounds, promotions, migrations, restarts) of this run, per seat and in total, read from the agents\' transcripts and the run\'s events. Read only.',
+      'Tokens, cost, wall time, time spent waiting on the human, rework (change rounds, promotions, migrations, restarts) and guard denials (by rule) of this run, per seat and in total, read from the agents\' transcripts and the run\'s events. Read only.',
       { json: { type: 'boolean', description: 'Return JSON instead of a table.' } },
       [],
       async (args) => asResult(await cmd.runReport(deps, await ref(), flag(args, 'json'))),
@@ -317,7 +366,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
 
 const REPORT_GUIDE = `Report to the planner. This is the only way the planner hears from you; plain text you write in this session is not delivered.
 Kinds:
-- done: you finished and verified (include branch, changed files, test output, anything you are unsure of in details). Default expects review. After the planner approves, commit, then send done again with expects none and the commit sha.
+- done: you finished and verified (include branch, changed files, test output, anything you are unsure of in details; when your brief has acceptance criteria, answer each in criteria). Default expects review. After the planner approves, commit, then send done again with expects none and the commit sha.
 - question: you need a decision before you can continue. Default expects answer. Set for to human when only the human can decide (scope, money, production).
 - blocked: something outside your control stops you; say what you tried. Default expects answer.
 - promote: the task needs a stronger model or more effort; say why. Default expects answer.
@@ -341,6 +390,11 @@ export const workerTools = (deps: Deps, identity: Identity, ports: ToolPorts = d
       details: { type: 'string', description: 'Branch, changed files, test output, options and your recommendation. Keep it factual.' },
       expects: { type: 'string', enum: EXPECTS, description: 'What you expect back. Omit for the default of the kind.' },
       for: { type: 'string', enum: ['human'], description: 'Set to human when only the human can decide.' },
+      criteria: {
+        type: 'array',
+        description: 'On done, when your brief has an ## Acceptance section: one entry per criterion, by id (AC1…), met or not, with the evidence (the command and its result, or file:line).',
+        items: { type: 'object', properties: { id: { type: 'string', description: 'AC1, AC2, …' }, met: { type: 'boolean' }, evidence: { type: 'string' } }, required: ['id', 'met', 'evidence'] },
+      },
     },
     ['kind', 'summary'],
     async (args) => {
@@ -348,7 +402,9 @@ export const workerTools = (deps: Deps, identity: Identity, ports: ToolPorts = d
       const checked = ports.validateReport(args)
       if (!checked.ok) return { text: checked.error, isError: true }
       const at = deps.clock.now()
-      const report = ports.stampReport(checked.value as ReportInput, { id: protocol.newReportId(identity.seat, at.getTime()), run: identity.run, seat: identity.seat, token: identity.token, at: at.toISOString() })
+      // The seat's criteria count rides on the report, so a done without answers shows the planner a reminder (DROVE-123).
+      const given = (await ports.loadRoster(identity.home, identity.run).catch(() => undefined))?.seats.find(entry => entry.name === identity.seat)?.acceptance?.length
+      const report = ports.stampReport(checked.value as ReportInput, { id: protocol.newReportId(identity.seat, at.getTime()), run: identity.run, seat: identity.seat, token: identity.token, at: at.toISOString(), ...(given ? { acceptance: given } : {}) })
       await ports.appendJsonl(join(ports.seatDir(identity.home, identity.run, identity.seat), 'outbox.jsonl'), report)
       return { text: `report ${report.id} recorded (${report.kind}, expects ${report.expects}). ${afterReport(report.kind, report.expects)}` }
     },

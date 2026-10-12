@@ -49,12 +49,16 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'review-loop' | 'run-budget' | 'pending-delivery' | 'guard-thrash'
   detail: string
   at: string
 }
 
 export type MergeGate = { result: 'passed' | 'refused' | 'pending'; at: string; detail: string }
+
+// A seat's last check run (DROVE-122), kept on the roster for the boards; the ledger holds every run. `stale` is set by the
+// watcher once the worktree's HEAD is no longer `sha`.
+export type SeatChecks = { result: 'passed' | 'failed'; sha: string; clean: boolean; at: string; failed?: string; stale?: boolean }
 
 export type Seat = {
   name: string
@@ -74,9 +78,13 @@ export type Seat = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
   budgetNoticed?: boolean
+  reviewChanges?: number
   slot?: number
   worktree: string
   branch: string
@@ -87,6 +95,7 @@ export type Seat = {
   lastReport?: LastReport
   lastSentAt?: string
   gate?: MergeGate
+  checks?: SeatChecks
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
@@ -111,6 +120,7 @@ export type DroveEventType =
   | 'seat.start_failed'
   | 'seat.relaunch'
   | 'seat.migrate'
+  | 'seat.owns'
   | 'seat.state'
   | 'seat.close'
   | 'report'
@@ -120,10 +130,11 @@ export type DroveEventType =
   | 'control.sent'
   | 'control.failed'
   | 'attention'
-  | 'guard.deny'
+  | 'guard.denied'
   | 'merge.passed'
   | 'merge.refused'
   | 'merge.pending'
+  | 'checks.ran'
 
 export type DroveEvent = {
   at: string

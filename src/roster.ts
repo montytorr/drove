@@ -1,5 +1,6 @@
 import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
+import { checkText } from '../mod/hooks/roster.ts'
 import { runDir } from './paths.ts'
 import { modelLabelOf } from './agents.ts'
 import { ensureHome, readJson, withLock, writeJsonAtomic } from './store.ts'
@@ -78,8 +79,9 @@ export const rosterLines = (roster: Roster, now: Date, agents?: HostAgents): str
     const owes = seat.owes === 'none' ? '' : ` · waiting for your ${seat.owes}`
     const attention = seat.attention.length > 0 ? ` · attention: ${seat.attention.map(item => item.reason).join(', ')}` : ''
     const cairn = seat.cairn ? ` · ${seat.cairn}` : ''
+    const checks = seat.checks ? ` · checks ${checkText(seat)}` : ''
     const role = seat.role && seat.role !== 'implementer' ? ` · ${seat.role} of ${seat.target ?? '?'}` : ''
-    return `- ${seat.name} [${seat.state}] ${seat.kind} ${shortModel(modelLabelOf(seat.kind, seat.model, agents))} ${seat.effort}${cairn}${role} · pane ${seat.paneId ?? '?'} · up ${minutesSince(seat.spawnedAt, now)}m${report}${owes}${attention}`
+    return `- ${seat.name} [${seat.state}] ${seat.kind} ${shortModel(modelLabelOf(seat.kind, seat.model, agents))} ${seat.effort}${cairn}${role} · pane ${seat.paneId ?? '?'} · up ${minutesSince(seat.spawnedAt, now)}m${checks}${report}${owes}${attention}`
   })
 }
 

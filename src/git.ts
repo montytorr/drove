@@ -30,6 +30,12 @@ export const addWorktree = async (exec: Exec, repo: string, path: string, branch
   await must(exec, repo, isExisting ? ['worktree', 'add', path, branch] : ['worktree', 'add', '--no-track', '-b', branch, path, from])
 }
 
+// The commit a local branch points at, or undefined when it does not exist.
+export const branchTip = async (exec: Exec, repo: string, branch: string): Promise<string | undefined> => {
+  const result = await git(exec, repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}^{commit}`])
+  return result.code === 0 ? result.stdout.trim() || undefined : undefined
+}
+
 export const branchExists = (exec: Exec, repo: string, branch: string): Promise<boolean> => refExists(exec, repo, `refs/heads/${branch}`)
 
 // A worktree holding changes that are not committed: the work of a seat that has not been approved yet.
@@ -172,10 +178,11 @@ export const mergeNoFf = async (exec: Exec, repo: string, branch: string, messag
   return { ok: false, output: (merged.stdout + merged.stderr).trim() }
 }
 
-// Pushes `branch` to the same name on `remote`: explicit refspec, no upstream set, never forced.
-export const pushBranch = async (exec: Exec, repo: string, remote: string, branch: string): Promise<ExecResult> => {
+// Pushes `branch` to the same name on `remote`: explicit refspec, no upstream set, never forced. With `sha`, that exact
+// commit is what the remote branch becomes, whatever the local branch has moved to since.
+export const pushBranch = async (exec: Exec, repo: string, remote: string, branch: string, sha?: string): Promise<ExecResult> => {
   if (branch === PROTECTED_BRANCH) return { code: 1, stdout: '', stderr: `refusing to push the ${PROTECTED_BRANCH} branch` }
-  return exec(['git', '-C', repo, 'push', remote, `refs/heads/${branch}:refs/heads/${branch}`], { timeoutMs: 120_000 })
+  return exec(['git', '-C', repo, 'push', remote, `${sha ?? `refs/heads/${branch}`}:refs/heads/${branch}`], { timeoutMs: 120_000 })
 }
 
 export const deleteRemoteBranch = async (exec: Exec, repo: string, remote: string, branch: string): Promise<ExecResult> => {

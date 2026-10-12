@@ -23,7 +23,7 @@ beforeEach(async () => {
 })
 
 test('cli knows the commands from the design', () => {
-  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'init', 'spawn', 'send', 'prompt', 'promote', 'migrate', 'roster', 'reports', 'report', 'capture', 'close', 'merge', 'board', 'down', 'up', 'attention', 'goal', 'doctor', 'budget', 'guard', 'mcp', 'mod'])
+  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'init', 'spawn', 'send', 'owns', 'prompt', 'promote', 'migrate', 'roster', 'reports', 'report', 'capture', 'close', 'merge', 'checks', 'board', 'down', 'up', 'attention', 'goal', 'doctor', 'budget', 'guard', 'mcp', 'mod'])
 })
 
 test('--owns splits on commas outside braces, and spawn reads --owns, --max-turns and --max-tokens', async () => {
@@ -107,6 +107,18 @@ test('merge takes a seat, --pr, --squash, -m, --no-checks and --run; without a s
   assert.ok(err.join('\n').length > 0)
 })
 
+test('merge takes --fresh, and checks takes a seat and --fresh (DROVE-122)', async () => {
+  assert.match(COMMANDS.merge?.usage ?? '', /\[--fresh\]/)
+  const missing = capture()
+  assert.equal(await main(['checks'], missing.io), 2)
+  assert.match(missing.err.join('\n'), /missing <seat>[\s\S]*drove checks <seat> \[--fresh\]/)
+  for (const argv of [['checks', 'w-api', '--fresh', '--run', 'no-such-run'], ['merge', 'w-api', '--fresh', '--run', 'no-such-run']]) {
+    const { err, io } = capture()
+    assert.equal(await main(argv, io), 1, argv.join(' '))
+    assert.match(err.join('\n'), /^no-run: no run named no-such-run/)
+  }
+})
+
 test('promote accepts a missing --model, so a Codex seat keeps its current one', async () => {
   const { err, io } = capture()
   assert.equal(await main(['promote', 'w-api', '--effort', 'high'], io), 1)
@@ -129,7 +141,8 @@ test('drove guard with no Drove identity allows silently', async () => {
 test('drove plan prints the run line and hands the exec plan to the launcher, returning its exit code', async () => {
   process.env.HERDR_PANE_ID = 'w1:p5'
   const { out, launched, io } = capture()
-  assert.equal(await main(['plan', '--kind', 'codex', '--goal', 'Do the goal'], io), 7)
+  // In a repo of its own with a main branch: a CI checkout of a feature branch has no main, and drove plan needs a base.
+  assert.equal(await inDir(await makeRepo('plan-repo'), () => main(['plan', '--kind', 'codex', '--goal', 'Do the goal'], io)), 7)
   assert.match(out.join('\n'), /^Run .* is up; starting the codex planner\./)
   assert.equal(launched.length, 1)
   assert.equal(launched[0]?.argv[0], 'codex')

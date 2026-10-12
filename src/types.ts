@@ -48,6 +48,10 @@ export type DroveConfig = {
   workerUserMemory?: boolean
   workerUserHooks?: boolean
   maxTurns?: number
+  reviewLoopLimit?: number
+  runMaxCost?: number
+  // One seat's denials of one rule that make the planner hear of it (defaults 3 in 10 minutes).
+  guardThrash?: { count: number; minutes: number }
 }
 
 export type PlannerMeta = {
@@ -86,12 +90,16 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'review-loop' | 'run-budget' | 'pending-delivery' | 'guard-thrash'
   detail: string
   at: string
 }
 
 export type MergeGate = { result: 'passed' | 'refused' | 'pending'; at: string; detail: string }
+
+// A seat's last check run (DROVE-122), kept on the roster for the boards; the ledger holds every run. `stale` is set by the
+// watcher once the worktree's HEAD is no longer `sha`.
+export type SeatChecks = { result: 'passed' | 'failed'; sha: string; clean: boolean; at: string; failed?: string; stale?: boolean }
 
 export type Seat = {
   name: string
@@ -111,9 +119,13 @@ export type Seat = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
   budgetNoticed?: boolean
+  reviewChanges?: number
   slot?: number
   worktree: string
   branch: string
@@ -124,6 +136,7 @@ export type Seat = {
   lastReport?: LastReport
   lastSentAt?: string
   gate?: MergeGate
+  checks?: SeatChecks
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
@@ -150,8 +163,14 @@ export type Report = {
   for?: 'human'
   summary: string
   details?: string
+  criteria?: Criterion[]
+  acceptance?: number
   at: string
 }
+
+// One acceptance criterion of a seat, as the worker's done report answers it (DROVE-123). `acceptance` on a Report is the
+// number of criteria Drove had written into the seat's brief when the report was stamped.
+export type Criterion = { id: string; met: boolean; evidence: string }
 
 export type ReportInput = {
   kind: ReportKind
@@ -159,6 +178,7 @@ export type ReportInput = {
   for?: 'human'
   summary: string
   details?: string
+  criteria?: Criterion[]
 }
 
 export type Control = {
@@ -190,6 +210,7 @@ export type DroveEventType =
   | 'seat.start_failed'
   | 'seat.relaunch'
   | 'seat.migrate'
+  | 'seat.owns'
   | 'seat.state'
   | 'seat.close'
   | 'report'
@@ -199,10 +220,11 @@ export type DroveEventType =
   | 'control.sent'
   | 'control.failed'
   | 'attention'
-  | 'guard.deny'
+  | 'guard.denied'
   | 'merge.passed'
   | 'merge.refused'
   | 'merge.pending'
+  | 'checks.ran'
 
 export type DroveEvent = {
   at: string
@@ -246,7 +268,24 @@ export type GuardInput = {
   seatRole?: SeatRole
 }
 
-export type GuardDecision = { allow: true } | { allow: false; reason: string }
+// Why the guard said no, as a stable id: the ledger (`guard.denied`), the thrash escalation and the run report group by it.
+export type GuardRule =
+  | 'owns'
+  | 'reviewer-readonly'
+  | 'planner-edit'
+  | 'planner-shell'
+  | 'push'
+  | 'production'
+  | 'herdr'
+  | 'merge-gate'
+  | 'agent-launch'
+  | 'drove-cli'
+  | 'github'
+  | 'run-state'
+  | 'unreadable'
+  | 'guard-error'
+
+export type GuardDecision = { allow: true } | { allow: false; reason: string; rule: GuardRule }
 
 export type ExecResult = { code: number; stdout: string; stderr: string }
 export type ExecOptions = { timeoutMs?: number; input?: string; env?: Record<string, string>; cwd?: string }
@@ -261,6 +300,8 @@ export type Deps = {
   codexUserHome?: string
   claudeUserConfig?: string
   claudeUserDir?: string
+  // Waits between gh retries (merge --pr); tests pass a no-op.
+  sleep?: (ms: number) => Promise<void>
 }
 
 export type HerdrAgent = {
@@ -352,8 +393,11 @@ export type SpawnRequest = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
 }
 
 export type SendRequest = {
@@ -377,6 +421,7 @@ export type MergeRequest = {
   squash?: boolean
   message?: string
   noChecks?: boolean
+  fresh?: boolean
 }
 
 export type MigrateRequest = {

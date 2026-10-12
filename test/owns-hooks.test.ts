@@ -22,6 +22,7 @@ const fakeDeps = () => {
     append: async (path, value) => void written.push({ path, value: value as Record<string, unknown> }),
     openIds: async () => [],
     seatToken: async () => undefined,
+    seatOwns: async () => undefined,
     adoptGoal: async () => undefined,
   }
   return { deps, written }
@@ -36,8 +37,8 @@ test('pre-tool-use: a worker with DROVE_OWNS is denied an edit outside its globs
   const env = { ...WORKER, DROVE_OWNS: OWNS }
   const denied = await hooks.runHook('pre-tool-use', pre('Edit', { file_path: join(worktree, 'src/launch.ts') }), env, deps)
   assert.equal(denied.code, 2)
-  assert.match(denied.stderr, /this file is outside the paths your brief gives you \(src\/guard\.ts, test\/\*\*\); ask the planner with the drove report tool/)
-  assert.equal(written.at(-1)?.value.type, 'guard.deny')
+  assert.match(denied.stderr, /src\/launch\.ts: this file is outside the paths your brief gives you \(src\/guard\.ts, test\/\*\*\); if you need it, send a question report asking the planner to add it to your owns with the set_owns tool, naming \S+src\/launch\.ts/)
+  assert.equal(written.at(-1)?.value.type, 'guard.denied')
   assert.equal((await hooks.runHook('pre-tool-use', pre('Edit', { file_path: join(worktree, 'src/guard.ts') }), env, deps)).code, 0)
   assert.equal((await hooks.runHook('pre-tool-use', pre('Bash', { command: 'echo x > package.json' }), env, deps)).code, 2)
   assert.equal((await hooks.runHook('pre-tool-use', pre('Bash', { command: 'echo x > test/a.txt' }), env, deps)).code, 0)

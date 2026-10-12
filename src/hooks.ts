@@ -1,15 +1,19 @@
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { commandOf, decide, denyText } from './guard.ts'
+import { commandOf, decide, denyText, editPathsOf, reasonOfText } from './guard.ts'
 import { agentName } from './herdr.ts'
 import { identityFromEnv, plannerDir, runDir, seatDir } from './paths.ts'
 import { goalFromPrompt, locateEnvelope, UNVERIFIED, verifyControl } from './protocol.ts'
-import type { AgentKind, GuardDecision, GuardInput, HookEventName, HookInput, HookRecord, Identity } from './types.ts'
+import { GUARD_THRASH_REASON, thrashLimits, thrashMarker, thrashOf, thrashText } from './thrash.ts'
+import type { SeatKnown, ThrashLimits } from './thrash.ts'
+import type { AgentKind, Attention, DroveEvent, GuardDecision, GuardInput, GuardRule, HookEventName, HookInput, HookRecord, Identity } from './types.ts'
 
 export const HOOK_EVENTS: readonly HookEventName[] = ['session-start', 'user-prompt-submit', 'pre-tool-use', 'stop', 'stop-failure', 'notification', 'permission-request']
 export const DENY_EXIT_CODE = 2
 
 const DETAIL_MAX = 200
+// How far back the thrash check reads events.jsonl: lines are capped at 8 KiB, and a busy run writes a few hundred bytes a second.
+const RECENT_BYTES = 512 * 1024
 const CODEX_ONLY_TOOLS = new Set(['shell', 'exec_command', 'apply_patch'])
 
 export type HookResult = { stdout: string; stderr: string; code: number }
@@ -23,7 +27,21 @@ export type HookDeps = {
   append: (path: string, value: unknown) => Promise<void>
   openIds: (identity: Identity) => Promise<string[]>
   seatToken: (identity: Identity) => Promise<string | undefined>
+  seatOwns: (identity: Identity) => Promise<string[] | undefined>
   adoptGoal: (identity: Identity, goal: string) => Promise<void>
+  // What the thrash escalation reads and writes (DROVE-121); a deps object without it never escalates.
+  thrash?: ThrashPort
+}
+
+export type ThrashPort = {
+  limits: (identity: Identity) => Promise<ThrashLimits>
+  recent: (identity: Identity) => Promise<DroveEvent[]>
+  // The seat's roster entry: an item already held, and the report the roster has ingested.
+  known: (identity: Identity) => Promise<SeatKnown>
+  raise: (identity: Identity, item: Attention, rule: GuardRule) => Promise<void>
+  // Two hooks of one seat (parallel tool calls) must not both raise the same item. A busy lock skips the escalation and
+  // never waits: the next denial counts again, and a denial must not be slow.
+  lock: (identity: Identity, work: () => Promise<void>) => Promise<void>
 }
 
 export const defaultHookDeps: HookDeps = {
@@ -38,15 +56,48 @@ export const defaultHookDeps: HookDeps = {
     return roster.openSeats(await roster.loadRoster(identity.home, identity.run)).flatMap(seat => [seat.name, agentName(identity.run, seat.name), ...(seat.paneId ? [seat.paneId] : []), ...(seat.sessionId ? [seat.sessionId] : [])])
   },
   seatToken: async identity => (await import('./store.ts')).readToken(join(seatDir(identity.home, identity.run, identity.seat), 'token')),
+  // The roster holds the seat's current owns: the planner may widen them after the launch env was written (DROVE-119).
+  seatOwns: async identity => {
+    const roster = await import('./roster.ts')
+    return roster.findSeat(await roster.loadRoster(identity.home, identity.run), identity.seat)?.owns
+  },
   adoptGoal: async (identity, goal) => {
     const roster = await import('./roster.ts')
     const run = await roster.loadRun(identity.home, identity.run)
     if (run && !run.goal && !run.planner.viaMod) await roster.saveRun(identity.home, { ...run, goal })
   },
+  thrash: {
+    limits: async identity => thrashLimits((await (await import('./store.ts')).readJson<{ guardThrash?: unknown }>(join(identity.home, 'config.json')).catch(() => undefined))?.guardThrash),
+    recent: async identity => (await import('./store.ts')).readJsonlTail<DroveEvent>(join(runDir(identity.home, identity.run), 'events.jsonl'), RECENT_BYTES),
+    known: async identity => {
+      const roster = await import('./roster.ts')
+      const seat = (await roster.loadRoster(identity.home, identity.run)).seats.find(entry => entry.name === identity.seat)
+      return { attention: seat?.attention ?? [], ...(seat?.lastReport ? { lastReportAt: seat.lastReport.at } : {}) }
+    },
+    raise: async (identity, item, rule) => {
+      const roster = await import('./roster.ts')
+      const marker = thrashMarker(rule)
+      await roster.updateRoster(identity.home, identity.run, current => ({
+        ...current,
+        seats: current.seats.map(seat =>
+          seat.name === item.seat ? { ...seat, attention: [...seat.attention.filter(entry => !(entry.reason === GUARD_THRASH_REASON && entry.detail.includes(marker))), item] } : seat,
+        ),
+      }))
+    },
+    // Held a moment (the work is one tail read and one roster write), stolen after 2 s, given up on after 250 ms.
+    lock: async (identity, work) => {
+      const store = await import('./store.ts')
+      try {
+        await store.withLock(join(seatDir(identity.home, identity.run, identity.seat), 'guard.lock'), work, 2000, 250)
+      } catch (error) {
+        if (!(error instanceof store.LockBusy)) throw error
+      }
+    },
+  },
 }
 
 const text = (value: unknown): string | undefined => (typeof value === 'string' && value.length > 0 ? value : undefined)
-const clip = (value: string): string => (value.length > DETAIL_MAX ? `${value.slice(0, DETAIL_MAX - 1)}…` : value)
+const clip = (value: string, max = DETAIL_MAX): string => (value.length > max ? `${value.slice(0, max - 1)}…` : value)
 
 export const detectAgent = (raw: Record<string, unknown>, env: NodeJS.ProcessEnv): AgentKind => {
   const declared = env.DROVE_AGENT
@@ -116,6 +167,7 @@ const mentionsSessions = (input: HookInput): boolean => /herdr|codex/.test(JSON.
 const guardInput = async (identity: Identity, input: HookInput, deps: HookDeps): Promise<GuardInput> => {
   const isPlanner = identity.role === 'planner'
   const home = process.env.HOME ?? homedir()
+  const owns = isPlanner ? undefined : (await deps.seatOwns(identity).catch(() => undefined)) ?? identity.owns
   return {
     agent: input.agent,
     role: identity.role,
@@ -124,7 +176,7 @@ const guardInput = async (identity: Identity, input: HookInput, deps: HookDeps):
     cwd: input.cwd ?? process.cwd(),
     writableRoots: isPlanner ? ['/tmp', '/private/tmp', join(home, '.claude', 'plans'), deps.scratchRoot(identity)] : [],
     openSeats: isPlanner && mentionsSessions(input) ? await deps.openIds(identity) : [],
-    ...(!isPlanner && identity.owns ? { owns: identity.owns } : {}),
+    ...(owns ? { owns } : {}),
     ...(!isPlanner && identity.seatRole ? { seatRole: identity.seatRole } : {}),
   }
 }
@@ -148,15 +200,33 @@ const renderPromptNotice = (notice: string): HookResult => ({
   code: 0,
 })
 
-const logDeny = async (identity: Identity, input: HookInput, reason: string, deps: HookDeps): Promise<void> => {
+// A seat that keeps meeting the same rule is stuck: when it crosses the line the planner gets an attention item. The item is
+// the planner's (a person is not asked), is raised once per seat and rule until the seat reports, and the report clears it.
+const escalate = async (identity: Identity, rule: GuardRule, deps: HookDeps): Promise<void> => {
+  const port = deps.thrash
+  if (!port || identity.role !== 'worker') return
+  await port.lock(identity, async () => {
+    const thrash = thrashOf(await port.recent(identity), identity.seat, rule, deps.now().getTime(), await port.limits(identity), await port.known(identity))
+    if (!thrash) return
+    const at = deps.now().toISOString()
+    const detail = clip(thrashText(thrash), 400)
+    await port.raise(identity, { seat: identity.seat, reason: GUARD_THRASH_REASON, detail, at }, rule)
+    await deps.append(deps.eventsPath(identity), { at, type: 'attention', seat: identity.seat, data: { reason: GUARD_THRASH_REASON, rule, detail, count: thrash.count } })
+  })
+}
+
+// The ledger: every denial is one `guard.denied` line (allows are never written), small enough for the 8 KiB line cap.
+const logDeny = async (identity: Identity, input: Pick<HookInput, 'tool' | 'toolInput'>, decision: { rule: GuardRule; reason: string }, deps: HookDeps): Promise<void> => {
   const command = input.toolInput ? commandOf(input.toolInput) : undefined
+  const path = input.toolInput && !command ? editPathsOf(input.tool ?? '', input.toolInput)[0] : undefined
   try {
     await deps.append(deps.eventsPath(identity), {
       at: deps.now().toISOString(),
-      type: 'guard.deny',
+      type: 'guard.denied',
       seat: identity.seat,
-      data: { tool: input.tool, ...(command ? { command: clip(command) } : {}), reason: clip(reason) },
+      data: { tool: clip(input.tool ?? 'unknown'), rule: decision.rule, ...(command ? { command: clip(command) } : {}), ...(path ? { path: clip(path) } : {}), reason: clip(reasonOfText(decision.reason)) },
     })
+    await escalate(identity, decision.rule, deps)
   } catch {
     // the deny stands even when the event log is unwritable
   }
@@ -165,9 +235,14 @@ const logDeny = async (identity: Identity, input: HookInput, reason: string, dep
 const preToolUse = async (identity: Identity, raw: Record<string, unknown>, agent: AgentKind, deps: HookDeps): Promise<HookResult> => {
   const input = parseHookInput('pre-tool-use', raw, agent)
   const decision = decide(await guardInput(identity, input, deps))
-  if (!decision.allow) await logDeny(identity, input, decision.reason, deps)
+  if (!decision.allow) await logDeny(identity, input, decision, deps)
   return renderHookOutput(agent, decision)
 }
+
+// What the hook does when the guard itself fails (it throws, or its input is not JSON): a planner and a reviewer seat are
+// the roles whose whole point is what they may not do, so the call is refused. Any other seat is let through, as before:
+// a broken guard must not stop an implementer's work, and the seat's own owns check is the only thing lost.
+export const failsClosed = (identity: Identity): boolean => identity.role === 'planner' || (identity.role === 'worker' && identity.seatRole === 'reviewer')
 
 export const runHook = async (event: HookEventName, stdin: string, env: NodeJS.ProcessEnv, deps: HookDeps = defaultHookDeps): Promise<HookResult> => {
   const identity = deps.identity(env)
@@ -188,8 +263,10 @@ export const runHook = async (event: HookEventName, stdin: string, env: NodeJS.P
     }
     return notice ? renderPromptNotice(notice) : { stdout: '', stderr: '', code: 0 }
   } catch (error) {
-    if (event !== 'pre-tool-use' || identity.role !== 'planner') return { stdout: '', stderr: '', code: 0 }
-    const reason = denyText('planner', `the guard could not check this call (${error instanceof Error ? error.message : String(error)}), so it is refused`)
-    return renderHookOutput(agent, { allow: false, reason })
+    if (event !== 'pre-tool-use' || !failsClosed(identity)) return { stdout: '', stderr: '', code: 0 }
+    const rule: GuardRule = 'guard-error'
+    const reason = denyText(identity.role, `the guard could not check this call (${error instanceof Error ? error.message : String(error)}), so it is refused`, rule)
+    await logDeny(identity, {}, { rule, reason }, deps)
+    return renderHookOutput(agent, { allow: false, reason, rule })
   }
 }
