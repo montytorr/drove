@@ -28,6 +28,8 @@ test('optional choice, fixed lists, required bounds and numeric caps', () => {
   refused(applyPolicy(policy, { maxCost: 10 }), /maxCost.*max is 5/)
   assert.ok('request' in applyPolicy(policy, { model: '', maxMinutes: 1 }))
   refused(applyPolicy({ model: { required: true } }, { model: '' }), /model.*required/)
+  assert.deepEqual(applyPolicy({}, { model: '' }), { request: { model: '' } })
+  assert.deepEqual(applyPolicy({ effort: { choice: ['high'] } }, { model: '', effort: 'high' }), { request: { model: '', effort: 'high' } })
 })
 
 test('both config sources retain intersections, fixed, smaller max and required', async () => {

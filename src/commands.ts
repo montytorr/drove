@@ -909,11 +909,17 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (denied) return denied
   const located = await locateFor(deps, identity, 'up')
   const config = await loadConfig(deps.home)
-  const defaultKind = config.workerKind === 'claude' || config.workerKind === 'codex' ? config.workerKind : 'error' in located || hasAgent(located.run, 'claude') ? 'claude' : 'codex'
+  if (request.kind !== undefined && request.kind !== 'claude' && request.kind !== 'codex') return failed('usage', '--kind must be claude or codex')
+  const defaultKind = config.workerKind === 'claude' || config.workerKind === 'codex' ? config.workerKind : 'error' in located || hasAgent(located.run, 'claude') ? 'claude' : hasAgent(located.run, 'codex') ? 'codex' : undefined
+  if (!('error' in located)) {
+    if (!request.kind && !defaultKind) return failed('agent-unavailable', 'neither claude nor codex is on this host (drove doctor)')
+    const unavailable = requireAgent(located.run, request.kind ?? defaultKind!)
+    if (unavailable) return unavailable
+  }
   const declared = 'error' in located ? {} : (await loadPolicy(deps.home, located.run.repo, { exec: deps.exec, base: located.run.base })).policy
   const fixedKind = declared.kind?.fixed
   const policyRole = request.role ?? declared.role?.fixed
-  const policyKind = request.kind ?? (fixedKind === 'claude' || fixedKind === 'codex' ? fixedKind : defaultKind)
+  const policyKind = request.kind ?? (fixedKind === 'claude' || fixedKind === 'codex' ? fixedKind : defaultKind ?? 'claude')
   const policy = 'error' in located ? { request } : await workerPolicy(deps, located.run, config, policyKind, request, { ...workerDefaults(config, policyKind), owns: policyRole === 'tester' ? [...TESTER_OWNS] : undefined })
   if ('error' in policy) return policy.error
   request = policy.request
@@ -1495,14 +1501,17 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
   if ('error' in located) return located.error
   const { run } = located
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
-  const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
+  const unavailable = requireAgent(run, request.kind)
+  if (unavailable) return unavailable
   const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
   if (!seat || ['closed', 'closing', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
+  if (seat.kind === request.kind) return failed('usage', `${seat.name} is already a ${seat.kind} worker; use promote to change its model or effort`)
+  const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
   const policy = await workerPolicy(deps, run, config, request.kind, request, { model: resolveModel(request.kind, undefined, config), effort: seat.effort }, ['kind', 'model', 'effort'])
   if ('error' in policy) return policy.error
   request = policy.request
-  const unavailable = requireAgent(run, request.kind)
-  if (unavailable) return unavailable
+  const policyUnavailable = requireAgent(run, request.kind)
+  if (policyUnavailable) return policyUnavailable
   if (seat.kind === request.kind) return failed('usage', `${seat.name} is already a ${seat.kind} worker; use promote to change its model or effort`)
   if (!existsSync(seat.worktree)) return failed('no-worktree', `${seat.name}'s worktree ${seat.worktree} is missing, so there is nothing to hand over; close the seat and spawn a new worker`)
   const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))

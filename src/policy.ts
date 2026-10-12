@@ -96,7 +96,7 @@ export const loadPolicy = async (home: string, repo: string, source: PolicySourc
 export type PolicyOptions = { defaults?: object; normalize?: Normalize }
 export const applyPolicy = <T extends object>(policy: SpawnPolicy, request: T, keys: readonly SpawnPolicyKey[] = POLICY_KEYS, options: PolicyOptions = {}): { request: T } | { error: CommandResult } => {
   const explicit = { ...request } as Record<string, unknown>
-  if (typeof explicit.model === 'string' && !explicit.model.trim()) explicit.model = undefined
+  if (policy.model && typeof explicit.model === 'string' && !explicit.model.trim()) explicit.model = undefined
   const reviewer = (policy.role?.fixed ?? explicit.role ?? (options.defaults as Record<string, unknown> | undefined)?.role) === 'reviewer'
   const result = Object.fromEntries(Object.entries(explicit).filter(([, value]) => value !== undefined)) as T & Record<string, unknown>
   for (const [key, value] of Object.entries(options.defaults ?? {})) if (policy[key as SpawnPolicyKey] && explicit[key] === undefined && !(reviewer && key === 'owns')) Object.assign(result, { [key]: value })
