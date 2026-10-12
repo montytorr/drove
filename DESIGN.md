@@ -633,7 +633,7 @@ Recommendations accepted by the planner on 2026-10-09; the human-run [verify] it
 
 ## 14. Unattended runs (DROVE-95, DROVE-96)
 
-A job that is not in herdr (Bothy: cron, a signed webhook, chat, a poll) has to start a run, watch it, hear what needs a person, and resume it. This is Drove's side of that; the job is Bothy's. **None of it has run against a real herdr server yet** (the Bothy proof, DROVE-95, does that): what is written here is the design and what the tests pin against a fake herdr.
+A job that is not in herdr (Bothy: cron, a signed webhook, chat, a poll) has to start a run, watch it, hear what needs a person, and resume it. This is Drove's side of that; the job is Bothy's. **It has run live** (2026-10-12, DROVE-110: a Bothy job started a detached run against a real herdr server) and the tests pin it against a fake herdr.
 
 **Detached start.** `drove plan --detached` and `drove up --detached` replace "this pane" with a workspace of Drove's own. The steps, through the same herdr adapter the worker panes use (`src/herdr.ts`):
 
@@ -671,7 +671,7 @@ What it needs on the host: a running herdr server on the default socket or `HERD
 - *Run status is `drove roster --json`.* It already held `run.status` and each seat's state and last report; it now also says whether the planner pane is alive (`planner.state`), gives the latest report across seats, and the roster's write time. There is no separate `status` command.
 - *Errors are data with `--json`.* `{"ok":false,"code","error"}` on stderr, exit 1; usage errors exit 2.
 
-**Open (the Bothy proof).** Whether a workspace opened with no client attached accepts `agent start` the way a visible one does; whether the Claude planner's wake (the channel, or `herdr agent prompt`) lands in a workspace nobody looks at; whether `workspace list` is the right liveness probe on every herdr version Drove supports (`herdr status server --json` also exists, but its shape is not pinned here); and which dialogs a first unattended launch really meets.
+**Open.** The live proof (DROVE-110) shows a workspace opened with no client attached accepts `agent start` and runs the planner. Still to confirm: whether the Claude planner's wake (the channel, or `herdr agent prompt`) lands in a workspace nobody looks at; whether `workspace list` is the right liveness probe on every herdr version Drove supports (`herdr status server --json` also exists, but its shape is not pinned here); and which dialogs a first unattended launch really meets.
 
 ## 15. Doctor and remote machines (DROVE-97)
 

@@ -158,7 +158,7 @@ Review and testing can be seats of their own. They are optional: the planner rea
 
 ## Unattended runs
 
-> **Unproven live.** This interface is built and tested against a fake herdr, not yet against a real herdr server and a job that wakes on its own. Every statement about a live run below is a design claim until the Bothy proof (DROVE-95) has run it. The JSON shapes are meant to stay stable; the proof may still change them.
+> **Proven live.** On 2026-10-12 a Bothy job started a detached run with `drove plan --from-cairn REF --detached --json`, Drove opened a herdr workspace for it and the planner worked the task to its end (DROVE-110). The JSON shapes are meant to stay stable.
 
 A job outside herdr (cron, a webhook, a chat command; Bothy is the first) can start a run, watch it, hear what needs a person, and resume it, using four commands and no pane.
 
