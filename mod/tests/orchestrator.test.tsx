@@ -892,6 +892,24 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'goal')).toHaveLength(1)
   })
 
+  test('set_owns runs drove owns with --add or --set for this run, and refuses an empty list or both', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, 'DROVE-33..')
+    expect(denial((await callTool($, 'set_owns', { name: 'w-auth', add: [' mod/types/index.d.ts ', 'src/types.ts'] })) as never)).toBeUndefined()
+    expect(denial((await callTool($, 'set_owns', { name: 'w-auth', set: ['docs/**'] })) as never)).toBeUndefined()
+    const calls = droveCalls(world, 'owns')
+    expect(calls.map(call => call.args)).toEqual([
+      ['owns', 'w-auth', '--add', 'mod/types/index.d.ts,src/types.ts', '--run', RUN],
+      ['owns', 'w-auth', '--set', 'docs/**', '--run', RUN],
+    ])
+    expect(denial((await callTool($, 'set_owns', { name: 'w-auth', add: [] })) as never)).toContain('empty')
+    expect(denial((await callTool($, 'set_owns', { name: 'w-auth' })) as never)).toContain('add or set')
+    expect(denial((await callTool($, 'set_owns', { name: 'w-auth', add: ['a'], set: ['b'] })) as never)).toContain('add or set')
+    expect(denial((await callTool($, 'set_owns', { name: 'Bad Name', add: ['a'] })) as never)).toContain('Worker names')
+    expect(droveCalls(world, 'owns')).toHaveLength(2)
+  })
+
   test('a goal the engine refuses is retried once, then toasted and sent with the next prompt you type', async ($, on) => {
     const { world, clock } = engine(on)
     world.submitFailures = 2

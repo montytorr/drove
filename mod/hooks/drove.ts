@@ -72,6 +72,9 @@ export const reportsArgs = (run: string, seat?: string, all?: boolean): string[]
 // The text goes on stdin (`-`), so a goal that starts with a dash or holds quotes reaches Drove whole.
 export const goalArgs = (run: string, cairn?: string): string[] => ['goal', '--run', run, ...(cairn ? ['--cairn', cairn] : []), '-']
 
+// --add widens a seat's owns, --set replaces them; the globs are comma-separated, as spawn's --owns is.
+export const ownsArgs = (run: string, name: string, mode: 'add' | 'set', globs: readonly string[]): string[] => ['owns', name, `--${mode}`, globs.join(','), '--run', run]
+
 export const budgetArgs = (run: string, size: number): string[] => ['budget', String(size), '--run', run]
 
 export const downArgs = (run: string): string[] => ['down', '--run', run]

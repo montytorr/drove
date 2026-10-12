@@ -44,6 +44,8 @@ const CASES: { name: string; rule: GuardRule; call: GuardInput }[] = [
   { name: 'a worker push', rule: 'push', call: bash('worker', 'git push origin HEAD') },
   { name: 'a planner push --all', rule: 'production', call: bash('planner', 'git push --all') },
   { name: 'a planner gh pr create on production', rule: 'production', call: bash('planner', 'gh pr create --base production --title t --body b') },
+  { name: 'a worker redirect into the run state', rule: 'run-state', call: bash('worker', 'echo {} > ~/.drove/runs/r1/roster.json') },
+  { name: 'a worker rm in the run state', rule: 'run-state', call: bash('worker', 'rm -rf $DROVE_HOME/runs/r1') },
   { name: 'a worker herdr write', rule: 'herdr', call: bash('worker', 'herdr pane split') },
   { name: 'a planner herdr write', rule: 'herdr', call: bash('planner', 'herdr pane close p1') },
   { name: 'a planner merge of a seat branch', rule: 'merge-gate', call: bash('planner', 'git merge worktree-w-api') },
@@ -65,7 +67,7 @@ test('every denial carries a stable rule and its text ends with one concrete nex
     assert.equal(decision.allow, false, `${name} is denied`)
     if (decision.allow) continue
     assert.equal(decision.rule, rule, `${name}: rule`)
-    if (rule === 'owns') assert.match(decision.reason, /ask the planner with the drove report tool\.$/, name)
+    if (rule === 'owns') assert.match(decision.reason, /if you need it, send a question report asking the planner to add it to your owns with the set_owns tool, naming \S+\.$/, name)
     else assert.match(decision.reason, /Next step: [^.]+\.$/, `${name}: ends with a next step`)
   }
 })
@@ -357,6 +359,7 @@ const brokenDeps = () => {
       throw new Error('roster unreadable')
     },
     seatToken: async () => undefined,
+    seatOwns: async () => undefined,
     adoptGoal: async () => undefined,
   }
   return { deps, written }
