@@ -8,7 +8,7 @@ import { nodeExec } from '../src/commands.ts'
 import { acquireBridge, attach, EXIT, report, runBridge } from '../src/modhost.ts'
 import type { BridgeIo, BridgeLine } from '../src/modhost.ts'
 import { plannerDir, seatDir } from '../src/paths.ts'
-import { loadRun, saveRun } from '../src/roster.ts'
+import { loadRoster, loadRun, saveRun, updateRoster } from '../src/roster.ts'
 import { appendJsonl, readJson, readJsonlFrom, writeJsonAtomic } from '../src/store.ts'
 import type { Deps, Report } from '../src/types.ts'
 import type { WatchOptions } from '../src/watch.ts'
@@ -134,6 +134,26 @@ test('the bridge lock never signals pid 0, the marker a released bridge leaves b
 })
 
 const modRun = async () => setup({ planner: { kind: 'claude', viaMod: true, sessionId: 's-1', paneId: 'w1:p1' } })
+
+test('the bridge carries detected agents and refreshes default model labels without changing stored seats', async () => {
+  const ctx = await modRun()
+  const agents = { at: ctx.clock.now().toISOString(), codex: { version: '0.162.0', model: 'first-default' } }
+  await saveRun(ctx.home, { ...ctx.run, agents })
+  await updateRoster(ctx.home, ctx.run.id, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, model: '' })) }))
+  let loops = 0
+  const io = fakeIo(63, async current => {
+    loops += 1
+    if (loops === 1) await saveRun(ctx.home, { ...ctx.run, agents: { ...agents, codex: { ...agents.codex, model: 'next-default' } } })
+    if (loops === 2) current.parent = 1
+  })
+  const code = await runBridge(ctx.deps, ctx.run.id, { sessionId: 's-1', watch: (() => ({ stop: () => {} })) as never }, io, new AbortController().signal)
+  assert.equal(code, EXIT.ok)
+  const labels = io.lines.flatMap(line => line.t === 'roster' ? [line.roster.seats[0]?.model] : [])
+  assert.deepEqual(labels, ['first-default', 'next-default'])
+  const runs = io.lines.flatMap(line => line.t === 'run' ? [line.run.agents?.codex?.model] : [])
+  assert.deepEqual(runs, labels)
+  assert.equal((await loadRoster(ctx.home, ctx.run.id)).seats[0]?.model, '')
+})
 
 test('the bridge streams the run, the roster with mod status, events and wakes, then stops when its parent goes', async () => {
   const ctx = await modRun()

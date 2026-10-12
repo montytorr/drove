@@ -1,4 +1,6 @@
 export type AgentKind = 'claude' | 'codex'
+export type HostAgent = { version: string; model?: string; effort?: string }
+export type HostAgents = { claude?: HostAgent; codex?: HostAgent; at: string }
 export type Role = 'planner' | 'worker'
 // What a worker seat is for (DROVE-91): absent means an implementer. A reviewer reads another seat's work and reports; a tester writes tests only.
 export type SeatRole = 'implementer' | 'reviewer' | 'tester'
@@ -27,6 +29,7 @@ export type DroveConfig = {
   plannerModel: Record<AgentKind, string>
   plannerEffort: Effort
   workerModel: Record<AgentKind, string>
+  workerKind?: 'auto' | 'claude' | 'codex'
   workerEffort: Effort
   promotedModel: Record<AgentKind, string>
   budget: number
@@ -70,6 +73,7 @@ export type RunMeta = {
   workspace?: string
   budget: number
   planner: PlannerMeta
+  agents?: HostAgents
 }
 
 export type LastReport = {
@@ -333,7 +337,7 @@ export type DeliveryAdapter = {
 
 export type SpawnRequest = {
   seat: string
-  kind: AgentKind
+  kind?: AgentKind
   cairn?: string
   brief: string
   model?: string
