@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { appendJsonl } from '../src/store.ts'
 import { deriveState, needsNudge } from '../src/detect.ts'
 import * as detect from '../src/detect.ts'
-import { updateRoster } from '../src/roster.ts'
+import { saveRun, updateRoster } from '../src/roster.ts'
 import { eventsOf, fakePorts, fileReport, rosterOf, setup } from './p4-helpers.ts'
 
 const queued = (calls: string[][]) => calls.filter((argv) => argv[0] === 'codex')
@@ -686,4 +686,75 @@ test('DROVE-122: a seat\'s last check result goes stale once its worktree HEAD m
   ctx.clock.advance(5000)
   await watcher.tick()
   assert.equal((await rosterOf(ctx)).seats[0]?.checks?.stale, false)
+})
+
+test('DROVE-141: a resting Claude planner reads working while a worker works, and gets its idle title back after', async () => {
+  const ctx = await setup({ planner: { kind: 'claude', viaMod: true } })
+  let worker: HerdrAgent['status'] = 'working'
+  let planner: HerdrAgent = { paneId: 'p-planner', status: 'done', title: 'Plan the run', terminalTitle: '✳ Plan the run' }
+  const { ports, titles } = fakePorts({
+    agents: () => [planner, { name: 'w-api', paneId: 'p-w-api', status: worker }],
+    deriveState: (_seat, signals) => ({ state: signals.herdr?.status === 'working' ? 'working' : 'idle', attention: [] }),
+  })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  assert.deepEqual(titles, ['\x1b]0;⠿ Plan the run\x07'])
+
+  planner = { ...planner, status: 'working', terminalTitle: '⠿ Plan the run' }
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  assert.equal(titles.length, 1, 'held: nothing more to write')
+
+  worker = 'idle'
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  assert.deepEqual(titles.slice(1), ['\x1b]0;✳ Plan the run\x07'])
+  watcher.stop()
+  assert.equal(titles.length, 2, 'nothing held, nothing to restore on stop')
+})
+
+test('DROVE-141: the planner light stays plain while a worker needs the human, and a stopping watcher restores the title', async () => {
+  const ctx = await setup({ planner: { kind: 'claude' }, seats: ['w-api', 'w-ui'] })
+  let asking = true
+  const planner: HerdrAgent = { paneId: 'p-planner', status: 'idle', title: 'Plan', terminalTitle: '✳ Plan' }
+  const { ports, titles } = fakePorts({
+    agents: () => [planner, { name: 'w-api', paneId: 'p-w-api', status: 'working' }, { name: 'w-ui', paneId: 'p-w-ui', status: asking ? 'blocked' : 'working' }],
+    deriveState: (_seat, signals) => ({ state: signals.herdr?.status === 'blocked' ? 'needs-input' : 'working', attention: [] }),
+  })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  assert.deepEqual(titles, [], 'a worker waits on a person')
+
+  asking = false
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  assert.deepEqual(titles, ['\x1b]0;⠿ Plan\x07'])
+  watcher.stop()
+  assert.deepEqual(titles.slice(1), ['\x1b]0;✳ Plan\x07'])
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  assert.equal(titles.length, 2, 'a stopped watcher writes no title again')
+})
+
+test('DROVE-141: a run that goes down while the planner light is on gets the idle title back', async () => {
+  const ctx = await setup({ planner: { kind: 'claude' } })
+  let planner: HerdrAgent = { paneId: 'p-planner', status: 'idle', title: 'Plan', terminalTitle: '✳ Plan' }
+  const { ports, titles } = fakePorts({ agents: () => [planner, { name: 'w-api', paneId: 'p-w-api', status: 'working' }] })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  assert.deepEqual(titles, ['\x1b]0;⠿ Plan\x07'])
+  planner = { ...planner, status: 'working', terminalTitle: '⠿ Plan' }
+  await saveRun(ctx.home, { ...ctx.run, status: 'down' })
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  assert.deepEqual(titles.slice(1), ['\x1b]0;✳ Plan\x07'])
+})
+
+test('DROVE-141: a Codex planner\'s title is never touched', async () => {
+  const ctx = await setup()
+  const { ports, titles } = fakePorts({ agents: () => [{ paneId: 'p-planner', status: 'idle', title: 'x', terminalTitle: '✳ x' }, { name: 'w-api', paneId: 'p-w-api', status: 'working' }] })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  watcher.stop()
+  assert.deepEqual(titles, [])
 })

@@ -43,6 +43,7 @@ export type LastReport = {
   id: string
   kind: ReportKind
   expects: Expects
+  for?: 'human'
   summary: string
   at: string
 }

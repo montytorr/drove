@@ -21,7 +21,7 @@ test('argv builders match the herdr CLI', () => {
 test('parseAgents reads the real agent list shape', () => {
   const agents = herdr.parseAgents(fixture('agent-list.json'))
   assert.equal(agents?.length, 4)
-  assert.deepEqual(agents?.[1], { name: 'w-core', kind: 'claude', paneId: 'w1T:pF', status: 'working', sessionId: '22222222-2222-4222-8222-222222222222', title: 'w-core' })
+  assert.deepEqual(agents?.[1], { name: 'w-core', kind: 'claude', paneId: 'w1T:pF', status: 'working', sessionId: '22222222-2222-4222-8222-222222222222', title: 'w-core', terminalTitle: '◐ w-core' })
   assert.equal(agents?.[0]?.status, 'blocked')
   assert.equal(agents?.[0]?.name, undefined)
   assert.equal(agents?.[3]?.sessionId, undefined)
