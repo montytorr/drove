@@ -37,7 +37,8 @@ Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence
 - New `drove trace [<run>] [--json] [--otlp URL]` (DROVE-130): the run as an OpenTelemetry span tree, printed, as OTLP/JSON or posted to `/v1/traces`. The `otlpEndpoint` config key exports it after `drove down`.
 - `drove report` gains guard denials by rule (`deny`), steering nudges by rule (`nudge`) and checks run and failed (`chk run/fail`) per seat and in total (DROVE-121, DROVE-122, DROVE-127).
 
-### Fixes (DROVE-116, DROVE-124, DROVE-125, DROVE-136)
+### Fixes (DROVE-116, DROVE-124, DROVE-125, DROVE-136, DROVE-140)
+- Timed-out commands terminate their whole process group, escalating from SIGTERM to SIGKILL after 3 seconds; checks record `timedOut: true` in their ledger and outcome text while keeping exit 124 (DROVE-140).
 - The mod's guard spawns in the repo and names a missing session cwd instead of failing obscurely; `close` refuses to remove the planner's own cwd (DROVE-116).
 - A brief left as `[Pasted text]` in an idle agent's input is submitted with one Enter (DROVE-124).
 - A brief longer than `briefPointerLines` (new config key, default 40) goes out as a signed pointer to the seat's `brief.md`, and a brief whose paste never reached the input is sent once more as that pointer (DROVE-136).
