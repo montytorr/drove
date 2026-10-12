@@ -4,9 +4,42 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
-### Seat limits and policy
+Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence ledgers for what a run did, steering that reads a seat's tool calls, acceptance criteria a worker answers, and a loop that checks work before a person reads it. Most of this is about the planner's review: fewer rounds, and a record of why one was needed.
+
+### Merge gate and checks (DROVE-122)
+- New `drove checks <seat> [--fresh] [--run ID]`, the planner's `run_checks` tool and the mod's `run_checks`: runs the merge plan's checks in a seat's worktree and answers pass or fail per command with the failing output tail, the commit and whether the tree was clean. It never writes to the repo, and a worker cannot call it.
+- Every run of the checks is a line per command in the run's `checks.jsonl`: seat, command, worktree, HEAD sha, `clean`, exit code, duration and the output tail. A `checks.ran` event and a `chk✓` / `chk✗` / `chk~` column on the boards show the last result at the seat's HEAD.
+- The merge gate reuses a passing record when every command of the plan passed at the seat's exact HEAD on a clean tree (`checks reused: passed at <sha7> <time>`); a new commit, a dirty tree, a missing or failing record, an unreadable ledger line or `--fresh` runs them again.
+- The gate merges (or, with `--pr`, pushes) exactly the sha it checked, and refuses with `head-moved` when the branch has moved since.
+
+### Planner's review (DROVE-123, DROVE-126, DROVE-127, DROVE-131)
+- New `acceptance` on spawn (`--acceptance TEXT`, repeatable) (DROVE-123): Given-When-Then criteria, numbered AC1…ACn in the brief, which the worker answers one by one in `criteria` of its done report (`{ id, met, evidence }`). The planner's wake shows them.
+- Worker role texts are SOP-style MUST / MUST NOT / SHOULD / MAY lists (DROVE-123), the same text for every seat of a role.
+- GoalLoop (DROVE-126): Drove checks an implementer's `done` report itself before the planner wakes, with `autoChecks` of the repo's `.drove.json` (else the merge plan). A failure goes back to the worker as a `changes` verdict with the failing command and its tail; the planner is woken on a pass, or after `autoCheckAttempts` (default 2) failures. `autoCheck: false` turns it off. Events `autocheck.passed` and `autocheck.failed`. A repo should give a fast `autoChecks`, because the default is the whole merge plan.
+- Steering (DROVE-127): a tool ledger per seat, read from the agent's own transcript. R1 (the same shell command failing 3 times in a row) sends the worker one message; R2 (a done report with no check after the last edit) adds a line to the planner's view of the report. Config key `steering`; each nudge is a `steer.nudged` event.
+- New `drove diagnose [<run>] [--json]` (DROVE-131): deterministic detectors (`scope-too-narrow`, `checks-failed-at-done`, `review-loop`, `no-acceptance`, `merge-conflict`, `ci-only-failure`, `brief-not-delivered`, `budget-hit`, `usage-limit`, `guard-thrash`, `steering`) name why a run needed rework and where the fix belongs: brief, role text, config, repo, planning or Drove.
+
+### Seat limits and policy (DROVE-120)
+- New `maxMinutes` and `maxCost` per seat (`--max-minutes`, `--max-cost`; the spawn tool and the mod's `spawn_worker`): wall clock since spawn and transcript cost. At the bound the board shows a `budget` attention and the worker is sent one notice; Drove does not kill it.
+- A `review-loop` attention after `reviewLoopLimit` (default 3) `changes` verdicts to one seat.
+- New `runMaxCost` config key: one `run-budget` attention when the run's cost passes it.
 - New `spawnPolicy` in `~/.drove/config.json` and the repo's committed `.drove.json` (DROVE-128): `fixed`, `choice`, `required` and `max` rules limit the settings the planner may give a worker. When both files set a rule, the narrower one wins. Both planners show the merged policy and any policy errors before spawning.
 - The CLI enforces the policy on spawn, promote and demote (`model` and `effort`), migrate (`kind`), `drove owns` and seats relaunched by `drove up`, including the defaults each seat would use. Refusals have code `policy`; local and `--pr` merges that change `spawnPolicy` have code `policy-change` and require a human merge. `drove doctor` checks unknown keys, wrong types, empty choices, fixed values outside choices and maximums on non-number settings.
+
+### Guard (DROVE-119, DROVE-121)
+- A denial carries a stable rule id and is a `guard.denied` event in the run's `events.jsonl`; every denial text ends with `Next step:` (DROVE-121).
+- A seat that meets one rule `guardThrash.count` times (default 3) within `guardThrash.minutes` (default 10) with no report raises a `guard-thrash` item for the planner.
+- An explicit fail mode: when the guard itself fails, the planner and a reviewer seat are refused and other workers carry on, with the refusal recorded as `guard-error`.
+- New `set_owns` tool and `drove owns <seat> --add|--set GLOBS` (DROVE-119) widen an open seat's `owns` mid-run; the guard reads `owns` from the roster at each call. A worker's Bash cannot write Drove's run state (rule `run-state`).
+
+### Observability (DROVE-130, DROVE-121, DROVE-127)
+- New `drove trace [<run>] [--json] [--otlp URL]` (DROVE-130): the run as an OpenTelemetry span tree, printed, as OTLP/JSON or posted to `/v1/traces`. The `otlpEndpoint` config key exports it after `drove down`.
+- `drove report` gains guard denials by rule (`deny`), steering nudges by rule (`nudge`) and checks run and failed (`chk run/fail`) per seat and in total (DROVE-121, DROVE-122, DROVE-127).
+
+### Fixes (DROVE-116, DROVE-124, DROVE-125)
+- The mod's guard spawns in the repo and names a missing session cwd instead of failing obscurely; `close` refuses to remove the planner's own cwd (DROVE-116).
+- A brief left as `[Pasted text]` in an idle agent's input is submitted with one Enter (DROVE-124).
+- `merge --pr` reuses an open PR, trusts a MERGED PR only when its head is the branch tip, retries the read after merging, and treats `gh` outages and empty JSON as pending (DROVE-125).
 
 ## [0.4.0] - 2026-10-12
 

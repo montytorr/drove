@@ -149,8 +149,9 @@ With `workerKind` set to `claude` or `codex`, the text says that kind is the def
 | `drove init <dir> [--json]` | make a new git repo (branch `main`, one empty commit) in an empty or missing directory, then attach the run there; refuses a non-empty directory or an existing repo |
 | `drove roster [--json] [--run ID]` | one line per seat; `--json` also gives the run's status, the planner pane's state and the latest report (see "Unattended runs") |
 | `drove attention [--run ID \| --all] [--json] [--follow]` | what waits on a person, as data: dialogs, questions for the human, pane-budget requests, gone seats; `--follow` streams new and resolved items as JSON lines (see "Unattended runs") |
-| `drove trace [<run>] [--json] [--otlp URL]` | a run as an OpenTelemetry span tree, or OTLP/JSON posted to a collector |
-| `drove report [<run>] [--json]` | tokens, cost, wall time, time waiting on the human and rework, per seat and in total |
+| `drove trace [<run>] [--json] [--otlp URL]` | a run as an OpenTelemetry span tree; `--json` prints OTLP/JSON, `--otlp` posts it to a collector (see below) |
+| `drove report [<run>] [--json]` | tokens, cost, wall time, time waiting on the human, rework, checks run, guard denials and steering nudges, per seat and in total |
+| `drove diagnose [<run>] [--json]` | deterministic detectors say why a run needed rework and where the fix belongs (see below) |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
 | `drove merge <seat> [--pr] [--squash] [--fresh] [-m MSG] [--run ID]` | integrate a worker's branch behind the repo's checks: they run in the seat's worktree (or a passing record at its HEAD is reused, unless `--fresh`), then the branch is merged `--no-ff` into the base; `--pr` goes through a GitHub pull request instead (see "The merge gate") |
@@ -177,7 +178,7 @@ With `workerKind` set to `claude` or `codex`, the text says that kind is the def
 
 `drove trace [<run>]` prints an indented run → seat → attempt tree, with check spans under the active attempt (otherwise the seat), merge outcomes under the seat, and guard denials, steering nudges and attention as span events. `--json` prints OTLP/JSON; `--otlp http://localhost:4318` posts it to `/v1/traces`, using `OTEL_EXPORTER_OTLP_HEADERS` when set. Trace and span ids stay the same on re-export. Usage and known costs come from the same transcripts as `report`. Merge durations are zero because the event log currently records only their outcomes. Set `otlpEndpoint` in `~/.drove/config.json` to export automatically after `down`; export failures do not fail shutdown and HTTP requests time out after two seconds.
 
-`drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `merge`, `run_checks`, `roster`, `capture`, `run_report`, `set_goal` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
+`drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `merge`, `run_checks`, `roster`, `capture`, `set_goal`, `set_owns`, `run_report` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
 
 ## Unattended runs
 
@@ -306,7 +307,25 @@ Drove runs where the code lives: a client's laptop, a dev box, a CI host. Nothin
 
 ## State and config
 
-State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `workerKind` (`auto`, `claude` or `codex`: the kind a spawn gets when it names none), `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia`, `labInstance` (the Cairn instance that holds Lab subjects, `croft` by default), `maxTurns` (a default turn budget for every worker; unset by default), `reviewLoopLimit` (change rounds before human attention; default 3), `runMaxCost` (optional USD run budget), `guardThrash` (`{"count": 3, "minutes": 10}`: how many denials of one guard rule, within how many minutes and with no report, make the planner hear of a stuck worker), `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`), and `workerPorts` and `workerCopy` (see "Isolating workers"). Defaults are in `src/commands.ts`.
+State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `roster.json`, `events.jsonl`, a `codex-home/` and a folder per seat holding its token, its report file and its launch spec. `codex-home/` is the `CODEX_HOME` Drove gives Codex workers: Drove writes its `config.toml` (the MCP server, repo trust and hook trust) and `hooks.json`, and symlinks your `auth.json`, `AGENTS.md` and skills into it, so the launch line stays short and Codex asks no hook-review question. Your own `~/.codex` is read, never written. Optional settings go in `~/.drove/config.json`: `plannerModel`, `workerModel`, `promotedModel`, `plannerEffort`, `workerEffort`, `budget`, `humanName`, `workerKind` (`auto`, `claude` or `codex`: the kind a spawn gets when it names none), `codexWorkerSandbox`, `codexBypassHookTrust`, `claudeChannel`, `briefVia`, `labInstance` (the Cairn instance that holds Lab subjects, `croft` by default), `maxTurns` (a default turn budget for every worker; unset by default), `workerEnv` (extra environment variables for worker launches, such as `{"MY_FLAG": "1"}`), and `workerPorts` and `workerCopy` (see "Isolating workers"). The keys for limits, checks, steering and export are in "Configuration keys" below. Defaults are in `src/commands.ts`.
+
+### Configuration keys
+
+The keys behind the merge gate, the limits and the observability features. `~/.drove/config.json` is yours and applies to every run; `.drove.json` is the repo's own, read from the main checkout, and wins when a value can be set in both (for `autoCheck`, either file set to `false` turns it off).
+
+| Key | Where | Default | What it does |
+|---|---|---|---|
+| `checks` | `.drove.json` | the repo's `typecheck`, `lint` and `test` scripts or Makefile targets | commands the merge gate and `drove checks` run |
+| `autoCheck` | `.drove.json` or `config.json` | on | `false` stops Drove checking an implementer's `done` report itself |
+| `autoChecks` | `.drove.json` | the merge plan's `checks` | a faster list for that check; `[]` turns it off |
+| `autoCheckAttempts` | `.drove.json` or `config.json` | 2 | failed checks sent back to the worker before the planner is woken |
+| `reviewLoopLimit` | `config.json` | 3 | `changes` verdicts to one seat before a `review-loop` attention |
+| `runMaxCost` | `config.json` | unset | USD bound on the whole run; over it raises one `run-budget` attention |
+| `guardThrash` | `config.json` | `{"count": 3, "minutes": 10}` | denials of one guard rule, within the window and with no report, that raise `guard-thrash` for the planner |
+| `steering` | `config.json` | `{"enabled": true, "repeatFailures": 3, "cooldownMinutes": 10, "checkCommands": []}` | R1 and R2 steering; `"enabled": false` reads nothing |
+| `otlpEndpoint` | `config.json` | unset | collector URL; `drove down` exports the run's trace there |
+
+The per-worker bounds (`--max-turns`, `--max-tokens`, `--max-minutes`, `--max-cost`) are options of `drove spawn`; `maxTurns` in `config.json` is their run-wide default for turns.
 
 ### Lean workers
 
