@@ -39,6 +39,7 @@ One binary, `drove` (`src/cli.ts`). Each subcommand is a thin wrapper over a fun
 | `drove roster [--json] [--run ID]` | anyone | One line per seat: state, kind, model, effort, Cairn ref, age, last report, and what the planner owes it. |
 | `drove attention [--run ID \| --all] [--json] [--follow]` | human, a poller | The things that wait on a person, as data: a dialog or approval, a report for the human, a refused 6th pane, a gone seat. One snapshot, or JSON lines of new and resolved items with `--follow` (§14). |
 | `drove report [<run>] [--json]` | anyone | Read-only run report (DROVE-106): per seat and in total, tokens (input, cache read, cache write, output) from the agent's own transcript, cost from a price table, wall time (spawn to close), time waiting on the human, rework (verdicts with changes, promotions, demotions, migrations, restarts) and guard denials (`deny`: per seat, in total and by rule, from the `guard.denied` events, §6). Also the `run_report` MCP tool, and the totals and per-seat lines `drove down` adds to the goal task's summary note. |
+| `drove diagnose [<run>] [--json] [--run ID]` | anyone | Read-only (DROVE-131): deterministic detectors over the run's records say why it needed rework and where the fix belongs, one line per finding (§6, Diagnose). `drove report` ends with a pointer to it when a run has findings. |
 | `drove trace [<run>] [--json] [--otlp URL]` | human, CI | Exports a stable OpenTelemetry run → seat → attempt tree from the roster, events, transcripts and check ledger. Checks belong to the active attempt or seat, merge outcomes to the seat, guard/steering/attention items are span events. OTLP/HTTP uses `/v1/traces` and `OTEL_EXPORTER_OTLP_HEADERS`; optional `otlpEndpoint` config exports on `down` with a two-second HTTP bound, ignoring failures. Merge settlement events have no start timestamp, so their spans have zero duration. No planner tool. |
 | `drove capture <seat> [--lines N]` | planner, human | Read-only `herdr agent read` of a seat's recent output. |
 | `drove close <seat> [--remove-worktree]` | planner | Stops the agent and closes its pane (and the tab when it is empty), and marks the seat closed. A Claude seat is stopped by closing the pane, never with `/exit` (§5), and its stale worktree lock is cleared afterwards, as in `up` and `promote`; a Codex seat is sent `/quit` first. It removes the worktree only when asked and only when the branch is merged into the base. |
@@ -412,6 +413,26 @@ Strands Agents' interventions return a typed action, record it and escalate; the
 | no Drove identity in the env | allowed: not a Drove session | allowed |
 
 `failsClosed` in `src/hooks.ts` is the one place that says which. A worker whose `DROVE_OWNS` cannot be parsed has no `owns`, as before. The refusal itself is written to the ledger as `guard-error`.
+
+### Diagnose (DROVE-131)
+
+`drove diagnose [<run>]` (`src/diagnose.ts`) reads `events.jsonl`, the roster, `checks.jsonl`, each seat's `brief.md` and `outbox.jsonl`, and applies the detectors below. They are deterministic: no model call and no network; the only outside read is `git diff --name-only` on seat branches still present, for `merge-conflict`. It prints one line per finding, `category · seat · confidence · evidence · suggested fix (where: brief | role text | config | repo | planning | Drove)`, then a blank line and a one-line summary. The summary also goes to stderr; a run with no findings prints `no findings` and exits 0. `--json` prints the findings as an array (`category`, `seat`, `confidence`, `evidence`, `fix: { where, text }`, and `with` for the other seats of a conflict). `high` means the evidence is the failure itself (a count of denials, a verdict, a refusal); `medium` means a link in the chain is inferred.
+
+| Category | Evidence | Fix (where) | Confidence |
+|---|---|---|---|
+| `scope-too-narrow` | `guard.denied` with rule `owns`, and a `seat.owns` that widens (`add`, or a `set` that adds globs) | brief: give the mirror paths with the owned file (`mod/types/index.d.ts` with `src/types.ts`) | high with both, medium with one |
+| `checks-failed-at-done` | a `done` report, then a failing `checks.ran`, an `autocheck.failed` or a `merge.refused` with `checks-failed` | config: `autoChecks`, or the role text | high; medium when only a PR refusal shows it |
+| `review-loop` | at least 2 `control.sent` verdicts `changes`, with each verdict's first notes line (kept in the event's `notes` since DROVE-131) | brief: criteria missing or too vague | high |
+| `no-acceptance` | a seat with no criteria (roster, `## Acceptance` in its brief, or a report stamped with a count) and at least 1 `changes` | brief: spawn with `--acceptance` | high |
+| `merge-conflict` | `merge.refused` with `merge-conflict` or `pr-conflicts`, and the other seats whose branch touched the same files (a branch already merged is read from its first-parent merge commit) | planning: split the files between seats | high with an overlapping seat, medium without |
+| `ci-only-failure` | `merge.refused` with `checks-failed` and a PR URL, while the seat's last `checks.ran` (without one, its ledger records at one sha) passed | repo: a test depends on the environment | medium; high when the refusal carries the checked sha |
+| `brief-not-delivered` | `control.failed`, `seat.start_failed`, an `attention` `stalled` for `agent_prompt_stalled` or `pending-delivery`, a spawn with a start timeout, a brief `control.sent` with `unconfirmed` | Drove | high; medium for an unconfirmed send |
+| `budget-hit` | `attention` `budget` or `run-budget` | config: raise the limit or split the task | high |
+| `usage-limit` | `attention` `usage-limit` | config: wait for the reset or migrate | high |
+| `guard-thrash` | `attention` `guard-thrash` | brief: say what the seat may not do | high |
+| `steering` | `steer.nudged` events (DROVE-127), one finding per rule: R1 repeated failure, R2 done without a check | R1: role text or brief; R2: config (`autoChecks`) or role text | high |
+
+A PR refusal that a passing local run explains is `ci-only-failure` and not also `checks-failed-at-done`.
 
 ### Merge gate (DROVE-92, DROVE-105)
 

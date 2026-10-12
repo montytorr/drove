@@ -251,7 +251,7 @@ const humanWait = (events: readonly DroveEvent[], stretch: readonly Interval[], 
 }
 
 // The verdict is in the event since DROVE-106; before that a verdict is read from what came next: a done report that expects a review means changes.
-const verdictOf = (event: DroveEvent, later: readonly DroveEvent[]): 'approve' | 'changes' | undefined => {
+export const verdictOf = (event: DroveEvent, later: readonly DroveEvent[]): 'approve' | 'changes' | undefined => {
   const given = event.data?.verdict
   if (given === 'approve' || given === 'changes') return given
   const next = later.find(item => item.type === 'report' || item.type === 'seat.spawn' || item.type === 'seat.close')

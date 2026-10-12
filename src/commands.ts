@@ -17,6 +17,7 @@ import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShel
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
+import { diagnoseRun, renderDiagnosis, reportPointer } from './diagnose.ts'
 import { buildTrace, postTrace, renderTrace } from './trace.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
@@ -2106,7 +2107,17 @@ export const runReport = async (deps: Deps, ref: RunRef, asJson: boolean): Promi
   if ('error' in located) return located.error
   const built = await buildReport(deps, located.run.id, deps.claudeUserDir ?? userClaudeDir())
   if (!built) return failed('no-run', `no run named ${located.run.id}`)
-  return ok(asJson ? JSON.stringify(built, null, 2) : renderReport(built), built)
+  const pointer = asJson ? undefined : await diagnoseRun(deps, located.run.id).then(found => (found ? reportPointer(found) : undefined), () => undefined)
+  return ok(asJson ? JSON.stringify(built, null, 2) : `${renderReport(built)}${pointer ? `\n${pointer}` : ''}`, built)
+}
+
+// DROVE-131: why a run needed rework and where the fix belongs; read only, any status. The summary also goes to stderr (the CLI reads it from data).
+export const diagnose = async (deps: Deps, ref: RunRef, asJson: boolean): Promise<CommandResult> => {
+  const located = await locateRun(deps, ref)
+  if ('error' in located) return located.error
+  const found = await diagnoseRun(deps, located.run.id)
+  if (!found) return failed('no-run', `no run named ${located.run.id}`)
+  return ok(asJson ? JSON.stringify(found.findings, null, 2) : renderDiagnosis(found), found)
 }
 
 export const runTrace = async (deps: Deps, ref: RunRef, request: { asJson?: boolean; otlp?: string }): Promise<CommandResult> => {

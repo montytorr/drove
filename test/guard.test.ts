@@ -293,6 +293,13 @@ test('drove subcommands are allowed or denied per role', () => {
   for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once', 'merge w-x', 'attention']) assert.ok(worker(`drove ${sub}`), sub)
 })
 
+test('drove diagnose is read only and the planner\'s: allowed there, denied to a worker (DROVE-131)', () => {
+  assert.equal(planner('drove diagnose'), undefined)
+  assert.equal(planner('drove diagnose --json'), undefined)
+  assert.match(worker('drove diagnose') ?? '', /not available to a worker/)
+  assert.ok(worker('drove diagnose drove-20261009-1042-a3f1 --json'))
+})
+
 test('drove owns is the planner\'s: allowed there, denied to a worker even with the env cleared or set to planner (DROVE-119)', () => {
   assert.equal(planner('drove owns w-x --add mod/types/index.d.ts'), undefined)
   assert.equal(planner('drove owns w-x --set "src/**,test/**"'), undefined)
