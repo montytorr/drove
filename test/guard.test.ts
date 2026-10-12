@@ -337,6 +337,21 @@ test('a worker may read Drove\'s run state through Bash but not write it (DROVE-
   ]) assert.match(worker(command) ?? '', /run state is the planner's/, command)
 })
 
+test('a worker reads the brief.md its pointer names with cat, owns or not, reviewer or not (DROVE-136)', () => {
+  const brief = '/home/u/.drove/runs/drove-20261012-1226-7f8e/seats/w-api/brief.md'
+  const scopes = [
+    { writableRoots: [], openSeats: [] },
+    { writableRoots: [], openSeats: [], owns: ['src/**'] },
+    { writableRoots: [], openSeats: [], readOnly: true },
+  ]
+  for (const scope of scopes) {
+    for (const command of [`cat ${brief}`, `cat "${brief}"`, `head -n 80 ${brief}`, `wc -l ${brief} && cat ${brief}`, `cat ~/.drove/runs/drove-20261012-1226-7f8e/seats/w-api/brief.md`]) {
+      assert.equal(guard.bashReason(command, 'worker', scope), undefined, command)
+    }
+  }
+  assert.match(guard.bashReason(`cat > ${brief}`, 'worker', { writableRoots: [], openSeats: [] }) ?? '', /run state is the planner's/)
+})
+
 test('a worker with owns is denied a write to Drove\'s run state too, and the planner is unaffected', () => {
   const owned = (command: string) => guard.bashReason(command, 'worker', { writableRoots: [], openSeats: [], owns: ['src/**'] })
   assert.match(owned('node -e "x" ~/.drove/runs/r1/roster.json') ?? '', /run state is the planner's/)

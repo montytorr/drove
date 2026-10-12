@@ -10,6 +10,7 @@ import { agentName } from '../src/herdr.ts'
 import { seatDir } from '../src/paths.ts'
 import { deriveState } from '../src/detect.ts'
 import { approvedText } from '../src/prompts.ts'
+import { parseEnvelope } from '../src/protocol.ts'
 import { loadRoster, loadRun, updateRoster } from '../src/roster.ts'
 import type { Deps, Identity, RunMeta } from '../src/types.ts'
 import { FakeHerdr, git, makeDeps, makeRepo, makeSeat, RUN, seedRun, tmp } from './p3-helpers.ts'
@@ -452,6 +453,58 @@ test('a stalled brief with nothing in the input stays not delivered and presses 
   assert.equal(spawned.ok, true, spawned.text)
   assert.match(spawned.text, /Brief: not delivered \(agent_prompt_stalled/)
   assert.equal(fake.keys.length, 0)
+})
+
+const briefPath = (deps: Deps): string => join(seatDir(deps.home, RUN, 'w-api'), 'brief.md')
+const tenLines = Array.from({ length: 10 }, (_, index) => `Step ${index + 1} of the brief.`).join('\n')
+const pointerBody = (text: string | undefined): string => parseEnvelope(text ?? '')?.body ?? ''
+
+test('a stalled brief with nothing in the input is sent again once as a pointer to brief.md (DROVE-136)', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const { fake, deps, identity } = await setup(new FakeHerdr({ promptStalls: 'empty', stallsFor: 1, startStatus: 'idle' }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief: tenLines })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /Brief: herdr-prompt\./)
+  assert.equal(fake.keys.length, 0)
+  assert.equal(fake.prompts.length, 2)
+  assert.match(fake.prompts[0]?.text ?? '', /Step 10 of the brief\./)
+  const pointer = pointerBody(fake.prompts[1]?.text)
+  const saved = (await readFile(briefPath(deps), 'utf8')).trim()
+  assert.equal(pointer, `Your brief is in \`${briefPath(deps)}\` (${saved.split('\n').length} lines): read it with the Read tool, then start.`)
+  assert.doesNotMatch(fake.prompts[1]?.text ?? '', /Step 10 of the brief\./)
+  const sent = (await readEvents(deps)).find(item => item.type === 'control.sent')
+  assert.equal(sent?.data?.pointer, true)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'working')
+})
+
+test('a brief longer than briefPointerLines goes out as a pointer first, with the full text already in brief.md (DROVE-136)', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const { fake, deps, identity } = await setup(new FakeHerdr({ startStatus: 'idle' }))
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ briefPointerLines: 5 }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief: tenLines })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal(fake.prompts.length, 1)
+  const saved = (await readFile(briefPath(deps), 'utf8')).trim()
+  assert.match(saved, /^Step 1 of the brief\.\nStep 2/)
+  assert.ok(saved.split('\n').length > 10)
+  assert.equal(pointerBody(fake.prompts[0]?.text), `Your brief is in \`${briefPath(deps)}\` (${saved.split('\n').length} lines): read it with the Read tool, then start.`)
+  assert.doesNotMatch(fake.prompts[0]?.text ?? '', /Step 2 of the brief/)
+  const sent = (await readEvents(deps)).find(item => item.type === 'control.sent')
+  assert.deepEqual(sent?.data, { kind: 'brief', via: 'herdr-prompt', pointer: true })
+})
+
+test('a brief at or under briefPointerLines, or with a setting that is not a count, goes out in full as before (DROVE-136)', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const fits = await setup(new FakeHerdr({ startStatus: 'idle' }))
+  await writeFile(join(fits.deps.home, 'config.json'), JSON.stringify({ briefPointerLines: 40 }))
+  assert.equal((await commands.spawn(fits.deps, fits.identity, { seat: 'w-api', kind: 'claude', brief: tenLines })).ok, true)
+  assert.match(fits.fake.prompts[0]?.text ?? '', /Step 10 of the brief\./)
+
+  const invalid = await setup(new FakeHerdr({ startStatus: 'idle' }))
+  await writeFile(join(invalid.deps.home, 'config.json'), JSON.stringify({ briefPointerLines: 'few' }))
+  assert.equal((await commands.spawn(invalid.deps, invalid.identity, { seat: 'w-api', kind: 'claude', brief: tenLines })).ok, true)
+  assert.match(invalid.fake.prompts[0]?.text ?? '', /Step 10 of the brief\./)
+  assert.equal(invalid.fake.prompts.length, 1)
 })
 
 test('a first turn that outlasts the prompt wait still yields a successful spawn', async () => {

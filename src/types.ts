@@ -37,6 +37,8 @@ export type DroveConfig = {
   codexWorkerSandbox: 'bypass' | 'workspace-write'
   claudeChannel: boolean
   briefVia: 'prompt' | 'launch-arg'
+  // A brief of more lines than this goes to the worker as a pointer to its brief.md (default 40; DROVE-136).
+  briefPointerLines?: number
   labInstance: string
   workerEnv: Record<string, string>
   workerPorts?: { base: number; stride: number }
@@ -383,9 +385,10 @@ export type UserPlugins = {
 
 export type Transport = 'launch-arg' | 'herdr-prompt' | 'codex-queue' | 'mod' | 'channel' | 'piggyback'
 
+// `stalled: 'empty'`: herdr typed the text and saw no activity, the agent is idle and nothing of the text is in its input (DROVE-136).
 export type Delivery =
   | { ok: true; via: Transport }
-  | { ok: false; queued: boolean; reason: string }
+  | { ok: false; queued: boolean; reason: string; stalled?: 'empty' }
 
 export type DeliveryAdapter = {
   transport: Transport

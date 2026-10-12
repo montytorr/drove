@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
-import { appendFile, readFile } from 'node:fs/promises'
+import { appendFile, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { afterEach, test } from 'node:test'
 import * as deliver from '../src/deliver.ts'
 import { deriveState } from '../src/detect.ts'
 import { seatDir } from '../src/paths.ts'
+import { parseEnvelope, verifyControl } from '../src/protocol.ts'
 import { loadRoster, updateRoster } from '../src/roster.ts'
 import type { Control, DeliveryAdapter, Report, RunMeta, Seat } from '../src/types.ts'
 import { FakeHerdr, herdrFail, makeDeps, makeSeat, result, seedRun } from './p3-helpers.ts'
@@ -168,7 +169,7 @@ test('agent_pane_busy is retried and then delivered', async () => {
   assert.equal(busy, -1)
 })
 
-test('agent_prompt_stalled is not resent: it raises a stalled item and stays out of the queue', async () => {
+test('agent_prompt_stalled raises a stalled item and stays out of the queue', async () => {
   const fake = new FakeHerdr()
   const base = fake.exec
   fake.exec = async argv => (argv[2] === 'prompt' ? herdrFail('agent_prompt_stalled') : base(argv))
@@ -229,15 +230,134 @@ test('a stalled prompt whose input starts with the typed text is submitted too',
   assert.equal(fake.keys.length, 1)
 })
 
-test('a stalled prompt with an empty input and an idle agent is reported not delivered, and nothing is sent twice', async () => {
+test('a stalled prompt with an empty input and an idle agent is sent again once, and reported not delivered when that stalls too', async () => {
   const { deps, run, fake } = await stalledSetup('empty')
   const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
   assert.equal(!delivery.ok && delivery.queued, false)
-  assert.match(!delivery.ok ? delivery.reason : '', /^agent_prompt_stalled: .*check the pane/)
+  assert.match(!delivery.ok ? delivery.reason : '', /^agent_prompt_stalled: .*check the pane.*sent again once and stalled again/)
   assert.equal(fake.keys.length, 0)
-  assert.equal(fake.prompts.length, 1)
+  assert.equal(fake.prompts.length, 2)
   assert.equal((await sentOf(deps, run)).length, 0)
   assert.equal((await loadRoster(deps.home, run.id)).seats[0]?.attention[0]?.reason, 'stalled')
+})
+
+const BRIEF_FILE_LINES = 12
+const longBody = (lines: number): string => Array.from({ length: lines }, (_, index) => `line ${index + 1} of the brief`).join('\n')
+const saveBriefFile = async (deps: Awaited<ReturnType<typeof setup>>['deps'], run: RunMeta, body: string, name = 'brief.md') => {
+  const file = join(seatDir(deps.home, run.id, 'w-ui'), name)
+  await mkdir(seatDir(deps.home, run.id, 'w-ui'), { recursive: true })
+  await writeFile(file, `${body}\n`)
+  return file
+}
+
+test('a brief whose paste never reached the input is sent again once as a signed pointer to brief.md (DROVE-136)', async () => {
+  const fake = new FakeHerdr({ promptStalls: 'empty', stallsFor: 1 })
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  const body = longBody(BRIEF_FILE_LINES)
+  const file = await saveBriefFile(deps, run, body)
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui', { kind: 'brief', expects: 'review', body }))
+  assert.deepEqual(delivery, { ok: true, via: 'herdr-prompt' })
+  assert.equal(fake.prompts.length, 2)
+  assert.match(fake.prompts[0]?.text ?? '', /line 12 of the brief/)
+  const pointer = fake.prompts[1]?.text ?? ''
+  assert.doesNotMatch(pointer, /line 1 of the brief/)
+  const envelope = parseEnvelope(pointer)
+  assert.equal(envelope?.fields.id, 'c-1')
+  assert.equal(envelope?.fields.kind, 'brief')
+  assert.equal(envelope?.body, `Your brief is in \`${file}\` (${BRIEF_FILE_LINES} lines): read it with the Read tool, then start.`)
+  assert.equal(envelope && verifyControl(envelope, 'token-w-ui'), true)
+  assert.equal((await sentOf(deps, run)).length, 1)
+  assert.deepEqual((await loadRoster(deps.home, run.id)).seats[0]?.attention, [])
+  const events = await lines(join(deps.home, 'runs', run.id, 'events.jsonl'))
+  assert.deepEqual(events.at(-1)?.data, { kind: 'brief', via: 'herdr-prompt', pointer: true, resent: true })
+  assert.equal(fake.keys.length, 0)
+})
+
+test('a pointer that is itself typed into a stalled input is submitted by Drove like any paste (DROVE-124)', async () => {
+  const fake = new FakeHerdr()
+  let stalls = 0
+  const base = fake.exec
+  fake.exec = async argv => {
+    if (argv[2] !== 'prompt') return base(argv)
+    stalls += 1
+    fake.screen = stalls === 1 ? '● Ready\n──────\n❯ \n──────' : `● Ready\n──────\n❯ ${(argv[4] ?? '').split('\n')[0]}\n──────`
+    return herdrFail('agent_prompt_stalled')
+  }
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  const body = longBody(BRIEF_FILE_LINES)
+  await saveBriefFile(deps, run, body)
+  const delivery = await deliver.deliverControl(deps, run, control('w-ui', { kind: 'brief', expects: 'review', body }))
+  assert.deepEqual(delivery, { ok: true, via: 'herdr-prompt', submitted: true })
+  assert.equal(fake.keys.length, 1)
+  assert.equal(stalls, 2)
+})
+
+test('a handoff brief that is not the seat\'s brief.md is saved to handoff.md for the pointer, and brief.md stays as it was', async () => {
+  const fake = new FakeHerdr({ promptStalls: 'empty', stallsFor: 1 })
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  const original = await saveBriefFile(deps, run, 'the original brief')
+  const handoff = longBody(5)
+  assert.equal((await deliver.deliverControl(deps, run, control('w-ui', { kind: 'brief', expects: 'review', body: handoff }))).ok, true)
+  const file = join(seatDir(deps.home, run.id, 'w-ui'), 'handoff.md')
+  assert.equal(await readFile(file, 'utf8'), `${handoff}\n`)
+  assert.equal(await readFile(original, 'utf8'), 'the original brief\n')
+  assert.match(parseEnvelope(fake.prompts[1]?.text ?? '')?.body ?? '', new RegExp(`^Your brief is in \`${file}\` \\(5 lines\\)`))
+})
+
+test('a Codex seat is pointed at the file with cat', async () => {
+  const fake = new FakeHerdr({ promptStalls: 'empty', stallsFor: 1 })
+  const { deps, run } = await setup(makeSeat('w-ui', { kind: 'codex' }), 'idle', fake)
+  const body = longBody(3)
+  await saveBriefFile(deps, run, body)
+  assert.equal((await deliver.deliverControl(deps, run, control('w-ui', { kind: 'brief', expects: 'review', body }))).ok, true)
+  assert.match(parseEnvelope(fake.prompts[1]?.text ?? '')?.body ?? '', /\(3 lines\): read it with `cat`, then start\.$/)
+})
+
+test('a message that stalled with an empty input is sent again once, as it was', async () => {
+  const fake = new FakeHerdr({ promptStalls: 'empty', stallsFor: 1 })
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', fake)
+  assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
+  assert.equal(fake.prompts.length, 2)
+  assert.equal(fake.prompts[0]?.text, fake.prompts[1]?.text)
+  const events = await lines(join(deps.home, 'runs', run.id, 'events.jsonl'))
+  assert.deepEqual(events.at(-1)?.data, { kind: 'message', via: 'herdr-prompt', resent: true })
+})
+
+test('a stalled input that holds the paste, or no readable screen, is not sent again', async () => {
+  const pasted = await stalledSetup('pasted')
+  assert.equal((await deliver.deliverControl(pasted.deps, pasted.run, control('w-ui'))).ok, true)
+  assert.equal(pasted.fake.prompts.length, 1)
+
+  const unreadable = await stalledSetup('empty')
+  unreadable.fake.agentReadFails = true
+  unreadable.fake.paneReadFails = 'pane_not_found'
+  assert.equal((await deliver.deliverControl(unreadable.deps, unreadable.run, control('w-ui'))).ok, false)
+  assert.equal(unreadable.fake.prompts.length, 1)
+})
+
+test('a brief longer than the limit is sent as a pointer first, and its full text is in brief.md before the prompt goes out', async () => {
+  const { deps, run, fake } = await setup(makeSeat('w-ui'), 'idle', new FakeHerdr())
+  const body = longBody(41)
+  const file = await saveBriefFile(deps, run, body)
+  const full = control('w-ui', { kind: 'brief', expects: 'review', body })
+  const sent = await deliver.briefForSend(deps, run, full, 40)
+  assert.equal(sent.body, `Your brief is in \`${file}\` (41 lines): read it with the Read tool, then start.`)
+  assert.equal(sent.id, full.id)
+  assert.equal(await readFile(file, 'utf8'), `${body}\n`)
+  assert.deepEqual(await deliver.deliverControl(deps, run, sent), { ok: true, via: 'herdr-prompt' })
+  assert.equal(fake.prompts.length, 1)
+  const events = await lines(join(deps.home, 'runs', run.id, 'events.jsonl'))
+  assert.deepEqual(events.at(-1)?.data, { kind: 'brief', via: 'herdr-prompt', pointer: true })
+})
+
+test('a brief at or under the limit, and any other kind, is left as it is', async () => {
+  const { deps, run } = await setup(makeSeat('w-ui'), 'idle', new FakeHerdr())
+  const atLimit = control('w-ui', { kind: 'brief', expects: 'review', body: longBody(40) })
+  assert.equal(await deliver.briefForSend(deps, run, atLimit, 40), atLimit)
+  const message = control('w-ui', { body: longBody(80) })
+  assert.equal(await deliver.briefForSend(deps, run, message, 40), message)
+  const pointer = control('w-ui', { kind: 'brief', body: 'Your brief is in `/x/brief.md` (90 lines): read it with the Read tool, then start.' })
+  assert.equal(await deliver.briefForSend(deps, run, pointer, 1), pointer)
 })
 
 test('a paste placeholder in the transcript, above an empty input, is not submitted', async () => {
@@ -251,6 +371,7 @@ test('a paste placeholder in the transcript, above an empty input, is not submit
   const delivery = await deliver.deliverControl(deps, run, control('w-ui'))
   assert.equal(delivery.ok, false)
   assert.equal(fake.keys.length, 0)
+  assert.equal(fake.prompts.length, 2)
 })
 
 test('a stalled prompt of an agent that is already working is delivered without Enter', async () => {
