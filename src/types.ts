@@ -46,6 +46,7 @@ export type DroveConfig = {
   workerUserHooks?: boolean
   maxTurns?: number
   reviewLoopLimit?: number
+  otlpEndpoint?: string
   runMaxCost?: number
   // One seat's denials of one rule that make the planner hear of it (defaults 3 in 10 minutes).
   guardThrash?: { count: number; minutes: number }
