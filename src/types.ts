@@ -302,6 +302,8 @@ export type Deps = {
   codexUserHome?: string
   claudeUserConfig?: string
   claudeUserDir?: string
+  // Waits between gh retries (merge --pr); tests pass a no-op.
+  sleep?: (ms: number) => Promise<void>
 }
 
 export type HerdrAgent = {
