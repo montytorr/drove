@@ -26,7 +26,7 @@ import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster
 import { steeringNotes } from './steer.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
 import type {
-  AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
+  AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HostAgents, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
 export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string; detached?: boolean; json?: boolean }
@@ -210,8 +210,8 @@ const resolveModel = (kind: AgentKind, value: string | undefined, config: DroveC
 const hasAgent = (run: RunMeta, kind: AgentKind): boolean =>
   run.agents === undefined || run.planner.kind === kind || run.agents[kind] !== undefined
 
-const requireAgent = (run: RunMeta, kind: AgentKind): CommandResult | undefined =>
-  hasAgent(run, kind) ? undefined : failed('agent-unavailable', `${kind} is not on this host (drove doctor)`)
+const requireAgent = (run: RunMeta, kind: AgentKind, fromWorkerKind = false): CommandResult | undefined =>
+  hasAgent(run, kind) ? undefined : failed('agent-unavailable', `${fromWorkerKind ? `workerKind is ${kind} in ~/.drove/config.json, but ` : ''}${kind} is not on this host (drove doctor)`)
 
 const newControlId = (now: Date): string => `c-${now.getTime().toString(36)}-${randomBytes(2).toString('hex')}`
 
@@ -545,7 +545,7 @@ export const refreshRoster = async (deps: Deps, run: RunMeta): Promise<void> => 
 
 // ---------- cairn goal and ref checks ----------
 
-type CairnTask = { ref: string; title: string; status: string; body: string }
+type CairnTask = { ref: string; title: string; status: string; body: string; labels: string[] }
 type CairnRead = { task: CairnTask } | { missing: string } | { skipped: string }
 
 const CAIRN_CLOSED = ['done', 'cancelled']
@@ -569,7 +569,7 @@ const textOf = (value: unknown): string => (typeof value === 'string' ? value : 
 
 const readCairnTask = async (deps: Deps, ref: string): Promise<CairnRead> => {
   const read = await cairnJson(deps, ['show', ref, '--full', '--json'])
-  if ('value' in read) return { task: { ref: textOf(read.value.ref) || ref, title: textOf(read.value.title), status: textOf(read.value.status), body: textOf(read.value.description) } }
+  if ('value' in read) return { task: { ref: textOf(read.value.ref) || ref, title: textOf(read.value.title), status: textOf(read.value.status), body: textOf(read.value.description), labels: Array.isArray(read.value.labels) ? read.value.labels.filter((label): label is string => typeof label === 'string') : [] } }
   return read
 }
 
@@ -607,7 +607,7 @@ const readLabSubject = async (deps: Deps, instance: string, ref: string): Promis
   return { subject: { ref: textOf(value.ref) || ref, title, body: textOf(value.body), todos } }
 }
 
-const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next'>, labInstance: string): Promise<GoalTask | { error: CommandResult } | undefined> => {
+const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next'>, labInstance: string, agents?: HostAgents): Promise<GoalTask | { error: CommandResult } | undefined> => {
   if (request.cairn === undefined && request.next === undefined) return undefined
   if (request.cairn !== undefined && request.next !== undefined) return { error: failed('usage', '--from-cairn and --next are exclusive') }
   if (request.goal) return { error: failed('usage', '--goal cannot be combined with --from-cairn or --next: the goal is the task') }
@@ -630,7 +630,7 @@ const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | '
   const { task } = read
   if (CAIRN_CLOSED.includes(task.status)) return { error: failed('task-closed', `Cairn task ${ref} is ${task.status}; pick an open task`) }
   if (!task.title) return { error: failed('cairn', `Cairn task ${ref} has no title to use as a goal`) }
-  return { ref, goal: `${ref}: ${task.title}`, prompt: cairnGoalPrompt(ref, task.title, task.body) }
+  return { ref, goal: `${ref}: ${task.title}`, prompt: cairnGoalPrompt(ref, task.title, task.body, task.labels, agents) }
 }
 
 const seatLine = (seat: Seat): string => {
@@ -757,10 +757,10 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const model = request.model ?? config.plannerModel[kind]
   const effort = request.effort ?? config.plannerEffort
   const sessionId = kind === 'claude' ? randomUUID() : undefined
-  const goalTask = await resolveGoalTask(deps, request, config.labInstance)
+  const agents = await detectRunAgents(deps)
+  const goalTask = await resolveGoalTask(deps, request, config.labInstance, agents)
   if (goalTask && 'error' in goalTask) return goalTask.error
   const goal = goalTask?.goal ?? request.goal
-  const agents = await detectRunAgents(deps)
 
   let run: RunMeta
   let previous: RunMeta | undefined
@@ -932,7 +932,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const defaultKind = config.workerKind === 'claude' || config.workerKind === 'codex' ? config.workerKind : 'error' in located || hasAgent(located.run, 'claude') ? 'claude' : hasAgent(located.run, 'codex') ? 'codex' : undefined
   if (!('error' in located)) {
     if (!request.kind && !defaultKind) return failed('agent-unavailable', 'neither claude nor codex is on this host (drove doctor)')
-    const unavailable = requireAgent(located.run, request.kind ?? defaultKind!)
+    const unavailable = requireAgent(located.run, request.kind ?? defaultKind!, request.kind === undefined && config.workerKind !== 'auto')
     if (unavailable) return unavailable
   }
   const declared = 'error' in located ? {} : (await loadPolicy(deps.home, located.run.repo, { exec: deps.exec, base: located.run.base })).policy

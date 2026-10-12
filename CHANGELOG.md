@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- Carry Cairn `kind:codex` / `kind:claude` labels into planner goals with host availability hints; name `workerKind` when its configured agent is absent, and show the detected Codex model in CLI planner tool descriptions (DROVE-129).
+
 Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence ledgers for what a run did, steering that reads a seat's tool calls, acceptance criteria a worker answers, and a loop that checks work before a person reads it. Most of this is about the planner's review: fewer rounds, and a record of why one was needed.
 
 ### Merge gate and checks (DROVE-122)
