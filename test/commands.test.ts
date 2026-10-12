@@ -434,6 +434,26 @@ test('briefVia "launch-arg" in the config restores the launch argument, and DROV
   assert.equal(overridden.fake.prompts.length, 1)
 })
 
+test('a brief herdr typed but did not submit is submitted by Drove and the spawn says so (DROVE-124)', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const { fake, deps, identity } = await setup(new FakeHerdr({ promptStalls: 'pasted', startStatus: 'idle' }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /Brief: delivered \(after submitting the pasted text\)\./)
+  assert.equal(fake.prompts.length, 1)
+  assert.equal(fake.keys.length, 1)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.state, 'working')
+})
+
+test('a stalled brief with nothing in the input stays not delivered and presses nothing', async () => {
+  delete process.env.DROVE_BRIEF_VIA
+  const { fake, deps, identity } = await setup(new FakeHerdr({ promptStalls: 'empty', startStatus: 'idle' }))
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /Brief: not delivered \(agent_prompt_stalled/)
+  assert.equal(fake.keys.length, 0)
+})
+
 test('a first turn that outlasts the prompt wait still yields a successful spawn', async () => {
   delete process.env.DROVE_BRIEF_VIA
   const { fake, deps, identity } = await setup(new FakeHerdr({ promptTimesOut: true }))
