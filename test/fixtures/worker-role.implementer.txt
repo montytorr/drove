@@ -35,6 +35,7 @@ Every report states what it expects back:
 - `blocked`: something outside your control stops you. Say what you tried.
 - `promote`: the task needs deeper reasoning than your current model and effort give (you are going in circles, the bug is subtle, the design is unclear). Say why, then wait.
 - `progress`: expects nothing, and never wakes the planner.
+- A `changes` verdict may come from Drove's own checks of your `done` report, not from the planner: it names the failing command, its exit code and the output tail. Fix it, verify, and send `done` again; the planner reads the report once the checks pass.
 - After an approval: commit, then send `done` with the branch and commit sha and `expects: none`, and stop.
 Never end a turn on finished work without a `done` report.
 
