@@ -2,7 +2,7 @@ import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
@@ -1721,7 +1721,8 @@ const releaseCairnClaim = async (deps: Deps, ref: string): Promise<string | unde
   }
 }
 
-export const close = async (deps: Deps, identity: Identity, seatName: string, removeWorktree: boolean): Promise<CommandResult> => {
+// `callerCwd` is the shell's own directory, passed only by the CLI: a removed worktree must not be the directory its caller stands in.
+export const close = async (deps: Deps, identity: Identity, seatName: string, removeWorktree: boolean, callerCwd?: string): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
   if (denied) return denied
   const located = await locateFor(deps, identity)
@@ -1729,6 +1730,8 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
   const { run } = located
   const seat = findSeat(await loadRoster(deps.home, run.id), seatName)
   if (!seat || seat.state === 'closed') return failed('no-seat', `no open seat named ${seatName}`)
+  if (removeWorktree && callerCwd !== undefined && seat.worktree && (resolve(callerCwd) === resolve(seat.worktree) || resolve(callerCwd).startsWith(resolve(seat.worktree) + sep)))
+    return failed('cwd-in-worktree', `your working directory ${callerCwd} is inside ${seat.name}'s worktree, which would be removed: cd to the repo (${run.repo}) first, then close it`)
   if (seat.paneId && seat.state !== 'gone' && seat.state !== 'down') {
     await updateRoster(deps.home, run.id, current => ({ ...current, seats: current.seats.map(entry => (entry.name === seat.name ? { ...entry, state: 'closing', attention: [] } : entry)) }))
     const stop = await stopAgent(deps, seat, timing.closeWaitMs)

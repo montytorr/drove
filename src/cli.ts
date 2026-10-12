@@ -272,7 +272,7 @@ export const COMMANDS: Record<string, Spec> = {
     why: 'quit a worker and close its pane',
     options: { 'remove-worktree': { type: 'boolean' } },
     run: async (values, positionals, io) =>
-      print(await commands.close(commands.defaultDeps(), commands.identityOrPlanner(), need(positionals[0], '<seat>'), values['remove-worktree'] === true), io),
+      print(await commands.close(commands.defaultDeps(), commands.identityOrPlanner(), need(positionals[0], '<seat>'), values['remove-worktree'] === true, process.cwd()), io),
   },
   merge: {
     usage: 'drove merge <seat> [--pr] [--squash] [-m MSG] [--fresh] [--run ID]',

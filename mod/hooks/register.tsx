@@ -655,8 +655,16 @@ const migrateWorker = async ($: EngineInterface, input: Record<string, unknown>)
   return answerOf(ran)
 }
 
-const closeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> =>
-  answerOf(await plannerRun($, drove.closeArgs(String(input.name ?? '').trim(), input.remove_worktree === true)))
+const closeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  const isRemoving = input.remove_worktree === true
+  if (isRemoving) {
+    const [orchestrator, seats, cwd] = await Promise.all([read($, orchestratorAtom), read($, seatsAtom), $.session.cwd()])
+    const seat = findSeat(seats, name)
+    if (orchestrator && seat?.worktree && drove.isInsideDir(cwd, seat.worktree)) return { deny: drove.cwdInWorktreeReason(name, seat.worktree, cwd, orchestrator.repo) }
+  }
+  return answerOf(await plannerRun($, drove.closeArgs(name, isRemoving)))
+}
 
 const mergeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
   const name = String(input.name ?? '').trim()
@@ -1505,12 +1513,14 @@ export const register: Register = (on, options) => {
     if (orchestrator) {
       if (drove.GUARDED_TOOLS.has(e.tool)) {
         const [cwd, sessionId, home] = await Promise.all([$.session.cwd(), $.session.id(), droveHome($)])
+        // The spawn runs in the repo: the session's cwd can be a removed worktree, and the guard reads the session's own from its stdin.
         const ran = await runDrove($, ['guard', 'pre-tool-use'], {
-          cwd,
+          cwd: orchestrator.repo,
           env: drove.plannerEnv(orchestrator.run, home),
           stdin: drove.guardStdin(e.tool, e as Record<string, unknown>, cwd, sessionId),
           timeoutMs: GUARD_TIMEOUT_MS,
         })
+        if (drove.isSpawnCwdGone(ran) && !(await $.fs.exists(cwd).catch(() => true))) return { deny: drove.missingCwdReason(cwd, orchestrator.repo) }
         const verdict = drove.guardVerdictOf(ran, entryOf($))
         if (!verdict.allow) return { deny: verdict.reason }
       }

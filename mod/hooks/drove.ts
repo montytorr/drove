@@ -126,6 +126,17 @@ export type GuardVerdict = { allow: true } | { allow: false; reason: string }
 export const brokenGuard = (detail: string, entry: string): string =>
   `Orchestrator mode: Drove's guard could not run, so this call is refused (fail closed). ${detail.trim().slice(0, 300)} — check that node 22.18 or newer is on PATH and that ${entry} exists (the mod's droveEntry setting), then retry.`
 
+// A spawn inherits the session's directory; once that is a removed worktree the failure reads like a missing node.
+export const isSpawnCwdGone = (ran: Ran): boolean => ran.exitCode === -1 && /ENOENT/.test(ran.stderr)
+
+export const missingCwdReason = (cwd: string, repo: string): string =>
+  `Orchestrator mode: the session's working directory ${cwd} no longer exists (a removed worktree?): cd back to the repo (${repo}), then retry.`
+
+export const isInsideDir = (path: string, dir: string): boolean => dir !== '' && (path === dir || path.startsWith(`${dir.replace(/\/+$/, '')}/`))
+
+export const cwdInWorktreeReason = (name: string, worktree: string, cwd: string, repo: string): string =>
+  `Orchestrator mode: your working directory ${cwd} is inside ${name}'s worktree ${worktree}, which remove_worktree would delete: cd to the repo (${repo}) first, then close it.`
+
 export const guardVerdictOf = (ran: Ran, entry: string): GuardVerdict => {
   if (ran.exitCode === 0) return { allow: true }
   if (ran.exitCode === 2) {
