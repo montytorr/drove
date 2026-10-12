@@ -1003,7 +1003,7 @@ test('promote --model opus resolves to the configured promoted Codex model', asy
   assert.equal(promoted.ok, true, promoted.text)
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.model, 'gpt-promoted')
   const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')[1] ?? []
-  assert.match(restart.join(' '), /--model gpt-promoted/)
+  assert.match(restart.join(' '), /-m gpt-promoted/)
 })
 
 test('a codex promote marks the seat starting before the agent stops, so the restart window never reads gone', async () => {
