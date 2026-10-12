@@ -63,8 +63,44 @@ export const DEFAULT_CONFIG: DroveConfig = {
   workerEnv: {},
 }
 
+const EXEC_KILL_GRACE_MS = 3_000
+const execSignals = { SIGINT: 130, SIGTERM: 143, SIGHUP: 129 } as const
+type ExecSignal = keyof typeof execSignals
+type ExecGroup = { stop: (code: number) => Promise<void> }
+const execGroups = new Set<ExecGroup>()
+const execSignalHandlers = new Map<ExecSignal, () => void>()
+let execExitCode: number | undefined
+
+const trackExecGroup = (group: ExecGroup): void => {
+  execGroups.add(group)
+  if (execSignalHandlers.size > 0) return
+  for (const signal of Object.keys(execSignals) as ExecSignal[]) {
+    const handler = () => {
+      // Run before existing once-listeners, which remove themselves when called.
+      // Servers and watches retain control of their own shutdown and exit status.
+      const ownsExit = !process.listeners(signal).some(listener => listener !== handler)
+      if (ownsExit) execExitCode = execSignals[signal]
+      void Promise.all([...execGroups].map(group => group.stop(execSignals[signal]))).then(() => {
+        if (ownsExit) process.exit(execSignals[signal])
+      })
+    }
+    execSignalHandlers.set(signal, handler)
+    process.prependListener(signal, handler)
+  }
+}
+
+const untrackExecGroup = (group: ExecGroup): void => {
+  execGroups.delete(group)
+  if (execGroups.size > 0) return
+  for (const [signal, handler] of execSignalHandlers) process.off(signal, handler)
+  execSignalHandlers.clear()
+}
+
 export const nodeExec: Exec = (argv, options = {}) =>
   new Promise<ExecResult>(resolve => {
+    // Resolving an interrupted exec can resume a caller's command sequence before
+    // the signal handler exits. Do not launch another detached group in that gap.
+    if (execExitCode !== undefined) return resolve({ code: execExitCode, stdout: '', stderr: 'interrupted' })
     const [command, ...args] = argv
     if (!command) return resolve({ code: 127, stdout: '', stderr: 'empty argv' })
     const timeoutMs = options.timeoutMs ?? 60_000
@@ -75,11 +111,12 @@ export const nodeExec: Exec = (argv, options = {}) =>
     let stdout = ''
     let stderr = ''
     let isDone = false
-    let timedOut = false
+    let cleanup: Promise<void> | undefined
     const finish = (result: ExecResult) => {
       if (isDone) return
       isDone = true
       clearTimeout(timer)
+      if (grouped) untrackExecGroup(group)
       resolve(result)
     }
     const signalGroup = (signal: NodeJS.Signals) => {
@@ -89,20 +126,30 @@ export const nodeExec: Exec = (argv, options = {}) =>
         if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
       }
     }
+    const stop = (result: () => ExecResult): Promise<void> => {
+      if (cleanup) return cleanup
+      clearTimeout(timer)
+      cleanup = new Promise<void>(done => {
+        signalGroup('SIGTERM')
+        // Keep this timer even if the leader closes: children can ignore SIGTERM or
+        // close their pipes while remaining alive. Return only after group cleanup.
+        setTimeout(() => {
+          signalGroup('SIGKILL')
+          finish(result())
+          done()
+        }, EXEC_KILL_GRACE_MS)
+      })
+      return cleanup
+    }
+    const group: ExecGroup = { stop: code => stop(() => ({ code, stdout, stderr })) }
     const timer = setTimeout(() => {
-      timedOut = true
-      signalGroup('SIGTERM')
-      // Keep this timer even if the leader closes: children can ignore SIGTERM or
-      // close their pipes while remaining alive. Return only after group cleanup.
-      setTimeout(() => {
-        signalGroup('SIGKILL')
-        finish({ code: 124, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms`, timedOut: true })
-      }, 3_000)
+      void stop(() => ({ code: 124, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms`, timedOut: true }))
     }, timeoutMs)
+    if (grouped && child.pid !== undefined) trackExecGroup(group)
     child.stdout.on('data', chunk => (stdout += chunk))
     child.stderr.on('data', chunk => (stderr += chunk))
-    child.on('error', error => finish({ code: 127, stdout, stderr: error.message }))
-    child.on('close', code => { if (!timedOut) finish({ code: code ?? 1, stdout, stderr }) })
+    child.on('error', error => { if (!cleanup) finish({ code: 127, stdout, stderr: error.message }) })
+    child.on('close', code => { if (!cleanup) finish({ code: code ?? 1, stdout, stderr }) })
     child.stdin.on('error', () => undefined)
     child.stdin.end(options.input ?? '')
   })

@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- Ctrl-C, SIGTERM and SIGHUP clean up running commands' process groups before the CLI exits, including descendants that ignore SIGTERM; long-lived processes retain control through their own signal handlers (DROVE-145).
+
 ## [0.5.0] - 2026-10-12
 
 Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence ledgers for what a run did, steering that reads a seat's tool calls, acceptance criteria a worker answers, and a loop that checks work before a person reads it. Most of this is about the planner's review: fewer rounds, and a record of why one was needed.
