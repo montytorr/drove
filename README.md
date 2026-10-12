@@ -160,6 +160,8 @@ Review and testing can be seats of their own. They are optional: the planner rea
 - **Checks**: `chk run/fail` counts the runs of the repo's checks (`checks.ran` events: `drove checks`, `run_checks`, a merge that ran them) and how many failed; a merge that reused a passing record at the seat's HEAD is not a run.
 - **Guard denials**: `deny` is the number of tool calls the guard refused the seat, from the `guard.denied` events; the line under the table breaks the run's total down by rule (`owns`, `push`, `herdr` and so on).
 
+`drove diagnose [<run>] [--json]` says why a run needed rework and where the fix belongs, from the same records plus the check ledger, the briefs and the reports. One line per finding: `category · seat · confidence · evidence · suggested fix (where: brief | role text | config | repo | planning | Drove)`, ending with a summary line that also goes to stderr; a run with nothing to report prints `no findings`. The detectors are `scope-too-narrow` (owns denials, then a widening), `checks-failed-at-done`, `review-loop`, `no-acceptance`, `merge-conflict` (naming the seats that touched the same files), `ci-only-failure`, `brief-not-delivered`, `budget-hit`, `usage-limit`, `guard-thrash` and `steering`; each is deterministic and its evidence is in DESIGN.md. `drove report` ends with a pointer to it when a run has findings.
+
 `drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `merge`, `run_checks`, `roster`, `capture`, `run_report`, `set_goal` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
 
 ## Unattended runs

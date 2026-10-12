@@ -194,7 +194,7 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
     const isReply = isReplyToOpenAsk(seat, control)
     if (control.expects !== 'none' || isReply || clearsOwed(control)) await updateRoster(deps.home, run, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? settleSent(entry, seat, control, isReply, sentAt) : entry)) }))
     const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
-    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
+    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(control.verdict === 'changes' ? { notes: clip(control.body.split('\n').find(row => row.trim()) ?? '', 160) } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
     attempts.delete(control.id)
   }
   return delivery
