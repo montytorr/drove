@@ -334,6 +334,7 @@ const ORCHESTRATOR_TOOLS = [
         target: { type: 'string', description: 'the worker a reviewer reviews or a tester tests; required for those roles' },
         userHooks: { type: 'boolean', description: 'optional, Claude workers: false leaves out the hooks in your own settings.json, and with them your own skills, agents and commands, which Claude reads from the same source; Drove’s hooks stay. Left out, Drove’s workerUserHooks setting decides (kept by default). Codex workers follow the setting alone' },
         owns: { type: 'array', items: { type: 'string' }, description: 'optional: globs, relative to the worktree, of the files this worker may change; Drove’s guard refuses its edits elsewhere. Left out, it may edit anywhere (a tester: the usual test globs)' },
+        acceptance: { type: 'array', items: { type: 'string' }, description: 'optional: the acceptance criteria, one testable statement each, ideally Given-When-Then, taken from the Cairn task body. Drove numbers them AC1…ACn and writes them into the worker’s brief as ## Acceptance (a reviewer or tester of it sees them too, unless you give it its own); the worker answers each in its done report. An empty statement is refused' },
         maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
         maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
         maxMinutes: { type: 'number', exclusiveMinimum: 0, description: 'Optional: wall clock minutes since spawn before a budget attention and one notice to report progress or promote and stop; never kills the worker.' },
@@ -422,6 +423,20 @@ const ORCHESTRATOR_TOOLS = [
         pr: { type: 'boolean', description: 'go through a GitHub pull request (the repo needs a remote); default is a local merge' },
         squash: { type: 'boolean', description: 'with pr: squash-merge the pull request instead of a merge commit' },
         message: { type: 'string', description: 'the merge commit message; default "merge: <the branch’s last commit subject>"' },
+        fresh: { type: 'boolean', description: 'run the checks again even when run_checks recorded a pass at the worker’s current commit on a clean tree (the merge reuses it otherwise)' },
+      },
+      required: ['name'],
+    },
+  },
+  {
+    name: 'run_checks',
+    description:
+      'Orchestrator mode: verify a worker’s done report yourself. Runs the repo’s checks (the merge plan: the checks list in .drove.json, else typecheck, lint, test) in the worker’s worktree and records each run by commit, so merge_worker reuses a pass instead of running them again. Returns pass or fail per command, the failing command’s exit code and output tail, the commit and whether the tree was clean (only a clean tree is evidence). A passing record at the worker’s current commit is reused unless fresh: true. It never writes to the repo. Send a failure back with message_worker or review_verdict changes.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string' },
+        fresh: { type: 'boolean', description: 'run the checks again even when a passing record exists for the worker’s current commit' },
       },
       required: ['name'],
     },
@@ -496,6 +511,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__migrate_worker: input => `moving ${String(input.name ?? '')} to ${String(input.kind ?? '')}`,
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
   mcp__orchestrator__merge_worker: input => `merging ${String(input.name ?? '')}`,
+  mcp__orchestrator__run_checks: input => `running ${String(input.name ?? '')}’s checks`,
   mcp__orchestrator__set_goal: () => 'setting the goal',
   mcp__orchestrator__set_owns: input => `changing what ${String(input.name ?? '')} may edit`,
   mcp__orchestrator__roster: () => 'checking the roster',
@@ -540,11 +556,13 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const target = typeof input.target === 'string' ? input.target.trim() : ''
   if (role !== 'implementer' && !target) return { deny: `A ${role} needs target: the worker it ${role === 'reviewer' ? 'reviews' : 'tests'}.` }
   if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
+  if (input.acceptance !== undefined && (!Array.isArray(input.acceptance) || input.acceptance.some(entry => typeof entry !== 'string' || !entry.trim()))) return { deny: '--acceptance takes non-empty statements, one per criterion' }
+  const acceptance = input.acceptance as string[] | undefined
   const maxMinutes = typeof input.maxMinutes === 'number' ? input.maxMinutes : undefined
   const maxCost = typeof input.maxCost === 'number' ? input.maxCost : undefined
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}), ...(maxMinutes !== undefined ? { maxMinutes } : {}), ...(maxCost !== undefined ? { maxCost } : {}) })
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}), ...(maxMinutes !== undefined ? { maxMinutes } : {}), ...(maxCost !== undefined ? { maxCost } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
@@ -648,7 +666,13 @@ const mergeWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const name = String(input.name ?? '').trim()
   if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
   const message = typeof input.message === 'string' && input.message.trim() ? input.message.trim() : undefined
-  return answerOf(await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS }))
+  return answerOf(await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, fresh: input.fresh === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS }))
+}
+
+const runChecksTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
+  return answerOf(await plannerRun($, drove.checksArgs(name, input.fresh === true), { timeoutMs: MERGE_TIMEOUT_MS }))
 }
 
 const setGoalTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
@@ -1469,6 +1493,9 @@ export const register: Register = (on, options) => {
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__merge_worker' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? mergeWorker($, e as Record<string, unknown>) : { deny: OFF },
+  ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__run_checks' as never }, async ($, e): Promise<ToolAnswer> =>
+    (await read($, orchestratorAtom)) ? runChecksTool($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__set_goal' as never }, async ($, e): Promise<ToolAnswer> => setGoalTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__set_owns' as never }, async ($, e): Promise<ToolAnswer> => setOwnsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))

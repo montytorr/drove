@@ -17,11 +17,25 @@ export const effortLetter = (effort: Effort): string => (effort === 'xhigh' ? 'x
 
 export const modelLetter = (seat: Pick<Seat, 'kind' | 'model'>): string => (seat.kind === 'codex' ? 'cx' : shortModel(seat.model).charAt(0))
 
-export const isAsking = (seat: Seat, status: OrchModStatus | undefined): boolean => Boolean(status?.asking) || seat.state === 'needs-input'
+// DROVE-122: a seat's last check run, as one word: stale once its worktree's HEAD has moved past the commit the run was at.
+export type CheckState = 'passed' | 'failed' | 'stale'
+
+export const checkState = (seat: Pick<Seat, 'checks'>): CheckState | undefined => (seat.checks === undefined ? undefined : seat.checks.stale ? 'stale' : seat.checks.result)
+
+// The long form, for the web panel: `passed at 1a2b3c4`, `failed: npm test at 1a2b3c4`, `stale: passed at 1a2b3c4, HEAD has moved`.
+export const checkText = (seat: Pick<Seat, 'checks'>): string => {
+  const { checks } = seat
+  if (checks === undefined) return ''
+  const at = checks.sha.slice(0, 7)
+  const ran = checks.result === 'passed' ? `passed at ${at}` : `failed${checks.failed ? `: ${checks.failed}` : ''} at ${at}`
+  return `${checks.stale ? 'stale: ' : ''}${ran}${checks.stale ? ', HEAD has moved' : ''}${checks.clean ? '' : ' (tree not clean)'}`
+}
+
+export const isAsking =(seat: Seat, status: OrchModStatus | undefined): boolean => Boolean(status?.asking) || seat.state === 'needs-input'
 
 // Attention the planner acts on by itself (a nudge to the seat, a retry, a wrap-up): a person is never asked about it, so
 // it is not "needs you" on any board and not an item of `drove attention` (DROVE-108).
-const PLANNER_ATTENTION: ReadonlySet<string> = new Set(['idle-without-report', 'stalled', 'budget', 'pending-delivery'])
+const PLANNER_ATTENTION: ReadonlySet<string> = new Set(['idle-without-report', 'stalled', 'budget', 'pending-delivery', 'guard-thrash'])
 
 export const isForHuman = (item: { reason: string }): boolean => !PLANNER_ATTENTION.has(item.reason)
 

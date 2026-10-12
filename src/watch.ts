@@ -24,7 +24,8 @@ export const LOOP_MS = 1_000
 export const COST_CHECK_MS = 60_000
 const HOOK_WINDOW = 50
 const WAIT = 'wait: '
-const KEPT_ATTENTION: readonly Attention['reason'][] = ['pending-delivery']
+// What a poll leaves alone: raised by someone other than the poll (a failed delivery, the guard hook) and cleared by its own event.
+const KEPT_ATTENTION: readonly Attention['reason'][] = ['pending-delivery', 'guard-thrash']
 
 export type WatchPorts = {
   runDir: typeof paths.runDir
@@ -236,6 +237,10 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   let plannerStatus: { status: HerdrAgent['status']; since: number } | undefined
   const notedPending = new Set<string>()
   let knownAttention = new Set<string>()
+  // Thrash items come from the guard hook, which already wrote their event; the wake still carries each one once, and
+  // not again after a restart: an item older than this watcher was announced by the one before it.
+  const knownThrash = new Set<string>()
+  const startedAt = deps.clock.now().toISOString()
   let freshAttention: Attention[] = []
   const hookWindows = new Map<string, { cursor: store.Cursor; records: HookRecord[]; turns: number; transcript?: string }>()
   const tokenCounters = new Map<string, usage.TokenCounter>()
@@ -295,6 +300,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
           ...seat,
           lastReport: { id: last.id, kind: last.kind, expects: last.expects, summary: last.summary, at: last.at },
           owes: owing ? owing.expects : seat.owes,
+          // Any report, a progress one too, ends the guard's thrash alarm: the seat is no longer silent about it.
+          attention: seat.attention.filter((item) => item.reason !== 'guard-thrash'),
         }
       }),
       updatedAt: deps.clock.now().toISOString(),
@@ -527,6 +534,12 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       }
     }
     if (derived.size === 0) return
+    // A seat's last check run goes stale once its worktree's HEAD has moved past the commit it ran at (DROVE-122).
+    const heads = new Map<string, string>()
+    for (const seat of ports.openSeats(current).filter((open) => open.checks !== undefined)) {
+      const head = await deps.exec(['git', '-C', seat.worktree, 'rev-parse', 'HEAD'], { timeoutMs: 10_000 })
+      if (head.code === 0 && head.stdout.trim()) heads.set(seat.name, head.stdout.trim())
+    }
     const at = now.toISOString()
     const transitions: { seat: string; from: Seat['state']; to: Seat['state'] }[] = []
     const restarting = new Set<string>()
@@ -541,8 +554,11 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         }
         const changed = result.state !== seat.state
         if (changed) transitions.push({ seat: seat.name, from: seat.state, to: result.state })
+        const head = heads.get(seat.name)
+        const isStale = seat.checks !== undefined && head !== undefined && head !== seat.checks.sha
         return {
           ...seat,
+          ...(seat.checks && head !== undefined && isStale !== (seat.checks.stale === true) ? { checks: { ...seat.checks, stale: isStale } } : {}),
           state: result.state,
           stateAt: changed ? at : seat.stateAt,
           ...(result.sessionId && !seat.sessionId ? { sessionId: result.sessionId } : {}),
@@ -567,6 +583,14 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       }
     }
     knownAttention = live
+    for (const seat of updated.seats) {
+      for (const item of seat.attention) {
+        const key = `${item.seat}|${item.at}`
+        if (item.reason !== 'guard-thrash' || knownThrash.has(key)) continue
+        knownThrash.add(key)
+        if (item.at >= startedAt) freshAttention.push(item)
+      }
+    }
     for (const seat of updated.seats) {
       const budget = seat.attention.find((item) => item.reason === 'budget')
       if (!derived.has(seat.name) || restarting.has(seat.name) || !budget || !detect.needsBudgetNotice(seat)) continue

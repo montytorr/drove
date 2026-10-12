@@ -667,3 +667,23 @@ test('a restart that never finishes reads gone once the bound has passed', async
   assert.deepEqual(seat?.attention.map((item) => item.reason), ['gone'])
   assert.equal((await eventsOf(ctx)).filter((event) => event.type === 'attention' && event.data?.reason === 'gone').length, 1)
 })
+
+test('DROVE-122: a seat\'s last check result goes stale once its worktree HEAD moves, and is read again when it returns', async () => {
+  let head = 'a'.repeat(40)
+  const ctx = await setup({ respond: (argv) => (argv.includes('rev-parse') ? { stdout: `${head}\n` } : {}) })
+  const checks = { result: 'passed' as const, sha: 'a'.repeat(40), clean: true, at: '2026-10-09T10:00:00.000Z' }
+  await updateRoster(ctx.home, ctx.run.id, (roster) => ({ ...roster, seats: roster.seats.map((seat) => ({ ...seat, checks })) }))
+  const { ports } = fakePorts({ agents: () => [{ name: 'w-api', paneId: 'p-w-api', status: 'working' }] })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  await watcher.tick()
+  assert.ok(ctx.calls.some((argv) => argv.join(' ') === `git -C /tmp/repo/.claude/worktrees/w-api rev-parse HEAD`))
+  assert.notEqual((await rosterOf(ctx)).seats[0]?.checks?.stale, true)
+  head = 'b'.repeat(40)
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  assert.deepEqual((await rosterOf(ctx)).seats[0]?.checks, { ...checks, stale: true })
+  head = 'a'.repeat(40)
+  ctx.clock.advance(5000)
+  await watcher.tick()
+  assert.equal((await rosterOf(ctx)).seats[0]?.checks?.stale, false)
+})

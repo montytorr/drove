@@ -7,13 +7,14 @@ import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
+import { type CheckPlan, checksOf, renderOutcome, repoVerifyCommands, reusedText, runChecks } from './checks.ts'
 import { BUSY_RETRY_MS, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
 import { applyCopy, copyNotes, freeSlot, planCopy, portEnv, seatEnv } from './isolation.ts'
 import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShellSafeArg, readClaudeAgents, readClaudeMcp, readClaudePlugins, readClaudeSettings, readClaudeSkills, readCodexHome, redactSpec, specFor, unknownPlugins, userClaudeConfig, userClaudeDir, writeLaunchFiles } from './launch.ts'
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
-import { type AvailableTrims, LAB_RE, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, verifyCommands, workerRole } from './prompts.ts'
+import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
@@ -391,17 +392,6 @@ const identityOfSeat = (deps: Deps, run: RunMeta, seat: Seat, token: string): Id
   ...(seat.owns ? { owns: seat.owns } : {}),
   ...(seat.role && seat.role !== 'implementer' ? { seatRole: seat.role } : {}),
 })
-
-const LOCKFILES = ['yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'bun.lock'] as const
-
-const repoVerifyCommands = async (repo: string): Promise<string[]> => {
-  const read = (name: string): Promise<string | undefined> => readFile(join(repo, name), 'utf8').catch(() => undefined)
-  return verifyCommands({
-    packageJson: await read('package.json'),
-    makefile: (await read('Makefile')) ?? (await read('makefile')),
-    lockfiles: LOCKFILES.filter(name => existsSync(join(repo, name))),
-  })
-}
 
 const writeLaunchJson = async (deps: Deps, run: string, seat: string, spec: Parameters<typeof redactSpec>[0]): Promise<void> => {
   await writeJsonAtomic(join(seatDir(deps.home, run, seat), 'launch.json'), redactSpec(spec))
@@ -899,6 +889,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (badBudget) return failed('usage', `${badBudget[0]} must be a whole number of at least 1`)
   const brief = request.brief.trim()
   if (!brief) return failed('usage', 'a worker needs a brief')
+  if (request.acceptance?.some(item => typeof item !== 'string' || !item.trim())) return failed('usage', '--acceptance takes non-empty statements, one per criterion')
+  const given = request.acceptance?.map(item => item.trim()).filter(Boolean)
   const located = await locateFor(deps, identity, 'up')
   if ('error' in located) return located.error
   const { run } = located
@@ -910,6 +902,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (targetSeat?.role === 'reviewer') return failed('usage', `--target ${targetSeat.name} is a reviewer, which changes nothing: target the seat it reviewed`)
   if (role === 'tester' && targetSeat && !(await git.branchExists(deps.exec, run.repo, targetSeat.branch))) return failed('git', `--target ${targetSeat.name}: its branch ${targetSeat.branch} does not exist, so a tester has nothing to branch from`)
 
+  // A reviewer or tester sees its target's criteria unless the planner gave it its own (DROVE-123).
+  const acceptance = given && given.length > 0 ? given : isReview ? targetSeat?.acceptance : undefined
   const config = await loadConfig(deps.home)
   const now = deps.clock.now()
   const iso = now.toISOString()
@@ -927,7 +921,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     ...(isReview && request.target ? { role, target: request.target } : {}),
     ...(request.skills ? { skills: [...new Set(request.skills)] } : {}), ...(request.agents ? { agents: [...new Set(request.agents)] } : {}),
     ...(request.userHooks !== undefined ? { userHooks: request.userHooks } : {}),
-    ...(owns ? { owns } : {}), model, effort, worktree, branch,
+    ...(owns ? { owns } : {}), ...(acceptance ? { acceptance } : {}), model, effort, worktree, branch,
     ...(request.maxTurns ?? config.maxTurns ? { maxTurns: request.maxTurns ?? config.maxTurns } : {}), ...(request.maxTokens ? { maxTokens: request.maxTokens } : {}),
     ...(request.maxMinutes !== undefined ? { maxMinutes: request.maxMinutes } : {}), ...(request.maxCost !== undefined ? { maxCost: request.maxCost } : {}),
     state: 'starting', stateAt: iso, spawnedAt: iso, owes: 'none', attention: [], ...(sessionId ? { sessionId } : {}),
@@ -1015,7 +1009,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const token = mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
   const workerIdentity = identityOfSeat(deps, run, seat, token)
-  const isBriefInline = isShellSafeArg(brief.trim())
+  const briefBody = acceptance ? `${brief}\n\n${acceptanceSection(acceptance, given && given.length > 0 ? undefined : targetSeat ? { seat: targetSeat.name, role } : undefined)}` : brief
+  const isBriefInline = isShellSafeArg(briefBody)
   const footerTarget = targetSeat
     ? { seat: targetSeat.name, branch: targetSeat.branch, worktree: targetSeat.worktree, base: baseUsed ?? run.base, briefFile: join(seatDir(deps.home, run.id, targetSeat.name), 'brief.md') }
     : undefined
@@ -1026,7 +1021,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     ...(config.workerPorts && ports.PORT ? { ports: { port: Number(ports.PORT), count: config.workerPorts.stride } } : {}),
     ...(copyPlan && copyPlan.files.length > 0 ? { copied: copyPlan.files } : {}),
   })
-  const briefText = isBriefInline ? `${brief.trim()} ${footerText.trimStart()}` : `${brief}${footerText}`
+  const briefText = isBriefInline ? `${briefBody} ${footerText.trimStart()}` : `${briefBody}${footerText}`
   const isViaPrompt = resolveBriefVia(config) === 'prompt' || !isShellSafeArg(briefText)
   const initialPrompt = isViaPrompt ? undefined : briefText
   await saveBrief(deps, run.id, seat.name, briefText)
@@ -1790,39 +1785,9 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 // ---------- merge: the gate between a worker's branch and the base ----------
 
 const REMOTE = 'origin'
-const CHECK_TIMEOUT_MS = 15 * 60_000
 const GH_TIMEOUT_MS = 60_000
-const TAIL_LINES = 40
-const TAIL_CHARS = 4_000
 // How long a PR in a repo with workflows may show no checks before it counts as a repo whose CI did not trigger.
 export const CI_GRACE_MS = 10 * 60_000
-// The checks run for the planner's repo, not as the planner: Drove's own identity must not leak into a test run.
-const NO_IDENTITY_ENV = { DROVE_RUN: '', DROVE_ROLE: '', DROVE_SEAT: '', DROVE_TOKEN: '', DROVE_OWNS: '' }
-
-const tailOf = (text: string): string => {
-  const lines = text.split('\n').map(line => line.trimEnd())
-  while (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
-  return lines.slice(-TAIL_LINES).join('\n').slice(-TAIL_CHARS)
-}
-
-// The base is the source of truth for what the checks are, so a branch cannot loosen its own gate by editing them:
-// `checks` in the repo's .drove.json (an empty list declares there are none), else the detected typecheck, lint and test.
-export const checksOf = async (repo: string): Promise<{ commands: string[]; source: string }> => {
-  const configured = await readJson<{ checks?: unknown }>(join(repo, '.drove.json')).catch(() => undefined)
-  if (Array.isArray(configured?.checks)) return { commands: configured.checks.filter((entry): entry is string => typeof entry === 'string' && entry.trim() !== ''), source: '.drove.json' }
-  return { commands: await repoVerifyCommands(repo), source: 'package.json scripts or Makefile targets' }
-}
-
-type CheckRun = { ok: true } | { ok: false; command: string; code: number; output: string }
-
-const runChecks = async (deps: Deps, worktree: string, commands: readonly string[]): Promise<CheckRun> => {
-  for (const command of commands) {
-    const ran = await deps.exec(['sh', '-c', command], { cwd: worktree, timeoutMs: CHECK_TIMEOUT_MS, env: NO_IDENTITY_ENV })
-    if (ran.code !== 0) return { ok: false, command, code: ran.code, output: tailOf(`${ran.stdout}\n${ran.stderr}`) }
-  }
-  return { ok: true }
-}
-
 type GhPr = { number: number; url: string; state: string; createdAt: string; mergeable: string; reviewDecision: string }
 type GhCheck = { name: string; bucket: string; link: string }
 
@@ -1860,7 +1825,8 @@ const hasWorkflows = async (...dirs: string[]): Promise<boolean> => {
   return false
 }
 
-const gateText = (checks: readonly string[], source: string): string => (checks.length > 0 ? `checks passed: ${checks.join(', ')}` : `no local checks (${source})`)
+const gateText = (plan: CheckPlan): string =>
+  plan.reused ? `checks reused: ${plan.reused}` : plan.commands.length > 0 ? `checks passed: ${plan.commands.join(', ')}` : `no local checks (${plan.source})`
 
 export const merge = async (deps: Deps, identity: Identity, ref: RunRef, request: MergeRequest): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
@@ -1895,14 +1861,28 @@ export const merge = async (deps: Deps, identity: Identity, ref: RunRef, request
   const unsaved = await git.dirtyLines(deps.exec, seat.worktree)
   if (unsaved.length > 0) return refuse('dirty-worktree', `${seat.name}'s worktree has uncommitted changes, which the merge would not carry and the checks would run on: ${unsaved.slice(0, 5).join('; ')}. Have the worker commit or discard them.`)
 
-  const plan = request.noChecks ? { commands: [] as string[], source: '--no-checks' } : await checksOf(run.repo)
+  const plan: CheckPlan = request.noChecks ? { commands: [], source: '--no-checks' } : await checksOf(run.repo)
   if (!request.noChecks && plan.commands.length === 0 && plan.source !== '.drove.json') {
     return refuse('no-checks', `no checks are defined for ${run.repo}: add a "checks" list to its .drove.json (an empty list says there are none), or a typecheck, lint or test script. The human can pass --no-checks.`)
   }
+  // The checks are run, or their evidence at this HEAD reused (checks.ts); `plan.reused` then says so for the merge detail.
   const check = async (): Promise<CommandResult | undefined> => {
-    const result = await runChecks(deps, seat.worktree, plan.commands)
-    if (result.ok) return undefined
-    return refuse('checks-failed', `merge refused: "${result.command}" failed (exit ${result.code}) in ${seat.worktree}. Last output:\n${result.output || '(no output)'}`, { check: result.command, exitCode: result.code })
+    if (plan.commands.length === 0) return undefined
+    const result = await runChecks(deps, run, seat, { plan, fresh: request.fresh })
+    if ('error' in result) return refuse(result.error.code, result.error.text)
+    if (result.passed) {
+      // What is merged is the commit that was checked: the worktree's HEAD must be the branch's tip (a worker that moved
+      // on, switched branches or detached HEAD since would have a commit merged that no check saw).
+      const tip = await git.branchTip(deps.exec, run.repo, seat.branch)
+      if (tip !== result.sha) {
+        return refuse('head-moved', `merge refused: the checks ran at ${result.sha.slice(0, 7)}, the worktree's HEAD in ${seat.worktree}, but ${seat.branch} is at ${tip?.slice(0, 7) ?? 'nothing'}: a commit nobody checked would be merged. Have ${seat.name} commit on ${seat.branch} (not a detached HEAD or another branch), then merge again.`, { checked: result.sha, tip: tip ?? null })
+      }
+      plan.sha = result.sha
+      if (result.reused) plan.reused = reusedText(result)
+      return undefined
+    }
+    const { command, exit, tail } = result.failed as NonNullable<typeof result.failed>
+    return refuse('checks-failed', `merge refused: "${command}" failed (exit ${exit}) in ${seat.worktree}. Last output:\n${tail || '(no output)'}`, { check: command, exitCode: exit })
   }
 
   if (!request.pr) return mergeLocal(deps, run, seat, base, request, plan, check, settle, refuse)
@@ -1915,7 +1895,7 @@ type Gate = {
 }
 
 const mergeLocal = async (
-  deps: Deps, run: RunMeta, seat: Seat, base: string, request: MergeRequest, plan: { commands: string[]; source: string },
+  deps: Deps, run: RunMeta, seat: Seat, base: string, request: MergeRequest, plan: CheckPlan,
   check: () => Promise<CommandResult | undefined>, settle: Gate['settle'], refuse: Gate['refuse'],
 ): Promise<CommandResult> => {
   const head = await git.headBranch(deps.exec, run.repo)
@@ -1924,11 +1904,13 @@ const mergeLocal = async (
   if (unsaved.length > 0) return refuse('dirty-checkout', `the main checkout ${run.repo} has uncommitted changes (${unsaved.slice(0, 5).join('; ')}): commit or stash them, then run drove merge again`)
   const failure = await check()
   if (failure) return failure
-  const message = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, seat.branch)}`
-  const merged = await git.mergeNoFf(deps.exec, run.repo, seat.branch, message)
+  // Merge the exact commit the checks vouched for (no checks, no pin: the human's --no-checks merges the branch).
+  const target = plan.sha ?? seat.branch
+  const message = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, target)}`
+  const merged = await git.mergeNoFf(deps.exec, run.repo, target, message)
   if (!merged.ok) return refuse('merge-conflict', `merge refused: ${seat.branch} does not merge cleanly into ${base} (the merge was aborted, ${base} is untouched): ${clip(merged.output, 400)}. Have the worker merge ${base} into its branch and resolve the conflicts.`)
-  const detail = gateText(plan.commands, plan.source)
-  await settle('merge.passed', `merged at ${merged.sha}; ${detail}`, { sha: merged.sha, checks: plan.commands, message })
+  const detail = gateText(plan)
+  await settle('merge.passed', `merged at ${merged.sha}; ${detail}`, { sha: merged.sha, checks: plan.commands, message, ...(plan.sha ? { checkedSha: plan.sha } : {}), ...(plan.reused ? { checksReused: true } : {}) })
   return ok(`Merged ${seat.branch} into ${base} at ${merged.sha} (--no-ff: "${message}"); ${detail}. ${base} is local and not pushed. Close ${seat.name} with drove close ${seat.name} --remove-worktree.`, { status: 'merged', mode: 'local', sha: merged.sha })
 }
 
@@ -1936,7 +1918,7 @@ const prBody = (run: RunMeta, seat: Seat, subjects: readonly string[]): string =
   [`## Commits`, ...subjects.map(subject => `- ${subject}`), '', ...(seat.cairn ? [`Cairn: ${seat.cairn}`] : []), `Drove run ${run.id}, seat ${seat.name} (${seat.branch}).`].join('\n')
 
 const mergePr = async (
-  deps: Deps, run: RunMeta, seat: Seat, base: string, request: MergeRequest, plan: { commands: string[]; source: string },
+  deps: Deps, run: RunMeta, seat: Seat, base: string, request: MergeRequest, plan: CheckPlan,
   check: () => Promise<CommandResult | undefined>, settle: Gate['settle'], refuse: Gate['refuse'],
 ): Promise<CommandResult> => {
   if (!(await git.hasRemote(deps.exec, run.repo))) return refuse('no-remote', `${run.repo} has no remote, so there is no pull request to open: use drove merge ${seat.name} without --pr`)
@@ -1948,7 +1930,9 @@ const mergePr = async (
     isChecked = true
   }
 
-  const pushed = await git.pushBranch(deps.exec, run.repo, REMOTE, seat.branch)
+  // The pull request holds one exact commit: the one the checks ran at, else the branch's tip as it is now.
+  const pushedSha = plan.sha ?? (await git.branchTip(deps.exec, run.repo, seat.branch))
+  const pushed = await git.pushBranch(deps.exec, run.repo, REMOTE, seat.branch, pushedSha)
   if (pushed.code !== 0) return refuse('push-failed', `could not push ${seat.branch} to ${REMOTE}: ${clip(pushed.stderr || pushed.stdout)}`)
 
   let pr = await viewPr(deps, run.repo, seat.branch)
@@ -1983,11 +1967,14 @@ const mergePr = async (
       if (!isChecked) {
         const failure = await check()
         if (failure) return failure
+        if (plan.sha && pushedSha && plan.sha !== pushedSha) {
+          return refuse('head-moved', `merge refused: the checks ran at ${plan.sha.slice(0, 7)} but the pull request holds ${pushedSha.slice(0, 7)}, which nobody checked: run drove merge ${seat.name} --pr again`, at)
+        }
         isChecked = true
       }
     }
     if (pr.reviewDecision === 'REVIEW_REQUIRED') return pending('a review is required on GitHub')
-    const subject = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, seat.branch)}`
+    const subject = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, pushedSha ?? seat.branch)}`
     const merged = await gh(deps, run.repo, ['pr', 'merge', String(pr.number), request.squash ? '--squash' : '--merge', '--subject', subject])
     if (merged.code !== 0) return refuse('pr-merge-failed', `gh pr merge refused ${pr.url}: ${clip(merged.stderr || merged.stdout)}`, at)
     const after = await viewPr(deps, run.repo, seat.branch)
@@ -2007,9 +1994,28 @@ const mergePr = async (
     if (forwarded.ok) sha = forwarded.sha
     else notes.push(`Local ${base} could not be fast-forwarded from ${REMOTE}/${base}: ${forwarded.error}`)
   }
-  const gated = isChecked ? gateText(plan.commands, plan.source) : 'GitHub checks green'
-  await settle('merge.passed', `${request.squash ? 'squash-merged' : 'merged'} ${pr.url}${sha ? `, local ${base} at ${sha}` : ''}; ${gated}`, { ...at, ...(sha ? { sha } : {}), squash: request.squash === true, checks: isChecked ? plan.commands : [] })
+  const gated = isChecked ? gateText(plan) : 'GitHub checks green'
+  await settle('merge.passed', `${request.squash ? 'squash-merged' : 'merged'} ${pr.url}${sha ? `, local ${base} at ${sha}` : ''}; ${gated}`, { ...at, ...(sha ? { sha } : {}), squash: request.squash === true, checks: isChecked ? plan.commands : [], ...(isChecked && plan.reused ? { checksReused: true } : {}) })
   return ok([`Merged ${pr.url} (${request.squash ? 'squash' : 'merge commit'}); ${gated}.`, ...notes, `Close ${seat.name} with drove close ${seat.name} --remove-worktree.`].join(' '), { status: 'merged', mode: 'pr', ...at, ...(sha ? { sha } : {}) })
+}
+
+// ---------- checks: a seat's merge-plan checks, run or reused, and recorded (DROVE-122) ----------
+
+export const checks = async (deps: Deps, identity: Identity, ref: RunRef, request: { seat: string; fresh?: boolean }): Promise<CommandResult> => {
+  const denied = requirePlanner(identity)
+  if (denied) return denied
+  const located = await locateRun(deps, { run: ref.run ?? (identity.run || undefined), repo: ref.repo }, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
+  if (!seat) return failed('no-seat', `no seat named ${request.seat}`)
+  const plan = await checksOf(run.repo)
+  if (plan.commands.length === 0 && plan.source !== '.drove.json') {
+    return failed('no-checks', `no checks are defined for ${run.repo}: add a "checks" list to its .drove.json, or a typecheck, lint or test script`)
+  }
+  const outcome = await runChecks(deps, run, seat, { plan, fresh: request.fresh })
+  if ('error' in outcome) return failed(outcome.error.code, outcome.error.text)
+  return ok(renderOutcome(outcome), outcome)
 }
 
 // ---------- report ----------

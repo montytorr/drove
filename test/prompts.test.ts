@@ -78,6 +78,15 @@ test('planner role integrates with drove merge, --pr when the repo has a remote 
   assert.doesNotMatch(prompts.workerRole(run, config), /drove merge/)
 })
 
+test('planner role verifies a done report with run_checks and says the merge reuses a pass at the current commit (DROVE-122)', () => {
+  for (const kind of ['claude', 'codex'] as const) {
+    const text = prompts.plannerRole(run, config, kind)
+    assert.match(text, /Verify its test claims with the drove run_checks tool \(`drove checks <seat>`\)/)
+    assert.match(text, /reuses a passing run_checks record at the worker's current commit instead \(`fresh: true` runs them again\)/)
+    assert.doesNotMatch(text, /Ask the worker to run tests and report the output/)
+  }
+})
+
 test('worker role covers rules, cairn, questions and reporting', () => {
   const text = prompts.workerRole(run, config)
   assert.match(text, /You are a worker of Drove run drove-20261009-1042-a3f1/)

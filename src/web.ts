@@ -5,7 +5,7 @@ import type { AddressInfo } from 'node:net'
 import { SPINNER, STATUS_TONE } from '../mod/hooks/board.ts'
 import type { BoardModel, BoardRow, Tone } from '../mod/hooks/board.ts'
 import { shortModel } from '../mod/hooks/protocol.ts'
-import { isAsking, isForHuman } from '../mod/hooks/roster.ts'
+import { checkText, isAsking, isForHuman } from '../mod/hooks/roster.ts'
 import { boardSource, isAnimated, modelOf, POLL_MS } from './board.ts'
 import type { BoardData, FrameInput } from './board.ts'
 import { capture } from './commands.ts'
@@ -33,6 +33,7 @@ export type WebSeat = Pick<Seat, 'name' | 'kind' | 'model' | 'effort' | 'state' 
   activity: string
   tone: Tone
   needsYou: boolean
+  checks?: string
   lastReport?: WebReport
 }
 
@@ -94,6 +95,7 @@ export const payloadOf = (data: BoardData, now: number, offsetMinutes: number): 
       activity: doingOf(rows.get(`w:${name}`)).text,
       tone: needsYou ? 'alert' : STATUS_TONE[state],
       needsYou,
+      ...(seat.checks === undefined ? {} : { checks: checkText(seat) }),
       ...(lastReport === undefined || Number.isNaN(reportAt) ? {} : { lastReport: { kind: lastReport.kind, expects: lastReport.expects, summary: lastReport.summary, at: reportAt } }),
     }
   })

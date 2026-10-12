@@ -3,7 +3,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { baseName, parseShell, unwrap } from './shell.ts'
 import type { Segment } from './shell.ts'
-import type { GuardDecision, GuardInput, Role } from './types.ts'
+import type { GuardDecision, GuardInput, GuardRule, Role } from './types.ts'
 
 export const EDIT_TOOLS: ReadonlySet<string> = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'apply_patch'])
 export const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'shell', 'exec_command'])
@@ -11,6 +11,11 @@ export const SHELL_TOOLS: ReadonlySet<string> = new Set(['Bash', 'shell', 'exec_
 type Context = Pick<GuardInput, 'writableRoots' | 'openSeats' | 'owns'> & { cwd?: string; readOnly?: boolean }
 // readOnly is a reviewer seat (DROVE-91): a worker whose Bash gets the planner's rules, with the repo's checks allowed.
 type Scope = { role: Role; roots: readonly string[]; seats: readonly string[]; cwd: string; owns?: readonly string[]; readOnly?: boolean }
+// A refusal: the rule it falls under (the ledger and the thrash count group by it), why, and a next step where the rule's usual one does not fit.
+export type Violation = { rule: GuardRule; reason: string; next?: string }
+const violation = (rule: GuardRule, reason: string, next?: string): Violation => ({ rule, reason, ...(next ? { next } : {}) })
+// What a planner's or a reviewer's shell rule is called: a reviewer is the planner's column with its own name.
+const shellRule = (scope: Scope): GuardRule => (scope.readOnly ? 'reviewer-readonly' : 'planner-shell')
 
 const MAX_NESTING = 6
 const HARMLESS_TARGETS = new Set(['/dev/null', '/dev/stdout', '/dev/stderr', '/dev/tty'])
@@ -98,7 +103,7 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'roster', 'attention', 'capture', 'close', 'down', 'doctor', 'owns'])
+const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'checks', 'roster', 'attention', 'capture', 'close', 'down', 'doctor', 'owns'])
 const WORKER_DROVE = new Set(['roster', 'capture', 'doctor'])
 
 // A worker's Bash may read Drove's run state (roster, events, its own brief) but not write it: the roster holds the seat's
@@ -148,10 +153,37 @@ const GIT_REF_WRITE_FLAG: Record<string, RegExp> = {
   tag: /^(?:-[a-zA-Z]*[dasSufFme]|--(?:delete|annotate|sign|local-user|force|file|message|edit))/,
 }
 
-export const denyText = (role: Role, reason: string): string =>
-  role === 'planner'
-    ? `Drove planner: ${reason}. You plan, delegate and review; you never change code or run scripts yourself. Delegate it to a worker with the drove spawn or send tools. (The human can leave planner mode by starting a plain session.)`
-    : `Drove worker: ${reason}.`
+// The one concrete next step a denial ends with, by rule and role. `owns` has none here: its refusal text ends with its own.
+const NEXT_STEP: Record<GuardRule, Record<Role, string>> = {
+  owns: { worker: '', planner: '' },
+  'reviewer-readonly': { worker: 'put what you found in your report with the drove report tool; the planner decides who changes it.', planner: '' },
+  'planner-edit': { worker: '', planner: 'delegate the change to a worker with the drove spawn or send tools.' },
+  'planner-shell': { worker: '', planner: 'delegate it to a worker with the drove spawn or send tools.' },
+  push: { worker: 'commit your work on your branch and report done; the planner merges and pushes.', planner: '' },
+  production: { worker: 'push main (or master) instead; nobody pushes to production.', planner: 'name main (or master) instead; nobody pushes to production.' },
+  herdr: { worker: 'ask the planner with the drove report tool; it opens and drives the panes.', planner: 'use the drove tools (spawn, send, close), which keep the roster and the pane budget.' },
+  'merge-gate': { worker: 'ask the planner with the drove report tool.', planner: "merge it with the drove merge tool (merge_worker in the mod): it runs the repo's checks first." },
+  'agent-launch': { worker: 'ask the planner with the drove report tool; it starts sessions with drove spawn.', planner: 'start the session with the drove spawn tool, and write to an open seat with drove send.' },
+  'drove-cli': { worker: 'use drove roster, capture or doctor, and ask the planner for anything else with the drove report tool.', planner: 'use the drove tools (goal, spawn, send, merge, roster, close); the human runs budget, plan and up.' },
+  github: { worker: 'ask the planner with the drove report tool.', planner: 'ask the human to run that command.' },
+  'run-state': { worker: 'if something there needs to change (your owns, say), send a question report to the planner with the drove report tool.', planner: '' },
+  unreadable: { worker: 'repeat the call with a literal command or path, with no variable or substitution in it.', planner: 'repeat the call with a literal command or path, with no variable or substitution in it.' },
+  'guard-error': { worker: 'try the call again; if it keeps failing, tell the planner with the drove report tool that the Drove guard is broken.', planner: 'try the call again; if it keeps failing, tell the human that the Drove guard is broken (drove doctor).' },
+}
+
+// `rule` is left out only by callers that have none; the text is then the reason and the role's note, as before DROVE-121.
+export const denyText = (role: Role, reason: string, rule?: GuardRule, next?: string): string => {
+  const step = next ?? (rule ? NEXT_STEP[rule][role] : '')
+  const tail = step ? ` Next step: ${step}` : ''
+  if (role !== 'planner') return `Drove worker: ${reason}.${tail}`
+  const mode = '(The human can leave planner mode by starting a plain session.)'
+  const note = `You plan, delegate and review; you never change code or run scripts yourself.${rule ? '' : ' Delegate it to a worker with the drove spawn or send tools.'} ${mode}`
+  return `Drove planner: ${reason}. ${note}${tail}`
+}
+
+// The refusal itself, as denyText built it from a reason: what the ledger and the thrash item keep of a denial.
+export const reasonOfText = (text: string): string =>
+  (text.replace(/^Drove (?:worker|planner): /, '').split(/\. (?:You plan, delegate and review|Next step:)/)[0] ?? text).replace(/\.$/, '')
 
 const expandHome = (path: string): string => (path === '~' || path.startsWith('~/') ? join(homedir(), path.slice(1)) : path)
 
@@ -256,9 +288,9 @@ const ownsText = (path: string, owns: readonly string[]): string =>
   `${path}: this file is outside the paths your brief gives you (${owns.join(', ')}); if you need it, send a question report asking the planner to add it to your owns with the set_owns tool, naming ${path}`
 
 // A path with a variable or a substitution cannot be resolved, so only literal paths are checked.
-const ownsReason = (path: string, scope: Scope): string | undefined => {
+const ownsReason = (path: string, scope: Scope): Violation | undefined => {
   if (scope.owns === undefined || HARMLESS_TARGETS.has(path) || /[$`]/.test(path)) return undefined
-  return isOwned(path, scope.owns, scope.cwd) ? undefined : ownsText(path, scope.owns)
+  return isOwned(path, scope.owns, scope.cwd) ? undefined : violation('owns', ownsText(path, scope.owns))
 }
 
 const OPTIONS_WITH_VALUE: Record<string, ReadonlySet<string>> = {
@@ -386,22 +418,22 @@ const seatOfRevision = (revision: string): string | undefined => {
   return undefined
 }
 
-const mergeReason = (words: readonly string[], mergeAt: number): string | undefined => {
+const mergeReason = (words: readonly string[], mergeAt: number): Violation | undefined => {
   for (let i = mergeAt + 1; i < words.length; i += 1) {
     const word = words[i] ?? ''
     if (MERGE_FLAGS_WITH_VALUE.has(word)) i += 1
     else if (!word.startsWith('-')) {
       const seat = seatOfRevision(word)
-      if (seat) return `git merge ${word} merges a worker's branch unchecked: use drove merge ${seat}: it runs the checks first`
+      if (seat) return violation('merge-gate', `git merge ${word} merges a worker's branch unchecked: use drove merge ${seat}: it runs the checks first`, `merge it with the drove merge tool (merge_worker in the mod): drove merge ${seat}.`)
     }
   }
   return undefined
 }
 
-const gitReadReason = (words: readonly string[], at: number): string | undefined => {
+const gitReadReason = (words: readonly string[], at: number): Violation | undefined => {
   const sub = words[at] ?? ''
   const rest = words.slice(at + 1)
-  const reason = `git ${sub || '<nothing>'} can change the repository; a reviewer reads only (git diff, log, show, status and the like)`
+  const reason = violation('reviewer-readonly', `git ${sub || '<nothing>'} can change the repository; a reviewer reads only (git diff, log, show, status and the like)`)
   if (rest.some(word => word === '--output' || word.startsWith('--output='))) return reason
   if (GIT_READ_ONLY.has(sub)) return undefined
   const listing = GIT_LISTING[sub]
@@ -411,14 +443,14 @@ const gitReadReason = (words: readonly string[], at: number): string | undefined
   return reason
 }
 
-const gitReason = (words: readonly string[], scope: Scope): string | undefined => {
+const gitReason = (words: readonly string[], scope: Scope): Violation | undefined => {
   const at = firstPositional(words, 1, GIT_OPTIONS_WITH_VALUE)
   if (words[at] === 'merge' && scope.role === 'planner') return mergeReason(words, at)
   if (scope.readOnly && words[at] !== 'push') return gitReadReason(words, at)
   if (words[at] !== 'push') return undefined
-  if (scope.role === 'worker') return WORKER_PUSH
-  if (words.some(word => PUSH_FLAGS_FOR_ALL.has(word))) return 'git push --all or --mirror would also push production, which nobody pushes to'
-  return pushesProduction(words, at, scope.cwd) ? 'nobody pushes to the production branch: push main (or master) instead' : undefined
+  if (scope.role === 'worker') return violation('push', WORKER_PUSH)
+  if (words.some(word => PUSH_FLAGS_FOR_ALL.has(word))) return violation('production', 'git push --all or --mirror would also push production, which nobody pushes to')
+  return pushesProduction(words, at, scope.cwd) ? violation('production', 'nobody pushes to the production branch: push main (or master) instead') : undefined
 }
 
 const namesProduction = (words: readonly string[]): boolean =>
@@ -437,89 +469,91 @@ const ghApiWrites = (words: readonly string[]): boolean =>
     return /^(?:-f|-F|--field|--raw-field|--input)(?:=.*)?$/.test(word) || /^-[fF]./.test(word)
   })
 
-const ghReadOnlyReason = (words: readonly string[]): string | undefined => {
+const ghReadOnlyReason = (words: readonly string[]): Violation | undefined => {
   if (isHelpOrVersion(words)) return undefined
   const at = firstPositional(words, 1, GH_OPTIONS_WITH_VALUE)
   const group = words[at] ?? ''
   const action = words[firstPositional(words, at + 1, GH_OPTIONS_WITH_VALUE)] ?? ''
-  if (group === 'api') return ghApiWrites(words) ? 'gh api with a method or fields writes to GitHub; a reviewer reads only' : undefined
+  if (group === 'api') return ghApiWrites(words) ? violation('reviewer-readonly', 'gh api with a method or fields writes to GitHub; a reviewer reads only') : undefined
   if (GH_READ_GROUPS.has(group) || GH_READS[group]?.has(action)) return undefined
-  return `gh ${group}${action ? ` ${action}` : ''} can change GitHub or the checkout; a reviewer reads only (gh pr view, list, diff, checks and the like, and gh api GETs)`
+  return violation('reviewer-readonly', `gh ${group}${action ? ` ${action}` : ''} can change GitHub or the checkout; a reviewer reads only (gh pr view, list, diff, checks and the like, and gh api GETs)`)
 }
 
-const ghReason = (words: readonly string[]): string | undefined => {
+const ghReason = (words: readonly string[]): Violation | undefined => {
   const at = firstPositional(words, 1, GH_OPTIONS_WITH_VALUE)
   const group = words[at] ?? ''
   const action = words[firstPositional(words, at + 1, GH_OPTIONS_WITH_VALUE)] ?? ''
-  if (GH_HUMAN_ONLY[group]?.has(action)) return `gh ${group} ${action} deletes, transfers or reconfigures GitHub: ask the human to run it`
+  if (GH_HUMAN_ONLY[group]?.has(action)) return violation('github', `gh ${group} ${action} deletes, transfers or reconfigures GitHub: ask the human to run it`)
   if (group === 'api' && words.some((word, i) => (/^-X$|^--method$/.test(words[i - 1] ?? '') && !/^get$/i.test(word)) || /^-(f|F)$|^--(field|raw-field|input)$/.test(word))) {
-    return 'gh api with a method or fields writes to GitHub: ask the human to run it'
+    return violation('github', 'gh api with a method or fields writes to GitHub: ask the human to run it')
   }
   if (!GH_PLANNER_WRITES[group]?.has(action)) return undefined
-  if (group === 'pr' && action === 'merge') return 'gh pr merge skips the merge gate: use drove merge <seat> --pr, which gates the merge on the checks; ask the human to merge other PRs'
-  if (namesProduction(words)) return `gh ${group} ${action} names the production branch: nobody pushes to the production branch, use main (or master) instead`
+  if (group === 'pr' && action === 'merge') {
+    return violation('merge-gate', 'gh pr merge skips the merge gate: use drove merge <seat> --pr, which gates the merge on the checks; ask the human to merge other PRs', 'merge a worker with the drove merge tool and pr: true (drove merge <seat> --pr); ask the human to merge other PRs.')
+  }
+  if (namesProduction(words)) return violation('production', `gh ${group} ${action} names the production branch: nobody pushes to the production branch, use main (or master) instead`)
   if (group === 'repo' && action === 'create' && (words.includes('--public') || !words.some(word => word === '--private' || word === '--internal'))) {
-    return 'gh repo create without --private or --internal would publish a repo: ask the human to run it'
+    return violation('github', 'gh repo create without --private or --internal would publish a repo: ask the human to run it', 'add --private or --internal, or ask the human to run it.')
   }
   return undefined
 }
 
-const herdrReason = (words: readonly string[], scope: Scope): string | undefined => {
+const herdrReason = (words: readonly string[], scope: Scope): Violation | undefined => {
   const group = words[firstPositional(words, 1)] ?? ''
   const actionAt = firstPositional(words, words.indexOf(group) + 1)
   const action = words[actionAt] ?? ''
   if (!HERDR_WRITES[group]?.has(action)) return undefined
-  if (scope.role === 'worker') return 'workers do not open or drive panes; ask the planner with the drove report tool'
+  if (scope.role === 'worker') return violation('herdr', 'workers do not open or drive panes; ask the planner with the drove report tool')
   if (group === 'agent' && action === 'prompt') {
     const seat = words[firstPositional(words, actionAt + 1, HERDR_OPTIONS_WITH_VALUE)] ?? ''
-    return scope.seats.includes(seat) ? undefined : `herdr agent prompt ${seat || '<nothing>'}: that is not an open seat of this run (use drove send)`
+    return scope.seats.includes(seat) ? undefined : violation('herdr', `herdr agent prompt ${seat || '<nothing>'}: that is not an open seat of this run (use drove send)`)
   }
-  return `herdr ${group} ${action} changes panes or agents: use the drove tools, which keep the roster and the pane budget`
+  return violation('herdr', `herdr ${group} ${action} changes panes or agents: use the drove tools, which keep the roster and the pane budget`)
 }
 
 const isPluginTest = (words: readonly string[]): boolean =>
   words[1] === 'plugin' && words[2] === 'test' && words.length <= 4 && !(words[3] ?? '').startsWith('-')
 
-const sessionReason = (head: 'claude' | 'codex', words: readonly string[], scope: Scope): string | undefined => {
+const sessionReason = (head: 'claude' | 'codex', words: readonly string[], scope: Scope): Violation | undefined => {
   if (isHelpOrVersion(words)) return undefined
   if (head === 'claude' && scope.role === 'worker' && isPluginTest(words)) return undefined
   if (head === 'codex' && scope.role === 'planner' && words[1] === 'queue') {
     const thread = optionValue(words, '--thread')
-    return thread !== undefined && scope.seats.includes(thread) ? undefined : `codex queue to ${thread ?? '<no thread>'}: that is not an open seat of this run`
+    return thread !== undefined && scope.seats.includes(thread) ? undefined : violation('agent-launch', `codex queue to ${thread ?? '<no thread>'}: that is not an open seat of this run`)
   }
-  return scope.role === 'worker'
+  return violation('agent-launch', scope.role === 'worker'
     ? `workers do not start other ${head} sessions; ask the planner with the drove report tool`
-    : `starting another ${head} session: use drove spawn`
+    : `starting another ${head} session: use drove spawn`)
 }
 
-const droveReason = (words: readonly string[], scope: Scope): string | undefined => {
+const droveReason = (words: readonly string[], scope: Scope): Violation | undefined => {
   const at = firstPositional(words, 1)
   const sub = words[at] ?? ''
   const allowed = scope.role === 'planner' ? PLANNER_DROVE : WORKER_DROVE
   const isBoardOnce = scope.role === 'planner' && sub === 'board' && words.includes('--once')
   if (scope.role === 'planner' && sub === 'merge' && words.some(word => word === '--no-checks' || word.startsWith('--no-checks='))) {
-    return "drove merge --no-checks skips the repo's checks and is for the human to run: let the checks pass, or ask the human"
+    return violation('merge-gate', "drove merge --no-checks skips the repo's checks and is for the human to run: let the checks pass, or ask the human", 'fix what the checks report and run drove merge again, or ask the human to run it with --no-checks.')
   }
   if (allowed.has(sub) || isBoardOnce) return undefined
-  return `drove ${sub || '<nothing>'} is not available to a ${scope.role}${sub === 'budget' ? ': ask the human to run it' : ''}`
+  return violation('drove-cli', `drove ${sub || '<nothing>'} is not available to a ${scope.role}${sub === 'budget' ? ': ask the human to run it' : ''}`)
 }
 
-const curlReason = (head: string, words: readonly string[]): string | undefined => {
-  if (head === 'wget') return words.some((word, i) => word === '-O-' || word === '-qO-' || (word === '-O' && words[i + 1] === '-')) ? undefined : 'wget writes a file'
+const curlReason = (head: string, words: readonly string[], scope: Scope): Violation | undefined => {
+  if (head === 'wget') return words.some((word, i) => word === '-O-' || word === '-qO-' || (word === '-O' && words[i + 1] === '-')) ? undefined : violation(shellRule(scope), 'wget writes a file')
   const writes = words.some((word, i) =>
     /^-(d|F|T)$|^--(data|data-raw|data-binary|data-urlencode|form|upload-file|json)$/.test(word) ||
     /^--data/.test(word) ||
     (/^-X$|^--request$/.test(words[i - 1] ?? '') && !/^(get|head)$/i.test(word)) ||
     /^-(o|O)$|^--(output|remote-name)$/.test(word),
   )
-  return writes ? 'curl that sends data or saves a file' : undefined
+  return writes ? violation(shellRule(scope), 'curl that sends data or saves a file') : undefined
 }
 
-const packageReason = (head: string, words: readonly string[]): string | undefined => {
+const packageReason = (head: string, words: readonly string[], scope: Scope): Violation | undefined => {
   const allowed = READ_ONLY_SUBCOMMANDS[head]
   const sub = words[head === 'make' ? 1 : firstPositional(words, 1)] ?? ''
   if (allowed?.has(sub) || (head === 'make' && words.slice(1).some(word => allowed?.has(word)))) return undefined
-  return `${head}${sub ? ` ${sub}` : ''} installs, builds or runs code (your CLAUDE.md: ask before running a script)`
+  return violation(shellRule(scope), `${head}${sub ? ` ${sub}` : ''} installs, builds or runs code (your CLAUDE.md: ask before running a script)`)
 }
 
 const patchPaths = (text: string): string[] =>
@@ -533,18 +567,18 @@ const isReviewerScratch = (path: string, cwd: string): boolean => {
   return (relation === '..' || relation.startsWith('../')) && isScratch(target)
 }
 
-const patchReason = (text: string, scope: Scope): string | undefined => {
+const patchReason = (text: string, scope: Scope): Violation | undefined => {
   const paths = patchPaths(text)
   const outside = paths.find(path => !(scope.readOnly ? isReviewerScratch(path, scope.cwd) : isInside(path, scope.roots, scope.cwd)))
-  if (paths.length === 0) return 'apply_patch changes files and no path could be read from it'
-  return outside === undefined ? undefined : `apply_patch on ${outside} changes code`
+  if (paths.length === 0) return violation('unreadable', 'apply_patch changes files and no path could be read from it')
+  return outside === undefined ? undefined : violation(scope.readOnly ? 'reviewer-readonly' : 'planner-edit', `apply_patch on ${outside} changes code`)
 }
 
-const redirectReason = (target: string, scope: Scope): string | undefined => {
+const redirectReason = (target: string, scope: Scope): Violation | undefined => {
   if (HARMLESS_TARGETS.has(target)) return undefined
-  if (/[$`]/.test(target)) return `redirecting output into ${target} writes to a path that cannot be checked`
+  if (/[$`]/.test(target)) return violation('unreadable', `redirecting output into ${target} writes to a path that cannot be checked`)
   const isAllowed = scope.readOnly ? isReviewerScratch(target, scope.cwd) : isInside(target, scope.roots, scope.cwd) || isPlannerScratchpad(target, scope.cwd)
-  return isAllowed ? undefined : `redirecting output into ${target} writes a file`
+  return isAllowed ? undefined : violation(shellRule(scope), `redirecting output into ${target} writes a file`)
 }
 
 // Where a planner or a reviewer may write with a file command: the planner's session scratchpad, a reviewer's temp directories.
@@ -574,34 +608,35 @@ const isCheckCommand = (head: string, words: readonly string[]): boolean => {
   return CHECKERS.has(head)
 }
 
-const plannerReason = (words: readonly string[], scope: Scope): string | undefined => {
+const plannerReason = (words: readonly string[], scope: Scope): Violation | undefined => {
   const first = words[0]
   if (first === undefined) return undefined
   const head = baseName(first)
-  if (first.startsWith('$')) return 'the command name comes from a variable or a substitution, which cannot be checked'
-  if (/^(\.{1,2}|~)\//.test(first) || (first.includes('/') && isInside(first, scope.roots, scope.cwd))) return `running ${first} executes a script`
+  const rule = shellRule(scope)
+  if (first.startsWith('$')) return violation('unreadable', 'the command name comes from a variable or a substitution, which cannot be checked')
+  if (/^(\.{1,2}|~)\//.test(first) || (first.includes('/') && isInside(first, scope.roots, scope.cwd))) return violation(rule, `running ${first} executes a script`)
   if (FILE_WRITERS.has(head)) {
     const targets = SCRATCHPAD_WRITERS.has(head) ? writeTargets(head, words) : []
     if (targets.length > 0 && targets.every(target => isScratchTarget(target, scope))) return undefined
-    return `${head} changes files or processes`
+    return violation(rule, `${head} changes files or processes`)
   }
-  if ((head === 'sed' || head === 'perl') && words.some(word => /^-[a-zA-Z]*i/.test(word) || word.startsWith('--in-place'))) return `${head} -i edits files in place`
-  if (head === 'find' && words.some(word => FIND_ACTIONS.has(word))) return 'find with an action runs commands or deletes files'
+  if ((head === 'sed' || head === 'perl') && words.some(word => /^-[a-zA-Z]*i/.test(word) || word.startsWith('--in-place'))) return violation(rule, `${head} -i edits files in place`)
+  if (head === 'find' && words.some(word => FIND_ACTIONS.has(word))) return violation(rule, 'find with an action runs commands or deletes files')
   if (scope.readOnly && isCheckCommand(head, words)) return undefined
-  if (head === 'perl' || RUNTIMES.has(head)) return `${head} runs code`
+  if (head === 'perl' || RUNTIMES.has(head)) return violation(rule, `${head} runs code`)
   if (head === 'gh') return scope.readOnly ? ghReadOnlyReason(words) : ghReason(words)
-  if (head === 'curl' || head === 'wget') return curlReason(head, words)
-  if (PACKAGE_TOOLS.has(head)) return packageReason(head, words)
+  if (head === 'curl' || head === 'wget') return curlReason(head, words, scope)
+  if (PACKAGE_TOOLS.has(head)) return packageReason(head, words, scope)
   return undefined
 }
 
-const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
+const segmentReason = (segment: Segment, scope: Scope): Violation | undefined => {
   const isStrict = scope.role === 'planner' || scope.readOnly === true
   if (isStrict && segment.stdoutFile !== undefined) {
     const reason = redirectReason(segment.stdoutFile, scope)
     if (reason) return reason
   }
-  if (scope.role === 'worker' && segment.stdoutFile !== undefined && mentionsDroveHome(segment.stdoutFile)) return STATE_TEXT
+  if (scope.role === 'worker' && segment.stdoutFile !== undefined && mentionsDroveHome(segment.stdoutFile)) return violation('run-state', STATE_TEXT)
   if (scope.role === 'worker' && scope.owns && segment.stdoutFile !== undefined) {
     const reason = ownsReason(segment.stdoutFile, scope)
     if (reason) return reason
@@ -610,7 +645,7 @@ const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
   const first = words[0]
   if (first === undefined) return undefined
   const head = baseName(first)
-  if (scope.role === 'worker' && !STATE_READERS.has(head) && words.some(mentionsDroveHome)) return STATE_TEXT
+  if (scope.role === 'worker' && !STATE_READERS.has(head) && words.some(mentionsDroveHome)) return violation('run-state', STATE_TEXT)
   if (scope.role === 'worker' && scope.owns) {
     const reason = writeTargets(head, words).map(target => ownsReason(target, scope)).find(Boolean)
     if (reason) return reason
@@ -624,8 +659,8 @@ const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
   return isStrict ? plannerReason(words, scope) : undefined
 }
 
-const commandReason = (command: string, scope: Scope, depth: number): string | undefined => {
-  if (depth > MAX_NESTING) return scope.role === 'planner' || scope.readOnly ? 'the command nests substitutions too deeply to check' : undefined
+const commandReason = (command: string, scope: Scope, depth: number): Violation | undefined => {
+  if (depth > MAX_NESTING) return scope.role === 'planner' || scope.readOnly ? violation('unreadable', 'the command nests substitutions too deeply to check') : undefined
   for (const pipeline of parseShell(command)) {
     for (const segment of pipeline) {
       const reason = segmentReason(segment, scope)
@@ -639,8 +674,10 @@ const commandReason = (command: string, scope: Scope, depth: number): string | u
   return undefined
 }
 
-export const bashReason = (command: string, role: Role, context: Context): string | undefined =>
+export const bashViolation = (command: string, role: Role, context: Context): Violation | undefined =>
   commandReason(command, { role, roots: context.writableRoots, seats: context.openSeats, cwd: context.cwd ?? process.cwd(), ...(context.owns && context.owns.length > 0 ? { owns: context.owns } : {}), ...(context.readOnly ? { readOnly: true } : {}) }, 0)
+
+export const bashReason = (command: string, role: Role, context: Context): string | undefined => bashViolation(command, role, context)?.reason
 
 const quoteWord = (word: string): string => (/^[\w@%+=:,./-]+$/.test(word) ? word : `'${word.replaceAll("'", `'\\''`)}'`)
 
@@ -666,7 +703,7 @@ export const editPathsOf = (tool: string, input: Record<string, unknown>): strin
 
 const ALLOW: GuardDecision = { allow: true }
 
-const denied = (role: Role, reason: string): GuardDecision => ({ allow: false, reason: denyText(role, reason) })
+const denied = (role: Role, rule: GuardRule, reason: string, next?: string): GuardDecision => ({ allow: false, rule, reason: denyText(role, reason, rule, next) })
 
 const workdirOf = (input: GuardInput): string => (typeof input.input.workdir === 'string' ? resolve(input.cwd, input.input.workdir) : input.cwd)
 
@@ -675,31 +712,31 @@ export const decide = (input: GuardInput): GuardDecision => {
   const isReviewer = role === 'worker' && input.seatRole === 'reviewer'
   if (EDIT_TOOLS.has(tool) && isReviewer) {
     const paths = editPathsOf(tool, input.input)
-    if (paths.length === 0) return denied(role, `${tool} changes code and no path could be read from it`)
+    if (paths.length === 0) return denied(role, 'unreadable', `${tool} changes code and no path could be read from it`)
     const outside = paths.find(path => !isReviewerScratch(path, input.cwd))
-    return outside === undefined ? ALLOW : denied(role, `${tool} on ${outside}: a reviewer seat is read-only and writes only scratch files under /tmp; put what you found in your report`)
+    return outside === undefined ? ALLOW : denied(role, 'reviewer-readonly', `${tool} on ${outside}: a reviewer seat is read-only and writes only scratch files under /tmp; put what you found in your report`)
   }
   if (EDIT_TOOLS.has(tool)) {
     const owns = role === 'worker' && input.owns && input.owns.length > 0 ? input.owns : undefined
     if (role === 'worker' && !owns) return ALLOW
     const paths = editPathsOf(tool, input.input)
-    if (paths.length === 0) return denied(role, `${tool} changes code and no path could be read from it`)
+    if (paths.length === 0) return denied(role, 'unreadable', `${tool} changes code and no path could be read from it`)
     if (owns) {
       const outside = paths.find(path => !isOwned(path, owns, input.cwd))
-      return outside === undefined ? ALLOW : denied(role, ownsText(outside, owns))
+      return outside === undefined ? ALLOW : denied(role, 'owns', ownsText(outside, owns))
     }
     const outside = paths.find(path => !isInside(path, input.writableRoots, input.cwd))
-    return outside === undefined ? ALLOW : denied(role, `${tool} on ${outside} changes code`)
+    return outside === undefined ? ALLOW : denied(role, 'planner-edit', `${tool} on ${outside} changes code`)
   }
   if (!SHELL_TOOLS.has(tool)) return ALLOW
   const command = commandOf(input.input)
-  if (command === undefined) return role === 'planner' || isReviewer ? denied(role, 'there is no command text to check') : ALLOW
-  const reason = bashReason(command, role, {
+  if (command === undefined) return role === 'planner' || isReviewer ? denied(role, 'unreadable', 'there is no command text to check') : ALLOW
+  const found = bashViolation(command, role, {
     writableRoots: isReviewer ? TMP_ROOTS : input.writableRoots,
     openSeats: input.openSeats,
     cwd: workdirOf(input),
     ...(input.owns ? { owns: input.owns } : {}),
     ...(isReviewer ? { readOnly: true } : {}),
   })
-  return reason ? denied(role, reason) : ALLOW
+  return found ? denied(role, found.rule, found.reason, found.next) : ALLOW
 }

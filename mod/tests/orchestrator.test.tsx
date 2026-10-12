@@ -135,7 +135,7 @@ describe('bridge stream', () => {
     expect(feedOf({ at: ISO, type: 'report.delivered', seat: 'w-auth' }, bodies)).toBeUndefined()
     expect(feedOf({ at: ISO, type: 'goal.set', data: { goal: 'Release 0.3.0' } }, bodies)).toMatchObject({ from: '⌘', kind: 'goal', summary: 'goal: Release 0.3.0' })
     expect(feedOf({ at: ISO, type: 'attention', seat: 'w-auth', data: { reason: 'dialog', detail: 'trust this folder' } }, bodies)).toMatchObject({ from: 'w-auth', to: 'Human', kind: 'attention', summary: 'dialog: trust this folder' })
-    for (const reason of ['idle-without-report', 'stalled', 'budget', 'pending-delivery']) {
+    for (const reason of ['idle-without-report', 'stalled', 'budget', 'pending-delivery', 'guard-thrash']) {
       expect(feedOf({ at: ISO, type: 'attention', seat: 'w-auth', data: { reason, detail: 'x' } }, bodies)).toMatchObject({ from: 'w-auth', to: '⌘', kind: 'notice', summary: `${reason}: x` })
     }
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: true, resumed: true, pane: 'w1:p2' } }, bodies)).toMatchObject({ kind: 'relaunch', to: 'w-auth', summary: 'relaunched (resumed) in pane w1:p2' })
@@ -194,6 +194,26 @@ describe('board model', () => {
     const roles = buildBoard({ ...base, frame: 0, seats: [seat(), seat({ name: 'r-auth', role: 'reviewer', target: 'w-auth' }), seat({ name: 't-auth', role: 'tester', target: 'w-auth' })] })
     expect(roles.workers.map(row => [row.cells[3]?.text, row.cells[4]?.text])).toEqual([['w-auth', ' '], ['r-auth', 'R'], ['t-auth', 'T']])
     expect(roles.workers[0]?.cells).toHaveLength((plain.workers[0]?.cells.length ?? 0) + 1)
+  })
+
+  test('a seat\'s last check result shows as a short marker: passed, failed, or stale once HEAD moved; the column only exists once a seat has one', () => {
+    const run = { sha: 'a'.repeat(40), clean: true, at: '2026-10-09T10:00:00.000Z' }
+    const none = buildBoard({ ...base, frame: 0, seats: [seat(), seat({ name: 'w-b' })] })
+    const marked = buildBoard({
+      ...base,
+      frame: 0,
+      seats: [seat({ checks: { ...run, result: 'passed' } }), seat({ name: 'w-b', checks: { ...run, result: 'failed', failed: 'npm test' } }), seat({ name: 'w-c', checks: { ...run, result: 'passed', stale: true } }), seat({ name: 'w-d' })],
+    })
+    const cells = (row: number) => marked.workers[row]?.cells ?? []
+    expect(cells(0).map(({ text }) => text)).toContain('chk✓')
+    expect(cells(1).map(({ text }) => text)).toContain('chk✗')
+    expect(cells(2).map(({ text }) => text)).toContain('chk~')
+    expect(cells(0).find(({ text }) => text === 'chk✓')?.tone).toBe('good')
+    expect(cells(1).find(({ text }) => text === 'chk✗')?.tone).toBe('alert')
+    expect(cells(3).map(({ text }) => text)).not.toContain('chk✓')
+    expect(cells(3)).toHaveLength(cells(0).length)
+    expect(cells(0)).toHaveLength((none.workers[0]?.cells.length ?? 0) + 1)
+    expect(cells(0).filter(({ width }) => width === undefined)).toHaveLength(1)
   })
 
   test('an asking seat pulses for a few seconds, then stays red; a bridge problem shows on the lead row', () => {
@@ -499,6 +519,8 @@ describe('orchestrator session', () => {
     expect(sections[1]?.text).toContain('A wake shows one line per worker report')
     expect(sections[1]?.text).toContain('call mcp__orchestrator__read_reports for the full text')
     expect(sections[1]?.text).toContain('integrate it with mcp__orchestrator__merge_worker (`drove merge <seat>`), never a plain `git merge`')
+    expect(sections[1]?.text).toContain('Verify its test claims with mcp__orchestrator__run_checks (`drove checks <seat>`)')
+    expect(sections[1]?.text).toContain("reuses a passing run_checks record at the worker's current commit instead (`fresh: true` runs them again)")
     expect(sections[1]?.text).toContain('pass `pr: true` (`drove merge <seat> --pr`')
   })
 
@@ -516,6 +538,25 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'merge').every(({ args }) => !args.includes('--no-checks'))).toBe(true)
     expect(denial((await callTool($, 'merge_worker', { name: 'W Bad' })) as never)).toContain('Worker names must match')
     expect(droveCalls(world, 'merge')).toHaveLength(2)
+    await callTool($, 'merge_worker', { name: 'w-auth', fresh: true })
+    expect(droveCalls(world, 'merge')[2]?.args).toEqual(['merge', 'w-auth', '--fresh'])
+  })
+
+  test('run_checks is drove checks: the worker, and --fresh on request, with a long timeout and nothing that writes', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    expect(denial((await callTool($, 'run_checks', { name: 'w-auth' })) as never)).toContain('Orchestrator mode is off')
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    expect(world.registeredTools).toContain('run_checks')
+    expect((world.toolSchemas.run_checks as { description: string }).description).toMatch(/done report/)
+    expect(denial((await callTool($, 'run_checks', { name: 'w-auth' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'checks')[0]?.args).toEqual(['checks', 'w-auth'])
+    await callTool($, 'run_checks', { name: 'w-auth', fresh: true })
+    expect(droveCalls(world, 'checks')[1]?.args).toEqual(['checks', 'w-auth', '--fresh'])
+    expect(denial((await callTool($, 'run_checks', { name: 'W Bad' })) as never)).toContain('Worker names must match')
+    expect(droveCalls(world, 'checks')).toHaveLength(2)
   })
 
   test("read_reports returns the workers' full reports through drove reports, for one worker or all of them", async ($, on) => {
@@ -595,6 +636,24 @@ describe('orchestrator session', () => {
     expect(text).toContain('`role`: `reviewer` or `tester`')
     expect(text).toContain('large or risky, touches security')
     expect(text).toMatch(/Each takes one of the \d+ panes like any worker/)
+  })
+
+  test('spawn_worker passes acceptance as one --acceptance per criterion, and the section tells the planner to write and review against it', async ($, on) => {
+    const { world } = engine(on)
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    await callTool($, 'spawn_worker', { name: 'w-ac', brief: 'Do it', acceptance: ['Given a, when b, then c', 'Given x, then y'] })
+    expect(droveCalls(world, 'spawn')[0]?.args.slice(-2)).toEqual(['--acceptance=Given a, when b, then c', '--acceptance=Given x, then y'])
+    for (const acceptance of [['fine', ' '], ['fine', 4], 'one']) {
+      expect(denial((await callTool($, 'spawn_worker', { name: 'w-bad', brief: 'x', acceptance })) as never)).toBe('--acceptance takes non-empty statements, one per criterion')
+    }
+    expect(droveCalls(world, 'spawn')).toHaveLength(1)
+    const { inputSchema } = world.toolSchemas.spawn_worker as { inputSchema: { properties: Record<string, { type: string }> } }
+    expect(inputSchema.properties.acceptance?.type).toBe('array')
+    const text = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections[1]?.text ?? ''
+    expect(text).toContain('Given-When-Then statements in the task body and pass them as `acceptance`')
+    expect(text).toContain('check it against the brief and each acceptance criterion')
   })
 
   test('spawn_worker passes plugins and userMemory to drove spawn, and its schema says what they default to', async ($, on) => {
