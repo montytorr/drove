@@ -98,6 +98,7 @@ export type LastReport = {
   id: string
   kind: ReportKind
   expects: Expects
+  for?: 'human'
   summary: string
   at: string
 }
@@ -333,6 +334,8 @@ export type HerdrAgent = {
   status: HerdrStatus
   sessionId?: string
   title?: string
+  // The raw OSC title, spinner glyph and all; `title` is herdr's copy with the glyph stripped.
+  terminalTitle?: string
 }
 
 export type LaunchFile = { path: string; content: string; mode: number }

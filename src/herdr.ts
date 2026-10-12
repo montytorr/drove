@@ -75,6 +75,7 @@ export const agentExplainArgv = (target: string): string[] => ['herdr', 'agent',
 export const paneCloseArgv = (paneId: string): string[] => ['herdr', 'pane', 'close', paneId]
 export const tabCloseArgv = (tabId: string): string[] => ['herdr', 'tab', 'close', tabId]
 export const tabGetArgv = (tabId: string): string[] => ['herdr', 'tab', 'get', tabId]
+export const paneProcessInfoArgv = (paneId: string): string[] => ['herdr', 'pane', 'process-info', '--pane', paneId]
 
 const parseJson = (text: string): unknown => {
   try {
@@ -107,6 +108,7 @@ const toAgent = (raw: unknown): ListedAgent | undefined => {
   const status = typeof agent.agent_status === 'string' && STATUSES.has(agent.agent_status) ? (agent.agent_status as HerdrStatus) : 'unknown'
   const session = asRecord(agent.agent_session)
   const title = typeof agent.terminal_title_stripped === 'string' ? agent.terminal_title_stripped.trim() : ''
+  const terminalTitle = typeof agent.terminal_title === 'string' ? agent.terminal_title : ''
   return {
     ...(typeof agent.name === 'string' ? { name: agent.name } : {}),
     ...(typeof agent.agent === 'string' ? { kind: agent.agent } : {}),
@@ -114,6 +116,7 @@ const toAgent = (raw: unknown): ListedAgent | undefined => {
     status,
     ...(typeof session?.value === 'string' ? { sessionId: session.value } : {}),
     ...(title ? { title } : {}),
+    ...(terminalTitle ? { terminalTitle } : {}),
   }
 }
 
@@ -124,6 +127,11 @@ export const parseAgents = (stdout: string): ListedAgent[] | undefined => {
 }
 
 export const parseAgent = (stdout: string): ListedAgent | undefined => toAgent(asRecord(asRecord(parseJson(stdout))?.result)?.agent)
+
+export const parseShellPid = (stdout: string): number | undefined => {
+  const pid = asRecord(asRecord(asRecord(parseJson(stdout))?.result)?.process_info)?.shell_pid
+  return typeof pid === 'number' && Number.isInteger(pid) && pid > 0 ? pid : undefined
+}
 
 export const parseNewPane = (stdout: string): { paneId: string; tabId?: string } | undefined => {
   const result = asRecord(asRecord(parseJson(stdout))?.result)

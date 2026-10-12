@@ -6,6 +6,7 @@ import * as commands from './commands.ts'
 import * as deliver from './deliver.ts'
 import * as detect from './detect.ts'
 import * as herdr from './herdr.ts'
+import * as light from './light.ts'
 import * as pendingLedger from './pending.ts'
 import * as paths from './paths.ts'
 import * as prompts from './prompts.ts'
@@ -61,6 +62,8 @@ export type WatchPorts = {
   userClaudeDir: typeof userClaudeDir
   transcriptStamp: (path: string) => Promise<string | undefined>
   modifiedAt: (path: string) => Promise<number | undefined>
+  paneTty: typeof light.paneTty
+  writeTty: typeof light.writeTty
   checkPlan: (repo: string) => Promise<string[]>
 }
 
@@ -98,6 +101,8 @@ export const defaultWatchPorts: WatchPorts = {
     return file ? `${file.size}:${file.mtimeMs}` : undefined
   },
   modifiedAt: async path => (await stat(path).catch(() => undefined))?.mtimeMs,
+  paneTty: light.paneTty,
+  writeTty: light.writeTty,
   checkPlan: steer.defaultCheckPlan,
 }
 
@@ -249,6 +254,9 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   let humanName: string | undefined
   const plannerHooks: { cursor: store.Cursor; sessionId?: string } = { cursor: { offset: 0 } }
   let plannerAgentSession: string | undefined
+  let lightHold: light.LightHold | undefined
+  let lightTty: { paneId: string; path: string } | undefined
+  let isStopped = false
 
   const serial = <T>(work: () => Promise<T>): Promise<T> => {
     const result = chain.then(work, work)
@@ -309,7 +317,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         const owing = mine.filter((report) => report.kind !== 'progress').at(-1)
         return {
           ...seat,
-          lastReport: { id: last.id, kind: last.kind, expects: last.expects, summary: last.summary, at: last.at },
+          lastReport: { id: last.id, kind: last.kind, expects: last.expects, ...(last.for ? { for: last.for } : {}), summary: last.summary, at: last.at },
           owes: owing ? owing.expects : seat.owes,
           // Any report, a progress one too, ends the guard's thrash alarm: the seat is no longer silent about it.
           attention: seat.attention.filter((item) => item.reason !== 'guard-thrash'),
@@ -615,6 +623,43 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     return cost
   }
 
+  // DROVE-141: the planner pane reads working in herdr while it waits on working workers (light.ts).
+  const writeTitle = async (paneId: string, title: string): Promise<boolean> => {
+    const path = lightTty?.paneId === paneId ? lightTty.path : await ports.paneTty(deps.exec, paneId)
+    if (!path || isStopped) return false
+    try {
+      ports.writeTty(path, light.oscTitle(title))
+    } catch (error) {
+      lightTty = undefined
+      throw error
+    }
+    lightTty = { paneId, path }
+    return true
+  }
+
+  const stepLight = async (run: RunMeta, planner: HerdrAgent | undefined, seats: readonly Seat[]) => {
+    const paneId = run.planner.paneId
+    if (!paneId || isStopped) return
+    // A run that goes down while Drove holds the title gets Claude's idle title back like any other end of the wait.
+    const isLit = run.planner.kind === 'claude' && run.status === 'up' && light.wantsWorking(seats, runBudgetRaised === true)
+    const step = light.stepLight(lightHold, planner, isLit, clockMs())
+    lightHold = undefined
+    if (step.write && !(await writeTitle(paneId, step.write))) return
+    lightHold = step.hold
+  }
+
+  // A watcher that stops while it holds the title puts Claude's idle title back on its way out.
+  const releaseLight = () => {
+    if (!lightHold || !lightTty) return
+    const { text } = lightHold
+    lightHold = undefined
+    try {
+      ports.writeTty(lightTty.path, light.oscTitle(light.idleTitle(text)))
+    } catch (error) {
+      onError(error, 'light')
+    }
+  }
+
   const poll = async (run: RunMeta) => {
     const now = deps.clock.now()
     const listed = await ports.listAgents(deps.exec)
@@ -663,7 +708,10 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         freshAttention.push(item)
       }
     }
-    if (derived.size === 0) return
+    if (derived.size === 0) {
+      await guarded('light', () => stepLight(run, planner, current.seats))
+      return
+    }
     // A seat's last check run goes stale once its worktree's HEAD has moved past the commit it ran at (DROVE-122).
     const heads = new Map<string, string>()
     for (const seat of ports.openSeats(current).filter((open) => open.checks !== undefined)) {
@@ -701,6 +749,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       updatedAt: at,
     }))
     for (const move of transitions) await emit('seat.state', move.seat, undefined, { from: move.from, to: move.to })
+    await guarded('light', () => stepLight(run, planner, updated.seats))
     const live = new Set<string>()
     for (const [name, result] of derived) {
       if (restarting.has(name)) continue
@@ -801,6 +850,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const stop = () => {
     if (timer) clearInterval(timer)
     timer = undefined
+    isStopped = true
+    releaseLight()
   }
 
   const watcher: Watcher = { tick, takePending, piggyback: piggybackText, start, stop }

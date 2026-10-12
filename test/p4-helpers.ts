@@ -86,6 +86,7 @@ export const rosterOf = (ctx: Ctx) => loadRoster(ctx.home, ctx.run.id)
 export const fakePorts = (overrides: Partial<WatchPorts> & { agents?: () => HerdrAgent[] } = {}) => {
   const controls: Control[] = []
   const flushed: string[] = []
+  const titles: string[] = []
   const { agents, ...rest } = overrides
   const ports: WatchPorts = {
     ...defaultWatchPorts,
@@ -104,7 +105,9 @@ export const fakePorts = (overrides: Partial<WatchPorts> & { agents?: () => Herd
       return []
     },
     nudgeText: () => 'nudge',
+    paneTty: async () => '/dev/ttys-planner',
+    writeTty: (_path, data) => void titles.push(data),
     ...rest,
   }
-  return { ports, controls, flushed }
+  return { ports, controls, flushed, titles }
 }
