@@ -2,6 +2,8 @@
 // plugin folder. test/mod-types.test.ts in the drove repo fails when a copied declaration drifts.
 // ---- copied from src/types.ts ----
 export type AgentKind = 'claude' | 'codex'
+export type HostAgent = { version: string; model?: string; effort?: string }
+export type HostAgents = { claude?: HostAgent; codex?: HostAgent; at: string }
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type SeatRole = 'implementer' | 'reviewer' | 'tester'
 
@@ -34,6 +36,7 @@ export type RunMeta = {
   workspace?: string
   budget: number
   planner: PlannerMeta
+  agents?: HostAgents
 }
 
 export type LastReport = {

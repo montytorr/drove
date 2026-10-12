@@ -4,6 +4,7 @@ import type { BoardModel, Cell, Tone } from '../mod/hooks/board.ts'
 import { feedOf } from '../mod/hooks/bridge.ts'
 import { FEED_MAX, openSeats } from '../mod/hooks/roster.ts'
 import type { OrchBridge, OrchFeedEntry, OrchLead, OrchModStatus } from '../mod/types/index.d.ts'
+import { modelLabelOf } from './agents.ts'
 import { plannerDir, runDir, seatDir } from './paths.ts'
 import { loadRoster, loadRun } from './roster.ts'
 import { readJson, readJsonlFrom } from './store.ts'
@@ -231,13 +232,13 @@ export const asksAtOf = (seats: readonly Seat[], status: Readonly<Record<string,
 export const modelOf = (input: FrameInput): BoardModel => {
   const model = buildBoard({
     orchestrator: { run: input.run.id, repo: input.run.repo, goal: input.run.goal, startedAt: Date.parse(input.run.createdAt) || input.now, budget: input.run.budget },
-    seats: input.roster.seats,
+    seats: input.roster.seats.map(seat => ({ ...seat, model: modelLabelOf(seat.kind, seat.model, input.run.agents) })),
     status: input.status,
     asksAt: asksAtOf(input.roster.seats, input.status),
     bridge: bridgeOf(input, input.now),
     feed: input.feed,
     lead: leadOf(input),
-    leadModel: input.run.planner.model,
+    leadModel: modelLabelOf(input.run.planner.kind, input.run.planner.model, input.run.agents),
     leadEffort: input.run.planner.effort,
     now: input.now,
     frame: input.frame,

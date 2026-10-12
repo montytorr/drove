@@ -5,6 +5,7 @@ import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
+import { detectRunAgents, modelLabelOf } from './agents.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
 import { type CheckPlan, checksOf, renderOutcome, repoVerifyCommands, reusedText, runChecks } from './checks.ts'
@@ -16,6 +17,7 @@ import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShel
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
+import { buildTrace, postTrace, renderTrace } from './trace.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { steeringNotes } from './steer.ts'
@@ -44,6 +46,7 @@ export const DEFAULT_CONFIG: DroveConfig = {
   plannerModel: { claude: 'claude-opus-5-5', codex: '' },
   plannerEffort: 'high',
   workerModel: { claude: 'claude-sonnet-5-5', codex: '' },
+  workerKind: 'auto',
   workerEffort: 'medium',
   promotedModel: { claude: 'claude-opus-5-5', codex: '' },
   budget: 5,
@@ -109,7 +112,7 @@ const portsOf = (value: unknown): DroveConfig['workerPorts'] => {
 }
 
 export const loadConfig = async (home: string): Promise<DroveConfig> => {
-  const { workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, reviewLoopLimit, runMaxCost, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerKind, workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, reviewLoopLimit, runMaxCost, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const ports = portsOf(workerPorts)
   const copy = namesOf(workerCopy)
   const mcp = namesOf(workerMcp)
@@ -119,6 +122,7 @@ export const loadConfig = async (home: string): Promise<DroveConfig> => {
   return {
     ...DEFAULT_CONFIG,
     ...file,
+    workerKind: workerKind === 'claude' || workerKind === 'codex' ? workerKind : 'auto',
     ...(ports ? { workerPorts: ports } : {}),
     ...(copy && copy.length > 0 ? { workerCopy: copy } : {}),
     ...(mcp ? { workerMcp: mcp } : {}),
@@ -154,6 +158,12 @@ const resolveModel = (kind: AgentKind, value: string | undefined, config: DroveC
   if (alias === 'sonnet') return config.workerModel[kind]
   return requested
 }
+
+const hasAgent = (run: RunMeta, kind: AgentKind): boolean =>
+  run.agents === undefined || run.planner.kind === kind || run.agents[kind] !== undefined
+
+const requireAgent = (run: RunMeta, kind: AgentKind): CommandResult | undefined =>
+  hasAgent(run, kind) ? undefined : failed('agent-unavailable', `${kind} is not on this host (drove doctor)`)
 
 const newControlId = (now: Date): string => `c-${now.getTime().toString(36)}-${randomBytes(2).toString('hex')}`
 
@@ -695,6 +705,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const goalTask = await resolveGoalTask(deps, request, config.labInstance)
   if (goalTask && 'error' in goalTask) return goalTask.error
   const goal = goalTask?.goal ?? request.goal
+  const agents = await detectRunAgents(deps)
 
   let run: RunMeta
   let previous: RunMeta | undefined
@@ -702,7 +713,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     const existing = await loadRun(deps.home, request.run)
     if (!existing) return failed('no-run', `no run named ${request.run}`)
     previous = existing
-    run = { ...existing, goal: goal ?? existing.goal, cairn: goalTask?.ref ?? existing.cairn, planner: { ...existing.planner, kind, paneId, model, effort, ...(sessionId ? { sessionId } : { sessionId: undefined }) } }
+    run = { ...existing, agents, goal: goal ?? existing.goal, cairn: goalTask?.ref ?? existing.cairn, planner: { ...existing.planner, kind, paneId, model, effort, ...(sessionId ? { sessionId } : { sessionId: undefined }) } }
   } else {
     const base = await git.baseRef(deps.exec, repo).catch(() => undefined)
     if (!base) return failed('no-base', `no main or master branch found in ${repo}`)
@@ -714,6 +725,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
       hasRemote: await git.hasRemote(deps.exec, repo),
       createdAt: now.toISOString(),
       status: 'up',
+      agents,
       ...(goal ? { goal } : {}),
       ...(goalTask ? { cairn: goalTask.ref } : {}),
       budget: config.budget,
@@ -860,7 +872,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   const denied = requirePlanner(identity)
   if (denied) return denied
   if (!SEAT_RE.test(request.seat) || request.seat === PLANNER_SEAT) return failed('usage', `seat names must match ${SEAT_RE} and not be "planner"; got "${request.seat}"`)
-  if (request.kind !== 'claude' && request.kind !== 'codex') return failed('usage', '--kind must be claude or codex')
+  if (request.kind !== undefined && request.kind !== 'claude' && request.kind !== 'codex') return failed('usage', '--kind must be claude or codex')
   if (request.cairn && !CAIRN_RE.test(request.cairn)) return failed('usage', `--cairn must look like DROVE-5; got "${request.cairn}"`)
   if (request.effort && !EFFORTS.includes(request.effort)) return failed('usage', `--effort must be one of ${EFFORTS.join(', ')}`)
   const badMcp = request.mcp?.find(name => !MCP_NAME_RE.test(name))
@@ -896,6 +908,13 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if ('error' in located) return located.error
   const { run } = located
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
+  const config = await loadConfig(deps.home)
+  const kind = request.kind ?? (config.workerKind === 'claude' || config.workerKind === 'codex'
+    ? config.workerKind
+    : hasAgent(run, 'claude') ? 'claude' : hasAgent(run, 'codex') ? 'codex' : undefined)
+  if (!kind) return failed('agent-unavailable', 'neither claude nor codex is on this host (drove doctor)')
+  const unavailable = requireAgent(run, kind)
+  if (unavailable) return unavailable
   const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn) : {}
   if ('error' in cairnCheck) return cairnCheck.error
   const targetSeat = request.target ? findSeat(await loadRoster(deps.home, run.id), request.target) : undefined
@@ -905,11 +924,10 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
 
   // A reviewer or tester sees its target's criteria unless the planner gave it its own (DROVE-123).
   const acceptance = given && given.length > 0 ? given : isReview ? targetSeat?.acceptance : undefined
-  const config = await loadConfig(deps.home)
   const now = deps.clock.now()
   const iso = now.toISOString()
-  const kind = request.kind
   const model = resolveModel(kind, request.model, config)
+  const modelLabel = modelLabelOf(kind, model, run.agents)
   const effort = request.effort ?? config.workerEffort
   const isClaude = kind === 'claude'
   const worktree = worktreePath(run.repo, request.seat)
@@ -1086,7 +1104,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   })
   const via = isViaPrompt ? await queueBrief(deps, run, seat.name, briefText) : 'launch-arg'
   if (!isViaPrompt) await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, data: { kind: 'brief', via: 'launch-arg' } })
-  return ok(`${isReview ? `${role === 'reviewer' ? 'Reviewer' : 'Tester'}` : 'Worker'} ${seat.name} (${kind}${model ? ` ${model}` : ''} ${effort}${isReview ? `, ${role === 'reviewer' ? 'reviewing' : 'testing'} ${request.target}` : ''}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${startNote ? ` Note: ${startNote}` : ''}${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch })
+  return ok(`${isReview ? `${role === 'reviewer' ? 'Reviewer' : 'Tester'}` : 'Worker'} ${seat.name} (${kind}${modelLabel ? ` ${modelLabel}` : ''} ${effort}${isReview ? `, ${role === 'reviewer' ? 'reviewing' : 'testing'} ${request.target}` : ''}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${startNote ? ` Note: ${startNote}` : ''}${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch, model: modelLabel })
 }
 
 // Claude creates its worktree from origin/main once the agent is up; bring it to the run base before the brief goes in.
@@ -1425,6 +1443,8 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
   if ('error' in located) return located.error
   const { run } = located
   if (run.status !== 'up') return failed('run-down', `run ${run.id} is down; start it with \`drove up\``)
+  const unavailable = requireAgent(run, request.kind)
+  if (unavailable) return unavailable
   const config = await loadConfig(deps.home)
   const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
   if (!seat || ['closed', 'closing', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
@@ -1435,6 +1455,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
 
   const kind = request.kind
   const model = resolveModel(kind, request.model, config)
+  const modelLabel = modelLabelOf(kind, model, run.agents)
   const effort = request.effort ?? seat.effort
   const iso = deps.clock.now().toISOString()
   const oldSession = seat.sessionId ?? (await hookSessionId(deps, run.id, seat.name))
@@ -1515,7 +1536,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
     )
     await recordEvent(deps, run.id, { type: 'seat.migrate', seat: seat.name, data: event })
     const via = await queueBrief(deps, run, seat.name, briefText)
-    return ok(`${seat.name} moved from ${seat.kind} to ${kind}${model ? ` ${model}` : ''} ${effort} in pane ${paneId}, worktree ${seat.worktree} on branch ${seat.branch}. Handoff brief: ${via}.${notes.map(note => ` ${note}`).join('')}`, { paneId, kind, branch: seat.branch })
+    return ok(`${seat.name} moved from ${seat.kind} to ${kind}${modelLabel ? ` ${modelLabel}` : ''} ${effort} in pane ${paneId}, worktree ${seat.worktree} on branch ${seat.branch}. Handoff brief: ${via}.${notes.map(note => ` ${note}`).join('')}`, { paneId, kind, branch: seat.branch, model: modelLabel })
   } finally {
     await clearRestarting(deps, run.id, seat.name)
   }
@@ -1553,17 +1574,18 @@ export const roster = async (deps: Deps, ref: RunRef, asJson: boolean): Promise<
   if ('error' in located) return located.error
   const { run } = located
   if (run.status === 'up') await refreshRoster(deps, run).catch(() => undefined)
-  const current = await loadRoster(deps.home, run.id)
+  const saved = await loadRoster(deps.home, run.id)
+  const current = { ...saved, seats: saved.seats.map(seat => ({ ...seat, model: modelLabelOf(seat.kind, seat.model, run.agents) })) }
   const attention = attentionOf(current)
   if (asJson) {
     // DROVE-95: what a poller outside the run needs besides the seats: whether the planner's pane is alive, and the
     // latest report any seat sent (each seat's own is in seats[].lastReport).
-    const planner = { ...run.planner, ...(await plannerStateOf(deps, run)) }
+    const planner = { ...run.planner, model: modelLabelOf(run.planner.kind, run.planner.model, run.agents), ...(await plannerStateOf(deps, run)) }
     const lastReport = current.seats.flatMap(seat => (seat.lastReport ? [{ seat: seat.name, ...seat.lastReport }] : [])).sort((a, b) => a.at.localeCompare(b.at)).at(-1) ?? null
     const body = { run, seats: current.seats, attention, planner, lastReport, updatedAt: current.updatedAt }
     return ok(JSON.stringify(body, null, 2), { ...body, roster: current })
   }
-  const lines = [`run ${run.id} · ${basename(run.repo)} · ${run.status} · budget ${run.budget}`, ...rosterLines(current, deps.clock.now())]
+  const lines = [`run ${run.id} · ${basename(run.repo)} · ${run.status} · budget ${run.budget}`, ...rosterLines(current, deps.clock.now(), run.agents)]
   if (attention.length > 0) lines.push('', 'needs attention:', ...attention.map(item => `- ${item.seat}: ${item.reason} · ${item.detail}`))
   return ok(lines.join('\n'), { run, roster: current, attention })
 }
@@ -2091,6 +2113,21 @@ export const runReport = async (deps: Deps, ref: RunRef, asJson: boolean): Promi
   return ok(asJson ? JSON.stringify(built, null, 2) : renderReport(built), built)
 }
 
+export const runTrace = async (deps: Deps, ref: RunRef, request: { asJson?: boolean; otlp?: string }): Promise<CommandResult> => {
+  const located = await locateRun(deps, ref)
+  if ('error' in located) return located.error
+  const trace = await buildTrace(deps, located.run.id, deps.claudeUserDir ?? userClaudeDir())
+  if (!trace) return failed('no-run', `no run named ${located.run.id}`)
+  if (request.otlp) {
+    try {
+      await postTrace(trace, request.otlp)
+    } catch (error) {
+      return failed('otlp-export', String(error))
+    }
+  }
+  return ok(request.asJson ? JSON.stringify(trace, null, 2) : renderTrace(trace), trace)
+}
+
 // ---------- down / up ----------
 
 const SPAWNED_ORDER = (a: Seat, b: Seat): number => a.spawnedAt.localeCompare(b.spawnedAt)
@@ -2126,6 +2163,14 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
   await saveRun(deps.home, { ...run, status: 'down', tabId: undefined, workspace: undefined, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } })
   if (run.workspace) await herdr.run(deps.exec, herdr.workspaceCloseArgv(run.workspace))
   await recordEvent(deps, run.id, { type: 'run.down', data: { saved, unsaved } })
+  // Export only after down is persisted; a collector failure must never prevent shutdown.
+  try {
+    const endpoint = (await loadConfig(deps.home)).otlpEndpoint
+    if (endpoint) {
+      const trace = await buildTrace(deps, run.id, deps.claudeUserDir ?? userClaudeDir())
+      if (trace) await postTrace(trace, endpoint, 2_000)
+    }
+  } catch { /* best effort */ }
   const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString(), (await loadConfig(deps.home)).labInstance)
   return ok(
     [`Run ${run.id} is down: ${saved.length} seat(s) saved for resume${saved.length ? ` (${saved.join(', ')})` : ''}.`, ...(unsaved.length ? [`No session id for ${unsaved.join(', ')}: they cannot be resumed.`] : []), `Resume with \`drove up --run ${run.id}\`.`, ...(cairnNote ? [cairnNote] : [])].join(' '),
@@ -2242,6 +2287,8 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
   if ('error' in located) return located.error
   let { run } = located
   const config = await loadConfig(deps.home)
+  run = { ...run, agents: await detectRunAgents(deps) }
+  await saveRun(deps.home, run)
 
   if (seatName) {
     let seat = findSeat(await loadRoster(deps.home, run.id), seatName)

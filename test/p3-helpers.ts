@@ -79,6 +79,8 @@ export class FakeHerdr {
   exec: Exec = async argv => {
     this.calls.push([...argv])
     const [bin, group, action] = argv
+    if (group === '--version' && bin === 'claude') return result('2.1.296 (Claude Code)')
+    if (group === '--version' && bin === 'codex') return result('codex-cli 0.162.0')
     if (bin === 'git') return nodeExec(argv)
     if (bin === 'codex' && group === 'queue') return this.codexQueue(argv)
     if (bin !== 'herdr') return result('', 127, `unexpected ${bin}`)
