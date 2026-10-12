@@ -2,6 +2,7 @@ import { join } from 'node:path'
 import { modelLabelOf } from './agents.ts'
 import * as commands from './commands.ts'
 import * as paths from './paths.ts'
+import { LAB_RE } from './prompts.ts'
 import * as protocol from './protocol.ts'
 import * as roster from './roster.ts'
 import * as store from './store.ts'
@@ -123,6 +124,41 @@ const defineTool = (name: string, description: string, properties: Record<string
   },
 })
 
+export const CLAIM_BEAT_EVERY_MS = 10 * 60_000
+const CLAIM_BEAT_TIMEOUT_MS = 5_000
+
+// DROVE-143: the planner holds run.cairn for the whole run while workers commit on their own tasks, so nothing lands on it and Cairn's
+// claim reaper would release it. A planner tool call beats it, at most once every 10 minutes. Best effort: a failure is swallowed.
+const claimBeater = (deps: Deps, identity: Identity, ports: ToolPorts) => {
+  let last: number | undefined
+  return async (): Promise<void> => {
+    try {
+      const now = deps.clock.now().getTime()
+      if (last !== undefined && now - last < CLAIM_BEAT_EVERY_MS) return
+      const previous = last
+      last = now
+      const run = await ports.loadRun(deps.home, identity.run)
+      if (!run?.cairn) {
+        last = previous
+        return
+      }
+      const argv = LAB_RE.test(run.cairn) ? ['cairn', '--instance', (await commands.loadConfig(deps.home)).labInstance, 'beat', run.cairn] : ['cairn', 'beat', run.cairn]
+      await deps.exec(argv, { timeoutMs: CLAIM_BEAT_TIMEOUT_MS })
+    } catch {}
+  }
+}
+
+// The beat runs alongside the tool, so it only adds time when it outlasts the tool, and never more than its timeout.
+const withBeat = (tool: McpTool, beat: () => Promise<void>): McpTool => ({
+  ...tool,
+  call: async (args) => {
+    const beating = beat()
+    const result = await tool.call(args)
+    await beating
+    return result
+  },
+})
+
 const seatProp = { type: 'string', description: 'Seat name, e.g. w-api. Run roster to see the seats of this run.' }
 const expectsProp = { type: 'string', enum: EXPECTS, description: 'What you expect back from the worker: review (a done report with the diff ready), answer (a reply) or none.' }
 
@@ -149,7 +185,8 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
     return raised.ok ? undefined : `Could not raise the budget: ${raised.text}`
   }
 
-  return [
+  const beat = claimBeater(deps, identity, ports)
+  const tools: McpTool[] = [
     defineTool(
       'spawn',
       `Start a worker: a Claude worker gets Claude's own worktree (branch worktree-SEAT) and a ${codex} worker a Drove worktree (branch drove/SEAT); kind is optional, and left out it follows the workerKind setting (see "Claude or Codex for a worker" in your instructions for when to pick which); opens a pane in the run tab and launches the agent with your brief. Give each worker one Cairn ref and a self-contained brief (files it owns, acceptance, what to verify). Returns at once with the seat running. Do NOT wait, poll or sleep afterwards: the worker's report is delivered to you as a message (or at the end of your next tool result). Spawn the next independent worker, or end your turn.`,
@@ -365,6 +402,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       async () => asResult(await cmd.down(deps, await ref())),
     ),
   ]
+  return tools.map(tool => withBeat(tool, beat))
 }
 
 const REPORT_GUIDE = `Report to the planner. This is the only way the planner hears from you; plain text you write in this session is not delivered.
