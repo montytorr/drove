@@ -196,6 +196,26 @@ describe('board model', () => {
     expect(roles.workers[0]?.cells).toHaveLength((plain.workers[0]?.cells.length ?? 0) + 1)
   })
 
+  test('a seat\'s last check result shows as a short marker: passed, failed, or stale once HEAD moved; the column only exists once a seat has one', () => {
+    const run = { sha: 'a'.repeat(40), clean: true, at: '2026-10-09T10:00:00.000Z' }
+    const none = buildBoard({ ...base, frame: 0, seats: [seat(), seat({ name: 'w-b' })] })
+    const marked = buildBoard({
+      ...base,
+      frame: 0,
+      seats: [seat({ checks: { ...run, result: 'passed' } }), seat({ name: 'w-b', checks: { ...run, result: 'failed', failed: 'npm test' } }), seat({ name: 'w-c', checks: { ...run, result: 'passed', stale: true } }), seat({ name: 'w-d' })],
+    })
+    const cells = (row: number) => marked.workers[row]?.cells ?? []
+    expect(cells(0).map(({ text }) => text)).toContain('chk✓')
+    expect(cells(1).map(({ text }) => text)).toContain('chk✗')
+    expect(cells(2).map(({ text }) => text)).toContain('chk~')
+    expect(cells(0).find(({ text }) => text === 'chk✓')?.tone).toBe('good')
+    expect(cells(1).find(({ text }) => text === 'chk✗')?.tone).toBe('alert')
+    expect(cells(3).map(({ text }) => text)).not.toContain('chk✓')
+    expect(cells(3)).toHaveLength(cells(0).length)
+    expect(cells(0)).toHaveLength((none.workers[0]?.cells.length ?? 0) + 1)
+    expect(cells(0).filter(({ width }) => width === undefined)).toHaveLength(1)
+  })
+
   test('an asking seat pulses for a few seconds, then stays red; a bridge problem shows on the lead row', () => {
     const asking = { status: { 'w-auth': { asking: 'asking in its pane: Which table?' } }, asksAt: { 'w-auth': NOW + 59_000 }, seats: [seat()] }
     const on = buildBoard({ ...base, ...asking, frame: 0 }).workers[0]?.cells[1]?.tone
@@ -499,6 +519,8 @@ describe('orchestrator session', () => {
     expect(sections[1]?.text).toContain('A wake shows one line per worker report')
     expect(sections[1]?.text).toContain('call mcp__orchestrator__read_reports for the full text')
     expect(sections[1]?.text).toContain('integrate it with mcp__orchestrator__merge_worker (`drove merge <seat>`), never a plain `git merge`')
+    expect(sections[1]?.text).toContain('Verify its test claims with mcp__orchestrator__run_checks (`drove checks <seat>`)')
+    expect(sections[1]?.text).toContain("reuses a passing run_checks record at the worker's current commit instead (`fresh: true` runs them again)")
     expect(sections[1]?.text).toContain('pass `pr: true` (`drove merge <seat> --pr`')
   })
 
@@ -516,6 +538,25 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'merge').every(({ args }) => !args.includes('--no-checks'))).toBe(true)
     expect(denial((await callTool($, 'merge_worker', { name: 'W Bad' })) as never)).toContain('Worker names must match')
     expect(droveCalls(world, 'merge')).toHaveLength(2)
+    await callTool($, 'merge_worker', { name: 'w-auth', fresh: true })
+    expect(droveCalls(world, 'merge')[2]?.args).toEqual(['merge', 'w-auth', '--fresh'])
+  })
+
+  test('run_checks is drove checks: the worker, and --fresh on request, with a long timeout and nothing that writes', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    expect(denial((await callTool($, 'run_checks', { name: 'w-auth' })) as never)).toContain('Orchestrator mode is off')
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    expect(world.registeredTools).toContain('run_checks')
+    expect((world.toolSchemas.run_checks as { description: string }).description).toMatch(/done report/)
+    expect(denial((await callTool($, 'run_checks', { name: 'w-auth' })) as never)).toBeUndefined()
+    expect(droveCalls(world, 'checks')[0]?.args).toEqual(['checks', 'w-auth'])
+    await callTool($, 'run_checks', { name: 'w-auth', fresh: true })
+    expect(droveCalls(world, 'checks')[1]?.args).toEqual(['checks', 'w-auth', '--fresh'])
+    expect(denial((await callTool($, 'run_checks', { name: 'W Bad' })) as never)).toContain('Worker names must match')
+    expect(droveCalls(world, 'checks')).toHaveLength(2)
   })
 
   test("read_reports returns the workers' full reports through drove reports, for one worker or all of them", async ($, on) => {

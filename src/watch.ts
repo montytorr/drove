@@ -449,6 +449,12 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       derived.set(seat.name, { ...result, ...(sessionId ? { sessionId } : {}) })
     }
     if (derived.size === 0) return
+    // A seat's last check run goes stale once its worktree's HEAD has moved past the commit it ran at (DROVE-122).
+    const heads = new Map<string, string>()
+    for (const seat of ports.openSeats(current).filter((open) => open.checks !== undefined)) {
+      const head = await deps.exec(['git', '-C', seat.worktree, 'rev-parse', 'HEAD'], { timeoutMs: 10_000 })
+      if (head.code === 0 && head.stdout.trim()) heads.set(seat.name, head.stdout.trim())
+    }
     const at = now.toISOString()
     const transitions: { seat: string; from: Seat['state']; to: Seat['state'] }[] = []
     const restarting = new Set<string>()
@@ -463,8 +469,11 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
         }
         const changed = result.state !== seat.state
         if (changed) transitions.push({ seat: seat.name, from: seat.state, to: result.state })
+        const head = heads.get(seat.name)
+        const isStale = seat.checks !== undefined && head !== undefined && head !== seat.checks.sha
         return {
           ...seat,
+          ...(seat.checks && head !== undefined && isStale !== (seat.checks.stale === true) ? { checks: { ...seat.checks, stale: isStale } } : {}),
           state: result.state,
           stateAt: changed ? at : seat.stateAt,
           ...(result.sessionId && !seat.sessionId ? { sessionId: result.sessionId } : {}),

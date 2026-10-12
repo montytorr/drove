@@ -91,6 +91,10 @@ export type Attention = {
 
 export type MergeGate = { result: 'passed' | 'refused' | 'pending'; at: string; detail: string }
 
+// A seat's last check run (DROVE-122), kept on the roster for the boards; the ledger holds every run. `stale` is set by the
+// watcher once the worktree's HEAD is no longer `sha`.
+export type SeatChecks = { result: 'passed' | 'failed'; sha: string; clean: boolean; at: string; failed?: string; stale?: boolean }
+
 export type Seat = {
   name: string
   kind: AgentKind
@@ -123,6 +127,7 @@ export type Seat = {
   lastReport?: LastReport
   lastSentAt?: string
   gate?: MergeGate
+  checks?: SeatChecks
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
@@ -210,6 +215,7 @@ export type DroveEventType =
   | 'merge.passed'
   | 'merge.refused'
   | 'merge.pending'
+  | 'checks.ran'
 
 export type DroveEvent = {
   at: string
@@ -402,6 +408,7 @@ export type MergeRequest = {
   squash?: boolean
   message?: string
   noChecks?: boolean
+  fresh?: boolean
 }
 
 export type MigrateRequest = {

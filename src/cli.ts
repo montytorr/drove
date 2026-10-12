@@ -275,9 +275,9 @@ export const COMMANDS: Record<string, Spec> = {
       print(await commands.close(commands.defaultDeps(), commands.identityOrPlanner(), need(positionals[0], '<seat>'), values['remove-worktree'] === true), io),
   },
   merge: {
-    usage: 'drove merge <seat> [--pr] [--squash] [-m MSG] [--run ID]',
-    why: "integrate a worker's branch behind the repo's checks: local runs them in the seat's worktree then merges --no-ff into the base; --pr pushes, opens a PR, reads its checks and gh pr merges when green (pending returns the PR URL: run it again)",
-    options: { pr: { type: 'boolean' }, squash: { type: 'boolean' }, message: { type: 'string', short: 'm' }, 'no-checks': { type: 'boolean' }, run: { type: 'string' } },
+    usage: 'drove merge <seat> [--pr] [--squash] [-m MSG] [--fresh] [--run ID]',
+    why: "integrate a worker's branch behind the repo's checks: local runs them in the seat's worktree then merges --no-ff into the base; --pr pushes, opens a PR, reads its checks and gh pr merges when green (pending returns the PR URL: run it again); a passing record of the checks at the seat's HEAD is reused unless --fresh",
+    options: { pr: { type: 'boolean' }, squash: { type: 'boolean' }, message: { type: 'string', short: 'm' }, 'no-checks': { type: 'boolean' }, fresh: { type: 'boolean' }, run: { type: 'string' } },
     run: async (values, positionals, io) =>
       print(
         await commands.merge(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), {
@@ -286,9 +286,17 @@ export const COMMANDS: Record<string, Spec> = {
           squash: values.squash === true,
           message: str(values, 'message'),
           noChecks: values['no-checks'] === true,
+          fresh: values.fresh === true,
         }),
         io,
       ),
+  },
+  checks: {
+    usage: 'drove checks <seat> [--fresh] [--run ID]',
+    why: "run the merge plan's checks in a seat's worktree (or reuse a passing record at its HEAD), record them, and print pass or fail per command with the failing tail; never writes to the repo",
+    options: { fresh: { type: 'boolean' }, run: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(await commands.checks(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { seat: need(positionals[0], '<seat>'), fresh: values.fresh === true }), io),
   },
   board: {
     usage: 'drove board [--once] [--web [--port N]] [--run ID]',

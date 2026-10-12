@@ -536,6 +536,7 @@ const PAGE = String.raw`<!doctype html>
     const owes = el('div', 'downes')
     const list = el('dl')
     const setBranch = fieldOf(list, 'branch', false)
+    const setChecks = fieldOf(list, 'checks', false)
     const setWorktree = fieldOf(list, 'worktree', true)
     const setSession = fieldOf(list, 'session', true)
     const threadRule = el('div', 'rule')
@@ -552,7 +553,7 @@ const PAGE = String.raw`<!doctype html>
     const pre = el('pre', '', tail.text)
     pane.append(summary, pre)
     rootNode.append(head, spec, act, owes, list, threadRule, report, thread, pane)
-    const mine = { name, root: rootNode, ref, state, badge, spec, act, owes, setBranch, setWorktree, setSession, threadNote, report, thread, cache: new Map(), signature: '', stale, pre, stick: true, top: 0 }
+    const mine = { name, root: rootNode, ref, state, badge, spec, act, owes, setBranch, setChecks, setWorktree, setSession, threadNote, report, thread, cache: new Map(), signature: '', stale, pre, stick: true, top: 0 }
     pane.addEventListener('toggle', () => {
       savePaneOpen(pane.open)
       if (pane.open) settle(mine)
@@ -621,6 +622,7 @@ const PAGE = String.raw`<!doctype html>
     mine.act.textContent = seat.activity || ''
     mine.act.hidden = !seat.activity || !!owes
     mine.setBranch(seat.branch || '')
+    mine.setChecks(seat.checks || '')
     mine.setWorktree(seat.worktree || '')
     mine.setSession(panelKit.shortId(seat.sessionId), seat.sessionId || '')
     paintReport(mine, seat.lastReport)
@@ -841,7 +843,7 @@ const PAGE = String.raw`<!doctype html>
         node.ref.hidden = !seat.cairn
         node.badge.hidden = !seat.needsYou
         node.act.textContent = seat.activity || seat.state
-        node.root.title = (seat.activity || seat.state) + '\n' + seat.modelLabel + ' · ' + seat.effort + ' · ' + seat.kind
+        node.root.title = (seat.activity || seat.state) + '\n' + seat.modelLabel + ' · ' + seat.effort + ' · ' + seat.kind + (seat.checks ? '\nchecks ' + seat.checks : '')
         node.root.style.setProperty('--c', toneColor(seat.tone))
         node.root.classList.toggle('working', seat.state === 'working' && !seat.needsYou)
         node.root.classList.toggle('sel', openSeat === seat.name)
