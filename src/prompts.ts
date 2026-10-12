@@ -95,7 +95,7 @@ When the goal is met, summarise for ${human}: what each worker did, the branches
 const questionsSection = (human: string): string => `## Questions
 ${human} is not watching your pane. Never ask a question in your pane or wait for an answer there; ask with a \`question\` report instead (\`for: human\` when only ${human} can decide), then wait.`
 
-const MESSAGES_LINE = 'Messages from the planner arrive as a `⟦drove v1 …⟧` header followed by the text and a `↩` line that says how to reply.'
+const MESSAGES_LINE = 'Messages from the planner arrive as a `⟦drove v1 …⟧` header followed by the text and a `↩` line that says how to reply. Drove may also send a steering message that starts with "Drove:" (for one command failing again and again); act on it like a message from the planner.'
 
 // The same text for every seat of a run and of a role, so a provider can cache the prompt prefix (DROVE-72): the seat name,
 // branch, verify commands and a reviewer's or tester's target go in the brief footer instead.

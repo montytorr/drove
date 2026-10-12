@@ -63,6 +63,9 @@ export type SeatReport = {
   // Guard refusals the seat met (`guard.denied` events), in all and by rule (DROVE-121).
   denials: number
   denialsByRule: Record<string, number>
+  // Steering the seat got from Drove (`steer.nudged` events), in all and by rule (DROVE-127).
+  nudges: number
+  nudgesByRule: Record<string, number>
   tokens?: Usage & { total: number }
   cost?: number
   unpriced: string[]
@@ -80,7 +83,7 @@ export type RunReport = {
   at: string
   elapsedMs: number
   seats: SeatReport[]
-  totals: { seats: number; wallMs: number; humanMs: number; rework: Rework; checks: CheckCounts; denials: number; denialsByRule: Record<string, number>; tokens: Usage & { total: number }; cost?: number; unpriced: string[]; notFound: string[] }
+  totals: { seats: number; wallMs: number; humanMs: number; rework: Rework; checks: CheckCounts; denials: number; denialsByRule: Record<string, number>; nudges: number; nudgesByRule: Record<string, number>; tokens: Usage & { total: number }; cost?: number; unpriced: string[]; notFound: string[] }
 }
 
 const emptyRework = (): Rework => ({ changes: 0, approvals: 0, promotions: 0, demotions: 0, migrations: 0, restarts: 0 })
@@ -290,6 +293,18 @@ const denialsOf = (events: readonly DroveEvent[]): { denials: number; denialsByR
   return { denials, denialsByRule }
 }
 
+const nudgesOf = (events: readonly DroveEvent[]): { nudges: number; nudgesByRule: Record<string, number> } => {
+  const nudgesByRule: Record<string, number> = {}
+  let nudges = 0
+  for (const event of events) {
+    if (event.type !== 'steer.nudged') continue
+    const rule = typeof event.data?.rule === 'string' ? event.data.rule : 'unknown'
+    nudgesByRule[rule] = (nudgesByRule[rule] ?? 0) + 1
+    nudges += 1
+  }
+  return { nudges, nudgesByRule }
+}
+
 const checksOf = (events: readonly DroveEvent[]): CheckCounts => {
   const ran = events.filter(event => event.type === 'checks.ran')
   return { runs: ran.length, failures: ran.filter(event => event.data?.passed === false).length }
@@ -360,6 +375,7 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
       rework: reworkOf(own),
       checks: checksOf(own),
       ...denialsOf(own),
+      ...nudgesOf(own),
       ...(tokens.usage.size ? { tokens: { ...sum, total: totalTokens(sum) } } : {}),
       ...(cost.cost === undefined ? {} : { cost: cost.cost }),
       unpriced: cost.unpriced,
@@ -385,6 +401,8 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
       rework: emptyRework(),
       checks: { runs: 0, failures: 0 },
       ...denialsOf(events.filter(event => event.seat === 'planner')),
+      nudges: 0,
+      nudgesByRule: {},
       ...(found.usage.size ? { tokens: { ...sum, total: totalTokens(sum) } } : {}),
       ...(cost.cost === undefined ? {} : { cost: cost.cost }),
       unpriced: cost.unpriced,
@@ -415,6 +433,7 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
       checks: { runs: workers.reduce((sum, row) => sum + row.checks.runs, 0), failures: workers.reduce((sum, row) => sum + row.checks.failures, 0) },
       // Every denial of the run, a planner's included, even when its row is missing (no session id) or its seat is gone.
       ...denialsOf(events),
+      ...nudgesOf(events),
       tokens: { ...all, total: totalTokens(all) },
       ...(costs.length ? { cost: costs.reduce((sum, row) => sum + (row.cost as number), 0) } : {}),
       unpriced: [...new Set(rows.flatMap(row => row.unpriced))],
@@ -451,7 +470,7 @@ export const kindLines = (report: RunReport): string[] => {
 }
 
 export const renderReport = (report: RunReport): string => {
-  const header = ['seat', 'agent', 'model', 'wall', 'human', 'tokens', 'in/out', 'cost', 'deny', 'chg/pro/dem/mig/rst', 'chk run/fail']
+  const header = ['seat', 'agent', 'model', 'wall', 'human', 'tokens', 'in/out', 'cost', 'deny', 'nudge', 'chg/pro/dem/mig/rst', 'chk run/fail']
   const rows = report.seats.map(row => [
     row.seat,
     row.kind,
@@ -462,17 +481,19 @@ export const renderReport = (report: RunReport): string => {
     row.tokens ? `${compact(row.tokens.input + row.tokens.cacheRead + row.tokens.cacheWrite5m + row.tokens.cacheWrite1h)}/${compact(row.tokens.output)}` : '-',
     dollars(row.cost, row.unpriced.length > 0),
     String(row.denials),
+    String(row.nudges),
     reworkCell(row.rework),
     checksCell(row.checks),
   ])
   const t = report.totals
-  rows.push([`total (${t.seats} seats)`, '', '', duration(t.wallMs), duration(t.humanMs), compact(t.tokens.total), `${compact(t.tokens.input + t.tokens.cacheRead + t.tokens.cacheWrite5m + t.tokens.cacheWrite1h)}/${compact(t.tokens.output)}`, dollars(t.cost, t.unpriced.length > 0), String(t.denials), reworkCell(t.rework), checksCell(t.checks)])
+  rows.push([`total (${t.seats} seats)`, '', '', duration(t.wallMs), duration(t.humanMs), compact(t.tokens.total), `${compact(t.tokens.input + t.tokens.cacheRead + t.tokens.cacheWrite5m + t.tokens.cacheWrite1h)}/${compact(t.tokens.output)}`, dollars(t.cost, t.unpriced.length > 0), String(t.denials), String(t.nudges), reworkCell(t.rework), checksCell(t.checks)])
   const widths = header.map((title, column) => Math.max(title.length, ...rows.map(row => (row[column] ?? '').length)))
   const line = (cells: string[]) => cells.map((cell, column) => (column >= 3 ? cell.padStart(widths[column] as number) : cell.padEnd(widths[column] as number))).join('  ').trimEnd()
   const out = [`run ${report.run} · ${report.status} · started ${report.startedAt} · ${duration(report.elapsedMs)} elapsed${report.cairn ? ` · ${report.cairn}` : ''}`, ...kindLines(report), '', line(header), ...rows.map((row, index) => (index === rows.length - 1 ? `${'-'.repeat(widths.reduce((sum, width) => sum + width + 2, -2))}\n${line(row)}` : line(row)))]
   out.push('', `chk = check runs (drove checks, run_checks, the merge gate) and how many failed; reused evidence is not a run.`)
   out.push(`wall = spawn to close, summed over a seat's incarnations; human = time an attention item waited on the human (dialog, permission, trust, usage limit); cache reads and writes are in tokens.`)
   if (t.denials > 0) out.push(`deny = tool calls the guard refused; by rule: ${Object.entries(t.denialsByRule).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([rule, count]) => `${rule} ${count}`).join(', ')}.`)
+  if (t.nudges > 0) out.push(`nudge = steering Drove gave a seat from its tool ledger (R1 the same command failed in a row, R2 a done report with no check after the last edit); by rule: ${Object.entries(t.nudgesByRule).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([rule, count]) => `${rule} ${count}`).join(', ')}.`)
   if (t.unpriced.length) out.push(`No price for ${t.unpriced.join(', ')}: those tokens are counted, their cost is not (a + after a cost marks it partial).`)
   const missing = report.seats.filter(row => row.notFound.length > 0)
   if (missing.length) out.push(`No transcript found for ${missing.map(row => `${row.seat} (${row.notFound.length})`).join(', ')}: their tokens are missing or partial.`)
@@ -484,9 +505,9 @@ export const noteLines = (report: RunReport): string[] => {
   const t = report.totals
   const tokens = (usage: Usage & { total: number }) => `${compact(usage.total)} tokens (${compact(usage.output)} out)`
   return [
-    `Cost and rework: ${tokens(t.tokens)}, ${dollars(t.cost, t.unpriced.length > 0)}, ${duration(t.wallMs)} of seat time, ${duration(t.humanMs)} waiting on the human; ${t.rework.changes} change round(s), ${t.rework.promotions} promotion(s), ${t.rework.demotions} demotion(s), ${t.rework.migrations} migration(s), ${t.rework.restarts} restart(s)${t.denials > 0 ? `, ${t.denials} guard denial(s)` : ''}.`,
+    `Cost and rework: ${tokens(t.tokens)}, ${dollars(t.cost, t.unpriced.length > 0)}, ${duration(t.wallMs)} of seat time, ${duration(t.humanMs)} waiting on the human; ${t.rework.changes} change round(s), ${t.rework.promotions} promotion(s), ${t.rework.demotions} demotion(s), ${t.rework.migrations} migration(s), ${t.rework.restarts} restart(s)${t.denials > 0 ? `, ${t.denials} guard denial(s)` : ''}${t.nudges > 0 ? `, ${t.nudges} steering nudge(s)` : ''}.`,
     ...kindLines(report),
-    ...report.seats.map(row => `- ${row.seat} (${row.kind} ${row.model || '?'}): ${row.tokens ? tokens(row.tokens) : 'no transcript'}, ${dollars(row.cost, row.unpriced.length > 0)}, ${duration(row.wallMs)}, human ${duration(row.humanMs)}, chg/pro/dem/mig/rst ${reworkCell(row.rework)}, checks run/fail ${checksCell(row.checks)}${row.denials > 0 ? `, guard denials ${row.denials}` : ''}`),
+    ...report.seats.map(row => `- ${row.seat} (${row.kind} ${row.model || '?'}): ${row.tokens ? tokens(row.tokens) : 'no transcript'}, ${dollars(row.cost, row.unpriced.length > 0)}, ${duration(row.wallMs)}, human ${duration(row.humanMs)}, chg/pro/dem/mig/rst ${reworkCell(row.rework)}, checks run/fail ${checksCell(row.checks)}${row.denials > 0 ? `, guard denials ${row.denials}` : ''}${row.nudges > 0 ? `, steering nudges ${row.nudges}` : ''}`),
     ...(t.unpriced.length ? [`No price for ${t.unpriced.join(', ')}: tokens only.`] : []),
     ...(t.notFound.length ? [`No transcript found for ${t.notFound.join(', ')}.`] : []),
   ]

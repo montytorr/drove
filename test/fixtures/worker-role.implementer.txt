@@ -38,4 +38,4 @@ Every report states what it expects back:
 - After an approval: commit, then send `done` with the branch and commit sha and `expects: none`, and stop.
 Never end a turn on finished work without a `done` report.
 
-Messages from the planner arrive as a `⟦drove v1 …⟧` header followed by the text and a `↩` line that says how to reply.
+Messages from the planner arrive as a `⟦drove v1 …⟧` header followed by the text and a `↩` line that says how to reply. Drove may also send a steering message that starts with "Drove:" (for one command failing again and again); act on it like a message from the planner.

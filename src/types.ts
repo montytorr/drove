@@ -53,6 +53,9 @@ export type DroveConfig = {
   runMaxCost?: number
   // One seat's denials of one rule that make the planner hear of it (defaults 3 in 10 minutes).
   guardThrash?: { count: number; minutes: number }
+  // Steering from the seat's tool ledger (DROVE-127): on unless `enabled` is false; `repeatFailures` of one command in a row
+  // (default 3), one R1 message per seat in `cooldownMinutes` (10), and `checkCommands` beyond the repo's own.
+  steering?: { enabled?: boolean; repeatFailures?: number; cooldownMinutes?: number; checkCommands?: string[] }
 }
 
 export type PlannerMeta = {
@@ -166,6 +169,8 @@ export type Report = {
   details?: string
   criteria?: Criterion[]
   acceptance?: number
+  // A line Drove added to the planner's rendering of the report (DROVE-127). Never from the worker: the watcher sets it.
+  steering?: string
   at: string
 }
 
@@ -226,6 +231,7 @@ export type DroveEventType =
   | 'merge.refused'
   | 'merge.pending'
   | 'checks.ran'
+  | 'steer.nudged'
 
 export type DroveEvent = {
   at: string

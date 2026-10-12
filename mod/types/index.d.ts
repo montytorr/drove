@@ -135,6 +135,7 @@ export type DroveEventType =
   | 'merge.refused'
   | 'merge.pending'
   | 'checks.ran'
+  | 'steer.nudged'
 
 export type DroveEvent = {
   at: string
