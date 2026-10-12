@@ -25,7 +25,7 @@ export const attachArgs = (input: { sessionId: string; paneId?: string; goal?: s
 
 export const bridgeArgs = (run: string, sessionId: string): string[] => ['mod', 'bridge', '--run', run, '--session', sessionId]
 
-export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; skills?: readonly string[]; agents?: readonly string[]; userMemory?: boolean; userHooks?: boolean; role?: SeatRole; target?: string; owns?: readonly string[]; maxTurns?: number; maxTokens?: number }): string[] => [
+export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; skills?: readonly string[]; agents?: readonly string[]; userMemory?: boolean; userHooks?: boolean; role?: SeatRole; target?: string; owns?: readonly string[]; acceptance?: readonly string[]; maxTurns?: number; maxTokens?: number }): string[] => [
   'spawn', input.name, '--kind', input.kind, '--brief', '-', '--effort', input.effort,
   ...(input.model ? ['--model', input.model] : []),
   ...(input.cairn ? ['--cairn', input.cairn] : []),
@@ -38,6 +38,7 @@ export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort
   ...(input.target ? ['--target', input.target] : []),
   ...(input.userHooks !== undefined ? ['--user-hooks', input.userHooks ? 'on' : 'off'] : []),
   ...(input.owns && input.owns.length > 0 ? ['--owns', input.owns.join(',')] : []),
+  ...(input.acceptance ?? []).map(item => `--acceptance=${item}`),
   ...(input.maxTurns ? ['--max-turns', String(input.maxTurns)] : []),
   ...(input.maxTokens ? ['--max-tokens', String(input.maxTokens)] : []),
 ]

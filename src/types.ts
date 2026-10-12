@@ -107,6 +107,7 @@ export type Seat = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
   budgetNoticed?: boolean
@@ -146,8 +147,14 @@ export type Report = {
   for?: 'human'
   summary: string
   details?: string
+  criteria?: Criterion[]
+  acceptance?: number
   at: string
 }
+
+// One acceptance criterion of a seat, as the worker's done report answers it (DROVE-123). `acceptance` on a Report is the
+// number of criteria Drove had written into the seat's brief when the report was stamped.
+export type Criterion = { id: string; met: boolean; evidence: string }
 
 export type ReportInput = {
   kind: ReportKind
@@ -155,6 +162,7 @@ export type ReportInput = {
   for?: 'human'
   summary: string
   details?: string
+  criteria?: Criterion[]
 }
 
 export type Control = {
@@ -348,6 +356,7 @@ export type SpawnRequest = {
   target?: string
   userHooks?: boolean
   owns?: string[]
+  acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
 }
