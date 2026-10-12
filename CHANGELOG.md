@@ -6,6 +6,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 - Carry Cairn `kind:codex` / `kind:claude` labels into planner goals with host availability hints; name `workerKind` when its configured agent is absent, and show the detected Codex model in CLI planner tool descriptions (DROVE-129).
 
+## [0.5.0] - 2026-10-12
+
 Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence ledgers for what a run did, steering that reads a seat's tool calls, acceptance criteria a worker answers, and a loop that checks work before a person reads it. Most of this is about the planner's review: fewer rounds, and a record of why one was needed.
 
 ### Merge gate and checks (DROVE-122)
@@ -35,17 +37,28 @@ Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence
 - An explicit fail mode: when the guard itself fails, the planner and a reviewer seat are refused and other workers carry on, with the refusal recorded as `guard-error`.
 - New `set_owns` tool and `drove owns <seat> --add|--set GLOBS` (DROVE-119) widen an open seat's `owns` mid-run; the guard reads `owns` from the roster at each call. A worker's Bash cannot write Drove's run state (rule `run-state`).
 
-### Observability (DROVE-130, DROVE-121, DROVE-127)
+### Host agents and Claude or Codex (DROVE-117, DROVE-118)
+- Drove detects `claude` and `codex` on the host at `plan`, attach and `up` (DROVE-117) and saves them on the run; a failed detection behaves like an older run, and the planner's own kind is always allowed. A spawn or migrate to a kind the host lacks is refused. A Codex seat shows the model from `~/.codex/config.toml` (profiles too) when it was launched without `-m`.
+- New `workerKind` config key (`auto`, `claude` or `codex`) and a kind split (seats and tokens per kind) in `drove report`.
+- Both planners' role texts say when to pick Codex or Claude for a worker, with rules shown only for kinds the host has (DROVE-118). `kind` is optional on `drove spawn`, the spawn tool and the mod's `spawn_worker`.
+
+### Observability (DROVE-130, DROVE-121, DROVE-127, DROVE-115)
 - New `drove trace [<run>] [--json] [--otlp URL]` (DROVE-130): the run as an OpenTelemetry span tree, printed, as OTLP/JSON or posted to `/v1/traces`. The `otlpEndpoint` config key exports it after `drove down`.
 - `drove report` gains guard denials by rule (`deny`), steering nudges by rule (`nudge`) and checks run and failed (`chk run/fail`) per seat and in total (DROVE-121, DROVE-122, DROVE-127).
 
-### Fixes (DROVE-116, DROVE-124, DROVE-125, DROVE-136, DROVE-140, DROVE-142)
+### Fixes (DROVE-114, DROVE-116, DROVE-124, DROVE-125, DROVE-136, DROVE-140, DROVE-141, DROVE-142)
+- The web board's seat panel is useful (DROVE-115): a header, the seat's real fields, its thread of briefs and reports, and a steady tail of its pane.
+- `drove capture` and the board's pane tails fall back to the pane read when herdr's agent read refuses (DROVE-114).
+- The planner pane reads **working** (yellow) in herdr while its turn has ended and a worker is still working with nobody waiting on the human; Drove sets a spinner title on the pane's tty from the watcher (checked every 5 s, both planners) and restores it when the wait ends or the run goes down (DROVE-141).
 - Timed-out commands terminate their whole process group, escalating from SIGTERM to SIGKILL after 3 seconds; checks record `timedOut: true` in their ledger and outcome text while keeping exit 124 (DROVE-140).
 - The mod's guard spawns in the repo and names a missing session cwd instead of failing obscurely; `close` refuses to remove the planner's own cwd (DROVE-116).
 - A brief left as `[Pasted text]` in an idle agent's input is submitted with one Enter (DROVE-124).
 - A brief longer than `briefPointerLines` (new config key, default 40) goes out as a signed pointer to the seat's `brief.md`, and a brief whose paste never reached the input is sent once more as that pointer (DROVE-136).
 - `merge --pr` reuses an open PR, trusts a MERGED PR only when its head is the branch tip, retries the read after merging, and treats `gh` outages and empty JSON as pending (DROVE-125).
 - `merge --pr` answers pending, not `push-failed`, when GitHub refuses the push with a 5xx or a network error, and shares one 300 s budget between its `gh` calls (45 s each) and the push, fetch and branch delete (90 s each), so a slow GitHub ends in `pending` before the mod's 600 s cap aborts `merge_worker`; the mod reports a merge it still had to cut off as pending too (DROVE-142).
+- The load-sensitive tests wait on observable events instead of timers (DROVE-134).
+- A local `main` and `origin/main` that had diverged were merged with both sides kept (DROVE-132).
+- The README commands and config keys, DESIGN section 6 and the repo's `.drove.json` `autoChecks` match the Strands round (DROVE-135).
 
 ## [0.4.0] - 2026-10-12
 
@@ -186,6 +199,7 @@ See [Known limits](README.md#known-limits) in the README.
 
 Full history: see the commit log.
 
+[0.5.0]: https://github.com/montytorr/drove/releases/tag/v0.5.0
 [0.4.0]: https://github.com/montytorr/drove/releases/tag/v0.4.0
 [0.3.0]: https://github.com/montytorr/drove/releases/tag/v0.3.0
 [0.2.0]: https://github.com/montytorr/drove/releases/tag/v0.2.0
