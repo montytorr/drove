@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import * as commands from '../src/commands.ts'
+import { REMOTE_TIMEOUT_MS } from '../src/git.ts'
 import { runDir } from '../src/paths.ts'
 import { loadRoster, updateRoster } from '../src/roster.ts'
 import { readJsonlFrom } from '../src/store.ts'
@@ -24,6 +25,16 @@ type FakeGh = {
   // gh pr checks printed nothing at all, exit 0.
   checksEmpty?: boolean
   pushes: string[][]
+  // The next n pushes are rejected with `pushError`, as GitHub does in an incident.
+  pushFailures?: number
+  pushError?: string
+  // gh calls that never return: the fake exec answers as nodeExec does at its timeout (exit 124) and the clock moves on by it.
+  hang?: 'all' | 'checks' | 'merge' | 'after-merge'
+  // What the local checks cost on the clock (a slow suite), on top of running for real.
+  checksCostMs?: number
+  // The timeoutMs every gh call and every push was given.
+  ghTimeouts: number[]
+  pushTimeouts: number[]
 }
 
 const PR_URL = 'https://github.com/acme/widget/pull/7'
@@ -52,7 +63,7 @@ const world = async (options: { remote?: boolean; checks?: string[] | null; work
   await git(worktree, 'commit', '-q', '-m', 'feat: add the feature')
 
   const clock = makeClock()
-  const fake: FakeGh = { calls: [], checks: [], pushes: [] }
+  const fake: FakeGh = { calls: [], checks: [], pushes: [], ghTimeouts: [], pushTimeouts: [] }
   const ghExec = async (argv: readonly string[]): Promise<ExecResult> => {
     fake.calls.push([...argv])
     const [, group, action] = argv
@@ -89,9 +100,27 @@ const world = async (options: { remote?: boolean; checks?: string[] | null; work
     }
     return { code: 127, stdout: '', stderr: `unexpected gh ${argv.join(' ')}` }
   }
+  const timedOut = (execOptions: { timeoutMs?: number } | undefined): ExecResult => {
+    const ms = execOptions?.timeoutMs ?? 60_000
+    clock.advance(ms)
+    return { code: 124, stdout: '', stderr: `\ntimed out after ${ms}ms` }
+  }
   const exec: Exec = async (argv, execOptions) => {
-    if (argv[0] === 'gh') return ghExec(argv)
-    if (argv[0] === 'git' && argv.includes('push')) fake.pushes.push([...argv])
+    if (argv[0] === 'gh') {
+      fake.ghTimeouts.push(execOptions?.timeoutMs ?? 60_000)
+      const [, , action] = argv
+      const isHung = fake.hang === 'all' || (fake.hang === 'checks' && action === 'checks') || (fake.hang === 'merge' && action === 'merge') || (fake.hang === 'after-merge' && fake.pr?.state === 'MERGED' && action === 'view')
+      return isHung ? timedOut(execOptions) : ghExec(argv)
+    }
+    if (argv[0] === 'git' && argv.includes('push')) {
+      fake.pushes.push([...argv])
+      fake.pushTimeouts.push(execOptions?.timeoutMs ?? 60_000)
+      if (fake.pushFailures) {
+        fake.pushFailures -= 1
+        return { code: 1, stdout: '', stderr: fake.pushError ?? `remote: Internal Server Error\nremote: Request ID C12A:184574:29B19F:2F58F3:6ACD0661\nTo github.com:acme/widget.git\n ! [remote rejected] ${argv.at(-1)} (Internal Server Error)\nerror: failed to push some refs to 'github.com:acme/widget.git'` }
+      }
+    }
+    if (argv[0] === 'sh' && fake.checksCostMs) clock.advance(fake.checksCostMs)
     return commands.nodeExec(argv, execOptions)
   }
   const deps: Deps = { exec, clock, home: await tmp('home'), sleep: async () => {} }
@@ -336,6 +365,121 @@ test('--pr answers pending, with the URL, when gh gives a 5xx on the checks read
   w.fake.checksEmpty = false
   w.fake.checksError = 'unknown flag'
   assert.equal((await w.merge({ pr: true })).ok, false)
+})
+
+// DROVE-142: a slow or failing GitHub is pending (run it again), never a refusal and never a call the mod's cap aborts.
+test('--pr answers pending when GitHub refuses the push with a 500; the next call pushes and goes on', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.checks = [{ name: 'test', bucket: 'pass', link: '' }]
+  w.fake.pushFailures = 1
+  const first = await w.merge({ pr: true })
+  assert.equal(first.ok, true, first.text)
+  assert.match(first.text, /^pending: GitHub refused the push of worktree-w-api to origin \(remote: Internal Server Error .*\)\. Run drove merge w-api --pr again later\./)
+  assert.deepEqual(first.ok && first.data, { status: 'pending', mode: 'pr' })
+  assert.equal(w.fake.calls.some(call => call[2] === 'create'), false, 'no PR is opened for a branch that is not there')
+  assert.equal((await w.gateOf())?.result, 'pending')
+  const types = (await w.events()).map(entry => entry.type)
+  assert.ok(types.includes('merge.pending'))
+  assert.equal(types.includes('merge.refused'), false)
+
+  const second = await w.merge({ pr: true })
+  assert.equal(second.ok, true, second.text)
+  assert.match(second.text, /^Merged https:\/\/github\.com\/acme\/widget\/pull\/7 /)
+  assert.equal(w.fake.pushes.filter(argv => !argv.includes('--delete')).length, 2, 'the first push was refused, the second went through')
+  assert.equal(await git(w.remote, 'branch', '--list', 'worktree-w-api'), '', 'the branch was deleted after the merge')
+  assert.equal((await w.gateOf())?.result, 'passed')
+})
+
+test('--pr reads a 5xx or a network error on the push as pending, and any other rejection as push-failed', async () => {
+  for (const error of [
+    'fatal: unable to access \'https://github.com/acme/widget.git/\': The requested URL returned error: 503',
+    "fatal: unable to access 'https://github.com/acme/widget.git/': Could not resolve host: github.com",
+    'ssh: connect to host github.com port 22: Connection timed out\nfatal: Could not read from remote repository.',
+    'error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502\nfatal: the remote end hung up unexpectedly',
+  ]) {
+    const w = await world({ remote: true, workflows: true })
+    w.fake.pushFailures = 1
+    w.fake.pushError = error
+    const answer = await w.merge({ pr: true })
+    assert.equal(answer.ok, true, `${error}: ${answer.ok ? '' : answer.text}`)
+    assert.match(answer.text, /^pending: /)
+  }
+  const w = await world({ remote: true, workflows: true })
+  w.fake.pushFailures = 1
+  w.fake.pushError = 'remote: Permission to acme/widget.git denied to someone.\nfatal: unable to access: The requested URL returned error: 403'
+  const denied = await w.merge({ pr: true })
+  assert.equal(denied.ok === false && denied.code, 'push-failed')
+  assert.equal((await w.gateOf())?.result, 'refused')
+})
+
+test('--pr answers pending when a gh call never returns, inside its budget, with every call given a timeout', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.hang = 'all'
+  const before = w.clock.now().getTime()
+  const pending = await w.merge({ pr: true })
+  assert.equal(pending.ok, true, pending.text)
+  assert.match(pending.text, /^pending: GitHub did not answer the look-up of the pull request of worktree-w-api\. Run drove merge w-api --pr again later\./)
+  assert.ok(w.clock.now().getTime() - before <= commands.PR_BUDGET_MS, 'the hung calls fit the budget')
+  assert.ok(w.fake.ghTimeouts.length >= 2)
+  assert.ok(w.fake.ghTimeouts.every(ms => ms >= commands.PR_MIN_CALL_MS && ms <= commands.GH_TIMEOUT_MS), `gh timeouts: ${w.fake.ghTimeouts.join(',')}`)
+  assert.ok(w.fake.pushTimeouts.length === 1 && w.fake.pushTimeouts.every(ms => ms <= REMOTE_TIMEOUT_MS), `push timeouts: ${w.fake.pushTimeouts.join(',')}`)
+  assert.equal((await w.gateOf())?.result, 'pending')
+  // The branch got pushed meanwhile; once GitHub answers, the same call goes on.
+  w.fake.hang = undefined
+  w.fake.checks = [{ name: 'test', bucket: 'pass', link: '' }]
+  const merged = await w.merge({ pr: true })
+  assert.equal(merged.ok, true, merged.text)
+})
+
+test('--pr names the PR when the checks read, the merge or its read-back never returns', async () => {
+  const w = await world({ remote: true, workflows: true })
+  w.fake.checks = [{ name: 'test', bucket: 'pass', link: '' }]
+  w.fake.hang = 'checks'
+  const checks = await w.merge({ pr: true })
+  assert.match(checks.text, /^pending: GitHub did not answer the read of the checks .* on https:\/\/github\.com\/acme\/widget\/pull\/7\./)
+
+  w.fake.hang = 'merge'
+  const merge = await w.merge({ pr: true })
+  assert.match(merge.text, /^pending: GitHub did not answer the merge on https:\/\/github\.com\/acme\/widget\/pull\/7\./)
+  assert.equal(w.fake.pr?.state, 'OPEN')
+
+  // The merge went through but nothing reads back: pending, not a refusal, and the next call settles the merged PR.
+  w.fake.hang = 'after-merge'
+  const before = w.clock.now().getTime()
+  const readBack = await w.merge({ pr: true })
+  assert.equal(readBack.ok, true, readBack.text)
+  assert.match(readBack.text, /^pending: gh pr merge ran, but GitHub did not answer the read of the pull request afterwards on https:\/\/github\.com\/acme\/widget\/pull\/7\./)
+  assert.ok(w.clock.now().getTime() - before <= commands.PR_BUDGET_MS + 6 * commands.PR_MIN_CALL_MS, 'the read-back is cut short once the budget is spent')
+  assert.equal(w.fake.pr?.state, 'MERGED')
+  w.fake.hang = undefined
+  const settled = await w.merge({ pr: true })
+  assert.equal(settled.ok, true, settled.text)
+  assert.match(settled.text, /^Merged https:\/\/github\.com\/acme\/widget\/pull\/7 /)
+  assert.equal((await w.gateOf())?.result, 'passed')
+})
+
+test('--pr spends one budget: local checks that used it end in pending before the push, and the next call reuses them', async () => {
+  const w = await world({ remote: true })
+  w.fake.checks = 'none'
+  w.fake.checksCostMs = commands.PR_BUDGET_MS - 1_000
+  const pending = await w.merge({ pr: true })
+  assert.equal(pending.ok, true, pending.text)
+  assert.match(pending.text, /^pending: this merge spent its 300s budget on GitHub before the push\. Run drove merge w-api --pr again later\./)
+  assert.equal(w.fake.pushes.length, 0)
+  assert.equal(w.fake.calls.some(call => call[2] === 'create'), false)
+
+  w.fake.checksCostMs = 0
+  const merged = await w.merge({ pr: true })
+  assert.equal(merged.ok, true, merged.text)
+  assert.match(merged.text, /checks reused: passed at /)
+})
+
+test("--pr's budget leaves the mod's merge_worker cap well out of reach", async () => {
+  const source = await readFile(join(import.meta.dirname, '..', 'mod', 'hooks', 'register.tsx'), 'utf8')
+  const cap = Number(/const MERGE_TIMEOUT_MS = ([\d_]+)/.exec(source)?.[1]?.replaceAll('_', ''))
+  assert.ok(cap > 0, 'the mod names its merge cap')
+  assert.ok(commands.PR_BUDGET_MS * 2 <= cap, `a budget of ${commands.PR_BUDGET_MS}ms leaves the rest of the ${cap}ms cap for the settle tail`)
+  assert.ok(commands.GH_TIMEOUT_MS < commands.PR_BUDGET_MS && REMOTE_TIMEOUT_MS < commands.PR_BUDGET_MS)
 })
 
 test('--pr for a PR already MERGED on GitHub settles it: fast-forward, event, branch deleted', async () => {

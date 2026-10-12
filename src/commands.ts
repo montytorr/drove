@@ -1917,7 +1917,13 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 // ---------- merge: the gate between a worker's branch and the base ----------
 
 const REMOTE = 'origin'
-const GH_TIMEOUT_MS = 60_000
+// One gh call; a read of a pull request answers in seconds, so a call past this is GitHub being away.
+export const GH_TIMEOUT_MS = 45_000
+// What a --pr merge spends on GitHub (gh, push, fetch) before it answers pending. The mod's merge_worker is cut off at 600 s
+// (MERGE_TIMEOUT_MS in mod/hooks/register.tsx), so Drove must answer well before it: once the budget is spent only the reads
+// that confirm a merge already made, and its clean-up, still run, each cut at PR_MIN_CALL_MS.
+export const PR_BUDGET_MS = 300_000
+export const PR_MIN_CALL_MS = 10_000
 // How long a PR in a repo with workflows may show no checks before it counts as a repo whose CI did not trigger.
 export const CI_GRACE_MS = 10 * 60_000
 type GhPr = { number: number; url: string; state: string; createdAt: string; mergeable: string; reviewDecision: string; headRefOid: string }
@@ -1933,8 +1939,8 @@ const ghJson = <T>(result: ExecResult): T | undefined => {
   }
 }
 
-// A 5xx or a network error from gh is the service being away, not an answer about the pull request.
-const isTransient = (text: string): boolean => /HTTP 5\d\d|\b50[0-4]\b|bad gateway|service unavailable|gateway time-?out|timed? ?out|connection (reset|refused)|network is unreachable|no such host|could not resolve host|\bEOF\b|TLS handshake|unexpected end of JSON input/i.test(text)
+// A 5xx or a network error from gh or git is the service being away, not an answer about the pull request or the branch.
+const isTransient = (text: string): boolean => /HTTP 5\d\d|\b50[0-4]\b|internal server error|returned error: 5\d\d|bad gateway|service unavailable|gateway time-?out|timed? ?out|connection (reset|refused|closed)|failed to connect|rpc failed|remote end hung up|unexpected disconnect|network is unreachable|no such host|could not resolve host|temporary failure in name resolution|\bEOF\b|TLS handshake|unexpected end of JSON input/i.test(text)
 const RETRY_WAITS_MS = [1000, 2000, 4000]
 
 // `target` is a branch name, or a PR number once it is known: a number cannot pick another PR of the same branch.
@@ -2090,11 +2096,27 @@ const mergePr = async (
   const hasCi = await hasWorkflows(run.repo, seat.worktree)
   let isChecked = false
   let pushedSha: string | undefined
+  // Everything that talks to GitHub (gh, push, fetch) shares one budget, so a slow GitHub ends in `pending` before the mod's
+  // cap aborts the call. A call is cut at the time left, but never below PR_MIN_CALL_MS: a merge already made is still read back.
+  const startedAt = deps.clock.now().getTime()
+  const timeLeft = (): number => PR_BUDGET_MS - (deps.clock.now().getTime() - startedAt)
+  const net: Deps = { ...deps, exec: (argv, options = {}) => deps.exec(argv, { ...options, timeoutMs: Math.max(PR_MIN_CALL_MS, Math.min(options.timeoutMs ?? GH_TIMEOUT_MS, timeLeft())) }) }
+  const answerPending = async (why: string, found?: Pick<GhPr, 'url' | 'number'>): Promise<CommandResult> => {
+    const at = found ? { url: found.url, pr: found.number } : {}
+    await settle('merge.pending', why, at)
+    return ok(`pending: ${why}${found ? ` on ${found.url}` : ''}. Run drove merge ${seat.name} --pr again later.`, { status: 'pending', mode: 'pr', ...at })
+  }
+  // The PR to name in an answer before the branch's own PR is known: an old closed or merged one of the name is not it.
+  const openOf = (found: GhPr | undefined): GhPr | undefined => (found?.state === 'OPEN' ? found : undefined)
+  const outOfTime = (step: string, found?: GhPr): Promise<CommandResult> | undefined =>
+    timeLeft() < PR_MIN_CALL_MS ? answerPending(`this merge spent its ${Math.round(PR_BUDGET_MS / 1000)}s budget on GitHub before ${step}`, found) : undefined
+  // A call GitHub did not answer in time (exit 124 from the exec's timeout), or answered with a 5xx or a network error.
+  const isAway = (ran: ExecResult): boolean => ran.code === 124 || isTransient(`${ran.stderr}\n${ran.stdout}`)
   // A PR already MERGED on GitHub (a merge whose answer was lost) is settled as it is: nothing is checked or pushed again.
   // Only when it merged this very commit: a branch name is reused, and `gh pr view <branch>` can return an old merged PR of it.
   const tip = await git.branchTip(deps.exec, run.repo, seat.branch)
   const mergedTip = (found: GhPr | undefined, sha: string | undefined): boolean => found?.state === 'MERGED' && !!sha && found.headRefOid === sha
-  let pr = await viewPr(deps, run.repo, seat.branch)
+  let pr = await viewPr(net, run.repo, seat.branch)
   if (!mergedTip(pr, tip)) {
     if (!hasCi) {
       const failure = await check()
@@ -2106,18 +2128,24 @@ const mergePr = async (
     pushedSha = plan.sha ?? (await git.branchTip(deps.exec, run.repo, seat.branch))
     const changedPolicy = await policyChange(deps.exec, run.repo, run.base, pushedSha ?? seat.branch)
     if (changedPolicy) return refuse('policy-change', changedPolicy)
-    const pushed = await git.pushBranch(deps.exec, run.repo, REMOTE, seat.branch, pushedSha)
-    if (pushed.code !== 0) return refuse('push-failed', `could not push ${seat.branch} to ${REMOTE}: ${clip(pushed.stderr || pushed.stdout)}`)
+    // The checks may have used the budget; they are recorded, so the next call reuses them instead of running them again.
+    const lateForPush = outOfTime('the push', pr)
+    if (lateForPush) return lateForPush
+    const pushed = await git.pushBranch(net.exec, run.repo, REMOTE, seat.branch, pushedSha)
+    if (pushed.code !== 0) {
+      // A 5xx or a network error is GitHub being away: the branch is fine, and the next call pushes it again.
+      if (isAway(pushed)) {
+        const reason = pushed.code === 124 ? `the push of ${seat.branch} to ${REMOTE} did not finish in time` : `GitHub refused the push of ${seat.branch} to ${REMOTE} (${clip(pushed.stderr || pushed.stdout, 200)})`
+        return answerPending(reason, openOf(pr))
+      }
+      return refuse('push-failed', `could not push ${seat.branch} to ${REMOTE}: ${clip(pushed.stderr || pushed.stdout)}`)
+    }
 
-    pr = await viewPr(deps, run.repo, seat.branch)
+    pr = await viewPr(net, run.repo, seat.branch)
     // Reuse the open PR of the branch when the view did not give it (a closed or merged one of the same name can shadow it).
     if (!pr || pr.state !== 'OPEN') {
-      const open = await openPrOf(deps, run.repo, seat.branch, base)
-      if (open === 'transient') {
-        const why = `GitHub did not answer the look-up of the pull request of ${seat.branch}`
-        await settle('merge.pending', why)
-        return ok(`pending: ${why}. Run drove merge ${seat.name} --pr again later.`, { status: 'pending', mode: 'pr' })
-      }
+      const open = await openPrOf(net, run.repo, seat.branch, base)
+      if (open === 'transient') return answerPending(`GitHub did not answer the look-up of the pull request of ${seat.branch}`)
       if (open) pr = open
     }
     // A merged PR of another commit is not this branch's PR: a new one is opened for what was just pushed.
@@ -2126,9 +2154,13 @@ const mergePr = async (
       const subjects = await git.commitSubjects(deps.exec, run.repo, (await git.freshestBase(deps.exec, run.repo, run.base)).ref, seat.branch)
       const last = subjects.at(-1) ?? seat.branch
       const title = seat.cairn && !last.includes(seat.cairn) ? `${last} (${seat.cairn})` : last
-      const created = await gh(deps, run.repo, ['pr', 'create', '--head', seat.branch, '--base', base, '--title', title, '--body', prBody(run, seat, subjects)])
+      const lateForCreate = outOfTime('opening the pull request')
+      if (lateForCreate) return lateForCreate
+      const created = await gh(net, run.repo, ['pr', 'create', '--head', seat.branch, '--base', base, '--title', title, '--body', prBody(run, seat, subjects)])
+      // A create whose answer was lost may have made the PR: the next call finds it by its branch and reuses it.
+      if (created.code !== 0 && isAway(created)) return answerPending(`GitHub did not answer the opening of the pull request of ${seat.branch}`)
       if (created.code !== 0) return refuse('pr-failed', `gh pr create failed: ${clip(created.stderr || created.stdout)}`)
-      pr = await viewPr(deps, run.repo, seat.branch)
+      pr = await viewPr(net, run.repo, seat.branch)
       if (pr?.state === 'MERGED' && !mergedTip(pr, pushedSha)) pr = undefined
       if (!pr) return refuse('pr-failed', `gh pr create ran, but the pull request for ${seat.branch} cannot be read back: ${clip(created.stdout)}`)
     }
@@ -2140,11 +2172,10 @@ const mergePr = async (
   if (pr.state !== 'MERGED') {
     if (pr.mergeable === 'CONFLICTING') return refuse('pr-conflicts', `${pr.url} has conflicts with ${base}: have the worker merge ${base} into its branch, then run drove merge ${seat.name} --pr again`, at)
     if (pr.reviewDecision === 'CHANGES_REQUESTED') return refuse('pr-changes-requested', `${pr.url} has changes requested on GitHub: address them, then run drove merge ${seat.name} --pr again`, at)
-    const pending = async (why: string): Promise<CommandResult> => {
-      await settle('merge.pending', why, at)
-      return ok(`pending: ${why} on ${pr.url}. Run drove merge ${seat.name} --pr again later.`, { status: 'pending', mode: 'pr', ...at })
-    }
-    const checks = await prChecks(deps, run.repo, pr.number)
+    const pending = (why: string): Promise<CommandResult> => answerPending(why, pr)
+    const lateForChecks = outOfTime('reading the checks', pr)
+    if (lateForChecks) return lateForChecks
+    const checks = await prChecks(net, run.repo, pr.number)
     if ('error' in checks && checks.transient) return pending(`GitHub did not answer the read of the checks (${checks.error})`)
     if ('error' in checks) return refuse('checks-unreadable', `could not read the checks of ${pr.url}: ${checks.error}`, at)
     const failing = checks.filter(entry => entry.bucket === 'fail' || entry.bucket === 'cancel')
@@ -2165,14 +2196,19 @@ const mergePr = async (
     }
     if (pr.reviewDecision === 'REVIEW_REQUIRED') return pending('a review is required on GitHub')
     const subject = request.message?.trim() || `merge: ${await git.commitSubject(deps.exec, run.repo, pushedSha ?? seat.branch)}`
-    const merged = await gh(deps, run.repo, ['pr', 'merge', String(pr.number), request.squash ? '--squash' : '--merge', '--subject', subject])
+    const lateForMerge = outOfTime('the merge', pr)
+    if (lateForMerge) return lateForMerge
+    const merged = await gh(net, run.repo, ['pr', 'merge', String(pr.number), request.squash ? '--squash' : '--merge', '--subject', subject])
+    // The merge may have gone through before the answer was lost: the next call reads the PR and settles it if it is MERGED.
+    if (merged.code !== 0 && isAway(merged)) return pending('GitHub did not answer the merge')
     if (merged.code !== 0) return refuse('pr-merge-failed', `gh pr merge refused ${pr.url}: ${clip(merged.stderr || merged.stdout)}`, at)
-    const after = await mergedState(deps, run.repo, pr.number)
-    if (after?.state !== 'MERGED') return refuse('pr-merge-failed', `gh pr merge ran but ${pr.url} is ${after?.state ?? 'unreadable'}, not MERGED`, at)
+    const after = await mergedState(net, run.repo, pr.number)
+    if (!after) return pending('gh pr merge ran, but GitHub did not answer the read of the pull request afterwards')
+    if (after.state !== 'MERGED') return refuse('pr-merge-failed', `gh pr merge ran but ${pr.url} is ${after.state}, not MERGED`, at)
   }
 
   const notes: string[] = []
-  const removed = await git.deleteRemoteBranch(deps.exec, run.repo, REMOTE, seat.branch)
+  const removed = await git.deleteRemoteBranch(net.exec, run.repo, REMOTE, seat.branch)
   if (removed.code !== 0) notes.push(`The remote branch ${seat.branch} was not deleted (${clip(removed.stderr || removed.stdout, 160)}).`)
   const head = await git.headBranch(deps.exec, run.repo)
   const unsaved = head === base ? await git.dirtyLines(deps.exec, run.repo) : []
@@ -2180,7 +2216,7 @@ const mergePr = async (
   if (head !== base) notes.push(`The main checkout is on ${head ?? 'no branch'}, not ${base}, so local ${base} was not updated: git switch ${base} and pull.`)
   else if (unsaved.length > 0) notes.push(`The main checkout has uncommitted changes, so local ${base} was not updated: commit or stash them, then git pull --ff-only.`)
   else {
-    const forwarded = await git.fastForwardFromRemote(deps.exec, run.repo, REMOTE, base)
+    const forwarded = await git.fastForwardFromRemote(net.exec, run.repo, REMOTE, base)
     if (forwarded.ok) sha = forwarded.sha
     else notes.push(`Local ${base} could not be fast-forwarded from ${REMOTE}/${base}: ${forwarded.error}`)
   }

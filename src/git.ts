@@ -4,6 +4,8 @@ import type { Exec, ExecResult } from './types.ts'
 export const PROTECTED_BRANCH = 'production'
 
 const git = (exec: Exec, repo: string, args: readonly string[]): Promise<ExecResult> => exec(['git', '-C', repo, ...args], { timeoutMs: 30_000 })
+// One call to the remote (a push, a remote branch delete, a fetch). Past this it is cut, and the remote counts as away.
+export const REMOTE_TIMEOUT_MS = 90_000
 
 const must = async (exec: Exec, repo: string, args: readonly string[]): Promise<string> => {
   const result = await git(exec, repo, args)
@@ -182,17 +184,17 @@ export const mergeNoFf = async (exec: Exec, repo: string, branch: string, messag
 // commit is what the remote branch becomes, whatever the local branch has moved to since.
 export const pushBranch = async (exec: Exec, repo: string, remote: string, branch: string, sha?: string): Promise<ExecResult> => {
   if (branch === PROTECTED_BRANCH) return { code: 1, stdout: '', stderr: `refusing to push the ${PROTECTED_BRANCH} branch` }
-  return exec(['git', '-C', repo, 'push', remote, `${sha ?? `refs/heads/${branch}`}:refs/heads/${branch}`], { timeoutMs: 120_000 })
+  return exec(['git', '-C', repo, 'push', remote, `${sha ?? `refs/heads/${branch}`}:refs/heads/${branch}`], { timeoutMs: REMOTE_TIMEOUT_MS })
 }
 
 export const deleteRemoteBranch = async (exec: Exec, repo: string, remote: string, branch: string): Promise<ExecResult> => {
   if (branch === PROTECTED_BRANCH) return { code: 1, stdout: '', stderr: `refusing to delete the ${PROTECTED_BRANCH} branch` }
-  return exec(['git', '-C', repo, 'push', remote, '--delete', branch], { timeoutMs: 120_000 })
+  return exec(['git', '-C', repo, 'push', remote, '--delete', branch], { timeoutMs: REMOTE_TIMEOUT_MS })
 }
 
 // Brings the local base up to date with the remote's after a PR merged on GitHub: fetch, then fast-forward only.
 export const fastForwardFromRemote = async (exec: Exec, repo: string, remote: string, base: string): Promise<{ ok: true; sha: string } | { ok: false; error: string }> => {
-  const fetched = await exec(['git', '-C', repo, 'fetch', remote, base], { timeoutMs: 120_000 })
+  const fetched = await exec(['git', '-C', repo, 'fetch', remote, base], { timeoutMs: REMOTE_TIMEOUT_MS })
   if (fetched.code !== 0) return { ok: false, error: (fetched.stderr || fetched.stdout).trim().slice(0, 300) }
   const merged = await git(exec, repo, ['merge', '--ff-only', `${remote}/${base}`])
   if (merged.code !== 0) return { ok: false, error: (merged.stderr || merged.stdout).trim().slice(0, 300) }
