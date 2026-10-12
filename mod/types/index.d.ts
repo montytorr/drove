@@ -46,7 +46,7 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery' | 'guard-thrash'
   detail: string
   at: string
 }
@@ -117,7 +117,7 @@ export type DroveEventType =
   | 'control.sent'
   | 'control.failed'
   | 'attention'
-  | 'guard.deny'
+  | 'guard.denied'
   | 'merge.passed'
   | 'merge.refused'
   | 'merge.pending'

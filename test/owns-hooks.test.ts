@@ -37,7 +37,7 @@ test('pre-tool-use: a worker with DROVE_OWNS is denied an edit outside its globs
   const denied = await hooks.runHook('pre-tool-use', pre('Edit', { file_path: join(worktree, 'src/launch.ts') }), env, deps)
   assert.equal(denied.code, 2)
   assert.match(denied.stderr, /this file is outside the paths your brief gives you \(src\/guard\.ts, test\/\*\*\); ask the planner with the drove report tool/)
-  assert.equal(written.at(-1)?.value.type, 'guard.deny')
+  assert.equal(written.at(-1)?.value.type, 'guard.denied')
   assert.equal((await hooks.runHook('pre-tool-use', pre('Edit', { file_path: join(worktree, 'src/guard.ts') }), env, deps)).code, 0)
   assert.equal((await hooks.runHook('pre-tool-use', pre('Bash', { command: 'echo x > package.json' }), env, deps)).code, 2)
   assert.equal((await hooks.runHook('pre-tool-use', pre('Bash', { command: 'echo x > test/a.txt' }), env, deps)).code, 0)

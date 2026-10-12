@@ -56,6 +56,9 @@ export type SeatReport = {
   wallMs: number
   humanMs: number
   rework: Rework
+  // Guard refusals the seat met (`guard.denied` events), in all and by rule (DROVE-121).
+  denials: number
+  denialsByRule: Record<string, number>
   tokens?: Usage & { total: number }
   cost?: number
   unpriced: string[]
@@ -73,7 +76,7 @@ export type RunReport = {
   at: string
   elapsedMs: number
   seats: SeatReport[]
-  totals: { seats: number; wallMs: number; humanMs: number; rework: Rework; tokens: Usage & { total: number }; cost?: number; unpriced: string[]; notFound: string[] }
+  totals: { seats: number; wallMs: number; humanMs: number; rework: Rework; denials: number; denialsByRule: Record<string, number>; tokens: Usage & { total: number }; cost?: number; unpriced: string[]; notFound: string[] }
 }
 
 const emptyRework = (): Rework => ({ changes: 0, approvals: 0, promotions: 0, demotions: 0, migrations: 0, restarts: 0 })
@@ -268,6 +271,21 @@ const reworkOf = (events: readonly DroveEvent[]): Rework => {
   return rework
 }
 
+// `guard.deny` is what runs before DROVE-121 wrote; it carries no rule.
+const GUARD_DENIALS = new Set(['guard.denied', 'guard.deny'])
+
+const denialsOf = (events: readonly DroveEvent[]): { denials: number; denialsByRule: Record<string, number> } => {
+  const denialsByRule: Record<string, number> = {}
+  let denials = 0
+  for (const event of events) {
+    if (!GUARD_DENIALS.has(event.type)) continue
+    const rule = typeof event.data?.rule === 'string' ? event.data.rule : 'unknown'
+    denialsByRule[rule] = (denialsByRule[rule] ?? 0) + 1
+    denials += 1
+  }
+  return { denials, denialsByRule }
+}
+
 const readEvents = async (path: string): Promise<DroveEvent[]> => {
   const lines = await readLines(path)
   return ((lines ?? []) as unknown as DroveEvent[]).filter(event => typeof event?.at === 'string' && typeof event.type === 'string')
@@ -318,6 +336,7 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
       wallMs: unionMs(stretch),
       humanMs: humanWait(own, stretch, end),
       rework: reworkOf(own),
+      ...denialsOf(own),
       ...(tokens.usage.size ? { tokens: { ...sum, total: totalTokens(sum) } } : {}),
       ...(cost.cost === undefined ? {} : { cost: cost.cost }),
       unpriced: cost.unpriced,
@@ -341,6 +360,7 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
       wallMs: Math.max(0, end - start),
       humanMs: 0,
       rework: emptyRework(),
+      ...denialsOf(events.filter(event => event.seat === 'planner')),
       ...(found.usage.size ? { tokens: { ...sum, total: totalTokens(sum) } } : {}),
       ...(cost.cost === undefined ? {} : { cost: cost.cost }),
       unpriced: cost.unpriced,
@@ -368,6 +388,8 @@ export const buildReport = async (deps: Deps, runId: string, claudeDir: string):
       wallMs: workers.reduce((sum, row) => sum + row.wallMs, 0),
       humanMs: workers.reduce((sum, row) => sum + row.humanMs, 0),
       rework: sumRework(rows.map(row => row.rework)),
+      // Every denial of the run, a planner's included, even when its row is missing (no session id) or its seat is gone.
+      ...denialsOf(events),
       tokens: { ...all, total: totalTokens(all) },
       ...(costs.length ? { cost: costs.reduce((sum, row) => sum + (row.cost as number), 0) } : {}),
       unpriced: [...new Set(rows.flatMap(row => row.unpriced))],
@@ -390,7 +412,7 @@ const dollars = (cost: number | undefined, partial: boolean): string => (cost ==
 const reworkCell = (rework: Rework): string => `${rework.changes}/${rework.promotions}/${rework.demotions}/${rework.migrations}/${rework.restarts}`
 
 export const renderReport = (report: RunReport): string => {
-  const header = ['seat', 'agent', 'model', 'wall', 'human', 'tokens', 'in/out', 'cost', 'chg/pro/dem/mig/rst']
+  const header = ['seat', 'agent', 'model', 'wall', 'human', 'tokens', 'in/out', 'cost', 'deny', 'chg/pro/dem/mig/rst']
   const rows = report.seats.map(row => [
     row.seat,
     row.kind,
@@ -400,14 +422,16 @@ export const renderReport = (report: RunReport): string => {
     row.tokens ? compact(row.tokens.total) : 'n/a',
     row.tokens ? `${compact(row.tokens.input + row.tokens.cacheRead + row.tokens.cacheWrite5m + row.tokens.cacheWrite1h)}/${compact(row.tokens.output)}` : '-',
     dollars(row.cost, row.unpriced.length > 0),
+    String(row.denials),
     reworkCell(row.rework),
   ])
   const t = report.totals
-  rows.push([`total (${t.seats} seats)`, '', '', duration(t.wallMs), duration(t.humanMs), compact(t.tokens.total), `${compact(t.tokens.input + t.tokens.cacheRead + t.tokens.cacheWrite5m + t.tokens.cacheWrite1h)}/${compact(t.tokens.output)}`, dollars(t.cost, t.unpriced.length > 0), reworkCell(t.rework)])
+  rows.push([`total (${t.seats} seats)`, '', '', duration(t.wallMs), duration(t.humanMs), compact(t.tokens.total), `${compact(t.tokens.input + t.tokens.cacheRead + t.tokens.cacheWrite5m + t.tokens.cacheWrite1h)}/${compact(t.tokens.output)}`, dollars(t.cost, t.unpriced.length > 0), String(t.denials), reworkCell(t.rework)])
   const widths = header.map((title, column) => Math.max(title.length, ...rows.map(row => (row[column] ?? '').length)))
   const line = (cells: string[]) => cells.map((cell, column) => (column >= 3 ? cell.padStart(widths[column] as number) : cell.padEnd(widths[column] as number))).join('  ').trimEnd()
   const out = [`run ${report.run} · ${report.status} · started ${report.startedAt} · ${duration(report.elapsedMs)} elapsed${report.cairn ? ` · ${report.cairn}` : ''}`, '', line(header), ...rows.map((row, index) => (index === rows.length - 1 ? `${'-'.repeat(widths.reduce((sum, width) => sum + width + 2, -2))}\n${line(row)}` : line(row)))]
   out.push('', `wall = spawn to close, summed over a seat's incarnations; human = time an attention item waited on the human (dialog, permission, trust, usage limit); cache reads and writes are in tokens.`)
+  if (t.denials > 0) out.push(`deny = tool calls the guard refused; by rule: ${Object.entries(t.denialsByRule).sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([rule, count]) => `${rule} ${count}`).join(', ')}.`)
   if (t.unpriced.length) out.push(`No price for ${t.unpriced.join(', ')}: those tokens are counted, their cost is not (a + after a cost marks it partial).`)
   const missing = report.seats.filter(row => row.notFound.length > 0)
   if (missing.length) out.push(`No transcript found for ${missing.map(row => `${row.seat} (${row.notFound.length})`).join(', ')}: their tokens are missing or partial.`)
@@ -419,8 +443,8 @@ export const noteLines = (report: RunReport): string[] => {
   const t = report.totals
   const tokens = (usage: Usage & { total: number }) => `${compact(usage.total)} tokens (${compact(usage.output)} out)`
   return [
-    `Cost and rework: ${tokens(t.tokens)}, ${dollars(t.cost, t.unpriced.length > 0)}, ${duration(t.wallMs)} of seat time, ${duration(t.humanMs)} waiting on the human; ${t.rework.changes} change round(s), ${t.rework.promotions} promotion(s), ${t.rework.demotions} demotion(s), ${t.rework.migrations} migration(s), ${t.rework.restarts} restart(s).`,
-    ...report.seats.map(row => `- ${row.seat} (${row.kind} ${row.model || '?'}): ${row.tokens ? tokens(row.tokens) : 'no transcript'}, ${dollars(row.cost, row.unpriced.length > 0)}, ${duration(row.wallMs)}, human ${duration(row.humanMs)}, chg/pro/dem/mig/rst ${reworkCell(row.rework)}`),
+    `Cost and rework: ${tokens(t.tokens)}, ${dollars(t.cost, t.unpriced.length > 0)}, ${duration(t.wallMs)} of seat time, ${duration(t.humanMs)} waiting on the human; ${t.rework.changes} change round(s), ${t.rework.promotions} promotion(s), ${t.rework.demotions} demotion(s), ${t.rework.migrations} migration(s), ${t.rework.restarts} restart(s)${t.denials > 0 ? `, ${t.denials} guard denial(s)` : ''}.`,
+    ...report.seats.map(row => `- ${row.seat} (${row.kind} ${row.model || '?'}): ${row.tokens ? tokens(row.tokens) : 'no transcript'}, ${dollars(row.cost, row.unpriced.length > 0)}, ${duration(row.wallMs)}, human ${duration(row.humanMs)}, chg/pro/dem/mig/rst ${reworkCell(row.rework)}${row.denials > 0 ? `, guard denials ${row.denials}` : ''}`),
     ...(t.unpriced.length ? [`No price for ${t.unpriced.join(', ')}: tokens only.`] : []),
     ...(t.notFound.length ? [`No transcript found for ${t.notFound.join(', ')}.`] : []),
   ]

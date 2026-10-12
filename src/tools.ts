@@ -300,7 +300,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
     ),
     defineTool(
       'run_report',
-      'Tokens, cost, wall time, time spent waiting on the human and rework (change rounds, promotions, migrations, restarts) of this run, per seat and in total, read from the agents\' transcripts and the run\'s events. Read only.',
+      'Tokens, cost, wall time, time spent waiting on the human, rework (change rounds, promotions, migrations, restarts) and guard denials (by rule) of this run, per seat and in total, read from the agents\' transcripts and the run\'s events. Read only.',
       { json: { type: 'boolean', description: 'Return JSON instead of a table.' } },
       [],
       async (args) => asResult(await cmd.runReport(deps, await ref(), flag(args, 'json'))),

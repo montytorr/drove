@@ -45,6 +45,8 @@ export type DroveConfig = {
   workerUserMemory?: boolean
   workerUserHooks?: boolean
   maxTurns?: number
+  // One seat's denials of one rule that make the planner hear of it (defaults 3 in 10 minutes).
+  guardThrash?: { count: number; minutes: number }
 }
 
 export type PlannerMeta = {
@@ -82,7 +84,7 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery' | 'guard-thrash'
   detail: string
   at: string
 }
@@ -195,7 +197,7 @@ export type DroveEventType =
   | 'control.sent'
   | 'control.failed'
   | 'attention'
-  | 'guard.deny'
+  | 'guard.denied'
   | 'merge.passed'
   | 'merge.refused'
   | 'merge.pending'
@@ -242,7 +244,23 @@ export type GuardInput = {
   seatRole?: SeatRole
 }
 
-export type GuardDecision = { allow: true } | { allow: false; reason: string }
+// Why the guard said no, as a stable id: the ledger (`guard.denied`), the thrash escalation and the run report group by it.
+export type GuardRule =
+  | 'owns'
+  | 'reviewer-readonly'
+  | 'planner-edit'
+  | 'planner-shell'
+  | 'push'
+  | 'production'
+  | 'herdr'
+  | 'merge-gate'
+  | 'agent-launch'
+  | 'drove-cli'
+  | 'github'
+  | 'unreadable'
+  | 'guard-error'
+
+export type GuardDecision = { allow: true } | { allow: false; reason: string; rule: GuardRule }
 
 export type ExecResult = { code: number; stdout: string; stderr: string }
 export type ExecOptions = { timeoutMs?: number; input?: string; env?: Record<string, string>; cwd?: string }

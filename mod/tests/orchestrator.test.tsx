@@ -135,7 +135,7 @@ describe('bridge stream', () => {
     expect(feedOf({ at: ISO, type: 'report.delivered', seat: 'w-auth' }, bodies)).toBeUndefined()
     expect(feedOf({ at: ISO, type: 'goal.set', data: { goal: 'Release 0.3.0' } }, bodies)).toMatchObject({ from: '⌘', kind: 'goal', summary: 'goal: Release 0.3.0' })
     expect(feedOf({ at: ISO, type: 'attention', seat: 'w-auth', data: { reason: 'dialog', detail: 'trust this folder' } }, bodies)).toMatchObject({ from: 'w-auth', to: 'Human', kind: 'attention', summary: 'dialog: trust this folder' })
-    for (const reason of ['idle-without-report', 'stalled', 'budget', 'pending-delivery']) {
+    for (const reason of ['idle-without-report', 'stalled', 'budget', 'pending-delivery', 'guard-thrash']) {
       expect(feedOf({ at: ISO, type: 'attention', seat: 'w-auth', data: { reason, detail: 'x' } }, bodies)).toMatchObject({ from: 'w-auth', to: '⌘', kind: 'notice', summary: `${reason}: x` })
     }
     expect(feedOf({ at: ISO, type: 'seat.relaunch', seat: 'w-auth', data: { ok: true, resumed: true, pane: 'w1:p2' } }, bodies)).toMatchObject({ kind: 'relaunch', to: 'w-auth', summary: 'relaunched (resumed) in pane w1:p2' })

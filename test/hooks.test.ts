@@ -80,11 +80,11 @@ test('stop-failure: Claude\'s StopFailure hook is recorded with the API error, t
 
 test('renderHookOutput: exit 2 and stderr for both, JSON for Claude', () => {
   assert.deepEqual(hooks.renderHookOutput('claude', { allow: true }), { stdout: '', stderr: '', code: 0 })
-  const claude = hooks.renderHookOutput('claude', { allow: false, reason: 'no' })
+  const claude = hooks.renderHookOutput('claude', { allow: false, reason: 'no', rule: 'planner-edit' })
   assert.equal(claude.code, 2)
   assert.equal(claude.stderr, 'no')
   assert.deepEqual(JSON.parse(claude.stdout), { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: 'no' } })
-  assert.deepEqual(hooks.renderHookOutput('codex', { allow: false, reason: 'no' }), { stdout: '', stderr: 'no', code: 2 })
+  assert.deepEqual(hooks.renderHookOutput('codex', { allow: false, reason: 'no', rule: 'planner-edit' }), { stdout: '', stderr: 'no', code: 2 })
 })
 
 test('toRecord keeps only what the roster needs', () => {
@@ -100,7 +100,7 @@ test('pre-tool-use: the planner is denied a code edit and the deny is logged', a
   assert.equal(JSON.parse(result.stdout).hookSpecificOutput.permissionDecision, 'deny')
   assert.equal(written.length, 1)
   assert.equal(written[0]?.path, '/h/events.jsonl')
-  assert.equal(written[0]?.value.type, 'guard.deny')
+  assert.equal(written[0]?.value.type, 'guard.denied')
   assert.equal(written[0]?.value.seat, 'planner')
 })
 
@@ -211,7 +211,7 @@ test('with the real P1 modules: records land in hooks.jsonl and the roster feeds
   assert.equal(records[0].event, 'session-start')
   assert.equal(records[0].sessionId, 'thread-abc')
   assert.match(readFileSync(join(runDir(home, run), 'planner', 'hooks.jsonl'), 'utf8'), /planner-sess/)
-  assert.match(readFileSync(join(runDir(home, run), 'events.jsonl'), 'utf8'), /guard\.deny/)
+  assert.match(readFileSync(join(runDir(home, run), 'events.jsonl'), 'utf8'), /guard\.denied/)
 })
 
 // ---------- a Codex worker verifies the planner's control envelopes (DROVE-47) ----------

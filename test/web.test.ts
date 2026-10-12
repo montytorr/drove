@@ -572,7 +572,7 @@ test('runWeb prints the URL and stops cleanly when its signal aborts', async () 
 
 test('DROVE-108: only a person\'s attention is "needs you": the planner\'s items, and the notices they leave in the feed, are not', async () => {
   const deps = await makeHome()
-  const planners = ['idle-without-report', 'stalled', 'budget', 'pending-delivery'] as const
+  const planners = ['idle-without-report', 'stalled', 'budget', 'pending-delivery', 'guard-thrash'] as const
   const withItem = (name: string, reason: Seat['attention'][number]['reason']) => seat({ name, attention: [{ seat: name, reason, detail: 'd', at: '2026-10-09T10:40:00.000Z' }] })
   const seats = [...planners.map(reason => withItem(`w-${reason}`, reason)), withItem('w-dialog', 'dialog'), withItem('w-limit', 'usage-limit')]
   await writeJsonAtomic(join(runDir(deps.home, RUN.id), 'roster.json'), { ...ROSTER, seats: [...ROSTER.seats, ...seats] })
