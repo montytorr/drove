@@ -32,6 +32,7 @@ const fakeCommands = () => {
     down: record('down'),
     raiseBudget: record('raiseBudget'),
     setGoal: record('setGoal'),
+    setOwns: record('setOwns', 2),
   } as unknown as ToolPorts['commands']
   return { commands, calls }
 }
@@ -120,6 +121,18 @@ test('set_goal passes the line and the optional Cairn ref for this run, and need
   assert.deepEqual(fake.calls, [
     { name: 'setGoal', args: [ref, { goal: 'Release 0.3.0', cairn: 'DROVE-102' }] },
     { name: 'setGoal', args: [ref, { goal: 'Software factory', cairn: undefined }] },
+  ])
+})
+
+test('set_owns passes add or set for the seat and refuses a malformed list', async () => {
+  const { fake, tool } = await plannerWith()
+  await tool('set_owns').call({ seat: 'w-ui', add: [' mod/types/index.d.ts ', ''] })
+  await tool('set_owns').call({ seat: 'w-ui', set: ['docs/**'] })
+  const bad = await tool('set_owns').call({ seat: 'w-ui', add: 'docs' })
+  assert.equal(bad.isError, true)
+  assert.deepEqual(fake.calls, [
+    { name: 'setOwns', args: [{ seat: 'w-ui', add: ['mod/types/index.d.ts'] }] },
+    { name: 'setOwns', args: [{ seat: 'w-ui', set: ['docs/**'] }] },
   ])
 })
 

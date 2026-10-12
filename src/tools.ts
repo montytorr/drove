@@ -6,11 +6,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'roster', 'capture', 'set_goal', 'run_report', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'roster', 'capture', 'set_goal', 'set_owns', 'run_report', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'checks' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'runReport'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'checks' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'setOwns' | 'runReport'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -308,6 +308,24 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       },
       ['goal'],
       async (args) => asResult(await cmd.setGoal(deps, await ref(), { goal: text(args, 'goal') as string, cairn: text(args, 'cairn', false) })),
+    ),
+    defineTool(
+      'set_owns',
+      'Change the files an open worker may edit, mid-run. Use add when a worker asks (a question report) for one more path, e.g. the mod mirror mod/types/index.d.ts when it changes src/types.ts; set replaces the whole list. The guard takes it at the worker\'s next edit, no restart, and the worker is told. A reviewer seat is read-only and refused; an empty list is refused; a worker spawned without owns has no limit to widen.',
+      {
+        seat: seatProp,
+        add: { type: 'array', items: { type: 'string' }, description: 'Globs, relative to the worker\'s worktree, to allow in addition to its owns.' },
+        set: { type: 'array', items: { type: 'string' }, description: 'Globs that replace its owns. Give add or set, not both.' },
+      },
+      ['seat'],
+      async (args) =>
+        asResult(
+          await cmd.setOwns(deps, identity, {
+            seat: seatName(args),
+            ...(args.add != null ? { add: names(args, 'add') } : {}),
+            ...(args.set != null ? { set: names(args, 'set') } : {}),
+          }),
+        ),
     ),
     defineTool(
       'run_report',

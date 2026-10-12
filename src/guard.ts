@@ -98,8 +98,20 @@ const HERDR_WRITES: Record<string, ReadonlySet<string>> = {
   server: new Set(['stop', 'restart']),
 }
 
-const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'checks', 'roster', 'attention', 'capture', 'close', 'down', 'doctor'])
+const PLANNER_DROVE = new Set(['goal', 'init', 'spawn', 'send', 'prompt', 'promote', 'merge', 'checks', 'roster', 'attention', 'capture', 'close', 'down', 'doctor', 'owns'])
 const WORKER_DROVE = new Set(['roster', 'capture', 'doctor'])
+
+// A worker's Bash may read Drove's run state (roster, events, its own brief) but not write it: the roster holds the seat's
+// owns, so a write there would let a worker widen its own (DROVE-119). Like the rest of this guard it reads arguments.
+// These heads only read it or carry the path as text (a commit message, a Cairn note); a redirect into it is denied for all.
+const STATE_READERS = new Set(['cat', 'head', 'tail', 'ls', 'grep', 'rg', 'wc', 'jq', 'stat', 'git', 'cairn', 'echo', 'printf'])
+// The path itself: a .drove component, a reference to $DROVE_HOME, or the resolved home. A bare DROVE_HOME in an
+// `env -u DROVE_HOME` or `DROVE_HOME=/x` prefix is not a path into the state.
+const mentionsDroveHome = (word: string): boolean => {
+  const home = process.env.DROVE_HOME
+  return /(?:^|[/=~])\.drove(?:\/|$)/.test(word) || /\$\{?DROVE_HOME\b/.test(word) || (home !== undefined && home.length > 1 && word.includes(home))
+}
+const STATE_TEXT = "Drove's run state is the planner's; ask the planner with the drove report tool"
 
 const WORKER_PUSH = 'workers never push; report done and let the planner and the human decide'
 
@@ -241,7 +253,7 @@ export const isPlannerScratchpad = (path: string, cwd: string): boolean => {
 const SCRATCHPAD_WRITERS = new Set(['rm', 'rmdir', 'mv', 'cp', 'mkdir', 'touch', 'tee'])
 
 const ownsText = (path: string, owns: readonly string[]): string =>
-  `${path}: this file is outside the paths your brief gives you (${owns.join(', ')}); ask the planner with the drove report tool`
+  `${path}: this file is outside the paths your brief gives you (${owns.join(', ')}); if you need it, send a question report asking the planner to add it to your owns with the set_owns tool, naming ${path}`
 
 // A path with a variable or a substitution cannot be resolved, so only literal paths are checked.
 const ownsReason = (path: string, scope: Scope): string | undefined => {
@@ -589,6 +601,7 @@ const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
     const reason = redirectReason(segment.stdoutFile, scope)
     if (reason) return reason
   }
+  if (scope.role === 'worker' && segment.stdoutFile !== undefined && mentionsDroveHome(segment.stdoutFile)) return STATE_TEXT
   if (scope.role === 'worker' && scope.owns && segment.stdoutFile !== undefined) {
     const reason = ownsReason(segment.stdoutFile, scope)
     if (reason) return reason
@@ -597,6 +610,7 @@ const segmentReason = (segment: Segment, scope: Scope): string | undefined => {
   const first = words[0]
   if (first === undefined) return undefined
   const head = baseName(first)
+  if (scope.role === 'worker' && !STATE_READERS.has(head) && words.some(mentionsDroveHome)) return STATE_TEXT
   if (scope.role === 'worker' && scope.owns) {
     const reason = writeTargets(head, words).map(target => ownsReason(target, scope)).find(Boolean)
     if (reason) return reason
