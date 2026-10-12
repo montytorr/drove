@@ -141,6 +141,27 @@ export const LAYOUT_SOURCE = `(() => {
   return layoutOf
 })()`
 
+// What the seat panel computes, apart from the DOM: the seat's thread (entries to or from it, newest first), the `kind · model · effort` line with a model
+// that is never blank, a short session id, and the pane text after a read, which keeps the last good text marked stale when a read fails.
+// Plain JS like LAYOUT_SOURCE, in String.raw so its regexes keep their backslashes: the page runs this text as it is, and a test evaluates it.
+export const PANEL_SOURCE = String.raw`(() => {
+  const THREAD_SIZE = 6
+  const threadOf = (feed, name, size) => feed.filter((entry) => entry.from === name || entry.to === name).slice(-(size || THREAD_SIZE)).reverse()
+  const specOf = (seat) => [seat.kind, seat.model || seat.modelLabel || 'default', seat.effort].filter(Boolean).join(' · ')
+  const shortId = (id) => (id && id.length > 12 ? id.slice(0, 8) + '…' : id || '')
+  const tailAfter = (prev, read, now) => {
+    if (read.ok) {
+      const text = read.text.replace(/\s+$/, '')
+      return { text: text.trim() ? text : '(the pane is empty)', readAt: now, stale: false, reason: '' }
+    }
+    if (read.status === 404) return { text: 'this seat is closed', readAt: 0, stale: false, reason: '' }
+    const reason = (read.text || '').trim() || 'could not read the pane'
+    if (prev.readAt) return { text: prev.text, readAt: prev.readAt, stale: true, reason }
+    return { text: reason, readAt: 0, stale: false, reason }
+  }
+  return { threadOf, specOf, shortId, tailAfter }
+})()`
+
 const PAGE = String.raw`<!doctype html>
 <html lang="en">
 <head>
@@ -188,11 +209,37 @@ const PAGE = String.raw`<!doctype html>
   .seat { cursor: pointer; border-radius: 3px; }
   .seat:hover, .seat:focus-visible { background: var(--hover); outline: none; }
   .seat.open { background: var(--hover); }
-  .detail { margin: 6px 0 8px; padding: 8px 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; }
-  .detail dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0 2ch; margin: 0 0 8px; }
+  .detail { --c: var(--tone-muted); margin: 6px 0 10px; padding: 10px 14px 12px; background: var(--panel); border: 1px solid var(--line); border-top: 2px solid var(--c); border-radius: 12px; }
+  .slot .detail { margin: 12px 0 0; box-shadow: 0 6px 18px var(--shadow); scroll-margin: 12px; }
+  .dhead { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 10px; }
+  .dhead .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--c); flex: none; }
+  .dhead .dname { font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+  .dhead .dref { color: var(--dim); }
+  .dhead .dstate { color: var(--c); font-size: 12px; }
+  .dhead .dbadge { padding: 0 8px; font-size: 10px; font-weight: 700; line-height: 17px; color: var(--bg); background: var(--tone-alert); border-radius: 999px; }
+  .dhead .x { margin-left: auto; width: 28px; height: 28px; padding: 0; font: inherit; font-size: 18px; line-height: 1; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 8px; cursor: pointer; }
+  .dhead .x:hover, .dhead .x:focus-visible { color: var(--text); border-color: var(--line); outline: none; }
+  .dspec { color: var(--muted); font-size: 12px; }
+  .dact { margin-top: 6px; overflow-wrap: anywhere; }
+  .downes { margin-top: 2px; color: var(--tone-warn); font-size: 12px; }
+  .detail dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 2ch; margin: 8px 0 0; font-size: 12px; }
   .detail dt { color: var(--muted); }
-  .detail dd { margin: 0; overflow-wrap: anywhere; }
-  .detail .cmd { color: var(--muted); overflow-wrap: anywhere; user-select: all; }
+  .detail dd { display: flex; align-items: baseline; gap: 1ch; min-width: 0; margin: 0; }
+  .detail dd .v { min-width: 0; overflow-wrap: anywhere; user-select: all; }
+  .copy { flex: none; font: inherit; font-size: 11px; padding: 0 8px; color: var(--muted); background: transparent; border: 1px solid var(--line); border-radius: 999px; cursor: pointer; }
+  .copy:hover, .copy:focus-visible { color: var(--text); border-color: var(--muted); outline: none; }
+  .detail .rule { margin-top: 12px; font-size: 12px; }
+  .detail .rule::before { flex: 0 0 1ch; }
+  .report { margin: 6px 0 4px; padding: 6px 10px; background: var(--bg); border-left: 2px solid var(--rc, var(--line)); border-radius: 0 6px 6px 0; }
+  .report .meta { color: var(--muted); font-size: 12px; }
+  .report .body { white-space: pre-wrap; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; overflow: hidden; }
+  .thread .note { padding: 2px 6px; font-size: 12px; }
+  .pane summary { cursor: pointer; list-style: none; }
+  .pane summary::-webkit-details-marker { display: none; }
+  .pane summary:focus-visible { outline: 1px solid var(--muted); border-radius: 4px; }
+  .pane .lbl::before { content: "▸ "; }
+  .pane[open] .lbl::before { content: "▾ "; }
+  .pane .stale { color: var(--tone-warn); }
   .detail pre { margin: 8px 0 0; padding: 8px; max-height: 292px; overflow: auto; line-height: 1.4; background: var(--bg); border: 1px solid var(--line); border-radius: 6px; white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; font-size: 12px; }
 
   .graph { position: relative; overflow: hidden; border: 1px solid var(--line); border-radius: 16px; background: radial-gradient(var(--grid) 1px, transparent 1.5px) 0 0 / 22px 22px, var(--bg); }
@@ -273,6 +320,8 @@ const PAGE = String.raw`<!doctype html>
   const FILTERS = [['needs', 'needs you', NEEDS_YOU], ['reports', 'reports', REPORTS], ['all', 'all', null]]
   const VIEWS = [['graph', 'Graph'], ['board', 'Board']]
   const VIEW_KEY = 'drove.board.view'
+  const PANE_KEY = 'drove.board.pane'
+  const panelKit = __PANEL__
   const TAIL_MS = 4000
   const FLIGHT_MS = 1300
   const FLIGHT_GAP_MS = 220
@@ -339,10 +388,28 @@ const PAGE = String.raw`<!doctype html>
     }
   }
 
+  const readPaneOpen = () => {
+    try {
+      return localStorage.getItem(PANE_KEY) !== 'closed'
+    } catch (error) {
+      return true
+    }
+  }
+
+  const savePaneOpen = (isOpen) => {
+    try {
+      localStorage.setItem(PANE_KEY, isOpen ? 'open' : 'closed')
+    } catch (error) {
+      // a browser that will not store it opens the pane next time
+    }
+  }
+
+  const FIRST_TAIL = { text: 'reading the pane…', readAt: 0, stale: false, reason: '' }
+
   let data
   let view = readView()
   let openSeat = ''
-  let tailText = 'reading the pane…'
+  let tail = FIRST_TAIL
   let tailTimer
   let tailBusy = false
   let filter = 'all'
@@ -354,21 +421,18 @@ const PAGE = String.raw`<!doctype html>
     if (!openSeat || tailBusy) return
     const name = openSeat
     tailBusy = true
+    let read
     try {
       const res = await fetch('/api/seat/' + encodeURIComponent(name) + '/tail' + q, { cache: 'no-store' })
-      const text = await res.text()
-      if (name !== openSeat) return
-      tailText = res.ok ? (text.trim() ? text : '(the pane is empty)') : res.status === 404 ? 'this seat is closed' : 'could not read the pane: ' + text.trim()
+      read = { ok: res.ok, status: res.status, text: await res.text() }
     } catch (error) {
-      if (name !== openSeat) return
-      tailText = 'could not read the pane'
+      read = { ok: false, status: 0, text: '' }
     } finally {
       tailBusy = false
     }
-    if (panel) {
-      panel.pre.textContent = tailText
-      settle(panel)
-    }
+    if (name !== openSeat) return
+    tail = panelKit.tailAfter(tail, read, Date.now())
+    if (panel) paintTail(panel)
   }
 
   // The pane text follows its newest lines unless the reader has scrolled up in it.
@@ -390,11 +454,21 @@ const PAGE = String.raw`<!doctype html>
     } else {
       closePanel()
       openSeat = name
-      tailText = 'reading the pane…'
+      tail = FIRST_TAIL
       tailTimer = setInterval(fetchTail, TAIL_MS)
       fetchTail()
     }
     if (data) render(data)
+    if (openSeat && panel && panel.root.isConnected) panel.root.scrollIntoView({ block: 'nearest', behavior: reduceMotion() ? 'auto' : 'smooth' })
+  }
+
+  // Close from the × or Esc; focus goes back to the seat's node when it was inside the panel.
+  const dismiss = () => {
+    const name = openSeat
+    const wasInside = !!panel && panel.root.contains(document.activeElement)
+    closePanel()
+    if (data) render(data)
+    if (wasInside && shell) shell.graph.focus(name)
   }
 
   const ageOf = (iso) => {
@@ -406,32 +480,153 @@ const PAGE = String.raw`<!doctype html>
     return Math.round(secs / 86400) + 'd'
   }
 
-  // One panel per open seat: its fields are rewritten on every update, its pane text is left alone, so a scrolled pane stays where it is.
-  const panelFor = (seat) => {
-    if (!panel || panel.name !== seat.name) {
-      const rootNode = el('div', 'detail')
-      const list = el('dl')
-      const pre = el('pre', '', tailText)
-      rootNode.append(list, pre)
-      const mine = { name: seat.name, root: rootNode, list, pre, stick: true, top: 0 }
-      pre.addEventListener('scroll', () => {
-        if (pre.clientHeight === 0) return
-        mine.top = pre.scrollTop
-        mine.stick = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24
-      })
-      panel = mine
+  const copyButton = (label, textOf) => {
+    const button = el('button', 'copy', 'copy')
+    button.type = 'button'
+    button.setAttribute('aria-label', 'copy the ' + label)
+    button.addEventListener('click', async () => {
+      let isCopied = false
+      try {
+        await navigator.clipboard.writeText(textOf())
+        isCopied = true
+      } catch (error) {
+        isCopied = false
+      }
+      button.textContent = isCopied ? 'copied' : 'select it'
+      setTimeout(() => {
+        button.textContent = 'copy'
+      }, 1400)
+    })
+    return button
+  }
+
+  // A dt/dd pair that hides itself while empty; a copied field copies its whole value, which may be longer than the text shown.
+  const fieldOf = (list, label, canCopy) => {
+    const dt = el('dt', '', label)
+    const dd = el('dd')
+    const value = el('span', 'v')
+    let whole = ''
+    dd.append(value)
+    if (canCopy) dd.append(copyButton(label, () => whole))
+    list.append(dt, dd)
+    return (text, full) => {
+      whole = full === undefined ? text : full
+      value.textContent = text
+      value.title = whole
+      dt.hidden = !text
+      dd.hidden = !text
     }
-    const fields = [
-      ['kind', seat.kind], ['model', seat.model], ['effort', seat.effort],
-      ['state', seat.state + ' for ' + ageOf(seat.stateAt)], ['branch', seat.branch], ['worktree', seat.worktree],
-      ['cairn', seat.cairn || '-'], ['session', seat.sessionId || '-'], ['waiting for the planner', seat.owes === 'none' ? '-' : seat.owes],
-    ]
-    const items = []
-    for (const [label, value] of fields) items.push(el('dt', '', label), el('dd', '', value))
-    items.push(el('dt', '', 'capture'), el('dd', 'cmd', 'drove capture ' + seat.name))
-    items.push(el('dt', '', 'cd'), el('dd', 'cmd', seat.worktree))
-    panel.list.replaceChildren(...items)
-    return panel.root
+  }
+
+  const buildPanel = (name) => {
+    const rootNode = el('section', 'detail')
+    rootNode.setAttribute('aria-label', name + ' details')
+    const head = el('div', 'dhead')
+    const ref = el('span', 'dref')
+    const state = el('span', 'dstate')
+    const badge = el('span', 'dbadge', 'needs you')
+    const close = el('button', 'x', '×')
+    close.type = 'button'
+    close.title = 'close (Esc)'
+    close.setAttribute('aria-label', 'close the ' + name + ' details')
+    close.addEventListener('click', dismiss)
+    head.append(el('span', 'dot'), el('span', 'dname', name), ref, state, badge, close)
+    const spec = el('div', 'dspec')
+    const act = el('div', 'dact')
+    const owes = el('div', 'downes')
+    const list = el('dl')
+    const setBranch = fieldOf(list, 'branch', false)
+    const setWorktree = fieldOf(list, 'worktree', true)
+    const setSession = fieldOf(list, 'session', true)
+    const threadRule = el('div', 'rule')
+    const threadNote = el('span', 'r', '')
+    threadRule.append(el('span', '', 'thread'), threadNote)
+    const report = el('div', 'report')
+    const thread = el('div', 'thread')
+    const pane = el('details', 'pane')
+    pane.open = readPaneOpen()
+    const summary = el('summary', 'rule')
+    const stale = el('span', 'stale')
+    stale.hidden = true
+    summary.append(el('span', 'lbl', 'pane'), stale)
+    const pre = el('pre', '', tail.text)
+    pane.append(summary, pre)
+    rootNode.append(head, spec, act, owes, list, threadRule, report, thread, pane)
+    const mine = { name, root: rootNode, ref, state, badge, spec, act, owes, setBranch, setWorktree, setSession, threadNote, report, thread, cache: new Map(), signature: '', stale, pre, stick: true, top: 0 }
+    pane.addEventListener('toggle', () => {
+      savePaneOpen(pane.open)
+      if (pane.open) settle(mine)
+    })
+    pre.addEventListener('scroll', () => {
+      if (pre.clientHeight === 0) return
+      mine.top = pre.scrollTop
+      mine.stick = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24
+    })
+    return mine
+  }
+
+  const paintTail = (target) => {
+    if (target.pre.textContent !== tail.text) target.pre.textContent = tail.text
+    target.stale.hidden = !tail.stale
+    target.stale.textContent = tail.stale ? 'stale · last read ' + clockText(tail.readAt, new Date(tail.readAt).getTimezoneOffset()) : ''
+    target.stale.title = tail.reason
+    settle(target)
+  }
+
+  const paintReport = (target, report) => {
+    target.report.hidden = !report
+    if (!report) return
+    const tone = toneColor(KIND_TONE[report.kind] || 'muted')
+    target.report.style.setProperty('--rc', tone)
+    const meta = el('div', 'meta', 'latest report · ')
+    const kind = el('span', '', report.kind)
+    kind.style.color = tone
+    const expects = report.expects && report.expects !== 'none' ? ' · expects ' + report.expects : ''
+    meta.append(kind, expects + ' · ' + clockText(report.at, new Date(report.at).getTimezoneOffset()))
+    const body = el('div', 'body', report.summary)
+    body.title = report.summary
+    target.report.replaceChildren(meta, body)
+  }
+
+  // The seat's own lines, built like the timeline's and kept by id, so one the reader expanded stays expanded.
+  const paintThread = (target, entries) => {
+    target.threadNote.textContent = entries.length ? 'last ' + entries.length + ' · newest first' : ''
+    const next = entries.map((entry) => entry.id).join(',')
+    if (next === target.signature) return
+    target.signature = next
+    const live = new Set(entries.map((entry) => entry.id))
+    for (const id of [...target.cache.keys()]) if (!live.has(id)) target.cache.delete(id)
+    const nodes = entries.map((entry) => {
+      if (!target.cache.has(entry.id)) target.cache.set(entry.id, entryOf(entry))
+      return target.cache.get(entry.id)
+    })
+    if (nodes.length === 0) nodes.push(el('div', 'note', 'No brief or report yet.'))
+    target.thread.replaceChildren(...nodes)
+  }
+
+  // One panel per open seat: its fields are rewritten on every update, its pane text only when a read brings new text, so a scrolled pane stays where it is.
+  // The graph view and the board view show the same panel.
+  const panelFor = (seat) => {
+    if (!panel || panel.name !== seat.name) panel = buildPanel(seat.name)
+    const mine = panel
+    mine.root.style.setProperty('--c', toneColor(seat.tone))
+    mine.ref.textContent = seat.cairn || ''
+    mine.ref.hidden = !seat.cairn
+    mine.state.textContent = seat.state + ' · ' + ageOf(seat.stateAt)
+    mine.badge.hidden = !seat.needsYou
+    mine.spec.textContent = panelKit.specOf(seat)
+    const owes = seat.owes && seat.owes !== 'none' ? seat.owes : ''
+    mine.owes.textContent = owes ? 'waiting for the planner: ' + owes : ''
+    mine.owes.hidden = !owes
+    mine.act.textContent = seat.activity || ''
+    mine.act.hidden = !seat.activity || !!owes
+    mine.setBranch(seat.branch || '')
+    mine.setWorktree(seat.worktree || '')
+    mine.setSession(panelKit.shortId(seat.sessionId), seat.sessionId || '')
+    paintReport(mine, seat.lastReport)
+    paintThread(mine, panelKit.threadOf((data && data.feed) || [], seat.name))
+    paintTail(mine)
+    return mine.root
   }
 
   // ---------- timeline ----------
@@ -760,6 +955,10 @@ const PAGE = String.raw`<!doctype html>
       root: wrap,
       update,
       place,
+      focus: (name) => {
+        const node = seatNodes.get(name)
+        if (node && !wrap.hidden) node.root.focus()
+      },
       send: (entries) => entries.slice(-MAX_FLIGHTS).forEach((entry, at) => fly(entry, at * FLIGHT_GAP_MS)),
     }
   }
@@ -844,6 +1043,7 @@ const PAGE = String.raw`<!doctype html>
   const render = (next) => {
     data = next
     if (!shell) buildShell()
+    const active = document.activeElement
     const { model, run } = data
     const seatList = data.seats || []
     const byName = new Map(seatList.map((seat) => [seat.name, seat]))
@@ -865,9 +1065,11 @@ const PAGE = String.raw`<!doctype html>
     const feed = data.feed || []
     shell.graph.update({ seats: seatList, lead: data.lead })
     if (view === 'board') renderBoard(byName)
-    shell.slot.replaceChildren(...(view === 'graph' && openSeat && byName.has(openSeat) ? [panelFor(byName.get(openSeat))] : []))
+    const slotted = view === 'graph' && openSeat && byName.has(openSeat) ? panelFor(byName.get(openSeat)) : undefined
+    if (shell.slot.firstChild !== slotted || shell.slot.childNodes.length > 1) shell.slot.replaceChildren(...(slotted ? [slotted] : []))
     shell.timeline.update(feed)
     settle(panel)
+    if (panel && active && active !== document.activeElement && panel.root.contains(active)) active.focus({ preventScroll: true })
     const fresh = feed.filter((entry) => !seen.has(entry.id))
     for (const entry of feed) seen.add(entry.id)
     if (!isFirst && view === 'graph' && !document.hidden) shell.graph.send(fresh)
@@ -882,10 +1084,7 @@ const PAGE = String.raw`<!doctype html>
   }
 
   document.addEventListener('keydown', (event) => {
-    if (event.key === 'Escape' && openSeat) {
-      closePanel()
-      if (data) render(data)
-    }
+    if (event.key === 'Escape' && openSeat) dismiss()
   })
 
   let source
@@ -926,3 +1125,4 @@ export const pageOf = (): string =>
     .replace('__HUMAN__', () => JSON.stringify(HUMAN))
     .replace('__CLOCK__', () => CLOCK_SOURCE)
     .replace('__LAYOUT__', () => LAYOUT_SOURCE)
+    .replace('__PANEL__', () => PANEL_SOURCE)
