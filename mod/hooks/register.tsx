@@ -699,7 +699,13 @@ const mergeWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   const name = String(input.name ?? '').trim()
   if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
   const message = typeof input.message === 'string' && input.message.trim() ? input.message.trim() : undefined
-  return answerOf(await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, fresh: input.fresh === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS }))
+  const ran = await plannerRun($, drove.mergeArgs({ name, pr: input.pr === true, squash: input.squash === true, fresh: input.fresh === true, ...(message ? { message } : {}) }), { timeoutMs: MERGE_TIMEOUT_MS })
+  // drove merge --pr answers pending well before this cap (PR_BUDGET_MS); a call still cut off is the planner's pending too,
+  // not an outage: the branch, the PR and the recorded checks are kept, and a PR already merged is settled by the next call.
+  if (input.pr === true && drove.isCutOff(ran)) {
+    return { result: `pending: drove merge ${name} --pr was still running after ${MERGE_TIMEOUT_MS / 1000}s and was stopped, so GitHub or the checks are slow. Nothing is lost: call merge_worker with pr: true again later.` }
+  }
+  return answerOf(ran)
 }
 
 const runChecksTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
