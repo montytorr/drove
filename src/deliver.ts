@@ -1,6 +1,6 @@
 import { rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
-import { agentPromptArgv, getAgent, retryWhileBusy } from './herdr.ts'
+import { agentPromptArgv, agentSendKeysArgv, getAgent, readPane, readScreen, retryWhileBusy, run as runHerdr } from './herdr.ts'
 import { formatControl, renderReports } from './protocol.ts'
 import { PLANNER_SEAT, plannerDir, runDir, seatDir } from './paths.ts'
 import { findSeat, loadRoster, updateRoster } from './roster.ts'
@@ -24,7 +24,9 @@ const plannerIdleSince = new Map<string, number>()
 
 export const codexQueueArgv = (thread: string, text: string): string[] => ['codex', 'queue', '--thread', thread, '--message', text]
 
-export type UnconfirmedDelivery = { ok: true; via: Transport; unconfirmed: true }
+// `submitted`: herdr typed the text and stalled, and Drove pressed Enter itself (DROVE-124).
+export type UnconfirmedDelivery = { ok: true; via: Transport; unconfirmed: true; submitted?: true }
+export type SubmittedDelivery = { ok: true; via: Transport; submitted: true }
 
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 
@@ -57,10 +59,45 @@ const waitForIdle = async (deps: Deps, target: string): Promise<'idle' | 'workin
   }
 }
 
+const INPUT_LINES = 20
+const INPUT_NEEDLE_CHARS = 160
+const PROMPT_LINE = /^[\s│|]*[❯›>]\s?(.*)$/u
+const PASTE_PLACEHOLDER = /^\[Pasted (?:text|content)\b/i
+
+const squash = (text: string): string => text.replace(/\s+/g, ' ').trim()
+
+// The input line is the last prompt line on the screen; the ones above it are the transcript echoing turns already taken.
+// It holds the text herdr typed when it shows a paste placeholder, or starts with the start of that text.
+export const unsubmittedInput = (screen: string, text: string): boolean => {
+  const line = screen.split('\n').slice(-INPUT_LINES).findLast(candidate => PROMPT_LINE.test(candidate))
+  const input = squash((PROMPT_LINE.exec(line ?? '')?.[1] ?? '').replace(/[│|]\s*$/, ''))
+  if (!input) return false
+  const needle = squash(text.split('\n')[0] ?? '').slice(0, INPUT_NEEDLE_CHARS)
+  return PASTE_PLACEHOLDER.test(input) || (needle.length >= 8 && input.startsWith(needle))
+}
+
+const STALLED_REASON = 'agent_prompt_stalled: herdr typed the text but saw no activity; it may still have landed, so check the pane before sending it again'
+
+// herdr's `agent prompt` pastes the text and presses Enter; a long paste can swallow that Enter and leave `[Pasted text #1 +70 lines]`
+// in the input of an idle agent. That is the one stall Drove can repair: press Enter once, then wait for the agent to show activity.
+const submitStalled = async (deps: Deps, seat: Seat, target: string, text: string): Promise<Delivery | UnconfirmedDelivery | SubmittedDelivery | undefined> => {
+  const byAgent = await readScreen(deps.exec, target, INPUT_LINES)
+  const screen = byAgent.ok || !seat.paneId ? byAgent : await readPane(deps.exec, seat.paneId, INPUT_LINES)
+  if (!screen.ok || !unsubmittedInput(screen.value, text)) return undefined
+  const pressed = await runHerdr(deps.exec, agentSendKeysArgv(target, ['Enter']), 10_000)
+  if (!pressed.ok) return { ok: false, queued: false, reason: `${STALLED_REASON}; the text sits unsubmitted in ${seat.name}'s input and herdr would not press Enter (${pressed.code})` }
+  for (let waited = 0; ; waited += confirmTiming.pollMs) {
+    const live = await getAgent(deps.exec, target)
+    if (live.ok && (live.value.status === 'working' || live.value.status === 'blocked')) return { ok: true, via: 'herdr-prompt', submitted: true }
+    if (waited >= confirmTiming.waitMs) return { ok: true, via: 'herdr-prompt', unconfirmed: true, submitted: true }
+    await sleep(confirmTiming.pollMs)
+  }
+}
+
 export const herdrPromptAdapter = (deps: Deps): DeliveryAdapter => ({
   transport: 'herdr-prompt',
   canDeliver: seat => Boolean(seat.paneId),
-  deliver: async (seat, text): Promise<Delivery | UnconfirmedDelivery> => {
+  deliver: async (seat, text): Promise<Delivery | UnconfirmedDelivery | SubmittedDelivery> => {
     const target = targetOf(seat)
     let ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
     if (ran.ok) return { ok: true, via: 'herdr-prompt' }
@@ -69,7 +106,11 @@ export const herdrPromptAdapter = (deps: Deps): DeliveryAdapter => ({
     if (ran.code === 'agent_prompt_stalled') {
       const live = await getAgent(deps.exec, target)
       if (live.ok && (live.value.status === 'working' || live.value.status === 'blocked')) return { ok: true, via: 'herdr-prompt' }
-      return { ok: false, queued: false, reason: 'agent_prompt_stalled: herdr typed the text but saw no activity; it may still have landed, so check the pane before sending it again' }
+      if (live.ok && (live.value.status === 'idle' || live.value.status === 'done')) {
+        const submitted = await submitStalled(deps, seat, target, text)
+        if (submitted) return submitted
+      }
+      return { ok: false, queued: false, reason: STALLED_REASON }
     }
     // herdr can refuse a prompt while the agent is mid-turn, sometimes with no message at all (`exit_1:`).
     // Ask what the agent is doing instead of passing the bare exit code on.
@@ -187,14 +228,16 @@ const attempt = async (deps: Deps, run: string, seat: Seat, control: Control): P
   if (!adapter) return { ok: false, queued: false, reason: `no transport can reach ${seat.name} yet (no pane or thread)` }
   const typedAt = deps.clock.now().getTime()
   const typed = await adapter.deliver(seat, formatControl(control, token))
-  const delivery: Delivery | UnconfirmedDelivery = typed.ok && 'unconfirmed' in typed && typed.unconfirmed && (await confirmedByHook(deps, run, seat, typedAt)) ? { ok: true, via: typed.via } : typed
+  const isSubmitted = typed.ok && 'submitted' in typed && Boolean(typed.submitted)
+  const isHookConfirmed = typed.ok && 'unconfirmed' in typed && typed.unconfirmed && (await confirmedByHook(deps, run, seat, typedAt))
+  const delivery: Delivery | UnconfirmedDelivery | SubmittedDelivery = typed.ok && isHookConfirmed ? { ok: true, via: typed.via, ...(isSubmitted ? { submitted: true as const } : {}) } : typed
   if (delivery.ok) {
     const sentAt = deps.clock.now().toISOString()
     await appendJsonl(sentFile(deps, run, seat.name), { id: control.id, via: delivery.via, at: sentAt } satisfies Sent)
     const isReply = isReplyToOpenAsk(seat, control)
     if (control.expects !== 'none' || isReply || clearsOwed(control)) await updateRoster(deps.home, run, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? settleSent(entry, seat, control, isReply, sentAt) : entry)) }))
     const isUnconfirmed = 'unconfirmed' in delivery && delivery.unconfirmed
-    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}) } })
+    await recordEvent(deps, run, { type: 'control.sent', seat: seat.name, id: control.id, data: { kind: control.kind, via: delivery.via, ...(control.verdict ? { verdict: control.verdict } : {}), ...(isUnconfirmed ? { unconfirmed: true } : {}), ...(isSubmitted ? { submitted: true } : {}) } })
     attempts.delete(control.id)
   }
   return delivery
