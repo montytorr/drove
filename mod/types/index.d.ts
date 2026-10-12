@@ -13,6 +13,10 @@ export type ControlKind = 'brief' | 'message' | 'answer' | 'verdict' | 'promote'
 
 export type SeatState = 'starting' | 'working' | 'idle' | 'done' | 'blocked' | 'needs-input' | 'unknown' | 'gone' | 'closing' | 'closed' | 'down'
 
+export type SpawnPolicyKey = 'kind' | 'model' | 'effort' | 'mcp' | 'plugins' | 'skills' | 'agents' | 'userMemory' | 'userHooks' | 'owns' | 'maxTurns' | 'maxTokens' | 'maxMinutes' | 'maxCost' | 'role' | 'bound'
+export type SpawnPolicyRule = { fixed?: unknown; choice?: unknown[]; required?: true; max?: number }
+export type SpawnPolicy = Partial<Record<SpawnPolicyKey, SpawnPolicyRule>>
+
 export type PlannerMeta = {
   kind: AgentKind
   paneId?: string
