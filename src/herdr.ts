@@ -51,6 +51,9 @@ export const agentPromptArgv = (target: string, text: string, timeoutMs = DEFAUL
 
 export const agentTypeArgv = (target: string, text: string): string[] => ['herdr', 'agent', 'prompt', target, text]
 
+// DROVE-124: presses keys in an agent's input. Drove uses it for one key only, Enter, to submit text herdr typed but did not submit.
+export const agentSendKeysArgv = (target: string, keys: readonly string[]): string[] => ['herdr', 'agent', 'send-keys', target, ...keys]
+
 export const agentReadArgv = (target: string, lines: number, source: ReadSource = 'recent-unwrapped'): string[] => [
   'herdr', 'agent', 'read', target, '--source', source, '--lines', String(lines),
 ]
