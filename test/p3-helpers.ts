@@ -34,7 +34,7 @@ const UNSAFE_AGENT_ARG = /[\u0000-\u001f\u007f]/
 
 export type FakeAgent = { name: string; paneId: string; tabId: string; status: HerdrStatus; sessionId?: string; kind?: string }
 
-export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean | string; paneReadFails?: string; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number; startLeavesAgent?: boolean; promptTimesOut?: boolean }
+export type FakeHerdrOptions = { git?: boolean; agentReadFails?: boolean | string; paneReadFails?: string; startFails?: string; screen?: string; startSession?: string; startStatus?: HerdrStatus; busyStarts?: number; startLeavesAgent?: boolean; promptTimesOut?: boolean; promptStalls?: 'pasted' | 'empty' }
 
 export class FakeHerdr {
   calls: string[][] = []
@@ -49,6 +49,11 @@ export class FakeHerdr {
   busyStarts = 0
   startLeavesAgent = false
   promptTimesOut = false
+  // herdr typed the text and answered agent_prompt_stalled: the input holds a paste placeholder ('pasted') or nothing ('empty'), and the agent stays as it was.
+  promptStalls: 'pasted' | 'empty' | undefined
+  keys: { target: string; keys: string[] }[] = []
+  sendKeysFails = ''
+  enterSubmits = true
   queueFails = false
   onStart: ((name: string) => Promise<void>) | undefined
   agentReadFails: boolean | string = false
@@ -66,6 +71,7 @@ export class FakeHerdr {
     this.busyStarts = options.busyStarts ?? 0
     this.startLeavesAgent = options.startLeavesAgent ?? false
     this.promptTimesOut = options.promptTimesOut ?? false
+    this.promptStalls = options.promptStalls
     this.agentReadFails = options.agentReadFails ?? false
     this.paneReadFails = options.paneReadFails ?? ''
   }
@@ -174,12 +180,24 @@ export class FakeHerdr {
     }
     if (action === 'read') return this.agentReadFails ? herdrFail(typeof this.agentReadFails === 'string' ? this.agentReadFails : 'agent_not_found') : this.json({ result: { text: this.screen } })
     if (action === 'start') return this.start(argv)
+    if (action === 'send-keys') {
+      const agent = this.lookup(target)
+      if (!agent) return herdrFail('agent_not_found')
+      if (this.sendKeysFails) return herdrFail(this.sendKeysFails)
+      this.keys.push({ target, keys: argv.slice(4) })
+      if (this.enterSubmits) agent.status = 'working'
+      return this.json({ result: {} })
+    }
     if (action === 'prompt') {
       const agent = this.lookup(target)
       if (!agent) return herdrFail('agent_not_found')
       if (agent.status === 'blocked') return herdrFail('agent_blocked')
       const text = argv[4] ?? ''
       this.prompts.push({ target, text })
+      if (this.promptStalls && text !== '/exit' && text !== '/quit') {
+        this.screen = this.promptStalls === 'pasted' ? '● Ready\n\n──────\n❯ [Pasted text #1 +70 lines]\n──────\n  ? for shortcuts' : '● Ready\n\n──────\n❯ \n──────\n  ? for shortcuts'
+        return herdrFail('agent_prompt_stalled', 'herdr typed the text but saw no activity')
+      }
       if (text === '/exit' || text === '/quit') this.agents.delete(agent.name)
       else agent.status = 'working'
       return this.promptTimesOut && text !== '/exit' && text !== '/quit' ? herdrFail('timeout') : this.json({ result: {} })
