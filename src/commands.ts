@@ -182,7 +182,6 @@ const isBadOwnsGlob = (glob: string): boolean => glob.startsWith('/') || glob.st
 const resolveModel = (kind: AgentKind, value: string | undefined, config: DroveConfig): string => {
   const requested = value?.trim()
   if (!requested) return config.workerModel[kind]
-  if (kind === 'codex') return requested
   const alias = requested.toLowerCase()
   if (alias === 'opus') return config.promotedModel[kind]
   if (alias === 'sonnet') return config.workerModel[kind]
@@ -1331,7 +1330,7 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
   const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
   const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
   if (!seat || ['closed', 'gone', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
-  const policy = await workerPolicy(deps, run, config, seat.kind, request, { model: !request.model?.trim() && seat.kind === 'codex' ? seat.model : resolveModel(seat.kind, undefined, config), effort: config.workerEffort }, ['model', 'effort'])
+  const policy = await workerPolicy(deps, run, config, seat.kind, request, { model: !request.model?.trim() && seat.kind === 'codex' ? seat.model : resolveModel(seat.kind, undefined, config), effort: seat.effort }, ['model', 'effort'])
   if ('error' in policy) return policy.error
   request = policy.request
   const model = !request.model?.trim() && seat.kind === 'codex' ? seat.model : resolveModel(seat.kind, request.model, config)

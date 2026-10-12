@@ -19,11 +19,12 @@ Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence
 - Steering (DROVE-127): a tool ledger per seat, read from the agent's own transcript. R1 (the same shell command failing 3 times in a row) sends the worker one message; R2 (a done report with no check after the last edit) adds a line to the planner's view of the report. Config key `steering`; each nudge is a `steer.nudged` event.
 - New `drove diagnose [<run>] [--json]` (DROVE-131): deterministic detectors (`scope-too-narrow`, `checks-failed-at-done`, `review-loop`, `no-acceptance`, `merge-conflict`, `ci-only-failure`, `brief-not-delivered`, `budget-hit`, `usage-limit`, `guard-thrash`, `steering`) name why a run needed rework and where the fix belongs: brief, role text, config, repo, planning or Drove.
 
-### Seat limits and policy (DROVE-120)
+### Seat limits and policy (DROVE-120, DROVE-128)
 - New `maxMinutes` and `maxCost` per seat (`--max-minutes`, `--max-cost`; the spawn tool and the mod's `spawn_worker`): wall clock since spawn and transcript cost. At the bound the board shows a `budget` attention and the worker is sent one notice; Drove does not kill it.
 - A `review-loop` attention after `reviewLoopLimit` (default 3) `changes` verdicts to one seat.
 - New `runMaxCost` config key: one `run-budget` attention when the run's cost passes it.
 - New `spawnPolicy` in `~/.drove/config.json` and the repo's committed `.drove.json` (DROVE-128): `fixed`, `choice`, `required` and `max` rules limit the settings the planner may give a worker. When both files set a rule, the narrower one wins. Both planners show the merged policy and any policy errors before spawning.
+- Once a policy names `mcp`, `plugins`, `skills` or `agents`, those seat lists replace the run-wide worker trims instead of adding to them.
 - The CLI enforces the policy on spawn, promote and demote (`model` and `effort`), migrate (`kind`), `drove owns` and seats relaunched by `drove up`, including the defaults each seat would use. Refusals have code `policy`; local and `--pr` merges that change `spawnPolicy` have code `policy-change` and require a human merge. `drove doctor` checks unknown keys, wrong types, empty choices, fixed values outside choices and maximums on non-number settings.
 
 ### Guard (DROVE-119, DROVE-121)

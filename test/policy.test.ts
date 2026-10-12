@@ -3,7 +3,7 @@ import { existsSync } from 'node:fs'
 import { writeFile, readFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { applyPolicy, mergePolicies, validatePolicy, loadPolicy, policyText } from '../src/policy.ts'
+import { applyPolicy, mergePolicies, validatePolicy, loadPolicy, policyText, policyChange } from '../src/policy.ts'
 import { DEFAULT_CONFIG, spawn, promote, migrate, setOwns, up, timing, readSpawnPolicy, nodeExec } from '../src/commands.ts'
 import { plannerRole } from '../src/prompts.ts'
 import { runDoctor, type DoctorDeps } from '../src/doctor.ts'
@@ -43,6 +43,17 @@ test('both config sources retain intersections, fixed, smaller max and required'
   await writeFile(join(home, 'config.json'), JSON.stringify({ spawnPolicy: user }))
   await writeFile(join(repoPath, '.drove.json'), JSON.stringify({ spawnPolicy: repo }))
   assert.deepEqual(await loadPolicy(home, repoPath), { policy: expected, errors: [] })
+})
+
+test('committed autoChecks without spawnPolicy imposes no policy and is safe to merge', async () => {
+  const home = await makeRepo(); const repo = await makeRepo()
+  await writeFile(join(repo, '.drove.json'), JSON.stringify({ autoChecks: ['npm run typecheck'] }))
+  await git(repo, 'add', '.drove.json'); await git(repo, 'commit', '-qm', 'fast automatic checks')
+  const base = await git(repo, 'rev-parse', 'HEAD')
+  assert.deepEqual(await loadPolicy(home, repo, { exec: nodeExec, base }), { policy: {}, errors: [] })
+  await writeFile(join(repo, '.drove.json'), JSON.stringify({ autoChecks: ['npm run typecheck', 'npm test'] }))
+  await git(repo, 'add', '.drove.json'); await git(repo, 'commit', '-qm', 'update automatic checks')
+  assert.equal(await policyChange(nodeExec, repo, base, 'HEAD'), undefined)
 })
 
 test('malformed policies identify unknown keys, types, inconsistent fixed and nonnumeric max', () => {
@@ -224,11 +235,26 @@ test('planner policy errors keep Codex model names literal even when an alias ma
 })
 
 
-test('Codex model strings that resemble Claude aliases are used literally', async () => {
+test('Codex policy comparison stays literal while launch aliases still resolve', async () => {
   const { deps, identity } = await setup({ model: { choice: ['sonnet'] } })
   const spawned = await spawn(deps, identity, { seat: 'w-codex-literal', kind: 'codex', model: 'sonnet', brief: 'Test' })
   assert.equal(spawned.ok, true, spawned.text)
-  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.model, 'sonnet')
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.model, DEFAULT_CONFIG.workerModel.codex)
+  const denied = await spawn(deps, identity, { seat: 'w-codex-full', kind: 'codex', model: DEFAULT_CONFIG.workerModel.codex, brief: 'Test' })
+  assert.equal(denied.ok, false); assert.equal(!denied.ok && denied.code, 'policy')
+})
+
+test('owns policies allow reviewer spawn and relaunch without owned globs', async () => {
+  const { deps, repo, identity } = await setup({ owns: { choice: ['src/**'] } })
+  assert.equal((await spawn(deps, identity, { seat: 'w-target', kind: 'claude', brief: 'Test', owns: ['src/**'] })).ok, true)
+  const spawned = await spawn(deps, identity, { seat: 'w-review', kind: 'claude', brief: 'Review', role: 'reviewer', target: 'w-target' })
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.equal((await loadRoster(deps.home, RUN)).seats.find(seat => seat.name === 'w-review')?.owns, undefined)
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => seat.name === 'w-review' ? { ...seat, state: 'down' as const } : seat) }))
+  const relaunched = await up(deps, { run: RUN, repo }, 'w-review')
+  assert.equal(relaunched.ok, true, relaunched.text)
+  assert.equal((await loadRoster(deps.home, RUN)).seats.find(seat => seat.name === 'w-review')?.owns, undefined)
+  assert.deepEqual(applyPolicy({ role: { fixed: 'reviewer' }, owns: { fixed: ['src/**'], required: true } }, {}), { request: { role: 'reviewer' } })
 })
 
 

@@ -97,14 +97,15 @@ export type PolicyOptions = { defaults?: object; normalize?: Normalize }
 export const applyPolicy = <T extends object>(policy: SpawnPolicy, request: T, keys: readonly SpawnPolicyKey[] = POLICY_KEYS, options: PolicyOptions = {}): { request: T } | { error: CommandResult } => {
   const explicit = { ...request } as Record<string, unknown>
   if (typeof explicit.model === 'string' && !explicit.model.trim()) explicit.model = undefined
+  const reviewer = (policy.role?.fixed ?? explicit.role ?? (options.defaults as Record<string, unknown> | undefined)?.role) === 'reviewer'
   const result = Object.fromEntries(Object.entries(explicit).filter(([, value]) => value !== undefined)) as T & Record<string, unknown>
-  for (const [key, value] of Object.entries(options.defaults ?? {})) if (policy[key as SpawnPolicyKey] && explicit[key] === undefined) Object.assign(result, { [key]: value })
-  for (const key of arrays) if (policy[key] && result[key] === undefined) Object.assign(result, { [key]: [] })
+  for (const [key, value] of Object.entries(options.defaults ?? {})) if (policy[key as SpawnPolicyKey] && explicit[key] === undefined && !(reviewer && key === 'owns')) Object.assign(result, { [key]: value })
+  for (const key of arrays) if (policy[key] && result[key] === undefined && !(reviewer && key === 'owns')) Object.assign(result, { [key]: [] })
   const normalize = options.normalize ?? identity
   const refuse = (key: string, why: string) => ({ error: { ok: false, code: 'policy', text: `spawnPolicy.${key}: ${why}` } as CommandResult })
   for (const key of keys) {
     const rule = policy[key]
-    if (!rule || key === 'bound') continue
+    if (!rule || key === 'bound' || (reviewer && key === 'owns')) continue
     const given = explicit[key]
     if ('fixed' in rule) {
       if (given !== undefined && !same(normalize(key, given), normalize(key, rule.fixed))) return refuse(key, `fixed requires ${JSON.stringify(rule.fixed)}; got ${JSON.stringify(given)}`)

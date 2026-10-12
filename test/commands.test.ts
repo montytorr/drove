@@ -993,6 +993,19 @@ test('promote on a codex worker quits with /quit and resumes the thread', async 
   assert.ok(argv.includes('model_reasoning_effort="xhigh"'))
 })
 
+test('promote --model opus resolves to the configured promoted Codex model', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-alias', startStatus: 'idle' })
+  const { deps, identity } = await setup(fake)
+  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ promotedModel: { codex: 'gpt-promoted' } }))
+  assert.equal((await commands.spawn(deps, identity, { seat: 'w-cx-alias', kind: 'codex', brief })).ok, true)
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, state: 'idle' as const, lastReport: { id: 'r-alias', kind: 'done' as const, expects: 'none' as const, summary: 'ok', at: '2026-10-09T10:30:00.000Z' } })) }))
+  const promoted = await commands.promote(deps, identity, { seat: 'w-cx-alias', model: 'opus', effort: 'xhigh' })
+  assert.equal(promoted.ok, true, promoted.text)
+  assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.model, 'gpt-promoted')
+  const restart = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start')[1] ?? []
+  assert.match(restart.join(' '), /--model gpt-promoted/)
+})
+
 test('a codex promote marks the seat starting before the agent stops, so the restart window never reads gone', async () => {
   const fake = new FakeHerdr({ startSession: 'thread-xyz', startStatus: 'idle' })
   const { deps, identity } = await setup(fake)
