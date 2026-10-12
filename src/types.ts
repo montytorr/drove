@@ -45,6 +45,8 @@ export type DroveConfig = {
   workerUserMemory?: boolean
   workerUserHooks?: boolean
   maxTurns?: number
+  reviewLoopLimit?: number
+  runMaxCost?: number
   // One seat's denials of one rule that make the planner hear of it (defaults 3 in 10 minutes).
   guardThrash?: { count: number; minutes: number }
 }
@@ -84,7 +86,7 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery' | 'guard-thrash'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'review-loop' | 'run-budget' | 'pending-delivery' | 'guard-thrash'
   detail: string
   at: string
 }
@@ -116,7 +118,10 @@ export type Seat = {
   acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
   budgetNoticed?: boolean
+  reviewChanges?: number
   slot?: number
   worktree: string
   branch: string
@@ -387,6 +392,8 @@ export type SpawnRequest = {
   acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
 }
 
 export type SendRequest = {

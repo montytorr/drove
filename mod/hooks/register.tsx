@@ -337,6 +337,8 @@ const ORCHESTRATOR_TOOLS = [
         acceptance: { type: 'array', items: { type: 'string' }, description: 'optional: the acceptance criteria, one testable statement each, ideally Given-When-Then, taken from the Cairn task body. Drove numbers them AC1…ACn and writes them into the worker’s brief as ## Acceptance (a reviewer or tester of it sees them too, unless you give it its own); the worker answers each in its done report. An empty statement is refused' },
         maxTurns: { type: 'integer', minimum: 1, description: 'optional: how many turns the worker may take before it is told to report progress or promote and stop' },
         maxTokens: { type: 'integer', minimum: 1, description: 'optional: how many tokens the worker may use, same effect at the limit as maxTurns' },
+        maxMinutes: { type: 'number', exclusiveMinimum: 0, description: 'Optional: wall clock minutes since spawn before a budget attention and one notice to report progress or promote and stop; never kills the worker.' },
+        maxCost: { type: 'number', exclusiveMinimum: 0, description: 'Optional: USD budget from transcript usage and the run report price table. Unpriced models never trip it.' },
       },
       required: ['name', 'brief'],
     },
@@ -556,9 +558,11 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
   if (input.acceptance !== undefined && (!Array.isArray(input.acceptance) || input.acceptance.some(entry => typeof entry !== 'string' || !entry.trim()))) return { deny: '--acceptance takes non-empty statements, one per criterion' }
   const acceptance = input.acceptance as string[] | undefined
+  const maxMinutes = typeof input.maxMinutes === 'number' ? input.maxMinutes : undefined
+  const maxCost = typeof input.maxCost === 'number' ? input.maxCost : undefined
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
+  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(acceptance && acceptance.length > 0 ? { acceptance } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}), ...(maxMinutes !== undefined ? { maxMinutes } : {}), ...(maxCost !== undefined ? { maxCost } : {}) })
   const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
@@ -655,8 +659,16 @@ const migrateWorker = async ($: EngineInterface, input: Record<string, unknown>)
   return answerOf(ran)
 }
 
-const closeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> =>
-  answerOf(await plannerRun($, drove.closeArgs(String(input.name ?? '').trim(), input.remove_worktree === true)))
+const closeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  const isRemoving = input.remove_worktree === true
+  if (isRemoving) {
+    const [orchestrator, seats, cwd] = await Promise.all([read($, orchestratorAtom), read($, seatsAtom), $.session.cwd()])
+    const seat = findSeat(seats, name)
+    if (orchestrator && seat?.worktree && drove.isInsideDir(cwd, seat.worktree)) return { deny: drove.cwdInWorktreeReason(name, seat.worktree, cwd, orchestrator.repo) }
+  }
+  return answerOf(await plannerRun($, drove.closeArgs(name, isRemoving)))
+}
 
 const mergeWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
   const name = String(input.name ?? '').trim()
@@ -1505,12 +1517,14 @@ export const register: Register = (on, options) => {
     if (orchestrator) {
       if (drove.GUARDED_TOOLS.has(e.tool)) {
         const [cwd, sessionId, home] = await Promise.all([$.session.cwd(), $.session.id(), droveHome($)])
+        // The spawn runs in the repo: the session's cwd can be a removed worktree, and the guard reads the session's own from its stdin.
         const ran = await runDrove($, ['guard', 'pre-tool-use'], {
-          cwd,
+          cwd: orchestrator.repo,
           env: drove.plannerEnv(orchestrator.run, home),
           stdin: drove.guardStdin(e.tool, e as Record<string, unknown>, cwd, sessionId),
           timeoutMs: GUARD_TIMEOUT_MS,
         })
+        if (drove.isSpawnCwdGone(ran) && !(await $.fs.exists(cwd).catch(() => true))) return { deny: drove.missingCwdReason(cwd, orchestrator.repo) }
         const verdict = drove.guardVerdictOf(ran, entryOf($))
         if (!verdict.allow) return { deny: verdict.reason }
       }

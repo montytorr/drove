@@ -46,7 +46,7 @@ export type LastReport = {
 
 export type Attention = {
   seat: string
-  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'pending-delivery' | 'guard-thrash'
+  reason: 'dialog' | 'permission' | 'trust' | 'hook-trust' | 'channel-confirm' | 'codex-version-mismatch' | 'usage-limit' | 'stalled' | 'idle-without-report' | 'gone' | 'budget' | 'review-loop' | 'run-budget' | 'pending-delivery' | 'guard-thrash'
   detail: string
   at: string
 }
@@ -78,7 +78,10 @@ export type Seat = {
   acceptance?: string[]
   maxTurns?: number
   maxTokens?: number
+  maxMinutes?: number
+  maxCost?: number
   budgetNoticed?: boolean
+  reviewChanges?: number
   slot?: number
   worktree: string
   branch: string

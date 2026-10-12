@@ -476,7 +476,11 @@ Signals, by freshness:
 - a stalled prompt;
 - idle without a report;
 - a gone pane;
-- a budget request.
+- a budget request;
+- a seat with `reviewLoopLimit` changes verdicts (default 3): `review-loop`, cleared by approval, promotion, migration or closing;
+- a run above optional `runMaxCost`: one durable `run-budget` item for the human.
+
+Seat budgets add `maxMinutes` (wall time since `spawnedAt`, including time the seat was down) and `maxCost` (USD transcript cost from the report price table) beside `maxTurns` and `maxTokens`. Both are spawn CLI flags and planner tool fields, stored in the roster and preserved across promote, up and migrate. The existing watcher poll checks them and sends the same one-time budget notice; it never kills a seat. Unknown model prices do not trip a cost bound. The run-cost warning is recorded as an attention event, so watcher restarts cannot repeat it.
 
 **Dialog detection.** When `agent start` returns `agent_not_ready`, when a seat turns `blocked`, or when a seat is not `working` and no `session-start` or `user-prompt-submit` hook has fired yet (the Codex hook-review dialog shows as `idle`, not `blocked`), Drove reads `herdr agent read <seat> --source visible --lines 40` and matches a regex table. The visible screen is used because Codex draws on the alternate screen, which never reaches the scrollback sources:
 

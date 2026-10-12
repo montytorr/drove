@@ -312,6 +312,19 @@ const priced = (usage: Map<string, Usage>): { models: ModelUsage[]; cost?: numbe
   return { models, cost: known.length ? known.reduce((sum, item) => sum + (item.cost as number), 0) : undefined, unpriced: models.filter(item => item.cost === undefined).map(item => item.model) }
 }
 
+// The same transcript accounting and prices as the report, for the watcher's seat budget check.
+export const seatCost = async (deps: Deps, run: RunMeta, seat: Seat, claudeDir: string): Promise<number | undefined> => {
+  const hooks = await readHooks(join(runDir(deps.home, run.id), 'seats', seat.name, 'hooks.jsonl'))
+  const costs: number[] = []
+  for (const kind of new Set([seat.kind, ...hooks.map(hook => hook.agent)])) {
+    const own = hooks.filter(hook => hook.agent === kind)
+    const found = await seatTokens(deps, run, { ...seat, kind, sessionId: kind === seat.kind ? seat.sessionId : undefined }, own, [Date.parse(run.createdAt), deps.clock.now().getTime()], claudeDir)
+    const cost = priced(found.usage).cost
+    if (cost !== undefined) costs.push(cost)
+  }
+  return costs.length ? costs.reduce((sum, cost) => sum + cost, 0) : undefined
+}
+
 export const buildReport = async (deps: Deps, runId: string, claudeDir: string): Promise<RunReport | undefined> => {
   const run = await loadRun(deps.home, runId)
   if (!run) return undefined
