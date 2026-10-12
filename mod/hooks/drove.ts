@@ -25,8 +25,10 @@ export const attachArgs = (input: { sessionId: string; paneId?: string; goal?: s
 
 export const bridgeArgs = (run: string, sessionId: string): string[] => ['mod', 'bridge', '--run', run, '--session', sessionId]
 
-export const spawnArgs = (input: { name: string; kind: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; skills?: readonly string[]; agents?: readonly string[]; userMemory?: boolean; userHooks?: boolean; role?: SeatRole; target?: string; owns?: readonly string[]; acceptance?: readonly string[]; maxTurns?: number; maxTokens?: number; maxMinutes?: number; maxCost?: number }): string[] => [
-  'spawn', input.name, '--kind', input.kind, '--brief', '-', '--effort', input.effort,
+export const spawnArgs = (input: { name: string; kind?: AgentKind; effort: Effort; model?: string; cairn?: string; mcp?: readonly string[]; plugins?: readonly string[]; skills?: readonly string[]; agents?: readonly string[]; userMemory?: boolean; userHooks?: boolean; role?: SeatRole; target?: string; owns?: readonly string[]; acceptance?: readonly string[]; maxTurns?: number; maxTokens?: number; maxMinutes?: number; maxCost?: number }): string[] => [
+  'spawn', input.name,
+  ...(input.kind ? ['--kind', input.kind] : []),
+  '--brief', '-', '--effort', input.effort,
   ...(input.model ? ['--model', input.model] : []),
   ...(input.cairn ? ['--cairn', input.cairn] : []),
   ...(input.mcp ? ['--mcp', input.mcp.join(',')] : []),

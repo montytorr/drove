@@ -6,6 +6,7 @@ import { SPINNER, STATUS_TONE } from '../mod/hooks/board.ts'
 import type { BoardModel, BoardRow, Tone } from '../mod/hooks/board.ts'
 import { shortModel } from '../mod/hooks/protocol.ts'
 import { checkText, isAsking, isForHuman } from '../mod/hooks/roster.ts'
+import { modelLabelOf } from './agents.ts'
 import { boardSource, isAnimated, modelOf, POLL_MS } from './board.ts'
 import type { BoardData, FrameInput } from './board.ts'
 import { capture } from './commands.ts'
@@ -91,7 +92,7 @@ export const payloadOf = (data: BoardData, now: number, offsetMinutes: number): 
     const reportAt = lastReport === undefined ? NaN : Date.parse(lastReport.at)
     return {
       name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes,
-      modelLabel: shortModel(seatModel),
+      modelLabel: shortModel(modelLabelOf(kind, seatModel, data.run.agents)),
       activity: doingOf(rows.get(`w:${name}`)).text,
       tone: needsYou ? 'alert' : STATUS_TONE[state],
       needsYou,
@@ -101,7 +102,7 @@ export const payloadOf = (data: BoardData, now: number, offsetMinutes: number): 
   })
   const doing = doingOf(model.lead)
   const { kind, model: leadModel, effort } = data.run.planner
-  const lead: WebLead = { kind, model: leadModel, modelLabel: shortModel(leadModel), effort, activity: doing.text, tone: doing.tone, isBusy: doing.tone === 'text' }
+  const lead: WebLead = { kind, model: leadModel, modelLabel: shortModel(modelLabelOf(kind, leadModel, data.run.agents)), effort, activity: doing.text, tone: doing.tone, isBusy: doing.tone === 'text' }
   return { run: data.run.id, status: data.run.status, model, lead, seats, feed: webFeedOf(data.feed) }
 }
 

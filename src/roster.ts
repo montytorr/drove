@@ -2,8 +2,9 @@ import { readdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { checkText } from '../mod/hooks/roster.ts'
 import { runDir } from './paths.ts'
+import { modelLabelOf } from './agents.ts'
 import { ensureHome, readJson, withLock, writeJsonAtomic } from './store.ts'
-import type { Attention, Roster, RunMeta, Seat, SeatState } from './types.ts'
+import type { Attention, HostAgents, Roster, RunMeta, Seat, SeatState } from './types.ts'
 
 export const CLOSED_STATES: ReadonlySet<SeatState> = new Set(['closed', 'gone', 'down'])
 
@@ -68,7 +69,7 @@ export const isOverBudget = (roster: Roster, budget: number): boolean => openSea
 
 const minutesSince = (iso: string, now: Date): number => Math.max(0, Math.round((now.getTime() - Date.parse(iso)) / 60_000))
 
-export const rosterLines = (roster: Roster, now: Date): string[] => {
+export const rosterLines = (roster: Roster, now: Date, agents?: HostAgents): string[] => {
   const listed = roster.seats.filter(seat => seat.state !== 'closed')
   if (listed.length === 0) return ['No seats are open.']
   return listed.map(seat => {
@@ -80,7 +81,7 @@ export const rosterLines = (roster: Roster, now: Date): string[] => {
     const cairn = seat.cairn ? ` · ${seat.cairn}` : ''
     const checks = seat.checks ? ` · checks ${checkText(seat)}` : ''
     const role = seat.role && seat.role !== 'implementer' ? ` · ${seat.role} of ${seat.target ?? '?'}` : ''
-    return `- ${seat.name} [${seat.state}] ${seat.kind} ${shortModel(seat.model)} ${seat.effort}${cairn}${role} · pane ${seat.paneId ?? '?'} · up ${minutesSince(seat.spawnedAt, now)}m${checks}${report}${owes}${attention}`
+    return `- ${seat.name} [${seat.state}] ${seat.kind} ${shortModel(modelLabelOf(seat.kind, seat.model, agents))} ${seat.effort}${cairn}${role} · pane ${seat.paneId ?? '?'} · up ${minutesSince(seat.spawnedAt, now)}m${checks}${report}${owes}${attention}`
   })
 }
 

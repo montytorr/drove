@@ -1,4 +1,5 @@
 import { join } from 'node:path'
+import { detectRunAgents, modelLabelOf } from './agents.ts'
 import { EFFORTS, loadConfig } from './commands.ts'
 import { recordEvent } from './deliver.ts'
 import * as git from './git.ts'
@@ -65,6 +66,7 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
   const model = request.model ?? config.plannerModel.claude
   const effort = request.effort ?? config.plannerEffort
   const planner = { kind: 'claude' as const, paneId, sessionId: request.sessionId, model, effort, viaMod: true }
+  const agents = await detectRunAgents(deps)
 
   let existing: RunMeta | undefined
   if (request.run) {
@@ -78,7 +80,7 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
 
   let run: RunMeta
   if (existing) {
-    run = { ...existing, goal: request.goal ?? existing.goal, ...(request.budget ? { budget: request.budget } : {}), planner }
+    run = { ...existing, agents, goal: request.goal ?? existing.goal, ...(request.budget ? { budget: request.budget } : {}), planner }
   } else {
     const base = await git.baseRef(deps.exec, repo).catch(() => undefined)
     if (!base) return failed('no-base', `no main or master branch found in ${repo}`)
@@ -91,6 +93,7 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
       hasRemote: await git.hasRemote(deps.exec, repo),
       createdAt: now.toISOString(),
       status: 'up',
+      agents,
       ...(request.goal ? { goal: request.goal } : {}),
       budget: request.budget ?? config.budget,
       planner,
@@ -207,7 +210,8 @@ export const runBridge = async (deps: Deps, runId: string, options: BridgeOption
         lastRun = runText
         write({ t: 'run', run })
       }
-      const roster = await loadRoster(deps.home, runId)
+      const saved = await loadRoster(deps.home, runId)
+      const roster = { ...saved, seats: saved.seats.map(seat => ({ ...seat, model: modelLabelOf(seat.kind, seat.model, run.agents) })) }
       const status = await statusOf(deps, runId, roster)
       const rosterText = withoutStamp(roster)
       const statusText = JSON.stringify(status)
