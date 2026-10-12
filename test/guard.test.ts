@@ -293,6 +293,50 @@ test('drove subcommands are allowed or denied per role', () => {
   for (const sub of ['spawn w-x', 'send w-x hi', 'close w-x', 'down', 'board --once', 'merge w-x', 'attention']) assert.ok(worker(`drove ${sub}`), sub)
 })
 
+test('drove owns is the planner\'s: allowed there, denied to a worker even with the env cleared or set to planner (DROVE-119)', () => {
+  assert.equal(planner('drove owns w-x --add mod/types/index.d.ts'), undefined)
+  assert.equal(planner('drove owns w-x --set "src/**,test/**"'), undefined)
+  for (const command of [
+    'drove owns w-x --add src/a.ts',
+    'env -u DROVE_ROLE drove owns w-x --add src/a.ts',
+    'DROVE_ROLE=planner drove owns w-x --add src/a.ts',
+    'env DROVE_ROLE=planner drove owns w-x --set a',
+  ]) assert.ok(worker(command), command)
+})
+
+test('a worker may read Drove\'s run state through Bash but not write it (DROVE-119)', () => {
+  for (const command of [
+    'cat ~/.drove/runs/r1/roster.json',
+    'jq .seats "$HOME/.drove/runs/r1/roster.json"',
+    'grep owns /home/u/.drove/runs/r1/events.jsonl',
+    'tail -n 5 "$DROVE_HOME/runs/r1/events.jsonl" | wc -l',
+    'ls ~/.drove/runs',
+    'git commit -m "feat(checks): ledger in ~/.drove/runs/<id>/checks.jsonl"',
+    'cairn note DROVE-122 "ledger lives in ~/.drove/runs" --kind finding',
+    'echo "see ~/.drove"',
+    'env -u DROVE_HOME -u DROVE_RUN npm test',
+    'DROVE_HOME=/tmp/x node --test test/a.test.ts',
+  ]) assert.equal(worker(command), undefined, command)
+  for (const command of [
+    'echo "{}" > "$HOME/.drove/runs/r1/roster.json"',
+    'cat x > ~/.drove/runs/r1/roster.json',
+    `node -e "require('fs').writeFileSync(process.env.HOME + '/.drove/runs/r1/roster.json', '{}')"`,
+    `python3 -c "open('/home/u/.drove/runs/r1/roster.json','w').write('{}')"`,
+    "sed -i 's/src/**/' ~/.drove/runs/r1/roster.json",
+    'cp /tmp/r.json $DROVE_HOME/runs/r1/roster.json',
+    'sed -i s/a/b/ ${DROVE_HOME}/runs/r1/roster.json',
+    'echo x > ~/.drove/runs/r/roster.json',
+    'env -u X sed -i s/a/b/ ~/.drove/runs/r1/roster.json',
+  ]) assert.match(worker(command) ?? '', /run state is the planner's/, command)
+})
+
+test('a worker with owns is denied a write to Drove\'s run state too, and the planner is unaffected', () => {
+  const owned = (command: string) => guard.bashReason(command, 'worker', { writableRoots: [], openSeats: [], owns: ['src/**'] })
+  assert.match(owned('node -e "x" ~/.drove/runs/r1/roster.json') ?? '', /run state is the planner's/)
+  assert.equal(owned('cat ~/.drove/runs/r1/roster.json'), undefined)
+  assert.equal(planner('cat ~/.drove/runs/r1/roster.json'), undefined)
+})
+
 test('planner: a git merge of a seat branch is denied and points at drove merge, in any spelling', () => {
   for (const command of [
     'git merge worktree-w-gate',

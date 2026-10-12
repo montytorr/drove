@@ -26,7 +26,7 @@ test('owns: edit tools are allowed inside the globs and denied outside, with the
   for (const path of ['src/launch.ts', 'src/deep/guard.ts', 'test/helpers.ts', 'mod/hooks/deep/x.ts', 'package.json', 'LICENSE']) {
     const decision = owned('Edit', { file_path: join(worktree, path) })
     assert.equal(decision.allow, false, path)
-    assert.match(reasonOf(decision) ?? '', /^Drove worker: .*this file is outside the paths your brief gives you \(src\/guard\.ts, test\/\*\*\/\*\.test\.ts, .*\); ask the planner with the drove report tool\.$/)
+    assert.match(reasonOf(decision) ?? '', /^Drove worker: .*this file is outside the paths your brief gives you \(src\/guard\.ts, test\/\*\*\/\*\.test\.ts, .*\); if you need it, send a question report asking the planner to add it to your owns with the set_owns tool, naming \S+\.$/)
   }
   assert.equal(owned('MultiEdit', { file_path: join(worktree, 'src/launch.ts') }).allow, false)
   assert.equal(owned('NotebookEdit', { notebook_path: join(worktree, 'n.ipynb') }).allow, false)
