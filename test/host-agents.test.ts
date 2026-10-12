@@ -108,12 +108,19 @@ test('workerKind supplies an omitted kind; an explicit kind wins; auto and inval
   }
 })
 
-test('a forced workerKind is still subject to host availability', async () => {
-  const { deps, identity } = await setup({ at: agents.at, claude: agents.claude })
-  await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerKind: 'codex' }))
-  const result = await commands.spawn(deps, identity, { seat: 'w-auto', brief })
-  assert.equal(result.ok, false)
-  assert.match(result.text, /codex is not on this host/)
+test('a forced workerKind absence names its config source; an explicit kind keeps the original message', async () => {
+  for (const kind of ['codex', 'claude'] as const) {
+    const other = kind === 'codex' ? 'claude' : 'codex'
+    const { fake, deps, identity, run } = await setup({ at: agents.at, [other]: agents[other] })
+    await saveRun(deps.home, { ...run, planner: { ...run.planner, kind: other } })
+    await writeFile(join(deps.home, 'config.json'), JSON.stringify({ workerKind: kind }))
+    const result = await commands.spawn(deps, identity, { seat: 'w-auto', brief })
+    assert.deepEqual(result, { ok: false, code: 'agent-unavailable', text: `workerKind is ${kind} in ~/.drove/config.json, but ${kind} is not on this host (drove doctor)` })
+    const explicit = await commands.spawn(deps, identity, { seat: 'w-explicit', kind, brief })
+    assert.deepEqual(explicit, { ok: false, code: 'agent-unavailable', text: `${kind} is not on this host (drove doctor)` })
+    assert.deepEqual(fake.calls, [])
+    assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
+  }
 })
 
 test('workerKind auto chooses Codex on a Codex-only host', async () => {

@@ -15,7 +15,7 @@ beforeEach(() => {
   process.env.DROVE_BRIEF_VIA = 'launch-arg'
 })
 
-type Task = { title: string; status: string; description?: string }
+type Task = { title: string; status: string; description?: string; labels?: string[] }
 
 const NOISE = 'cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record\n'
 
@@ -124,6 +124,30 @@ test('plan --from-cairn makes the task the run goal, stores run.cairn and says s
   assert.match(prompt, /Check refs at spawn\./)
   assert.match(prompt, /DROVE-70 is the run's goal task and you hold it/)
   assert.match(planned.text, /on Cairn task DROVE-70/)
+})
+
+test('plan --from-cairn carries kind labels and says when that kind is absent', async () => {
+  for (const kind of ['codex', 'claude'] as const) {
+    for (const available of [true, false]) {
+      const fake = new FakeHerdr()
+      stubCairn(fake, { 'DROVE-70': { title: 'Labelled task', status: 'todo', labels: ['frontend', `kind:${kind}`] } })
+      const base = fake.exec
+      fake.exec = async (argv, options) => argv[0] === kind && argv[1] === '--version'
+        ? { code: available ? 0 : 127, stdout: available ? '1.2.3' : '', stderr: '' }
+        : base(argv, options)
+      const repo = await makeRepo()
+      const deps = await makeDeps(fake)
+      process.env.HERDR_PANE_ID = 'w1:p5'
+      const planned = await commands.plan(deps, { repo, kind: kind === 'codex' ? 'claude' : 'codex', cairn: 'DROVE-70' })
+      assert.equal(planned.ok, true, planned.text)
+      const prompt = (planned.ok ? (planned.data as commands.ProcessPlan).argv.at(-1) : '') ?? ''
+      if (available) assert.ok(prompt.includes(`This task is labelled kind:${kind}: spawn its workers as ${kind}.`), prompt)
+      else {
+        assert.ok(prompt.includes(`This task is labelled kind:${kind}, but ${kind} is not detected on this host (drove doctor)`), prompt)
+        assert.ok(!prompt.includes(`spawn its workers as ${kind}.`), prompt)
+      }
+    }
+  }
 })
 
 test('plan --from-cairn refuses a closed or missing task, a goal beside it, and a task cairn cannot be asked about', async () => {

@@ -258,8 +258,16 @@ export const labSubjectPrompt = (subject: LabSubject, instance: string): string 
   ].join('\n\n')
 }
 
-export const cairnGoalPrompt = (ref: string, title: string, body: string): string =>
-  `This run's goal is Cairn task ${ref}: ${title}${body.trim() ? `\n\n${body.trim()}` : ''}\n\n${ref} is the run's goal task and you hold it: claim it first (\`cairn claim ${ref}\`), and run \`cairn check\` on its subject before planning. When the run is taken down, Drove writes a summary note on it.`
+export const cairnGoalPrompt = (ref: string, title: string, body: string, labels: readonly string[] = [], agents?: HostAgents): string => {
+  const kinds = labels.filter((label): label is `kind:${AgentKind}` => label === 'kind:codex' || label === 'kind:claude')
+  const kindNote = kinds.map(label => {
+    const kind = label.slice(5) as AgentKind
+    return agents?.[kind]
+      ? `This task is labelled ${label}: spawn its workers as ${kind}.`
+      : `This task is labelled ${label}, but ${kind} ${agents ? 'is not detected on this host' : 'could not be detected on this host'} (drove doctor); use an available kind.`
+  }).join('\n')
+  return `This run's goal is Cairn task ${ref}: ${title}${body.trim() ? `\n\n${body.trim()}` : ''}\n\n${kindNote ? `${kindNote}\n\n` : ''}${ref} is the run's goal task and you hold it: claim it first (\`cairn claim ${ref}\`), and run \`cairn check\` on its subject before planning. When the run is taken down, Drove writes a summary note on it.`
+}
 
 // The seat's acceptance criteria, numbered AC1…ACn, as `## Acceptance` in its brief (DROVE-123). `of` is the seat whose criteria a reviewer or tester inherits.
 export const acceptanceSection = (items: readonly string[], of?: { seat: string; role: SeatRole }): string =>
