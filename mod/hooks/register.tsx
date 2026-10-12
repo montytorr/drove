@@ -434,6 +434,19 @@ const ORCHESTRATOR_TOOLS = [
     },
   },
   {
+    name: 'set_owns',
+    description: 'Orchestrator mode: change the files an open worker may edit, mid-run. add allows more globs (use it when a worker asks for one more path, e.g. the mirror mod/types/index.d.ts when it changes src/types.ts); set replaces the whole list. Drove’s guard takes it at the worker’s next edit and the worker is told. A reviewer is read-only and refused, an empty list is refused, and a worker spawned without owns has no limit to widen.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'the worker’s seat name' },
+        add: { type: 'array', items: { type: 'string' }, description: 'globs, relative to the worktree, to allow in addition to its owns' },
+        set: { type: 'array', items: { type: 'string' }, description: 'globs that replace its owns; give add or set, not both' },
+      },
+      required: ['name'],
+    },
+  },
+  {
     name: 'roster',
     description: 'Orchestrator mode: list the workers, their state, model, effort, last report and what you owe them.',
     inputSchema: { type: 'object', properties: {} },
@@ -482,6 +495,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
   mcp__orchestrator__merge_worker: input => `merging ${String(input.name ?? '')}`,
   mcp__orchestrator__set_goal: () => 'setting the goal',
+  mcp__orchestrator__set_owns: input => `changing what ${String(input.name ?? '')} may edit`,
   mcp__orchestrator__roster: () => 'checking the roster',
   Bash: input => `running ${oneLine(String(input.command ?? ''), 60)}`,
   Read: input => `reading ${String(input.file_path ?? '').split('/').pop() ?? ''}`,
@@ -646,6 +660,22 @@ const setGoalTool = async ($: EngineInterface, input: Record<string, unknown>): 
     await persist($)
   }
   return answerOf(ran)
+}
+
+const globsOf = (value: unknown): string[] | undefined =>
+  Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === 'string').map(entry => entry.trim()).filter(Boolean) : undefined
+
+const setOwnsTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const name = String(input.name ?? '').trim()
+  if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
+  const add = globsOf(input.add)
+  const set = globsOf(input.set)
+  if ((add === undefined) === (set === undefined)) return { deny: 'Give add or set (a list of globs), one of them.' }
+  const globs = add ?? set ?? []
+  if (globs.length === 0) return { deny: 'The list is empty: an empty owns would lift the limit, so it is refused.' }
+  const orchestrator = await read($, orchestratorAtom)
+  if (!orchestrator) return { deny: OFF }
+  return answerOf(await plannerRun($, drove.ownsArgs(orchestrator.run, name, add ? 'add' : 'set', globs)))
 }
 
 const rosterTool = async ($: EngineInterface): Promise<ToolAnswer> => {
@@ -1437,6 +1467,7 @@ export const register: Register = (on, options) => {
     (await read($, orchestratorAtom)) ? mergeWorker($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__set_goal' as never }, async ($, e): Promise<ToolAnswer> => setGoalTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__set_owns' as never }, async ($, e): Promise<ToolAnswer> => setOwnsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__read_reports' as never }, async ($, e): Promise<ToolAnswer> => readReportsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({
     deny: toolFailure(next.error),

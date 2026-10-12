@@ -23,6 +23,7 @@ export type HookDeps = {
   append: (path: string, value: unknown) => Promise<void>
   openIds: (identity: Identity) => Promise<string[]>
   seatToken: (identity: Identity) => Promise<string | undefined>
+  seatOwns: (identity: Identity) => Promise<string[] | undefined>
   adoptGoal: (identity: Identity, goal: string) => Promise<void>
 }
 
@@ -38,6 +39,11 @@ export const defaultHookDeps: HookDeps = {
     return roster.openSeats(await roster.loadRoster(identity.home, identity.run)).flatMap(seat => [seat.name, agentName(identity.run, seat.name), ...(seat.paneId ? [seat.paneId] : []), ...(seat.sessionId ? [seat.sessionId] : [])])
   },
   seatToken: async identity => (await import('./store.ts')).readToken(join(seatDir(identity.home, identity.run, identity.seat), 'token')),
+  // The roster holds the seat's current owns: the planner may widen them after the launch env was written (DROVE-119).
+  seatOwns: async identity => {
+    const roster = await import('./roster.ts')
+    return roster.findSeat(await roster.loadRoster(identity.home, identity.run), identity.seat)?.owns
+  },
   adoptGoal: async (identity, goal) => {
     const roster = await import('./roster.ts')
     const run = await roster.loadRun(identity.home, identity.run)
@@ -116,6 +122,7 @@ const mentionsSessions = (input: HookInput): boolean => /herdr|codex/.test(JSON.
 const guardInput = async (identity: Identity, input: HookInput, deps: HookDeps): Promise<GuardInput> => {
   const isPlanner = identity.role === 'planner'
   const home = process.env.HOME ?? homedir()
+  const owns = isPlanner ? undefined : (await deps.seatOwns(identity).catch(() => undefined)) ?? identity.owns
   return {
     agent: input.agent,
     role: identity.role,
@@ -124,7 +131,7 @@ const guardInput = async (identity: Identity, input: HookInput, deps: HookDeps):
     cwd: input.cwd ?? process.cwd(),
     writableRoots: isPlanner ? ['/tmp', '/private/tmp', join(home, '.claude', 'plans'), deps.scratchRoot(identity)] : [],
     openSeats: isPlanner && mentionsSessions(input) ? await deps.openIds(identity) : [],
-    ...(!isPlanner && identity.owns ? { owns: identity.owns } : {}),
+    ...(owns ? { owns } : {}),
     ...(!isPlanner && identity.seatRole ? { seatRole: identity.seatRole } : {}),
   }
 }

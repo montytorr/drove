@@ -139,6 +139,8 @@ const ownsOf = (value: readonly string[] | undefined): string[] | undefined => {
   return globs.length > 0 ? globs : undefined
 }
 
+const isBadOwnsGlob = (glob: string): boolean => glob.startsWith('/') || glob.startsWith('~') || glob.split('/').includes('..')
+
 const resolveModel = (kind: AgentKind, value: string | undefined, config: DroveConfig): string => {
   const requested = value?.trim()
   if (!requested) return config.workerModel[kind]
@@ -885,7 +887,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (request.target && (!SEAT_RE.test(request.target) || request.target === PLANNER_SEAT || request.target === request.seat)) return failed('usage', `--target must name another seat of this run; got "${request.target}"`)
   if (role === 'reviewer' && ownsOf(request.owns)) return failed('usage', 'a reviewer is read-only, so --owns does not apply to it')
   const owns = ownsOf(request.owns) ?? (role === 'tester' ? [...TESTER_OWNS] : undefined)
-  const badOwns = owns?.find(glob => glob.startsWith('/') || glob.startsWith('~') || glob.split('/').includes('..'))
+  const badOwns = owns?.find(isBadOwnsGlob)
   if (badOwns !== undefined) return failed('usage', `--owns takes globs relative to the worktree, without .. or a leading / or ~; got "${badOwns}"`)
   const badBudget = [['--max-turns', request.maxTurns], ['--max-tokens', request.maxTokens]].find(([, value]) => value !== undefined && !isWhole(value))
   if (badBudget) return failed('usage', `${badBudget[0]} must be a whole number of at least 1`)
@@ -1158,6 +1160,40 @@ export const prompt = async (deps: Deps, identity: Identity, seatName: string, t
   if (!deliverable.ok) return failed('blocked', `not typed: ${deliverable.reason}`)
   const delivery = await herdrPromptAdapter(deps).deliver(seat, text)
   return delivery.ok ? ok(`Typed into ${seat.name}.`) : failed('delivery', delivery.reason)
+}
+
+// ---------- owns ----------
+
+export type OwnsRequest = { seat: string; add?: string[]; set?: string[] }
+
+// The planner widens (--add) or replaces (--set) an open seat's owns. The guard reads the seat's owns from the roster on every
+// call, so the change holds at the worker's next edit; the roster keeps it for `up`, promote and migrate (DROVE-119).
+export const setOwns = async (deps: Deps, identity: Identity, request: OwnsRequest): Promise<CommandResult> => {
+  const denied = requirePlanner(identity)
+  if (denied) return denied
+  const located = await locateFor(deps, identity)
+  if ('error' in located) return located.error
+  const { run } = located
+  const seat = findSeat(await loadRoster(deps.home, run.id), request.seat)
+  if (!seat || ['closed', 'gone', 'down'].includes(seat.state)) return failed('no-seat', `no open seat named ${request.seat}`)
+  if (seat.role === 'reviewer') return failed('usage', `${seat.name} is a reviewer: it is read-only and has no owns to change`)
+  if ((request.add === undefined) === (request.set === undefined)) return failed('usage', 'give --add GLOB,GLOB or --set GLOB,GLOB, one of them')
+  const globs = ownsOf(request.add ?? request.set)
+  if (!globs) return failed('usage', `${request.add ? '--add' : '--set'} needs at least one glob; an empty owns would lift the limit, so it is refused`)
+  const bad = globs.find(isBadOwnsGlob)
+  if (bad !== undefined) return failed('usage', `owns globs are relative to the worktree, without .. or a leading / or ~; got "${bad}"`)
+  if (request.add && !seat.owns) return failed('usage', `${seat.name} has no owns, so it may already edit anywhere; use --set to limit it`)
+  const previous = seat.owns
+  const owns = request.add ? [...new Set([...(previous ?? []), ...globs])] : globs
+  await updateRoster(deps.home, run.id, roster => ({ ...roster, seats: roster.seats.map(entry => (entry.name === seat.name ? { ...entry, owns } : entry)) }))
+  await recordEvent(deps, run.id, { type: 'seat.owns', seat: seat.name, data: { owns, ...(previous ? { previous } : {}), mode: request.add ? 'add' : 'set' } })
+  const body = request.add
+    ? `You may now also edit ${globs.join(', ')}. Your owned paths are ${owns.join(', ')}.`
+    : `Your owned paths are now ${owns.join(', ')}; edits outside them are refused.`
+  const control: Control = { v: 1, id: newControlId(deps.clock.now()), run: run.id, from: 'planner', to: seat.name, kind: 'message', expects: 'none', body, at: deps.clock.now().toISOString() }
+  const delivery = await deliverControl(deps, run, control)
+  const told = delivery.ok ? `told it via ${delivery.via}` : delivery.queued ? `message queued: ${delivery.reason}` : `message not delivered (${delivery.reason}); tell it with the send tool`
+  return ok(`${seat.name} owns ${owns.join(', ')} now (${request.add ? 'added' : 'set'}); ${told}.`, { seat: seat.name, owns, ...(previous ? { previous } : {}) })
 }
 
 // ---------- promote ----------
