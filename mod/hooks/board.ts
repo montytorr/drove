@@ -228,7 +228,7 @@ export const buildBoard = (input: {
     const asked = asksAt[seat.name]
     const isPulsing = asking && asked !== undefined && now - asked < PULSE_MS
     const stripeTone: Tone = isPulsing ? (isPulseOn ? 'alert' : 'dim') : asking ? 'alert' : STATUS_TONE[seat.state]
-    const model = seat.kind === 'codex' ? `codex${seat.model ? ` ${seat.model}` : ''}` : (shortModel(seat.model).split(' ')[0] ?? '')
+    const model = seat.kind === 'codex' ? seat.model || 'codex' : (shortModel(seat.model).split(' ')[0] ?? '')
     return {
       key: `w:${seat.name}`,
       cells: [
