@@ -184,6 +184,24 @@ export const COMMANDS: Record<string, Spec> = {
       )
     },
   },
+  owns: {
+    usage: 'drove owns <seat> --add GLOB,GLOB | --set GLOB,GLOB [--run ID]',
+    why: "widen (--add) or replace (--set) an open worker's owned paths; the guard takes it at the worker's next edit, and the worker is told",
+    options: { add: { type: 'string' }, set: { type: 'string' }, run: { type: 'string' } },
+    run: async (values, positionals, io) => {
+      const identity = commands.identityOrPlanner()
+      const add = str(values, 'add')
+      const set = str(values, 'set')
+      return print(
+        await commands.setOwns(commands.defaultDeps(), identity.run ? identity : { ...identity, run: str(values, 'run') ?? '' }, {
+          seat: need(positionals[0], '<seat>'),
+          ...(add !== undefined ? { add: splitGlobs(add) } : {}),
+          ...(set !== undefined ? { set: splitGlobs(set) } : {}),
+        }),
+        io,
+      )
+    },
+  },
   prompt: {
     usage: 'drove prompt <seat> TEXT|-',
     why: 'raw herdr agent prompt into a seat this run owns (guarded)',

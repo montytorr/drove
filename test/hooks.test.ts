@@ -25,6 +25,7 @@ const fakeDeps = (overrides: Partial<hooks.HookDeps> = {}) => {
     append: async (path, value) => void written.push({ path, value: value as Record<string, unknown> }),
     openIds: async () => ['w-api', 'sess-1'],
     seatToken: async () => undefined,
+    seatOwns: async () => undefined,
     adoptGoal: async () => undefined,
     ...overrides,
   }
