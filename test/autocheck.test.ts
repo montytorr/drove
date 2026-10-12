@@ -1,3 +1,4 @@
+import { waitFor } from './timing-helpers.ts'
 import assert from 'node:assert/strict'
 import { mkdir, mkdtemp, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -71,12 +72,10 @@ const world = async (options: { drove?: Record<string, unknown>; home?: Record<s
   const wakeText = () => queued().map(argv => argv.at(-1) ?? '').join('\n---\n')
   // Ticks until `done` holds: the checks run in the background, so a tick returns before they finish.
   const until = async (done: () => boolean | Promise<boolean>, what: string) => {
-    for (let i = 0; i < 400; i++) {
+    await waitFor(async () => {
       await watcher.tick()
-      if (await done()) return
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
-    assert.fail(`never reached: ${what}`)
+      return done()
+    }, what)
   }
   const wake = async () => {
     ctx.clock.advance(BATCH_MS)
@@ -237,11 +236,10 @@ test('AC5: a slow check does not block the tick, and another seat\'s report wake
   })
   const w = await world({ seats: ['w-api', 'w-ui'], drove: { checks: ['slow'] }, script: { run: () => gate.then(() => ({})) } })
   await w.done('w-api')
-  const started = Date.now()
   await w.watcher.tick()
-  await new Promise(resolve => setTimeout(resolve, 20))
+  await waitFor(() => w.shells.length === 1, 'the slow check starts')
   await w.watcher.tick()
-  assert.ok(Date.now() - started < 2000, 'ticks return while the check is running')
+  // The gate is still closed: returning from the tick proves it does not await the check.
   assert.deepEqual(w.shells, ['slow'])
 
   await fileReport(w.ctx, 'w-ui', 'question', 'which schema?')
@@ -270,7 +268,7 @@ test('a seat has one check at a time and a run at most two', async () => {
   await w.done('w-c')
   await w.watcher.tick()
   await w.watcher.tick()
-  await new Promise(resolve => setTimeout(resolve, 30))
+  await waitFor(() => w.shells.length === 2, 'two checks start')
   await w.watcher.tick()
   assert.equal(w.shells.length, 2, 'two seats run, the third waits')
   assert.equal(w.most.running, 2)
@@ -309,11 +307,10 @@ test('a held report left by a watcher that died is checked by the next one, whic
   const at = w.ctx.clock.now()
   const report = stampReport({ kind: 'done', summary: 'w-api finished', expects: 'review' }, { id: newReportId('w-api', at.getTime()), run: w.run.id, seat: 'w-api', token: 'token-w-api', at: at.toISOString() })
   await appendJsonl(pendingFile(w.ctx.home, w.run.id), { t: 'hold', report })
-  for (let i = 0; i < 100 && w.queued().length === 0; i++) {
-    await w.watcher.tick()
-    await new Promise(resolve => setTimeout(resolve, 5))
-    w.ctx.clock.advance(BATCH_MS)
-  }
+  await w.until(async () => {
+    await w.wake()
+    return w.queued().length === 1
+  }, 'the replacement watcher releases the held report')
   assert.equal(w.queued().length, 1)
   assert.match(w.wakeText(), /w-api finished[\s\S]*Drove ran npm run typecheck, npm test at 0123456: passed \(clean\)/)
 })
@@ -369,14 +366,14 @@ test('H2: read_reports never lists a done that is held, or one Drove sent back; 
   const held = await w.done('w-api')
   await fileReport(w.ctx, 'w-ui', 'question', 'which schema?')
   await w.watcher.tick()
-  await new Promise(resolve => setTimeout(resolve, 20))
+  await waitFor(() => w.shells.includes('npm test'), 'the gated check starts')
   await w.watcher.tick()
   assert.equal(idsOf(await readReports(w)).includes(held.id), false, 'held: checks still running')
   assert.deepEqual((await readReports(w)).map(report => report.kind), ['question'])
   assert.deepEqual(await readReports(w, { seat: 'w-api', all: true }), [])
   slow.open()
   await w.until(async () => w.controls.length === 1, 'the failure goes back')
-  await new Promise(resolve => setTimeout(resolve, 30))
+  await w.until(async () => (await rosterOf(w.ctx)).seats[0]?.autoCheckAttempts === 1, 'the failure round finishes')
   assert.equal(idsOf(await readReports(w)).includes(held.id), false, 'sent back: the planner never sees it')
   assert.deepEqual(await readReports(w, { seat: 'w-api', all: true }), [])
 })
@@ -435,15 +432,14 @@ test('M3: two watchers on one run check a seat once, and the count is not raced'
   const second = createWatcher(w.deps, w.run, { ports: other.ports, loop: false })
   await w.done()
   await w.watcher.tick()
-  await new Promise(resolve => setTimeout(resolve, 20))
+  await waitFor(() => w.shells.length > 0, 'the check starts')
   await second.tick()
-  await new Promise(resolve => setTimeout(resolve, 20))
   assert.equal(w.shells.length, 1, 'the second watcher found the seat taken and left it')
   slow.open()
   await w.until(async () => (await w.events('autocheck.failed')).length >= 1, 'the failure is recorded')
   await w.until(async () => w.controls.length + other.controls.length >= 1, 'the verdict goes back')
   await second.tick()
-  await new Promise(resolve => setTimeout(resolve, 30))
+  await w.until(async () => (await rosterOf(w.ctx)).seats[0]?.autoCheckAttempts === 1, 'the failure round finishes')
   assert.equal((await w.events('autocheck.failed')).length, 1)
   assert.equal(w.controls.length + other.controls.length, 1, 'one verdict')
   assert.equal(w.shells.length, 1)
@@ -457,7 +453,7 @@ test('M4: a question after a held done waits behind it and is released after it,
   w.ctx.clock.advance(10)
   await fileReport(w.ctx, 'w-api', 'question', 'which schema?')
   await w.watcher.tick()
-  await new Promise(resolve => setTimeout(resolve, 20))
+  await waitFor(() => w.shells.length > 0, 'the check starts')
   await w.wake()
   await w.wake()
   assert.equal(w.queued().length, 0, 'the question does not overtake the held done')
@@ -479,7 +475,7 @@ test('M4: when the done is sent back the question that followed it still reaches
   w.ctx.clock.advance(10)
   await fileReport(w.ctx, 'w-api', 'question', 'which schema?')
   await w.watcher.tick()
-  await new Promise(resolve => setTimeout(resolve, 20))
+  await waitFor(() => w.shells.length > 0, 'the check starts')
   slow.open()
   await w.until(async () => {
     await w.wake()
@@ -510,12 +506,11 @@ test('L2: a failure after the verdict went out does not hand the report to the p
   })
   const watcher = createWatcher(w.deps, w.run, { ports, loop: false, onError: () => {} })
   await w.done()
-  for (let i = 0; i < 200 && !failedOnce; i++) {
+  await waitFor(async () => {
     await watcher.tick()
-    await new Promise(resolve => setTimeout(resolve, 5))
-  }
+    return (await w.events('attention')).some(event => event.data?.reason === 'autocheck-error')
+  }, 'the failed roster write raises attention')
   assert.equal(failedOnce, true)
-  await new Promise(resolve => setTimeout(resolve, 30))
   w.ctx.clock.advance(BATCH_MS)
   await watcher.tick()
   assert.equal(w.queued().length, 0, 'the planner is not woken with a report the worker already has changes for')
