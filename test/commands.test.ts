@@ -1964,3 +1964,23 @@ test('a recovered codex seat keeps its CODEX_HOME through the adopt and the rela
   assert.ok(placedEnv(fake).includes(`CODEX_HOME=${await realpath(recorded)}`), placedEnv(fake).join(' '))
   assert.equal((await loadRoster(deps.home, RUN)).seats[0]?.codexHome, recorded)
 })
+
+test('nodeExec escalates for a child ignoring SIGTERM after its leader closes (DROVE-140)', async () => {
+  const script = `
+    const { spawn } = require('node:child_process');
+    const child = spawn(process.execPath, ['-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)"], { stdio: 'ignore' });
+    console.log(process.pid, child.pid);
+    setInterval(() => {}, 1000);
+  `
+  const ran = await commands.nodeExec([process.execPath, '-e', script], { timeoutMs: 500 })
+  assert.equal(ran.code, 124)
+  assert.equal(ran.timedOut, true)
+  const pids = ran.stdout.trim().split(/\s+/).map(Number)
+  assert.equal(pids.length, 2)
+  const ps = await commands.nodeExec(['ps', '-eo', 'pid=,pgid=,stat='])
+  assert.equal(ps.code, 0)
+  for (const line of ps.stdout.trim().split('\n')) {
+    const [pid, pgid, state] = line.trim().split(/\s+/)
+    if (pids.includes(Number(pid)) || Number(pgid) === pids[0]) assert.match(state!, /^Z/, `process still alive: ${line}`)
+  }
+})

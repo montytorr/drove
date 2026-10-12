@@ -67,24 +67,42 @@ export const nodeExec: Exec = (argv, options = {}) =>
   new Promise<ExecResult>(resolve => {
     const [command, ...args] = argv
     if (!command) return resolve({ code: 127, stdout: '', stderr: 'empty argv' })
-    const child = spawnProcess(command, args, { cwd: options.cwd, env: { ...process.env, ...options.env }, stdio: ['pipe', 'pipe', 'pipe'] })
+    const timeoutMs = options.timeoutMs ?? 60_000
+    // Exec captures I/O; interactive agents are launched separately by herdr. Isolate the
+    // group so a timed-out shell cannot leave its children running (DROVE-140).
+    const grouped = process.platform !== 'win32'
+    const child = spawnProcess(command, args, { cwd: options.cwd, env: { ...process.env, ...options.env }, stdio: ['pipe', 'pipe', 'pipe'], detached: grouped })
     let stdout = ''
     let stderr = ''
     let isDone = false
+    let timedOut = false
     const finish = (result: ExecResult) => {
       if (isDone) return
       isDone = true
       clearTimeout(timer)
       resolve(result)
     }
+    const signalGroup = (signal: NodeJS.Signals) => {
+      if (!grouped) { child.kill(signal); return }
+      if (child.pid === undefined) return
+      try { process.kill(-child.pid, signal) } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+      }
+    }
     const timer = setTimeout(() => {
-      child.kill('SIGKILL')
-      finish({ code: 124, stdout, stderr: `${stderr}\ntimed out after ${options.timeoutMs}ms` })
-    }, options.timeoutMs ?? 60_000)
+      timedOut = true
+      signalGroup('SIGTERM')
+      // Keep this timer even if the leader closes: children can ignore SIGTERM or
+      // close their pipes while remaining alive. Return only after group cleanup.
+      setTimeout(() => {
+        signalGroup('SIGKILL')
+        finish({ code: 124, stdout, stderr: `${stderr}\ntimed out after ${timeoutMs}ms`, timedOut: true })
+      }, 3_000)
+    }, timeoutMs)
     child.stdout.on('data', chunk => (stdout += chunk))
     child.stderr.on('data', chunk => (stderr += chunk))
     child.on('error', error => finish({ code: 127, stdout, stderr: error.message }))
-    child.on('close', code => finish({ code: code ?? 1, stdout, stderr }))
+    child.on('close', code => { if (!timedOut) finish({ code: code ?? 1, stdout, stderr }) })
     child.stdin.on('error', () => undefined)
     child.stdin.end(options.input ?? '')
   })

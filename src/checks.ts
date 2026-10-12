@@ -30,6 +30,7 @@ export type CheckRecord = {
   sha: string
   clean: boolean
   exit: number
+  timedOut?: boolean
   durationMs: number
   at: string
   tail: string
@@ -108,6 +109,7 @@ export type CommandOutcome = {
   command: string
   status: 'passed' | 'failed' | 'skipped'
   exit?: number
+  timedOut?: boolean
   durationMs?: number
   tail?: string
 }
@@ -211,6 +213,7 @@ export const runChecks = async (deps: Deps, run: RunMeta, seat: Seat, options: C
     const durationMs = Date.now() - started
     ranMs += durationMs
     at = deps.clock.now().toISOString()
+    const timeout = ran.timedOut ? { timedOut: true } : {}
     const tail = tailOf(`${ran.stdout}\n${ran.stderr}`)
     // A check that edits files (lint --fix, snapshots, codegen) leaves the tree it vouched for: its record is not evidence.
     if (treeClean) {
@@ -221,8 +224,8 @@ export const runChecks = async (deps: Deps, run: RunMeta, seat: Seat, options: C
         notes.push(`"${command}" left the worktree changed (${after.slice(0, 5).join('; ')}), so this run is not evidence a merge reuses.`)
       }
     }
-    await appendJsonl(ledgerPath(deps.home, run.id), fitted({ seat: seat.name, command, cwd: seat.worktree, sha, clean: treeClean, exit: ran.code, durationMs, at, tail }))
-    const outcome: CommandOutcome = { command, status: ran.code === 0 ? 'passed' : 'failed', exit: ran.code, durationMs, tail }
+    await appendJsonl(ledgerPath(deps.home, run.id), fitted({ seat: seat.name, command, cwd: seat.worktree, sha, clean: treeClean, exit: ran.code, ...timeout, durationMs, at, tail }))
+    const outcome: CommandOutcome = { command, status: ran.code === 0 ? 'passed' : 'failed', exit: ran.code, ...timeout, durationMs, tail }
     commands.push(outcome)
     if (ran.code !== 0) failed = outcome
   }
@@ -262,7 +265,7 @@ export const renderOutcome = (outcome: CheckOutcome): string => {
   const lines = outcome.commands.map(entry => {
     if (entry.status === 'skipped') return `- skipped  ${entry.command} (not run: an earlier check failed)`
     const timing = entry.durationMs === undefined || outcome.reused ? '' : `, ${seconds(entry.durationMs)}`
-    const row = `- ${entry.status === 'passed' ? 'passed ' : 'FAILED '} ${entry.command} (exit ${entry.exit}${timing})`
+    const row = `- ${entry.status === 'passed' ? 'passed ' : 'FAILED '} ${entry.command} (exit ${entry.exit}${entry.timedOut ? ", timedOut: true" : ""}${timing})`
     return entry.status === 'failed' ? `${row}\n  last output:\n${(entry.tail || '(no output)').split('\n').map(line => `  | ${line}`).join('\n')}` : row
   })
   const note = outcome.clean ? '' : 'The tree is not clean, so this result is recorded but is not evidence a merge reuses: the worker must commit, or the check must stop changing files.'

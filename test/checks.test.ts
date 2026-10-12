@@ -3,7 +3,7 @@ import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdir, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
-import { checksOf, ledgerPath, readLedger, runChecks, tailOf, TAIL_BYTES } from '../src/checks.ts'
+import { checksOf, ledgerPath, readLedger, renderOutcome, runChecks, tailOf, TAIL_BYTES } from '../src/checks.ts'
 import * as commands from '../src/commands.ts'
 import { checkState, checkText } from '../mod/hooks/roster.ts'
 import { runDir } from '../src/paths.ts'
@@ -388,4 +388,32 @@ test('a garbage line in the middle of the ledger also means no reuse', async () 
   assert.ok(!('error' in result))
   assert.equal(result.reused, false)
   assert.equal(w.runs(), 2)
+})
+
+test('a timed-out check kills its shell and long-running grandchildren and records timeout (DROVE-140)', async () => {
+  const w = await world({ checks: () => [
+    "echo $$; sh -c 'sleep 300 & echo $!; sleep 300 & echo $!; wait' & echo $!; wait",
+  ] })
+  const exec = w.deps.exec
+  w.deps.exec = (argv, options) => exec(argv, argv[0] === 'sh' ? { ...options, timeoutMs: 500 } : options)
+  const outcome = await runChecks(w.deps, w.run, w.seat)
+  assert.ok(!('error' in outcome))
+  assert.equal(outcome.passed, false)
+  assert.equal(outcome.failed?.exit, 124)
+  assert.equal(outcome.failed?.timedOut, true)
+  assert.match(renderOutcome(outcome), /exit 124, timedOut: true/)
+  const [record] = await readLedger(w.deps.home, RUN)
+  assert.equal(record?.exit, 124)
+  assert.equal(record?.timedOut, true)
+  const pids = record!.tail.split('\n').filter(line => /^\d+$/.test(line)).map(Number)
+  assert.equal(pids.length, 4, record!.tail)
+  const ps = await commands.nodeExec(['ps', '-eo', 'pid=,pgid=,stat='])
+  assert.equal(ps.code, 0)
+  for (const line of ps.stdout.trim().split('\n')) {
+    const [pid, pgid, state] = line.trim().split(/\s+/)
+    // A zombie has exited; only init can reap orphaned zombies on some test hosts.
+    if (pids.includes(Number(pid)) || Number(pgid) === pids[0]) {
+      assert.match(state!, /^Z/, `process still alive: ${line}`)
+    }
+  }
 })

@@ -313,7 +313,7 @@ export type GuardRule =
 
 export type GuardDecision = { allow: true } | { allow: false; reason: string; rule: GuardRule }
 
-export type ExecResult = { code: number; stdout: string; stderr: string }
+export type ExecResult = { code: number; stdout: string; stderr: string; timedOut?: boolean }
 export type ExecOptions = { timeoutMs?: number; input?: string; env?: Record<string, string>; cwd?: string }
 export type Exec = (argv: readonly string[], options?: ExecOptions) => Promise<ExecResult>
 
