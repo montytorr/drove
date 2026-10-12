@@ -194,6 +194,7 @@ export type DroveEventType =
   | 'seat.start_failed'
   | 'seat.relaunch'
   | 'seat.migrate'
+  | 'seat.owns'
   | 'seat.state'
   | 'seat.close'
   | 'report'

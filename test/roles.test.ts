@@ -459,6 +459,7 @@ const hookDeps = (): hooks.HookDeps => ({
   append: async () => undefined,
   openIds: async () => [],
   seatToken: async () => undefined,
+  seatOwns: async () => undefined,
   adoptGoal: async () => undefined,
 })
 
