@@ -40,7 +40,7 @@ Drove borrows from [Strands Agents](https://github.com/strands-agents): evidence
 ### Fixes (DROVE-116, DROVE-124, DROVE-125, DROVE-136)
 - The mod's guard spawns in the repo and names a missing session cwd instead of failing obscurely; `close` refuses to remove the planner's own cwd (DROVE-116).
 - A brief left as `[Pasted text]` in an idle agent's input is submitted with one Enter (DROVE-124).
-- A long paste into a fresh Claude Code is unreliable, so a brief of more than `briefPointerLines` lines (new config key, default 40) goes as a short signed pointer to the seat's `brief.md`, which already holds the full text (DROVE-136). A brief whose paste never reached an idle agent's input is sent again once the same way, recorded as `pointer: true` on `control.sent`; any other control that stalled with an empty input is sent again once as it was. A migration's handoff is pointed at `handoff.md`, never `brief.md`. The worker role text says a brief may arrive as a pointer.
+- A brief longer than `briefPointerLines` (new config key, default 40) goes out as a signed pointer to the seat's `brief.md`, and a brief whose paste never reached the input is sent once more as that pointer (DROVE-136).
 - `merge --pr` reuses an open PR, trusts a MERGED PR only when its head is the branch tip, retries the read after merging, and treats `gh` outages and empty JSON as pending (DROVE-125).
 
 ## [0.4.0] - 2026-10-12
