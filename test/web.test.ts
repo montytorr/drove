@@ -11,7 +11,7 @@ import { runDir, seatDir } from '../src/paths.ts'
 import { saveRun } from '../src/roster.ts'
 import { appendJsonl, writeJsonAtomic } from '../src/store.ts'
 import type { Deps, DroveEvent, Roster, RunMeta, Seat } from '../src/types.ts'
-import { CLOCK_SOURCE, KIND_ICONS, KIND_TONES, LAYOUT_SOURCE, LEAD_NAMES, NEEDS_YOU_KINDS, pageOf, REPORT_KINDS } from '../src/web/page.ts'
+import { CLOCK_SOURCE, KIND_ICONS, KIND_TONES, LAYOUT_SOURCE, LEAD_NAMES, NEEDS_YOU_KINDS, pageOf, PANEL_SOURCE, REPORT_KINDS } from '../src/web/page.ts'
 import * as web from '../src/web.ts'
 import { assertExports } from './helpers.ts'
 
@@ -315,7 +315,6 @@ test('the page has the seat panel, the feed chips and a light theme, and only ev
   assert.match(page, /prefers-color-scheme: light/)
   assert.match(page, /\/api\/seat\//)
   assert.match(page, /clearInterval\(tailTimer\)/)
-  assert.match(page, /drove capture/)
   assert.match(page, /needs you/)
   assert.doesNotMatch(page, /innerHTML|insertAdjacentHTML|outerHTML|document\.write/)
   assert.doesNotMatch(page, /method:\s*['"](?!GET)/i)
@@ -585,4 +584,69 @@ test('DROVE-108: only a person\'s attention is "needs you": the planner\'s items
   assert.deepEqual(attention.map(entry => [entry.kind, entry.to]), [...planners.map(() => ['notice', '⌘']), ['attention', 'Human']])
   assert.ok(!NEEDS_YOU_KINDS.includes('notice'))
   assert.ok(KIND_TONES.notice && KIND_ICONS.notice)
+})
+
+type Tail = { text: string; readAt: number; stale: boolean; reason: string }
+type PanelKit = {
+  threadOf: (feed: web.WebFeedEntry[], name: string, size?: number) => web.WebFeedEntry[]
+  specOf: (seat: Partial<web.WebSeat>) => string
+  shortId: (id: string | undefined) => string
+  tailAfter: (prev: Tail, read: { ok: boolean; status: number; text: string }, now: number) => Tail
+}
+const panelKit = (0, eval)(PANEL_SOURCE) as PanelKit
+
+test('DROVE-115: each seat carries its latest report for the panel, its time in epoch ms; a seat with none has no field', async () => {
+  const payload = payloadOfRun(await boardSource(await makeHome(), RUN.id)())
+  const by = Object.fromEntries(payload.seats.map(item => [item.name, item]))
+  assert.deepEqual(by['w-core']?.lastReport, { kind: 'done', expects: 'review', summary: 'core finished, 48 tests green', at: Date.parse('2026-10-09T10:35:00.000Z') })
+  assert.ok(by['w-web'] && !('lastReport' in by['w-web']))
+})
+
+test('DROVE-115: the seat thread is the entries to or from that seat only, newest first, six at most', () => {
+  const entry = (id: string, from: string, to: string): web.WebFeedEntry => ({ id, at: Number(id.slice(1)), from, to, kind: 'message', summary: id })
+  const feed = [entry('e1', '⌘', 'w-a'), entry('e2', 'w-a', '⌘'), entry('e3', '⌘', 'w-ab'), entry('e4', 'w-b', '⌘'), entry('e5', 'w-a', 'Human')]
+  assert.deepEqual(panelKit.threadOf(feed, 'w-a').map(item => item.id), ['e5', 'e2', 'e1'])
+  assert.deepEqual(panelKit.threadOf(feed, 'w-zz'), [])
+  const long = Array.from({ length: 9 }, (_, at) => entry(`e${at + 1}`, '⌘', 'w-a'))
+  assert.deepEqual(panelKit.threadOf(long, 'w-a').map(item => item.id), ['e9', 'e8', 'e7', 'e6', 'e5', 'e4'])
+  assert.deepEqual(panelKit.threadOf(long, 'w-a', 2).map(item => item.id), ['e9', 'e8'])
+})
+
+test('DROVE-115: the panel spec line is kind · model · effort and its model is never blank', () => {
+  assert.equal(panelKit.specOf({ kind: 'claude', model: 'claude-sonnet-5-5', modelLabel: 'Sonnet 5.5', effort: 'medium' }), 'claude · claude-sonnet-5-5 · medium')
+  assert.equal(panelKit.specOf({ kind: 'codex', model: '', modelLabel: 'default', effort: 'high' }), 'codex · default · high')
+  assert.equal(panelKit.specOf({ kind: 'codex', model: '', modelLabel: '', effort: 'high' }), 'codex · default · high')
+  assert.equal(panelKit.shortId('3f2a9c1e-7b4d-4c1a-9e2f-0a1b2c3d4e5f'), '3f2a9c1e…')
+  assert.equal(panelKit.shortId('abc'), 'abc')
+  assert.equal(panelKit.shortId(undefined), '')
+})
+
+test('DROVE-115: a failed pane read keeps the last good text and marks it stale; before any good read it shows the reason', () => {
+  const first: Tail = { text: 'reading the pane…', readAt: 0, stale: false, reason: '' }
+  const good = panelKit.tailAfter(first, { ok: true, status: 200, text: 'compiling\n\n  \n' }, 1000)
+  assert.deepEqual(good, { text: 'compiling', readAt: 1000, stale: false, reason: '' })
+  const failed = panelKit.tailAfter(good, { ok: false, status: 502, text: 'could not read w-a: agent_not_idle\n' }, 5000)
+  assert.deepEqual(failed, { text: 'compiling', readAt: 1000, stale: true, reason: 'could not read w-a: agent_not_idle' })
+  assert.deepEqual(panelKit.tailAfter(failed, { ok: false, status: 0, text: '' }, 9000), { text: 'compiling', readAt: 1000, stale: true, reason: 'could not read the pane' })
+  assert.deepEqual(panelKit.tailAfter(failed, { ok: true, status: 200, text: 'next' }, 9000), { text: 'next', readAt: 9000, stale: false, reason: '' })
+  assert.deepEqual(panelKit.tailAfter(first, { ok: false, status: 502, text: 'pane_not_found' }, 1000), { text: 'pane_not_found', readAt: 0, stale: false, reason: 'pane_not_found' })
+  assert.equal(panelKit.tailAfter(good, { ok: true, status: 200, text: ' \n' }, 2000).text, '(the pane is empty)')
+  assert.equal(panelKit.tailAfter(good, { ok: false, status: 404, text: 'no such seat' }, 2000).text, 'this seat is closed')
+})
+
+test('DROVE-115: the page panel has a header with a close button, copyable fields, the thread and a pane fold it remembers', () => {
+  const page = pageOf()
+  assert.match(page, /const panelKit = \(\(\) => \{/)
+  assert.match(page, /el\('button', 'x', '×'\)/)
+  assert.match(page, /event\.key === 'Escape' && openSeat\) dismiss\(\)/)
+  assert.match(page, /navigator\.clipboard\.writeText/)
+  assert.match(page, /const owes = seat\.owes && seat\.owes !== 'none' \? seat\.owes : ''/)
+  assert.match(page, /'waiting for the planner: ' \+ owes/)
+  assert.match(page, /el\('details', 'pane'\)/)
+  assert.match(page, /const PANE_KEY = 'drove\.board\.pane'/)
+  assert.match(page, /try \{\n\s+return localStorage\.getItem\(PANE_KEY\)/)
+  assert.match(page, /try \{\n\s+localStorage\.setItem\(PANE_KEY/)
+  assert.match(page, /'stale · last read '/)
+  assert.doesNotMatch(page, /drove capture|\['cd'|'cd'\)/)
+  assert.doesNotMatch(page, /__PANEL__/)
 })

@@ -27,12 +27,16 @@ const TAIL_PATH = /^\/api\/seat\/([^/]+)\/tail$/
 
 // What the seat panel and the graph show, from the roster the board already loads. `activity` is the board row's one line of what the seat is doing
 // (the spinner glyph cut off), `tone` is the colour of its state (alert while it needs you), and `needsYou` is set when it asks, is blocked or has an attention item that is a person's (the planner's own items do not count).
+// `lastReport` is the seat's latest report, its time in epoch milliseconds like the feed's, for the top of the panel's thread.
 export type WebSeat = Pick<Seat, 'name' | 'kind' | 'model' | 'effort' | 'state' | 'stateAt' | 'branch' | 'worktree' | 'cairn' | 'sessionId' | 'owes'> & {
   modelLabel: string
   activity: string
   tone: Tone
   needsYou: boolean
+  lastReport?: WebReport
 }
+
+export type WebReport = { kind: string; expects: string; summary: string; at: number }
 
 export type WebLead = { kind: AgentKind; model: string; modelLabel: string; effort: Effort; activity: string; tone: Tone; isBusy: boolean }
 
@@ -81,14 +85,16 @@ export const payloadOf = (data: BoardData, now: number, offsetMinutes: number): 
   const model = modelOf({ ...input, frame })
   const rows = new Map(model.workers.map(row => [row.key, row]))
   const seats = openSeats(data.roster).map((seat): WebSeat => {
-    const { name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes } = seat
+    const { name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes, lastReport } = seat
     const needsYou = isAsking(seat, data.status[name]) || state === 'blocked' || seat.attention.some(isForHuman)
+    const reportAt = lastReport === undefined ? NaN : Date.parse(lastReport.at)
     return {
       name, kind, model: seatModel, effort, state, stateAt, branch, worktree, cairn, sessionId, owes,
       modelLabel: shortModel(seatModel),
       activity: doingOf(rows.get(`w:${name}`)).text,
       tone: needsYou ? 'alert' : STATUS_TONE[state],
       needsYou,
+      ...(lastReport === undefined || Number.isNaN(reportAt) ? {} : { lastReport: { kind: lastReport.kind, expects: lastReport.expects, summary: lastReport.summary, at: reportAt } }),
     }
   })
   const doing = doingOf(model.lead)
