@@ -1,13 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { AgentKind, Effort, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat, SeatRole } from '../types'
+import type { AgentKind, Effort, HostAgents, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat, SeatRole } from '../types'
 import { BOARD_ID, EXPAND_INDENT, buildBoard, needsAnimation, timelineRoom } from './board'
 import type { BoardRow, Cell, Tone } from './board'
 import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeHeadlines } from './bridge'
 import type { BridgeLine, FeedDraft } from './bridge'
 import * as drove from './drove'
-import { type LeanSpawnTrims, modelNotice, orchestratorSection, workerModelSection } from './prompts'
+import { type LeanSpawnTrims, defaultKindOf, modelLabelOf, modelNotice, orchestratorSection, workerModelSection } from './prompts'
 import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, goalFromPrompt, oneLine, raiseEffort, renderControl, repoFlagOf, shortModel, verifyEnvelope } from './protocol'
 import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
 
@@ -231,6 +231,7 @@ const trimsOf = ($: EngineInterface): Promise<LeanSpawnTrims> => {
     const plugins = [...new Set([...enabled, ...dirNames])].filter(name => name !== 'orchestrator')
     const codexMcp = codexConfig === undefined ? undefined : [...new Set([...codexConfig.matchAll(/^\[mcp_servers\.([A-Za-z0-9_-]+)\]/gm)].map(match => match[1] ?? '').filter(name => name && name !== 'drove'))]
     return {
+      ...(droveConfig.workerKind === 'claude' || droveConfig.workerKind === 'codex' ? { workerKind: droveConfig.workerKind } : {}),
       ...(stringsOf(droveConfig.workerMcp) ? { workerMcp: stringsOf(droveConfig.workerMcp) } : {}),
       ...(stringsOf(droveConfig.workerPlugins) ? { workerPlugins: stringsOf(droveConfig.workerPlugins) } : {}),
       ...(stringsOf(droveConfig.workerSkills) ? { workerSkills: stringsOf(droveConfig.workerSkills) } : {}),
@@ -311,19 +312,21 @@ const pruneStore = async ($: EngineInterface) => {
   }
 }
 
-const ORCHESTRATOR_TOOLS = [
+const codexNameOf = (agents?: HostAgents): string => (agents?.codex?.model ? `Codex (${agents.codex.model})` : 'Codex')
+
+const orchestratorTools = (agents?: HostAgents) => [
   {
     name: 'spawn_worker',
     description:
-      'Orchestrator mode: start a worker through Drove in a new herdr pane, in its own git worktree, and give it a brief. kind claude (default, Sonnet unless you say otherwise) or codex. It reports back to you through Drove and can ask to be promoted. Up to the run’s pane budget without asking; beyond it the human is asked in a dialog. Returns once the brief is delivered.',
+      `Orchestrator mode: start a worker through Drove in a new herdr pane, in its own git worktree, and give it a brief. kind is optional: claude or codex (${codexNameOf(agents)} runs its default model unless you pass model); left out, Drove’s workerKind setting decides. See "Claude or Codex for a worker" in your instructions for when to pick which. It reports back to you through Drove and can ask to be promoted. Up to the run’s pane budget without asking; beyond it the human is asked in a dialog. Returns once the brief is delivered.`,
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'short unique name, [a-z][a-z0-9_-]{0,31}, e.g. w-auth' },
         brief: { type: 'string', description: 'the full, standalone task: goal, files it owns, what not to touch, acceptance criteria, how to verify' },
-        kind: { type: 'string', enum: ['claude', 'codex'], description: 'claude (default) or codex' },
+        kind: { type: 'string', enum: ['claude', 'codex'], description: 'optional: claude or codex. Left out, Drove’s workerKind setting decides; the rules for choosing are in your instructions' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh'], description: 'low: mechanical; medium: standard (default); high: tricky logic or debugging' },
-        model: { type: 'string', description: 'Claude: sonnet (default) or opus, or a full model id. Codex: a model id, or leave out for Drove’s default' },
+        model: { type: 'string', description: `Claude: sonnet (default) or opus, or a full model id. Codex: a model id, or leave out for its default${agents?.codex?.model ? ` (${agents.codex.model})` : ''}` },
         cairn: { type: 'string', description: 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
         mcp: { type: 'array', items: { type: 'string' }, description: 'optional: the user MCP servers this worker needs, by name; [] for Drove’s alone. Left out, Drove’s workerMcp setting decides' },
         plugins: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: the user plugins this worker needs, by name; [] for Drove’s mod alone. Left out, Drove’s workerPlugins setting decides (every enabled plugin when unset)' },
@@ -391,7 +394,7 @@ const ORCHESTRATOR_TOOLS = [
   },
   {
     name: 'migrate_worker',
-    description: 'Orchestrator mode: move a worker to the other agent kind (Claude to Codex, or Codex to Claude), usually because it hit its usage limit. It keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost.',
+    description: `Orchestrator mode: move a worker to the other agent kind (Claude to ${codexNameOf(agents)}, or Codex to Claude), usually because it hit its usage limit. It keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost. See "Claude or Codex for a worker" in your instructions for when to move a seat.`,
     inputSchema: {
       type: 'object',
       properties: {
@@ -453,7 +456,7 @@ const ORCHESTRATOR_TOOLS = [
 ] as const
 
 const registerOrchestratorTools = async ($: EngineInterface) => {
-  for (const tool of ORCHESTRATOR_TOOLS) await $.tool.register(tool as never)
+  for (const tool of orchestratorTools(lastRun?.agents)) await $.tool.register(tool as never)
 }
 
 const record = async ($: EngineInterface, entry: FeedDraft) => {
@@ -506,11 +509,15 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
   if (!brief) return { deny: 'A worker needs a brief.' }
   if (input.kind !== undefined && input.kind !== 'claude' && input.kind !== 'codex') return { deny: 'kind must be claude or codex.' }
-  const kind: AgentKind = input.kind === 'codex' ? 'codex' : 'claude'
+  const given: AgentKind | undefined = input.kind === 'codex' || input.kind === 'claude' ? input.kind : undefined
+  const kind = given ?? defaultKindOf(lastRun?.agents, (await trimsOf($)).workerKind)
   const cairnText = typeof input.cairn === 'string' ? input.cairn.trim() : ''
   if (cairnText && !CAIRN_RE.test(cairnText)) return { deny: `cairn must look like CCS-12; got "${cairnText}".` }
   const effort = isEffort(input.effort) ? input.effort : config.workerEffort
-  const model = kind === 'claude' ? resolveModel(input.model, config.workerModel) : typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
+  const asked = typeof input.model === 'string' && input.model.trim() ? input.model.trim() : undefined
+  const shownModel = kind === 'claude' ? resolveModel(input.model, config.workerModel) : modelLabelOf('codex', asked ?? '', lastRun?.agents)
+  // With no kind given, drove spawn picks the kind and resolves the model, so only the human-given model goes along.
+  const model = given === undefined ? asked : kind === 'claude' ? shownModel : asked
   if (!(await herdrPane($))) return { deny: 'This session is not running in a herdr pane (HERDR_PANE_ID is unset), so it cannot open worker panes.' }
   const mcp = Array.isArray(input.mcp) ? input.mcp.filter((entry): entry is string => typeof entry === 'string') : undefined
   const plugins = Array.isArray(input.plugins) ? input.plugins.filter((entry): entry is string => typeof entry === 'string') : undefined
@@ -526,8 +533,8 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   if (role === 'implementer' && target) return { deny: 'target applies to a reviewer or tester; set role.' }
   const maxTurns = typeof input.maxTurns === 'number' ? input.maxTurns : undefined
   const maxTokens = typeof input.maxTokens === 'number' ? input.maxTokens : undefined
-  const args = drove.spawnArgs({ name, kind, effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
-  const label = `${kind === 'codex' ? `Codex${model ? ` ${model}` : ''}` : shortModel(model ?? '')} ${effort}`
+  const args = drove.spawnArgs({ name, ...(given ? { kind: given } : {}), effort, model, ...(cairnText ? { cairn: cairnText } : {}), ...(mcp ? { mcp } : {}), ...(plugins ? { plugins } : {}), ...(skills ? { skills } : {}), ...(agents ? { agents } : {}), ...(userMemory !== undefined ? { userMemory } : {}), ...(userHooks !== undefined ? { userHooks } : {}), ...(role !== 'implementer' ? { role, target } : {}), ...(owns ? { owns } : {}), ...(maxTurns ? { maxTurns } : {}), ...(maxTokens ? { maxTokens } : {}) })
+  const label = `${kind === 'codex' ? `Codex${shownModel ? ` ${shownModel}` : ''}` : shortModel(shownModel)} ${effort}`
   pushBody(`${name}:brief`, `${label} · ${brief}`)
   let ran = await plannerRun($, args, { stdin: brief, timeoutMs: SPAWN_TIMEOUT_MS })
   if (ran.exitCode !== 0 && drove.failureOf(ran).code === 'over-budget') {
@@ -1496,7 +1503,7 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
-    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, { ...config, humanName: await humanNameOf($), trims: await trimsOf($) }), scope: 'session' as const }] }
+    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, { ...config, humanName: await humanNameOf($), trims: await trimsOf($), agents: lastRun?.agents }), scope: 'session' as const }] }
     const model = self ? workerModelSection(self) : undefined
     if (model) return { sections: [...composed.sections, { id: 'orchestrator:worker-model', text: model, scope: 'session' as const }] }
     return composed
@@ -1641,7 +1648,7 @@ export const register: Register = (on, options) => {
     const rows = e.props.scroll.bodyRows
     const board = buildBoard({
       orchestrator,
-      seats,
+      seats: seats.map(seat => ({ ...seat, model: modelLabelOf(seat.kind, seat.model, lastRun?.agents) })),
       status,
       asksAt,
       bridge,

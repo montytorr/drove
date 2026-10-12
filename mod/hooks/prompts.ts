@@ -1,4 +1,4 @@
-import type { OrchOrchestrator, OrchWorkerSelf } from '../types'
+import type { AgentKind, HostAgents, OrchOrchestrator, OrchWorkerSelf } from '../types'
 import { shortModel } from './protocol'
 
 const modelLine = (model: string | undefined, effort: unknown): string =>
@@ -19,6 +19,7 @@ export const modelNotice = (model: string | undefined, effort: unknown): string 
 export type LeanSpawnTrims = {
   workerMcp?: string[]; workerPlugins?: string[]; workerSkills?: string[]; workerAgents?: string[]; workerUserMemory?: boolean; workerUserHooks?: boolean
   mcp?: string[]; codexMcp?: string[]; plugins?: string[]; skills?: string[]; agents?: string[]
+  workerKind?: WorkerKindSetting
 }
 
 const listOf = (names: readonly string[] | undefined, none: string): string => (names && names.length > 0 ? names.join(', ') : none)
@@ -50,7 +51,36 @@ A worker is an implementer unless you spawn it with \`role\`: \`reviewer\` or \`
 - \`tester\`: branches from the target's branch head, so have the target commit first. It writes and runs tests only (\`owns\` defaults to the usual test globs; set it to override) and reports the tests added and what they caught. Merge its branch, with merge_worker, after the target's.
 Each takes one of the ${budget} panes like any worker, so open one only when it earns the pane, and close it when it has reported.`
 
-export type OrchestratorPromptConfig = { workerModel: string; promotedModel: string; humanName: string; trims?: LeanSpawnTrims }
+export type WorkerKindSetting = 'auto' | 'claude' | 'codex'
+
+// A run with no detection (saved before it, or detection failed) has both kinds, and the planner's own kind is always there.
+export const kindsOn = (agents: HostAgents | undefined, planner: AgentKind = 'claude'): AgentKind[] =>
+  (['claude', 'codex'] as const).filter(kind => agents === undefined || kind === planner || agents[kind] !== undefined)
+
+// The kind a spawn with no kind gets, the same rule as drove spawn: workerKind when it names one, else claude when it is there.
+export const defaultKindOf = (agents: HostAgents | undefined, workerKind: WorkerKindSetting = 'auto'): AgentKind =>
+  workerKind === 'claude' || workerKind === 'codex' ? workerKind : kindsOn(agents).includes('claude') ? 'claude' : 'codex'
+
+// A display fallback only, a copy of modelLabelOf in src/agents.ts: a Codex seat's stored model stays empty when it runs the default.
+export const modelLabelOf = (kind: AgentKind, model: string, agents?: HostAgents): string => model || (kind === 'codex' ? agents?.codex?.model ?? '' : '')
+
+// A copy of kindRules in src/prompts.ts, worded for spawn_worker (DROVE-118).
+export const kindRulesSection = (human: string, agents?: HostAgents, workerKind: WorkerKindSetting = 'auto'): string => {
+  const kinds = kindsOn(agents)
+  const codex = agents?.codex?.model ? `Codex (${agents.codex.model})` : 'Codex'
+  if (kinds.length === 1) return `## Claude or Codex for a worker\nOnly ${kinds[0] === 'codex' ? 'Codex' : 'Claude'} is on this host, so every worker is ${kinds[0] === 'codex' ? codex : 'Claude'}.`
+  const left = workerKind === 'auto'
+    ? 'left out, it is claude (the workerKind setting is auto, which picks claude when it is there)'
+    : `left out, it is ${workerKind}: the workerKind setting makes ${workerKind} the default, and these rules are the exceptions`
+  return `## Claude or Codex for a worker
+Both are on this host. \`kind\` is optional on spawn_worker; ${left}. Name it by these rules:
+- ${codex}: a self-contained implementation with clear acceptance tests (backend, algorithms, refactors, test suites), and long mechanical work.
+- ${codex} for review and load: the reviewer of a Claude worker's branch (and Claude for a Codex worker's), so a review comes from another model; also when a run has more than 2 or 3 workers, or after a seat of the other kind hit a usage limit (migrate_worker moves it).
+- Claude: UI and visual work that needs a Chrome check; work that relies on ${human}'s skills, MCP servers, plugins or agents (a Codex seat ignores those trims); anything that needs a back-and-forth with ${human}.
+A Cairn task labelled \`kind:codex\` or \`kind:claude\` asks for that kind.`
+}
+
+export type OrchestratorPromptConfig = { workerModel: string; promotedModel: string; humanName: string; trims?: LeanSpawnTrims; agents?: HostAgents }
 
 export const orchestratorSection = (state: OrchOrchestrator, config: OrchestratorPromptConfig): string => `# Orchestrator mode
 
@@ -63,7 +93,7 @@ A goal that needs a brand-new repository: run \`drove init <dir>\` (an empty or 
 ## How to work
 1. Understand the goal and the codebase (read, or use read-only subagents). Run \`cairn check\` as usual. Keep the run's goal true: when it is missing or vague (a bare ref, "..", a fragment), or when ${config.humanName}'s ask moves on to new work, set it with mcp__orchestrator__set_goal, as one plain line of what the run is doing now; the original ask stays context, not the goal.
 2. Plan: split the work into independent pieces, each with a clear owner, the files it may touch, and acceptance criteria. State the plan to ${config.humanName} in a few lines. Go ahead without waiting unless it touches prod, money, pushes, deletions or anything ambiguous; then ask with AskUserQuestion.
-3. Before delegating, file one Cairn task per piece (\`cairn add "<title>" --project <KEY> --type <type> --no-start --body -\`, with the brief as its body) and pass its ref as \`cairn\` to spawn_worker. Never hand a worker a task you hold yourself: the worker claims its task. The goal itself is a task you hold. When a piece is merged and pushed, claim its task and close it (\`cairn claim <ref>\`, then \`cairn done <ref> --resolution ... --kind fixed\`). Delegate with mcp__orchestrator__spawn_worker: one worker per piece, a Claude worker on ${shortModel(config.workerModel)} by default, or \`kind: codex\` for a Codex worker. The brief must stand alone: the goal, the exact files it owns, what not to touch, the acceptance criteria, how to verify (tests to run), and the git rules (it is already on its own branch in its own worktree: commit there, only its own paths, never push; it does not create or switch branches unless you ask).
+3. Before delegating, file one Cairn task per piece (\`cairn add "<title>" --project <KEY> --type <type> --no-start --body -\`, with the brief as its body) and pass its ref as \`cairn\` to spawn_worker. Never hand a worker a task you hold yourself: the worker claims its task. The goal itself is a task you hold. When a piece is merged and pushed, claim its task and close it (\`cairn claim <ref>\`, then \`cairn done <ref> --resolution ... --kind fixed\`). Delegate with mcp__orchestrator__spawn_worker: one worker per piece (a Claude worker runs ${shortModel(config.workerModel)} by default; see Claude or Codex for a worker, below). The brief must stand alone: the goal, the exact files it owns, what not to touch, the acceptance criteria, how to verify (tests to run), and the git rules (it is already on its own branch in its own worktree: commit there, only its own paths, never push; it does not create or switch branches unless you ask).
 4. Choose each worker's effort: low for mechanical edits, medium for a standard feature or fix, high for tricky logic or debugging. Every worker gets its own git worktree (Claude: \`.claude/worktrees/<name>\` on \`worktree-<name>\`; Codex: the same folder on \`drove/<name>\`), branched from the main checkout.
 5. Manage: workers report with Drove's report tool. A report says what it expects back: review, answer or none. Answer only what expects something. Progress reports never reach you (they only update the roster; call mcp__orchestrator__roster to see them), so never ask a worker to send one for your benefit. After you approve, the worker commits and confirms with a done report that expects none. Never send agreement or status narration. Relay between workers yourself; workers never message each other.
 6. Review every \`done\` report yourself: read the diff (\`git diff <base>...<branch>\` or the worktree), check it against the brief, then call mcp__orchestrator__review_verdict with approve or changes and concrete notes. Ask the worker to run tests and report the output; do not run them yourself. When the worker has confirmed its commit, integrate it with mcp__orchestrator__merge_worker (\`drove merge <seat>\`), never a plain \`git merge\`: it runs the repo's checks in the worker's worktree first and refuses the merge if they fail, returning the failing output (send the worker back with \`changes\`). When the repo has a remote with CI, pass \`pr: true\` (\`drove merge <seat> --pr\`, \`squash: true\` for one commit): it pushes the branch, opens a pull request and merges it once its checks are green. A result of "pending" carries the PR URL: call it again later, do not poll. The main checkout must be on the base branch and clean.
@@ -73,6 +103,8 @@ A goal that needs a brand-new repository: run \`drove init <dir>\` (an empty or 
 
 ## Reports arrive in Drove's words
 A wake shows one line per worker report, \`<name> · <kind> · expects … — <its summary>\`: that is all ${config.humanName} sees, and all you get. Before you act on a report that expects review or an answer, call mcp__orchestrator__read_reports for the full text (it returns the reports you have not read yet and marks them read; pass a name for one worker's). Each full report is headed \`[worker <name> · <kind> · expects …]\` and ends with an arrow that names Drove's commands. Use your tools for them: "drove send, kind verdict" is mcp__orchestrator__review_verdict; "drove send, kind answer" and "drove send" are mcp__orchestrator__message_worker; "drove promote" is mcp__orchestrator__promote_worker (or demote_worker); "drove close" is mcp__orchestrator__close_worker; "the drove roster tool" is mcp__orchestrator__roster. "Needs the human" lines are for ${config.humanName}: tell ${config.humanName}.
+
+${kindRulesSection(config.humanName, config.agents, config.trims?.workerKind)}
 
 ${leanSpawnsSection(config.humanName, config.trims)}
 

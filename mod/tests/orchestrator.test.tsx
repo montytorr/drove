@@ -2,10 +2,11 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On, SessionStartInput } from 'claude-code'
 import type { Engine } from 'claude-code/testing'
 
-import type { RunMeta, Seat } from '../types'
+import type { HostAgents, RunMeta, Seat } from '../types'
 import { buildBoard, fixedRows, gauge, needsAnimation, progressOf } from '../hooks/board'
 import { HEADLINE_SUMMARY_MAX, backoffMs, feedOf, parseLine, splitLines, splitWake, wakeHeadlines } from '../hooks/bridge'
 import { attachArgs, failureOf, guardStdin, guardVerdictOf, jsonResultOf, spawnArgs } from '../hooks/drove'
+import { defaultKindOf, modelLabelOf } from '../hooks/prompts'
 import { UNVERIFIED, hmacSha256, locateEnvelope, macOf, parseEnvelope, raiseEffort, renderControl, repoFlagOf, shortModel, verifyEnvelope } from '../hooks/protocol'
 
 const NOW = Date.parse('2026-10-06T10:00:00Z')
@@ -249,6 +250,7 @@ type World = {
   answer: string
   isOverBudget: boolean
   runGoal?: string
+  runAgents?: HostAgents
   isGuardBroken: boolean
   bridge: { push: (text: string | null) => void }
   bridgeCode: number
@@ -300,7 +302,7 @@ const fakeDrove = (world: World, call: Call) => {
     const repo = call.cwd ?? '/work/repo'
     if (repo.startsWith('/work/plain')) return ok(JSON.stringify({ ok: false, code: 'not-a-repo', text: `${repo} is not inside a git repository` }), 1)
     const id = repo === '/work/repo' || call.args.includes('--run') ? RUN : `${repo.split('/').at(-1)}-20261006-1000-abcd`
-    return ok(JSON.stringify({ ok: true, text: `Run ${id} is up`, data: { run: runMeta({ id, ...(call.args.includes('--run') ? {} : { repo }), ...(at > 0 ? { goal: call.args[at + 1] } : world.runGoal && call.args.includes('--run') ? { goal: world.runGoal } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}) }) } }))
+    return ok(JSON.stringify({ ok: true, text: `Run ${id} is up`, data: { run: runMeta({ id, ...(call.args.includes('--run') ? {} : { repo }), ...(at > 0 ? { goal: call.args[at + 1] } : world.runGoal && call.args.includes('--run') ? { goal: world.runGoal } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}), ...(world.runAgents ? { agents: world.runAgents } : {}) }) } }))
   }
   if (command === 'mod' && action === 'report') return ok(JSON.stringify({ ok: true, text: 'report r-1 recorded (done, expects review).' }))
   if (command === 'guard') {
@@ -494,7 +496,7 @@ describe('orchestrator session', () => {
     expect(sections[1]?.text).toContain(`Drove run ${RUN} on /work/repo`)
     expect(sections[1]?.text).toContain('`drove init <dir>`')
     expect(sections[1]?.text).toContain('`/orchestrate --repo <dir>`')
-    expect(sections[1]?.text).toContain('kind: codex')
+    expect(sections[1]?.text).toContain('## Claude or Codex for a worker')
     expect(sections[1]?.text).toContain('the human switched this session into orchestrator mode')
     expect(sections[1]?.text).toContain('A wake shows one line per worker report')
     expect(sections[1]?.text).toContain('call mcp__orchestrator__read_reports for the full text')
@@ -556,16 +558,18 @@ describe('orchestrator session', () => {
     expect(denial(spawned as never)).toBeUndefined()
     expect(String(spawned.result)).toContain('w1:p10')
     const [first] = droveCalls(world, 'spawn')
-    expect(first?.args).toEqual(['spawn', 'w-auth', '--kind', 'claude', '--brief', '-', '--effort', 'low', '--model', 'claude-sonnet-5-5', '--cairn', 'CCS-77'])
+    expect(first?.args).toEqual(['spawn', 'w-auth', '--brief', '-', '--effort', 'low', '--cairn', 'CCS-77'])
     expect(first?.stdin).toBe('Do w-auth')
     expect(first?.env).toMatchObject({ DROVE_RUN: RUN, DROVE_ROLE: 'planner' })
     await callTool($, 'spawn_worker', { name: 'w-cx', brief: 'Do it in Codex', kind: 'codex' })
     expect(droveCalls(world, 'spawn')[1]?.args).toEqual(['spawn', 'w-cx', '--kind', 'codex', '--brief', '-', '--effort', 'medium'])
+    await callTool($, 'spawn_worker', { name: 'w-cl', brief: 'Do it in Claude', kind: 'claude' })
+    expect(droveCalls(world, 'spawn')[2]?.args).toEqual(['spawn', 'w-cl', '--kind', 'claude', '--brief', '-', '--effort', 'medium', '--model', 'claude-sonnet-5-5'])
     expect(denial((await callTool($, 'spawn_worker', { name: 'Bad Name', brief: 'x' })) as never)).toContain('must match')
     expect(denial((await callTool($, 'spawn_worker', { name: 'w-z', brief: 'x', kind: 'gemini' })) as never)).toContain('claude or codex')
-    expect(droveCalls(world, 'spawn')).toHaveLength(2)
+    expect(droveCalls(world, 'spawn')).toHaveLength(3)
     await callTool($, 'spawn_worker', { name: 'w-own', brief: 'Own it', owns: ['src/a.ts', 3], maxTurns: 20, maxTokens: 'many' })
-    expect(droveCalls(world, 'spawn')[2]?.args.slice(-4)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20'])
+    expect(droveCalls(world, 'spawn')[3]?.args.slice(-4)).toEqual(['--owns', 'src/a.ts', '--max-turns', '20'])
   })
 
   test('spawn_worker passes role and target to drove spawn, and refuses a role without its target', async ($, on) => {
@@ -595,6 +599,94 @@ describe('orchestrator session', () => {
     expect(text).toContain('`role`: `reviewer` or `tester`')
     expect(text).toContain('large or risky, touches security')
     expect(text).toMatch(/Each takes one of the \d+ panes like any worker/)
+  })
+
+  const BOTH_KINDS: HostAgents = { at: ISO, claude: { version: '2.1.296' }, codex: { version: '0.162.0', model: 'gpt-6.1-sol', effort: 'high' } }
+  const kindRules = async ($: Engine) => {
+    const text = (await $.prompt.compose({ model: 'claude-opus-5-5', promptModel: 'claude-opus-5-5', surfaces: ['terminal'], tools: [], outputStyle: null, traits: [] } as never)).sections[1]?.text ?? ''
+    return /## Claude or Codex for a worker\n[\s\S]*?(?=\n\n## )/.exec(text)?.[0] ?? ''
+  }
+
+  test('with both kinds on the host the orchestrator section has the rules for when to pick codex and when claude', async ($, on) => {
+    const { world } = engine(on)
+    world.runAgents = BOTH_KINDS
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    const rules = await kindRules($)
+    expect(rules).toContain('Both are on this host. `kind` is optional on spawn_worker; left out, it is claude (the workerKind setting is auto, which picks claude when it is there). Name it by these rules:')
+    expect(rules).toContain('- Codex (gpt-6.1-sol): a self-contained implementation with clear acceptance tests (backend, algorithms, refactors, test suites), and long mechanical work.')
+    expect(rules).toContain("the reviewer of a Claude worker's branch (and Claude for a Codex worker's), so a review comes from another model; also when a run has more than 2 or 3 workers, or after a seat of the other kind hit a usage limit (migrate_worker moves it).")
+    expect(rules).toContain("- Claude: UI and visual work that needs a Chrome check; work that relies on the human's skills, MCP servers, plugins or agents (a Codex seat ignores those trims); anything that needs a back-and-forth with the human.")
+    expect(rules).toContain('A Cairn task labelled `kind:codex` or `kind:claude` asks for that kind.')
+    expect(rules.split('\n').length).toBeLessThanOrEqual(8)
+  })
+
+  test('a run with no detection reads as both kinds; workerKind in config.json words the default', async ($, on) => {
+    const { world } = engine(on)
+    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ workerKind: 'codex' })
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    const rules = await kindRules($)
+    expect(rules).toContain('Both are on this host.')
+    expect(rules).toContain('left out, it is codex: the workerKind setting makes codex the default, and these rules are the exceptions.')
+    expect(rules).toContain('- Codex: a self-contained implementation')
+  })
+
+  test('with only claude on the host the section is one line, and says so', async ($, on) => {
+    const { world } = engine(on)
+    world.runAgents = { at: ISO, claude: { version: '2.1.296' } }
+    on('prompt.compose', () => ({ sections: [{ id: 'intro', text: 'core', scope: 'shared' as const }] }))
+    await $.session.start(START)
+    await runCommand($, 'Ship it')
+    expect(await kindRules($)).toBe('## Claude or Codex for a worker\nOnly Claude is on this host, so every worker is Claude.')
+  })
+
+  test('kind is optional in spawn_worker, and its tool descriptions name the codex model and point to the rules', async ($, on) => {
+    const { world } = engine(on)
+    world.runAgents = BOTH_KINDS
+    await $.session.start(START)
+    await runCommand($, '')
+    const spawn = world.toolSchemas.spawn_worker as { description: string; inputSchema: { required: string[]; properties: Record<string, { description: string }> } }
+    expect(spawn.inputSchema.required).toEqual(['name', 'brief'])
+    expect(spawn.description).toContain('kind is optional: claude or codex (Codex (gpt-6.1-sol) runs its default model unless you pass model); left out, Drove’s workerKind setting decides.')
+    expect(spawn.description).toContain('"Claude or Codex for a worker" in your instructions')
+    expect(spawn.description + spawn.inputSchema.properties.kind?.description).not.toMatch(/claude \(default|Sonnet unless/)
+    expect(spawn.inputSchema.properties.kind?.description).toContain('Left out, Drove’s workerKind setting decides')
+    expect(spawn.inputSchema.properties.model?.description).toContain('Codex: a model id, or leave out for its default (gpt-6.1-sol)')
+    const migrate = world.toolSchemas.migrate_worker as { description: string }
+    expect(migrate.description).toContain('Claude to Codex (gpt-6.1-sol), or Codex to Claude')
+    expect(migrate.description).toContain('"Claude or Codex for a worker"')
+  })
+
+  test('a spawn with no kind leaves --kind and --model to drove spawn, and its toast names the kind workerKind picks, with the codex model', async ($, on) => {
+    const { world } = engine(on)
+    world.runAgents = BOTH_KINDS
+    world.files['/Users/test/.drove/config.json'] = JSON.stringify({ workerKind: 'codex' })
+    await $.session.start(START)
+    await runCommand($, '')
+    await callTool($, 'spawn_worker', { name: 'w-none', brief: 'Do it', model: 'opus' })
+    expect(droveCalls(world, 'spawn')[0]?.args).toEqual(['spawn', 'w-none', '--brief', '-', '--effort', 'medium', '--model', 'opus'])
+    expect(world.toasts).toContain('Worker w-none: Codex opus medium')
+    await callTool($, 'spawn_worker', { name: 'w-cx', brief: 'Do it', kind: 'codex' })
+    expect(world.toasts).toContain('Worker w-cx: Codex gpt-6.1-sol medium')
+    await callTool($, 'spawn_worker', { name: 'w-cl', brief: 'Do it', kind: 'claude' })
+    expect(world.toasts).toContain('Worker w-cl: Sonnet 5.5 medium')
+  })
+
+  test('without detection the Codex label has no model, as before', async ($, on) => {
+    const { world } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await callTool($, 'spawn_worker', { name: 'w-cx', brief: 'Do it', kind: 'codex' })
+    expect(world.toasts).toContain('Worker w-cx: Codex medium')
+    expect(modelLabelOf('codex', '', undefined)).toBe('')
+    expect(modelLabelOf('codex', '', BOTH_KINDS)).toBe('gpt-6.1-sol')
+    expect(modelLabelOf('codex', 'gpt-5', BOTH_KINDS)).toBe('gpt-5')
+    expect(modelLabelOf('claude', '', BOTH_KINDS)).toBe('')
+    expect(defaultKindOf(BOTH_KINDS)).toBe('claude')
+    expect(defaultKindOf(BOTH_KINDS, 'codex')).toBe('codex')
   })
 
   test('spawn_worker passes plugins and userMemory to drove spawn, and its schema says what they default to', async ($, on) => {

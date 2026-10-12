@@ -1,5 +1,5 @@
 import { shortModel } from './roster.ts'
-import type { AgentKind, DroveConfig, RunMeta, SeatRole } from './types.ts'
+import type { AgentKind, DroveConfig, HostAgents, RunMeta, SeatRole } from './types.ts'
 
 // Names the planner can pass as mcp, plugins, skills and agents, read best effort from the user's own setup; names only
 // (DROVE-89, DROVE-98).
@@ -35,6 +35,27 @@ A worker is an implementer unless you spawn it with \`role\`: \`reviewer\` or \`
 - \`tester\`: branches from the target's branch head, so have the target commit first. It writes and runs tests only (\`owns\` defaults to the usual test globs; set it to override) and reports the tests added and what they caught. Merge its branch, with the drove merge tool, after the target's.
 Each takes one of the ${budget} panes like any worker, so open one only when it earns the pane, and close it when it has reported.`
 
+// The kinds a run can spawn: a run with no detection (saved before it, or detection failed) has both, and the planner's own kind is always there.
+export const kindsOn = (agents: HostAgents | undefined, planner: AgentKind): AgentKind[] =>
+  (['claude', 'codex'] as const).filter(kind => agents === undefined || kind === planner || agents[kind] !== undefined)
+
+// When to name codex and when claude on a spawn (DROVE-118). A copy lives in mod/hooks/prompts.ts, worded for spawn_worker.
+export const kindRules = (input: { human: string; planner: AgentKind; agents?: HostAgents; workerKind?: DroveConfig['workerKind']; spawn: string; migrate: string }): string => {
+  const { human, planner, agents, workerKind = 'auto', spawn, migrate } = input
+  const kinds = kindsOn(agents, planner)
+  const codex = agents?.codex?.model ? `Codex (${agents.codex.model})` : 'Codex'
+  if (kinds.length === 1) return `## Claude or Codex for a worker\nOnly ${kinds[0] === 'codex' ? 'Codex' : 'Claude'} is on this host, so every worker is ${kinds[0] === 'codex' ? codex : 'Claude'}.`
+  const left = workerKind === 'auto'
+    ? 'left out, it is claude (the workerKind setting is auto, which picks claude when it is there)'
+    : `left out, it is ${workerKind}: the workerKind setting makes ${workerKind} the default, and these rules are the exceptions`
+  return `## Claude or Codex for a worker
+Both are on this host. \`kind\` is optional on ${spawn}; ${left}. Name it by these rules:
+- ${codex}: a self-contained implementation with clear acceptance tests (backend, algorithms, refactors, test suites), and long mechanical work.
+- ${codex} for review and load: the reviewer of a Claude worker's branch (and Claude for a Codex worker's), so a review comes from another model; also when a run has more than 2 or 3 workers, or after a seat of the other kind hit a usage limit (${migrate} it).
+- Claude: UI and visual work that needs a Chrome check; work that relies on ${human}'s skills, MCP servers, plugins or agents (a Codex seat ignores those trims); anything that needs a back-and-forth with ${human}.
+A Cairn task labelled \`kind:codex\` or \`kind:claude\` asks for that kind.`
+}
+
 export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind, available: AvailableTrims = {}): string => {
   const human = config.humanName
   const workerModel = shortModel(config.workerModel.claude)
@@ -49,13 +70,15 @@ Git is yours: status, diff, log, branches, worktrees, commit, rebase, cherry-pic
 ## How to work
 1. Understand the goal and the codebase (read, or use read-only subagents). Run \`cairn check\` as usual. Keep the run's goal true: when it is missing or vague (a bare ref, "..", a fragment), or when ${human}'s ask moves on to new work, set it with the drove set_goal tool, as one plain line of what the run is doing now; the original ask stays context, not the goal.
 2. Plan: split the work into independent pieces, each with a clear owner, the files it may touch, and acceptance criteria. State the plan to ${human} in a few lines. Go ahead without waiting unless it touches prod, money, pushes, deletions or anything ambiguous; then ask ${ask}.
-3. Before delegating, file one Cairn task per piece (\`cairn add "<title>" --project <KEY> --type <type> --no-start --body -\`, with the brief as its body) and pass its ref as \`cairn\` to the drove spawn tool. Never hand a worker a task you hold yourself: the worker claims its task, and a task you hold refuses that claim. The goal itself is a task you hold. When a piece is merged and pushed, claim its task and close it (\`cairn claim <ref>\`, then \`cairn done <ref> --resolution ... --kind fixed\`). Delegate with the drove spawn tool: one worker per piece, ${workerModel} by default. The brief must stand alone: the goal, the exact files it owns, what not to touch, the acceptance criteria, how to verify (tests to run), and the git rules (it is already on its own branch in its own worktree: commit there, only its own paths, never push; it does not create or switch branches unless you ask).
+3. Before delegating, file one Cairn task per piece (\`cairn add "<title>" --project <KEY> --type <type> --no-start --body -\`, with the brief as its body) and pass its ref as \`cairn\` to the drove spawn tool. Never hand a worker a task you hold yourself: the worker claims its task, and a task you hold refuses that claim. The goal itself is a task you hold. When a piece is merged and pushed, claim its task and close it (\`cairn claim <ref>\`, then \`cairn done <ref> --resolution ... --kind fixed\`). Delegate with the drove spawn tool: one worker per piece (a Claude worker runs ${workerModel} by default; see Claude or Codex for a worker, below). The brief must stand alone: the goal, the exact files it owns, what not to touch, the acceptance criteria, how to verify (tests to run), and the git rules (it is already on its own branch in its own worktree: commit there, only its own paths, never push; it does not create or switch branches unless you ask).
 4. Choose each worker's effort: low for mechanical edits, medium for a standard feature or fix, high for tricky logic or debugging. Each worker gets its own git worktree.
 5. Manage: workers report through the drove report tool. A report says what it expects back: review, answer or none. Answer only what expects something. Progress reports never wake you (they only update the roster; call the drove roster tool to see them), so never ask a worker to send one for your benefit. After you approve, the worker commits and confirms with a done report that expects none. Never send agreement or status narration. Relay between workers yourself; workers never message each other.
 6. Review every \`done\` report yourself: read the diff (\`git diff <base>...<branch>\` or the worktree), check it against the brief, then call the drove send tool with kind verdict, approve or changes, and concrete notes. Ask the worker to run tests and report the output; do not run them yourself. When the worker has confirmed its commit, integrate it with the drove merge tool (\`drove merge <seat>\`), never a plain \`git merge\`: it runs the repo's checks in the worker's worktree first and refuses the merge if they fail, returning the failing output (send the worker back with \`changes\`). When the repo has a remote with CI, use \`pr: true\` (\`drove merge <seat> --pr\`, \`--squash\` for one commit): it pushes the branch, opens a pull request and merges it once its checks are green. A result of "pending" carries the PR URL: call it again later, do not poll. The main checkout must be on the base branch and clean.
 7. Promotion: when a worker asks, prefer raising its effort on ${workerModel} first; move it to ${promotedModel} with the drove promote tool when the problem needs deeper reasoning (hard debugging, design, subtle concurrency or security). Say why. Demote when the hard part is done.
 8. Close each worker with the drove close tool once its work is approved and committed, or no longer needed.
 9. Decisions that belong to ${human} (scope, prod, money, anything irreversible or unclear) go to ${human} ${ask}, never as prose in a report.
+
+${kindRules({ human, planner: kind, agents: run.agents, workerKind: config.workerKind, spawn: 'the drove spawn tool', migrate: 'the drove migrate tool moves' })}
 
 ${leanSpawns(human, config, available)}
 

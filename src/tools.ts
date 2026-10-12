@@ -135,10 +135,10 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
   return [
     defineTool(
       'spawn',
-      'Start a worker: a Claude worker gets Claude\'s own worktree (branch worktree-SEAT) and a Codex worker a Drove worktree (branch drove/SEAT); opens a pane in the run tab and launches the agent with your brief. Give each worker one Cairn ref and a self-contained brief (files it owns, acceptance, what to verify). Returns at once with the seat running. Do NOT wait, poll or sleep afterwards: the worker\'s report is delivered to you as a message (or at the end of your next tool result). Spawn the next independent worker, or end your turn.',
+      'Start a worker: a Claude worker gets Claude\'s own worktree (branch worktree-SEAT) and a Codex worker a Drove worktree (branch drove/SEAT); kind is optional, and left out it follows the workerKind setting (see "Claude or Codex for a worker" in your instructions for when to pick which); opens a pane in the run tab and launches the agent with your brief. Give each worker one Cairn ref and a self-contained brief (files it owns, acceptance, what to verify). Returns at once with the seat running. Do NOT wait, poll or sleep afterwards: the worker\'s report is delivered to you as a message (or at the end of your next tool result). Spawn the next independent worker, or end your turn.',
       {
         seat: { type: 'string', description: 'New seat name: lowercase letters, digits, - and _, starting with a letter, up to 32 characters (e.g. w-api).' },
-        kind: { type: 'string', enum: KINDS, description: 'Which agent runs the seat: claude or codex.' },
+        kind: { type: 'string', enum: KINDS, description: 'Optional: claude or codex. Left out, the workerKind setting decides; the rules for choosing are in your instructions.' },
         cairn: { type: 'string', description: 'The Cairn task ref the worker claims (one ref per worker).' },
         brief: { type: 'string', description: 'The full brief. The worker sees nothing else.' },
         model: { type: 'string', description: 'Optional model override.' },
@@ -156,7 +156,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         maxTurns: { type: 'integer', minimum: 1, description: 'Optional: how many turns (stops) the worker may take. At the limit you get a budget attention and the worker is told once to report progress or promote and stop; it is not killed. Left out, the configured maxTurns applies, or none.' },
         maxTokens: { type: 'integer', minimum: 1, description: 'Optional: how many tokens (input, cached input and output, read from the agent\'s own transcript) the worker may use. Same effect at the limit as maxTurns.' },
       },
-      ['seat', 'kind', 'brief'],
+      ['seat', 'brief'],
       async (args) => {
         const seat = seatName(args)
         const blocked = await askForBudget(seat)
@@ -164,7 +164,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
         return asResult(
           await cmd.spawn(deps, identity, {
             seat,
-            kind: oneOf(args, 'kind', KINDS) as AgentKind,
+            ...(args.kind != null ? { kind: oneOf(args, 'kind', KINDS) as AgentKind } : {}),
             brief: text(args, 'brief') as string,
             cairn: text(args, 'cairn', false),
             model: text(args, 'model', false),
@@ -242,7 +242,7 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
     ),
     defineTool(
       'migrate',
-      'Move a worker to the other agent kind (Claude to Codex or Codex to Claude), usually because it hit its usage limit. The seat keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost.',
+      'Move a worker to the other agent kind (Claude to Codex, or Codex to Claude), usually because it hit its usage limit. The seat keeps its name, worktree, branch and Cairn task; the new agent starts fresh there with a handoff brief (its brief, commits, uncommitted changes and last reports). The turn in flight is lost. When to move a seat, and to which kind, is in "Claude or Codex for a worker" in your instructions.',
       {
         seat: seatProp,
         kind: { type: 'string', enum: KINDS, description: 'The kind to move to.' },
