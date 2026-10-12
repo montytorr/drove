@@ -748,7 +748,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   if (isDetached) {
     const opened = await openDetachedWorkspace(deps, run, spec.env)
     if ('code' in opened) return abandonDetached(deps, run, previous, opened)
-    run = { ...run, planner: { ...run.planner, paneId: opened.paneId } }
+    run = { ...run, workspace: opened.workspaceId, planner: { ...run.planner, paneId: opened.paneId } }
     await saveRun(deps.home, run)
     await recordEvent(deps, run.id, { type: 'run.up', data: { planner: kind, pane: opened.paneId, workspace: opened.workspaceId, detached: true, attached: Boolean(request.run) } })
     await writeLaunchFiles(spec)
@@ -2002,7 +2002,8 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
   }
   if (run.tabId) await herdr.run(deps.exec, herdr.tabCloseArgv(run.tabId))
   const plannerId = run.planner.sessionId ?? (await plannerSessionId(deps, run)) ?? (run.planner.paneId ? (await herdr.getAgent(deps.exec, run.planner.paneId).then(result => (result.ok ? result.value.sessionId : undefined))) : undefined)
-  await saveRun(deps.home, { ...run, status: 'down', tabId: undefined, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } })
+  await saveRun(deps.home, { ...run, status: 'down', tabId: undefined, workspace: undefined, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } })
+  if (run.workspace) await herdr.run(deps.exec, herdr.workspaceCloseArgv(run.workspace))
   await recordEvent(deps, run.id, { type: 'run.down', data: { saved, unsaved } })
   const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString(), (await loadConfig(deps.home)).labInstance)
   return ok(
@@ -2165,7 +2166,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
     opened = made
   }
   const paneId = opened?.paneId ?? hostPane ?? ''
-  run = { ...run, status: 'up', tabId: undefined, planner: { ...run.planner, paneId } }
+  run = { ...run, status: 'up', tabId: undefined, workspace: opened?.workspaceId, planner: { ...run.planner, paneId } }
   await saveRun(deps.home, run)
   const seats = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state === 'down').sort(SPAWNED_ORDER)
   const placed: Seat[] = []

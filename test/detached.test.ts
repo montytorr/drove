@@ -207,3 +207,46 @@ test('drove up --detached does not combine with --seat', async () => {
   const upped = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a', { detached: true })
   assert.equal(!upped.ok && upped.code, 'usage')
 })
+
+test('drove down closes the workspace a detached plan opened and clears it from the run', async () => {
+  const fake = new FakeHerdr()
+  const deps = await makeDeps(fake)
+  const repo = await realpath(await makeRepo())
+  const planned = await commands.plan(deps, { repo, kind: 'claude', goal: 'Ship the widget.', detached: true, json: true })
+  assert.equal(planned.ok, true, planned.text)
+  const data = JSON.parse(planned.text) as DetachedStart
+  assert.equal((await loadRun(deps.home, data.run))?.workspace, data.workspace)
+  assert.ok(fake.workspaces.has(data.workspace))
+
+  const downed = await commands.down(deps, { run: data.run, repo })
+  assert.equal(downed.ok, true, downed.text)
+  assert.deepEqual(fake.find('herdr', 'workspace', 'close'), ['herdr', 'workspace', 'close', data.workspace])
+  assert.equal(fake.workspaces.has(data.workspace), false)
+  const run = await loadRun(deps.home, data.run)
+  assert.deepEqual([run?.status, run?.workspace], ['down', undefined])
+})
+
+test('drove down closes no workspace for a run that was not started detached', async () => {
+  const fake = new FakeHerdr()
+  const deps = await makeDeps(fake)
+  await seedRun(deps, await makeRepo())
+  const downed = await commands.down(deps, { run: RUN, repo: '/x' })
+  assert.equal(downed.ok, true, downed.text)
+  assert.equal(fake.find('herdr', 'workspace', 'close'), undefined)
+})
+
+test('drove up --detached records the new workspace, and down closes that one', async () => {
+  const fake = new FakeHerdr({ startSession: 'thread-1' })
+  const repo = await makeRepo()
+  const deps = await makeDeps(fake)
+  await seedRun(deps, repo, [], { status: 'down' })
+  const upped = await commands.up(deps, { run: RUN, repo }, undefined, { detached: true, json: true })
+  assert.equal(upped.ok, true, upped.text)
+  const data = JSON.parse(upped.text) as DetachedStart
+  assert.equal((await loadRun(deps.home, RUN))?.workspace, data.workspace)
+
+  const downed = await commands.down(deps, { run: RUN, repo })
+  assert.equal(downed.ok, true, downed.text)
+  assert.deepEqual(fake.find('herdr', 'workspace', 'close'), ['herdr', 'workspace', 'close', data.workspace])
+  assert.equal((await loadRun(deps.home, RUN))?.workspace, undefined)
+})
