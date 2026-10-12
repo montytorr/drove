@@ -17,6 +17,7 @@ import { CHROME_SERVER, type CodexLaunchRequest, codexMcpNames, execArgv, isShel
 import { branchName, codexHomeDir, defaultHome, ENV, identityFromEnv, newRunId, PLANNER_SEAT, plannerDir, runDir, SEAT_RE, seatDir, userCodexHome, worktreePath } from './paths.ts'
 import { type AvailableTrims, LAB_RE, acceptanceSection, type LabSubject, approvedText, briefFooter, cairnGoalPrompt, labSubjectPrompt, plannerRole, resumedText, workerRole } from './prompts.ts'
 import { formatControl, REPORT_KINDS, renderReports } from './protocol.ts'
+import { buildTrace, postTrace, renderTrace } from './trace.ts'
 import { buildReport, noteLines, renderReport, type RunReport } from './report.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
@@ -2108,6 +2109,21 @@ export const runReport = async (deps: Deps, ref: RunRef, asJson: boolean): Promi
   return ok(asJson ? JSON.stringify(built, null, 2) : renderReport(built), built)
 }
 
+export const runTrace = async (deps: Deps, ref: RunRef, request: { asJson?: boolean; otlp?: string }): Promise<CommandResult> => {
+  const located = await locateRun(deps, ref)
+  if ('error' in located) return located.error
+  const trace = await buildTrace(deps, located.run.id, deps.claudeUserDir ?? userClaudeDir())
+  if (!trace) return failed('no-run', `no run named ${located.run.id}`)
+  if (request.otlp) {
+    try {
+      await postTrace(trace, request.otlp)
+    } catch (error) {
+      return failed('otlp-export', String(error))
+    }
+  }
+  return ok(request.asJson ? JSON.stringify(trace, null, 2) : renderTrace(trace), trace)
+}
+
 // ---------- down / up ----------
 
 const SPAWNED_ORDER = (a: Seat, b: Seat): number => a.spawnedAt.localeCompare(b.spawnedAt)
@@ -2143,6 +2159,14 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
   await saveRun(deps.home, { ...run, status: 'down', tabId: undefined, workspace: undefined, planner: { ...run.planner, ...(plannerId ? { sessionId: plannerId } : {}) } })
   if (run.workspace) await herdr.run(deps.exec, herdr.workspaceCloseArgv(run.workspace))
   await recordEvent(deps, run.id, { type: 'run.down', data: { saved, unsaved } })
+  // Export only after down is persisted; a collector failure must never prevent shutdown.
+  try {
+    const endpoint = (await loadConfig(deps.home)).otlpEndpoint
+    if (endpoint) {
+      const trace = await buildTrace(deps, run.id, deps.claudeUserDir ?? userClaudeDir())
+      if (trace) await postTrace(trace, endpoint, 2_000)
+    }
+  } catch { /* best effort */ }
   const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString(), (await loadConfig(deps.home)).labInstance)
   return ok(
     [`Run ${run.id} is down: ${saved.length} seat(s) saved for resume${saved.length ? ` (${saved.join(', ')})` : ''}.`, ...(unsaved.length ? [`No session id for ${unsaved.join(', ')}: they cannot be resumed.`] : []), `Resume with \`drove up --run ${run.id}\`.`, ...(cairnNote ? [cairnNote] : [])].join(' '),

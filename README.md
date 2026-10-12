@@ -147,6 +147,7 @@ With `workerKind` set to `claude` or `codex`, the text says that kind is the def
 | `drove init <dir> [--json]` | make a new git repo (branch `main`, one empty commit) in an empty or missing directory, then attach the run there; refuses a non-empty directory or an existing repo |
 | `drove roster [--json] [--run ID]` | one line per seat; `--json` also gives the run's status, the planner pane's state and the latest report (see "Unattended runs") |
 | `drove attention [--run ID \| --all] [--json] [--follow]` | what waits on a person, as data: dialogs, questions for the human, pane-budget requests, gone seats; `--follow` streams new and resolved items as JSON lines (see "Unattended runs") |
+| `drove trace [<run>] [--json] [--otlp URL]` | a run as an OpenTelemetry span tree, or OTLP/JSON posted to a collector |
 | `drove report [<run>] [--json]` | tokens, cost, wall time, time waiting on the human and rework, per seat and in total |
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
@@ -169,6 +170,8 @@ With `workerKind` set to `claude` or `codex`, the text says that kind is the def
 - **Rework**: `chg/pro/dem/mig/rst` are the verdicts that asked for changes, promotions, demotions, migrations and restarts, counted from `events.jsonl`.
 - **Checks**: `chk run/fail` counts the runs of the repo's checks (`checks.ran` events: `drove checks`, `run_checks`, a merge that ran them) and how many failed; a merge that reused a passing record at the seat's HEAD is not a run.
 - **Guard denials**: `deny` is the number of tool calls the guard refused the seat, from the `guard.denied` events; the line under the table breaks the run's total down by rule (`owns`, `push`, `herdr` and so on).
+
+`drove trace [<run>]` prints an indented run → seat → attempt tree, with check spans under the active attempt (otherwise the seat), merge outcomes under the seat, and guard denials, steering nudges and attention as span events. `--json` prints OTLP/JSON; `--otlp http://localhost:4318` posts it to `/v1/traces`, using `OTEL_EXPORTER_OTLP_HEADERS` when set. Trace and span ids stay the same on re-export. Usage and known costs come from the same transcripts as `report`. Merge durations are zero because the event log currently records only their outcomes. Set `otlpEndpoint` in `~/.drove/config.json` to export automatically after `down`; export failures do not fail shutdown and HTTP requests time out after two seconds.
 
 `drove --help` prints the same list. A planner normally uses the MCP tools `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `merge`, `run_checks`, `roster`, `capture`, `run_report`, `set_goal` and `down`; a worker has one tool, `report`. They call the same functions as the CLI.
 

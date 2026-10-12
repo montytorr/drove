@@ -262,6 +262,13 @@ export const COMMANDS: Record<string, Spec> = {
     run: async (values, positionals, io) =>
       print(await commands.runReport(commands.defaultDeps(), { run: positionals[0] ?? str(values, 'run'), repo: process.cwd() }, values.json === true), io),
   },
+  trace: {
+    usage: 'drove trace [<run>] [--json] [--otlp URL] [--run ID]',
+    why: 'a run as an OpenTelemetry span tree; export OTLP/JSON to a collector',
+    options: { json: { type: 'boolean' }, otlp: { type: 'string' }, run: { type: 'string' } },
+    run: async (values, positionals, io) =>
+      print(await commands.runTrace(commands.defaultDeps(), { run: positionals[0] ?? str(values, 'run'), repo: process.cwd() }, { asJson: values.json === true, otlp: str(values, 'otlp') }), io),
+  },
   capture: {
     usage: 'drove capture <seat> [--lines N] [--run ID]',
     why: "read a seat's recent output",
