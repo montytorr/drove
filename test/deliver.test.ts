@@ -418,7 +418,12 @@ test('an Enter that shows no activity is delivered-unconfirmed, and a hook recor
   confirmed.fake.enterSubmits = false
   const hooks = join(seatDir(confirmed.deps.home, confirmed.run.id, 'w-ui'), 'hooks.jsonl')
   const sentAt = confirmed.deps.clock.now().getTime()
-  setTimeout(() => void appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt + 1_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`), 20)
+  const exec = confirmed.deps.exec
+  confirmed.deps.exec = async argv => {
+    const result = await exec(argv)
+    if (argv[2] === 'send-keys') await appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt + 1_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`)
+    return result
+  }
   assert.deepEqual(await deliver.deliverControl(confirmed.deps, confirmed.run, control('w-ui')), { ok: true, via: 'herdr-prompt', submitted: true })
 })
 
@@ -457,7 +462,11 @@ test('a herdr wait timeout is confirmed by a user-prompt-submit hook record newe
   const hooks = join(seatDir(deps.home, run.id, 'w-ui'), 'hooks.jsonl')
   const sentAt = deps.clock.now().getTime()
   await appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt - 5_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`)
-  setTimeout(() => void appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt + 1_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`), 20)
+  deps.exec = async argv => {
+    if (argv[2] !== 'prompt') return base(argv)
+    await appendFile(hooks, `${JSON.stringify({ at: new Date(sentAt + 1_000).toISOString(), agent: 'claude', event: 'user-prompt-submit' })}\n`)
+    return herdrFail('timeout', 'timed out waiting for agent status')
+  }
   assert.deepEqual(await deliver.deliverControl(deps, run, control('w-ui')), { ok: true, via: 'herdr-prompt' })
   const events = await lines(join(deps.home, 'runs', run.id, 'events.jsonl'))
   assert.deepEqual(events.at(-1)?.data, { kind: 'message', via: 'herdr-prompt' })

@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict'
 import { spawn } from 'node:child_process'
+import { watch } from 'node:fs'
 import { mkdir, mkdtemp, readFile, readdir, rm, rmdir, stat, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { deferred, waitFor } from './timing-helpers.ts'
 import * as store from '../src/store.ts'
 
 const temp = (): Promise<string> => mkdtemp(join(tmpdir(), 'drove-store-'))
@@ -33,9 +35,13 @@ test('writeJsonAtomic round-trips, creates parents and uses mode 600', async () 
 test('a kill mid-write leaves the old file intact', async () => {
   const path = join(await temp(), 'roster.json')
   await store.writeJsonAtomic(path, { marker: 'old' })
-  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', CHILD, 'write-forever', path], { stdio: ['ignore', 'pipe', 'ignore'] })
-  await new Promise(resolve => child.stdout.once('data', resolve))
-  await new Promise(resolve => setTimeout(resolve, 150))
+  const writing = deferred()
+  const watcher = watch(join(path, '..'), (_event, name) => {
+    if (name?.endsWith('.tmp')) writing.resolve()
+  })
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', CHILD, 'write-forever', path], { stdio: 'ignore' })
+  await writing.promise
+  watcher.close()
   child.kill('SIGKILL')
   await new Promise(resolve => child.once('close', resolve))
   const value = await store.readJson<{ marker: string }>(path)
@@ -45,15 +51,19 @@ test('a kill mid-write leaves the old file intact', async () => {
 test('withLock serialises and removes the lock', async () => {
   const lock = join(await temp(), 'x.lock')
   const order: string[] = []
+  const entered = deferred()
+  const release = deferred()
   const slow = store.withLock(lock, async () => {
     order.push('a-start')
-    await new Promise(resolve => setTimeout(resolve, 100))
+    entered.resolve()
+    await release.promise
     order.push('a-end')
   })
-  await new Promise(resolve => setTimeout(resolve, 20))
+  await entered.promise
   const fast = store.withLock(lock, async () => {
     order.push('b')
   })
+  release.resolve()
   await Promise.all([slow, fast])
   assert.deepEqual(order, ['a-start', 'a-end', 'b'])
   await assert.rejects(stat(lock))
@@ -71,11 +81,11 @@ test('a held fresh lock blocks', async () => {
   let entered = false
   const attempt = store.withLock(lock, async () => {
     entered = true
-  })
-  await new Promise(resolve => setTimeout(resolve, 150))
+  }, 10_000, 0)
+  await assert.rejects(attempt, store.LockBusy)
   assert.equal(entered, false)
   await rmdir(lock)
-  await attempt
+  await store.withLock(lock, async () => { entered = true })
   assert.equal(entered, true)
 })
 
@@ -92,21 +102,24 @@ test('a lock held for 3x staleMs is kept alive by its heartbeat', async () => {
   const staleMs = 200
   let inside = 0
   let overlap = false
-  const hold = (ms: number) =>
-    store.withLock(
-      lock,
-      async () => {
-        inside += 1
-        overlap = overlap || inside > 1
-        await new Promise(resolve => setTimeout(resolve, ms))
-        inside -= 1
-      },
-      staleMs,
-    )
-  const first = hold(3 * staleMs)
-  await new Promise(resolve => setTimeout(resolve, 3 * staleMs - 50))
-  assert.ok(Date.now() - (await stat(lock)).mtimeMs < staleMs, 'heartbeat keeps the mtime fresh')
-  await Promise.all([first, hold(10), hold(10)])
+  const entered = deferred()
+  const release = deferred()
+  const first = store.withLock(lock, async () => {
+    inside += 1
+    entered.resolve()
+    await release.promise
+    inside -= 1
+  }, staleMs)
+  await entered.promise
+  const initialMtime = (await stat(lock)).mtimeMs
+  await waitFor(async () => (await stat(lock)).mtimeMs >= initialMtime + 3 * staleMs, 'three stale periods of heartbeats')
+  const contenders = [1, 2].map(() => store.withLock(lock, async () => {
+    inside += 1
+    overlap = overlap || inside > 1
+    inside -= 1
+  }, staleMs))
+  release.resolve()
+  await Promise.all([first, ...contenders])
   assert.equal(overlap, false)
 })
 
@@ -119,11 +132,11 @@ test('a stale-looking lock whose holder pid is alive is not stolen', async () =>
   let entered = false
   const attempt = store.withLock(lock, async () => {
     entered = true
-  }, 100)
-  await new Promise(resolve => setTimeout(resolve, 300))
+  }, 100, 0)
+  await assert.rejects(attempt, store.LockBusy)
   assert.equal(entered, false)
   await rm(lock, { recursive: true })
-  await attempt
+  await store.withLock(lock, async () => { entered = true })
   assert.equal(entered, true)
 })
 
