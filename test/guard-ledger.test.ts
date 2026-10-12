@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
-import { mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -246,13 +246,14 @@ test('a busy lock skips the escalation instead of making the denial wait, and th
   const env = workerEnv(ctx)
   const lock = join(seatDir(ctx.home, ctx.run.id, 'w-api'), 'guard.lock')
   await mkdir(lock, { recursive: true })
-  const started = Date.now()
+  // A live holder must remain the owner even if this machine pauses for >2 s.
+  await writeFile(join(lock, 'pid'), String(process.pid))
   for (const file of ['a', 'b', 'c']) {
     const result = await hooks.runHook('pre-tool-use', edit(join(worktree, `docs/${file}.md`)), env, depsOf(ctx))
     assert.equal(result.code, 2)
+    assert.ok((await stat(lock)).isDirectory(), 'the denial returned while the lock was still held')
     ctx.clock.advance(1000)
   }
-  assert.ok(Date.now() - started < 1500, 'three denials against a held lock took well under the 2 s steal time')
   assert.equal((await eventsOf(ctx)).filter(event => event.type === 'guard.denied').length, 3, 'the denials are still recorded')
   assert.equal((await thrashItems(ctx)).length, 0, 'the escalation was skipped')
   await rm(lock, { recursive: true })

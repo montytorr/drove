@@ -1,3 +1,4 @@
+import { deferred } from './timing-helpers.ts'
 import assert from 'node:assert/strict'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { mkdtemp, writeFile } from 'node:fs/promises'
@@ -280,9 +281,11 @@ test('live mode enters the alternate screen, hides the cursor, redraws on resize
 
 const fakeInput = () => {
   const calls: string[] = []
+  const ready = deferred()
   let listener: ((chunk: Buffer | string) => void) | undefined
   return {
     calls,
+    ready: ready.promise,
     send: (chunk: string) => listener?.(chunk),
     input: {
       setRawMode: (raw: boolean) => void calls.push(`raw:${raw}`),
@@ -291,6 +294,7 @@ const fakeInput = () => {
       onData: (next: (chunk: Buffer | string) => void) => {
         listener = next
         calls.push('listen')
+        ready.resolve()
         return () => {
           listener = undefined
           calls.push('unlisten')
@@ -312,19 +316,16 @@ const liveIo = (written: string[], input?: board.BoardInput): board.BoardIo => (
   input,
 })
 
-const pause = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
-
 test('live mode puts input in raw mode, ignores wheel, arrows and letters, and stops on q', async () => {
   const { deps } = await makeHome()
   const written: string[] = []
   const fake = fakeInput()
   const done = board.runBoard(deps, RUN.id, false, liveIo(written, fake.input))
-  await pause(30)
+  await fake.ready
   assert.deepEqual(fake.calls.slice(0, 3), ['raw:true', 'resume', 'listen'])
   const before = written.length
   const typed = ['\x1b[A', '\x1b[<64;10;5M', 'x', 'j']
   for (const chunk of typed) fake.send(chunk)
-  await pause(30)
   assert.ok(!written.slice(before).includes(board.LEAVE))
   assert.ok(!fake.calls.includes('raw:false'))
   fake.send('q')
@@ -338,7 +339,7 @@ test('live mode restores raw mode on Ctrl-C and on SIGINT', async () => {
   const { deps } = await makeHome()
   const ctrlC = fakeInput()
   const first = board.runBoard(deps, RUN.id, false, liveIo([], ctrlC.input))
-  await pause(20)
+  await ctrlC.ready
   ctrlC.send('\x03')
   await first
   assert.ok(ctrlC.calls.includes('raw:false'))
@@ -346,7 +347,7 @@ test('live mode restores raw mode on Ctrl-C and on SIGINT', async () => {
 
   const sig = fakeInput()
   const second = board.runBoard(deps, RUN.id, false, liveIo([], sig.input))
-  await pause(20)
+  await sig.ready
   process.emit('SIGINT')
   await second
   assert.ok(sig.calls.includes('raw:false'))

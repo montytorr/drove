@@ -13,6 +13,7 @@ import { appendJsonl, writeJsonAtomic } from '../src/store.ts'
 import type { Deps, DroveEvent, Roster, RunMeta, Seat } from '../src/types.ts'
 import { CLOCK_SOURCE, KIND_ICONS, KIND_TONES, LAYOUT_SOURCE, LEAD_NAMES, NEEDS_YOU_KINDS, pageOf, PANEL_SOURCE, REPORT_KINDS } from '../src/web/page.ts'
 import * as web from '../src/web.ts'
+import { deferred } from './timing-helpers.ts'
 import { assertExports } from './helpers.ts'
 
 const NOW = Date.parse('2026-10-09T10:42:00.000Z')
@@ -500,7 +501,7 @@ test('the page has the graph view, the Graph | Board switch it remembers, and th
   assert.doesNotMatch(page, /<script[^>]+src=|@import|url\(/)
 })
 
-const readEvents = (port: number, token: string, want: number): Promise<web.WebPayload[]> =>
+const readEvents = (port: number, token: string, want: number, onFrame?: (frame: web.WebPayload) => void): Promise<web.WebPayload[]> =>
   new Promise((resolve, reject) => {
     const seen: web.WebPayload[] = []
     const req = request({ host: '127.0.0.1', port, path: `/events?t=${token}`, headers: { host: `127.0.0.1:${port}` } }, res => {
@@ -512,7 +513,11 @@ const readEvents = (port: number, token: string, want: number): Promise<web.WebP
         for (let end = buffer.indexOf('\n\n'); end >= 0; end = buffer.indexOf('\n\n')) {
           const data = buffer.slice(0, end).split('\n').find(line => line.startsWith('data: '))
           buffer = buffer.slice(end + 2)
-          if (data) seen.push(JSON.parse(data.slice(6)) as web.WebPayload)
+          if (data) {
+            const frame = JSON.parse(data.slice(6)) as web.WebPayload
+            seen.push(frame)
+            onFrame?.(frame)
+          }
         }
         if (seen.length >= want) {
           req.destroy()
@@ -526,8 +531,9 @@ const readEvents = (port: number, token: string, want: number): Promise<web.WebP
 
 test('/events sends the model at once and again when the run changes', async () => {
   await withServer(async (server, deps) => {
-    const pending = readEvents(server.port, server.token, 2)
-    await new Promise(resolve => setTimeout(resolve, 60))
+    const initial = deferred()
+    const pending = readEvents(server.port, server.token, 2, () => initial.resolve())
+    await initial.promise
     await appendJsonl(join(runDir(deps.home, RUN.id), 'events.jsonl'), {
       at: '2026-10-09T10:41:30.000Z',
       type: 'report',
@@ -549,16 +555,17 @@ test('close ends open event streams and frees the port', async () => {
   const server = await web.startWeb(deps, RUN.id, { offsetMinutes: 0 })
   const stream = readEvents(server.port, server.token, 1)
   await stream
+  const connected = deferred()
   const open = new Promise<void>(resolve => {
     const req = request({ host: '127.0.0.1', port: server.port, path: `/events?t=${server.token}`, headers: { host: `127.0.0.1:${server.port}` } }, res => {
-      res.on('data', () => undefined)
+      res.on('data', () => connected.resolve())
       res.on('end', resolve)
       res.on('error', () => resolve())
     })
     req.on('error', () => resolve())
     req.end()
   })
-  await new Promise(resolve => setTimeout(resolve, 50))
+  await connected.promise
   await server.close()
   await open
   await assert.rejects(call(server.port, `/api/board?t=${server.token}`))
@@ -580,8 +587,12 @@ test('runWeb prints the URL and stops cleanly when its signal aborts', async () 
   const deps = await makeHome()
   const written: string[] = []
   const controller = new AbortController()
-  const done = web.runWeb(deps, RUN.id, { write: text => void written.push(text), signal: controller.signal })
-  await new Promise(resolve => setTimeout(resolve, 100))
+  const listening = deferred()
+  const done = web.runWeb(deps, RUN.id, { write: text => {
+    written.push(text)
+    listening.resolve()
+  }, signal: controller.signal })
+  await listening.promise
   const url = /http:\/\/127\.0\.0\.1:\d+\/\?t=[0-9a-f]{32}/.exec(written.join(''))?.[0]
   assert.ok(url, written.join(''))
   const reply = await call(Number(new URL(url).port), `/api/board?t=${new URL(url).searchParams.get('t')}`)
