@@ -71,6 +71,9 @@ export const mergeArgs = (input: { name: string; pr?: boolean; squash?: boolean;
   ...(input.message ? ['-m', input.message] : []),
 ]
 
+// A call that ran past its timeoutMs: $.process.run aborts it, and the mod reports that as drove-unavailable (exit -1).
+export const isCutOff = (ran: Ran): boolean => ran.exitCode === -1 && /aborted: still running after/.test(ran.stderr)
+
 export const checksArgs = (name: string, fresh?: boolean): string[] => ['checks', name, ...(fresh ? ['--fresh'] : [])]
 
 export const rosterArgs = (run: string): string[] => ['roster', '--run', run]

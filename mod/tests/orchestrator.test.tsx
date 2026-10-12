@@ -275,6 +275,7 @@ type World = {
   runAgents?: HostAgents
   isGuardBroken: boolean
   isSpawnCwdGone?: boolean
+  isMergeCutOff?: boolean
   bridge: { push: (text: string | null) => void }
   bridgeCode: number
   store: Map<string, unknown>
@@ -344,6 +345,7 @@ const fakeDrove = (world: World, call: Call) => {
     const reason = input.tool_name === 'Bash' && /\bnpm\b/.test(command) ? `Drove planner: ${command} runs code` : input.tool_name !== 'Bash' && !path.startsWith('/tmp') ? `Drove planner: ${input.tool_name} on ${path} changes code` : undefined
     return reason ? ok(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } }), 2) : ok('')
   }
+  if (command === 'merge' && world.isMergeCutOff) return ok('', -1, 'drove-unavailable: $.process.run(node) aborted: still running after 600000ms')
   if (command === 'spawn') {
     if (world.isOverBudget) return ok('', 1, 'over-budget: the pane budget of 5 is full; ask the human to run `drove budget 6`')
     return ok(`Worker ${action} (claude claude-sonnet-5-5 low) is running in pane w1:p10, worktree /work/repo/.claude/worktrees/${action} on branch worktree-${action}. Brief: herdr-prompt. Its reports will come to you.`)
@@ -553,6 +555,19 @@ describe('orchestrator session', () => {
     expect(droveCalls(world, 'merge')).toHaveLength(2)
     await callTool($, 'merge_worker', { name: 'w-auth', fresh: true })
     expect(droveCalls(world, 'merge')[2]?.args).toEqual(['merge', 'w-auth', '--fresh'])
+  })
+
+  test('merge_worker with pr that the 600 s cap cuts off answers pending, not drove-unavailable; a local merge keeps the failure', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    await emit(world, clock, { t: 'ready', run: RUN, pid: 9 }, { t: 'roster', roster: { v: 1, run: RUN, seats: [seat()], updatedAt: ISO }, status: {} })
+    world.isMergeCutOff = true
+    const cut = (await callTool($, 'merge_worker', { name: 'w-auth', pr: true })) as { deny?: string; result?: string }
+    expect(cut.deny).toBeUndefined()
+    expect(cut.result).toMatch(/^pending: drove merge w-auth --pr was still running after 600s .*call merge_worker with pr: true again later\./)
+    expect(denial((await callTool($, 'merge_worker', { name: 'w-auth' })) as never)).toContain('drove-unavailable')
   })
 
   test('run_checks is drove checks: the worker, and --fresh on request, with a long timeout and nothing that writes', async ($, on) => {
