@@ -1,3 +1,4 @@
+import { cairnEnv, cairnKeyHint } from './cairn.ts'
 import { access, constants, readFile, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -8,7 +9,7 @@ import { probeServer } from './herdr.ts'
 import { detectAgents, nodeAgentDeps } from './agents.ts'
 import { DROVE_PLUGIN, expandHome, pluginDirEntries, pluginNameOfDir, userClaudeDir } from './launch.ts'
 import { userCodexHome } from './paths.ts'
-import type { Exec, ExecResult } from './types.ts'
+import type { AgentKind, Exec, ExecResult } from './types.ts'
 
 export type CheckStatus = 'ok' | 'warn' | 'fail'
 export type Check = { id: string; status: CheckStatus; detail: string; fix?: string }
@@ -101,7 +102,7 @@ const checkHerdr = async (deps: DoctorDeps): Promise<Check[]> => {
   ]
 }
 
-const checkAgents = async (deps: DoctorDeps): Promise<Check[]> => {
+const checkAgents = async (deps: DoctorDeps): Promise<{ checks: Check[]; kind?: AgentKind }> => {
   const onPath = new Set<string>()
   const exec: Exec = async (argv, options) => {
     const result = await deps.exec(argv, options)
@@ -127,7 +128,7 @@ const checkAgents = async (deps: DoctorDeps): Promise<Check[]> => {
   if (hasCodex) checks.push(check('codex', 'ok', `codex-cli ${codex.version}${codex.model ? ` · ${codex.model}` : ''}${codex.effort ? ` · ${codex.effort} effort` : ''}`))
   else if (onPath.has('codex')) checks.push(check('codex', hasClaude ? 'warn' : 'fail', 'codex is on PATH but its version could not be read', 'run codex --version; update Codex if needed'))
   else checks.push(hasClaude ? check('codex', 'warn', 'codex is not on PATH (Codex workers are unavailable)', 'install Codex if you want Codex seats') : check('codex', 'fail', 'codex is not on PATH and neither is claude', 'install Claude Code or Codex and sign in'))
-  return checks
+  return { checks, kind: hasClaude ? 'claude' : hasCodex ? 'codex' : undefined }
 }
 
 const checkGh = async (deps: DoctorDeps): Promise<Check> => {
@@ -139,13 +140,14 @@ const checkGh = async (deps: DoctorDeps): Promise<Check> => {
     : check('gh', 'warn', 'gh is installed but not signed in', 'run gh auth login (the human does this; Drove never signs in)')
 }
 
-const checkCairn = async (deps: DoctorDeps): Promise<Check> => {
-  const version = await attempt(deps.exec, ['cairn', '--version'])
+const checkCairn = async (deps: DoctorDeps, kind?: AgentKind): Promise<Check> => {
+  const exec: Exec = (argv, options) => deps.exec(argv, { ...options, env: cairnEnv(kind) })
+  const version = await attempt(exec, ['cairn', '--version'])
   if (version.code !== 0) return check('cairn', 'fail', 'cairn is not installed', 'install the Cairn CLI: cairn setup --url <instance> (see "Running Drove on another machine")')
-  const read = await attempt(deps.exec, ['cairn', 'projects'])
+  const read = await attempt(exec, ['cairn', 'projects'])
   return read.code === 0
     ? check('cairn', 'ok', `${firstLine(version)}, read works`)
-    : check('cairn', 'fail', `cairn is installed but a read failed: ${firstLine(read)}`, 'sign in: cairn setup --url <instance>; or set CAIRN_BASE_URL and CAIRN_API_KEY')
+    : check('cairn', 'fail', `cairn is installed but a read failed: ${firstLine(read)}${cairnKeyHint(`${read.stderr}\n${read.stdout}`)}`, 'sign in: cairn setup --url <instance>; or set CAIRN_BASE_URL and CAIRN_API_KEY')
 }
 
 const checkHome = async (deps: DoctorDeps): Promise<Check> => {
@@ -214,12 +216,13 @@ const checkModNode = async (deps: DoctorDeps): Promise<Check | undefined> => {
 }
 
 export const runDoctor = async (deps: DoctorDeps): Promise<DoctorReport> => {
+  const agentChecks = checkAgents(deps)
   const [git, herdr, agents, gh, cairn, home, mod, modNode] = await Promise.all([
-    checkGit(deps), checkHerdr(deps), checkAgents(deps), checkGh(deps), checkCairn(deps), checkHome(deps), checkModInstalled(deps), checkModNode(deps),
+    checkGit(deps), checkHerdr(deps), agentChecks, checkGh(deps), agentChecks.then(({ kind }) => checkCairn(deps, kind)), checkHome(deps), checkModInstalled(deps), checkModNode(deps),
   ])
   const root = await toplevel(deps.exec, deps.cwd) ?? deps.cwd
   const policy = await loadPolicy(deps.home, root, deps.readText)
-  const checks = [check('spawn-policy', policy.errors.length ? 'fail' : 'ok', policy.errors.length ? policy.errors.join('; ') : 'spawn policy valid'), checkNode(deps), ...git, ...herdr, ...agents, gh, cairn, home, mod, ...(modNode ? [modNode] : [])]
+  const checks = [check('spawn-policy', policy.errors.length ? 'fail' : 'ok', policy.errors.length ? policy.errors.join('; ') : 'spawn policy valid'), checkNode(deps), ...git, ...herdr, ...agents.checks, gh, cairn, home, mod, ...(modNode ? [modNode] : [])]
   return { ok: checks.every(item => item.status !== 'fail'), checks }
 }
 

@@ -1,3 +1,4 @@
+import { cairnEnv } from './cairn.ts'
 import { join } from 'node:path'
 import { modelLabelOf } from './agents.ts'
 import * as commands from './commands.ts'
@@ -143,7 +144,7 @@ const claimBeater = (deps: Deps, identity: Identity, ports: ToolPorts) => {
         last = previous
         return
       }
-      await deps.exec(['cairn', 'beat', run.cairn], { timeoutMs: CLAIM_BEAT_TIMEOUT_MS })
+      await deps.exec(['cairn', 'beat', run.cairn], { timeoutMs: CLAIM_BEAT_TIMEOUT_MS, env: cairnEnv(run.planner.kind) })
     } catch {}
   }
 }
