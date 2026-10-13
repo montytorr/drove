@@ -4,9 +4,9 @@ Drove runs where the code lives: a client's laptop, a dev box, a CI host. Nothin
 
 ## Install
 
-Node 22.18+, `git`, herdr 0.9+, `claude` and/or `codex` (signed in), `gh` (signed in, only for `drove merge --pr`) and the Cairn CLI. Clone Drove and symlink `src/cli.ts` as in the [README's Install](../README.md#install).
+Node 22.18+, `git`, herdr 0.9+, `claude` and/or `codex` (signed in), `gh` (signed in, only for `drove merge --pr`) and the Cairn CLI. Clone Drove, run `npm install`, then `./src/cli.ts setup --yes` from the clone: it links the CLI, installs the mod and creates `DROVE_HOME` without asking, and does nothing the second time. See the [README's Install](../README.md#install).
 
-Then run `drove doctor` from the repo. It checks Node, git and the repo's remote, herdr and its server, `claude` and `codex`, `gh` and its sign-in, `cairn` with one read, `DROVE_HOME` and the mod's `nodePath`. Each check is `ok`, `warn` or `fail` with a one-line fix.
+Then run `drove doctor` from the repo. It checks Node, git and the repo's remote, herdr and its server, `claude` and `codex`, `gh` and its sign-in, `cairn` with one read, `DROVE_HOME`, the mod's `nodePath` and whether the mod is installed (`mod`). Each check is `ok`, `warn` or `fail` with a one-line fix.
 
 The exit status is 1 when a check fails, so a setup script can gate on it (`drove doctor --json` for a script). It is read-only and never starts a server; the planner and workers may run it.
 

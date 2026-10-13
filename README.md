@@ -65,24 +65,34 @@ There is no daemon. The planner's own MCP server (or, for a Claude planner with 
 - `claude` and/or `codex` on `PATH`, signed in.
 - `gh`, signed in, only for `drove merge --pr`.
 
-`drove doctor` checks all of this and prints a one-line fix for anything missing.
+`drove doctor` checks all of this (and that the mod is installed) and prints a one-line fix for anything missing.
 
 ## Install
 
 ```sh
+git clone https://github.com/montytorr/drove.git && cd drove
 npm install      # dev dependencies only: typescript, @types/node
-ln -sf ~/src/drove/src/cli.ts ~/.local/bin/drove   # the path of your clone; any directory on PATH
+./src/cli.ts setup
 ```
 
-The symlink is the recommended way: it survives `nvm use`. `src/cli.ts` is executable and runs under whichever `node` is on `PATH`, which must be Node 22.18+.
+`drove` is not on your `PATH` yet, so the first run goes through the clone: `src/cli.ts` is executable and runs under whichever `node` is on `PATH`, which must be Node 22.18+. Setup shows each change, with its path and before and after, and asks before writing. It then runs the doctor and lists what is left for you: herdr, Claude or Codex sign-in, `cairn setup`, `gh auth login`, folder trust for a repo.
 
-`npm link` from the repo also works, but under nvm a link exists for one Node version only. Do not install globally: Node does not strip types from files under `node_modules`.
+- `drove setup mod`, `cli` or `home` ensures one step only.
+- `--dry-run` prints the plan and writes nothing.
+- `--yes` writes without asking, for unattended installs. Without a terminal and without `--yes`, setup prints the plan and changes nothing.
+- It is safe to run again any time: a second run reports everything done and writes nothing. Run it from a new clone to repoint the link and the mod.
+
+### What setup does, by hand
+
+- **`cli`**: links `~/.local/bin/drove` (or `--bin DIR`) to this clone's `src/cli.ts`. By hand: `ln -sf ~/src/drove/src/cli.ts ~/.local/bin/drove`, any directory on `PATH`. A symlink survives `nvm use`; `npm link` is per Node version, and a global install does not work because Node does not strip types from files under `node_modules`.
+- **`mod`**: adds this clone's `mod` directory to `CLAUDE_CODE_PLUGIN_DIRS` (see below), after backing up `settings.json`. It never touches other keys or `~/.claude.json`.
+- **`home`**: creates `DROVE_HOME` (`~/.drove`).
 
 ### The Claude Code mod (optional)
 
 `drove plan` works without it. The mod (`mod/`, plugin name `orchestrator`) adds `/orchestrate`: a Claude Code session becomes the planner with the `*_worker` tools, a board inside Claude, in-app dialogs, and model and effort switched on each request. In a `drove plan` session it adds `/orchestrate board`.
 
-Claude Code loads it from `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of `~/.claude/settings.json`. The value is a list of directories separated by `:`; append your clone's `mod` directory to any existing value:
+Claude Code loads it from `CLAUDE_CODE_PLUGIN_DIRS` in the `env` block of `~/.claude/settings.json` (under `CLAUDE_CONFIG_DIR` when set). The value is a list of directories separated by `:`. By hand, append your clone's `mod` directory to any existing value:
 
 ```json
 {
@@ -165,7 +175,8 @@ drove board                        # in a spare pane
 | `drove up [--run ID] [--seat SEAT] [--detached [--json]]` | resume a run, relaunch one dead seat, or relaunch a lost planner |
 | `drove goal [--run ID] [--cairn REF] <text>\|-` | set the run's goal (the planner or the human; a worker is denied) |
 | `drove policy [--run ID] [--json]` | the merged `spawnPolicy` and its errors, read from the committed run base |
-| `drove doctor [--json]` | check what this machine needs; exits 1 when a check fails; read-only |
+| `drove doctor [--json]` | check what this machine needs, including whether the mod is installed (`mod`); exits 1 when a check fails; read-only |
+| `drove setup [cli\|mod\|home ...] [--yes] [--dry-run] [--bin DIR] [--json]` | install Drove on this machine: link the CLI, add the mod to Claude's settings, create `DROVE_HOME`; asks before each write, safe to re-run |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
 
