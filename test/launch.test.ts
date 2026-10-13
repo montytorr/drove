@@ -39,6 +39,24 @@ test('claude worker spec matches the golden file', () => {
   assert.ok(spec.argv.includes('--dangerously-skip-permissions'))
 })
 
+test('Claude launches forward the process CLAUDE_CONFIG_DIR only when non-empty', () => {
+  const previous = process.env.CLAUDE_CONFIG_DIR
+  try {
+    for (const value of [undefined, '/custom/claude', '']) {
+      if (value === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = value
+      for (const identity of [worker, planner]) {
+        const spec = launch.specFor(request({ identity }))
+        assert.equal(spec.env.CLAUDE_CONFIG_DIR, value || undefined)
+        assert.equal(Object.hasOwn(spec.env, 'CLAUDE_CONFIG_DIR'), Boolean(value))
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previous
+  }
+})
+
 test('a lean claude worker matches the golden file', () => {
   const spec = launch.claudeWorkerSpec(request({ cwd: '/work/repo', sessionId: '11111111-2222-3333-4444-555555555555', mcpAllow: ['mongodb'], userMcp: { mongodb: { command: 'mongo-mcp', args: ['--read-only'] }, notion: { command: 'notion-mcp' } } }))
   assertGolden('claude-worker-lean', spec)
@@ -179,6 +197,16 @@ test('codex planner spec matches the golden file', () => {
   assertGolden('codex-planner', spec)
   assert.equal(spec.env.DROVE_ROLE, 'planner')
   assert.ok(spec.argv.includes(`${HOME}/runs/${RUN}`))
+})
+
+test('Codex planners trust the repo with a per-process override, with or without a Drove home', () => {
+  for (const codexHome of [undefined, { dir: '/drove/codex-home', user: '/home/user/.codex', userConfig: '', userHooks: {}, links: [], skills: [] }]) {
+    const spec = launch.codexPlannerSpec(request({ identity: planner, kind: 'codex', repo: '/work/repo "quoted"', codexHome }))
+    const index = spec.argv.indexOf(String.raw`projects."/work/repo \"quoted\"".trust_level="trusted"`)
+    assert.ok(index > 0)
+    assert.equal(spec.argv[index - 1], '-c')
+    for (const file of spec.files) assert.ok(!file.path.startsWith('/home/user/.codex/'))
+  }
 })
 
 test('specFor dispatches on kind and role, and rejects a mismatched identity', () => {
@@ -416,6 +444,7 @@ test('the Drove config.toml holds the repo trust, the drove MCP server, the user
   assert.ok(config.includes('model = "gpt-6.1-sol"\npersonality = \'pragmatic\'\ncheck_for_update_on_startup = false\n'), config)
   assert.ok(!config.includes('model_reasoning_effort'), 'effort stays per seat on the launch line')
   assert.ok(config.includes('[projects."/work/repo"]\ntrust_level = "trusted"\n'))
+  assert.ok(config.includes('[projects."/work/repo/.claude/worktrees/w-api"]\ntrust_level = "trusted"\n'))
   assert.ok(!config.includes('/home/user/elsewhere'))
   assert.ok(config.includes('[mcp_servers.drove]\ncommand = "node"\nargs = ["/opt/drove/src/cli.ts", "mcp"]\nenv_vars = ["DROVE_HOME", "DROVE_RUN", "DROVE_ROLE", "DROVE_SEAT", "DROVE_TOKEN"]\ndefault_tools_approval_mode = "approve"\n'))
   assert.ok(config.includes('[mcp_servers.docs]\ncommand = "npx"\nargs = [\n  "docs-mcp",\n]\n\n[mcp_servers.docs.env]\nTOKEN_FILE = "/home/user/.docs"\n'))
@@ -428,6 +457,11 @@ test('the Drove config.toml holds the repo trust, the drove MCP server, the user
   assert.ok(config.includes(`[hooks.state."${CODEX_DIR}/hooks.json:session_start:1:0"]\ntrusted_hash = "${droveHash}"\n`))
   for (const position of ['pre_tool_use:0:0', 'user_prompt_submit:0:0', 'stop:1:0', 'permission_request:0:0']) assert.ok(config.includes(`hooks.json:${position}"]\ntrusted_hash = "sha256:`), position)
   assert.ok(!config.includes('\n\n\n'))
+})
+
+test('Codex home project trust keys are deduplicated when the launch cwd is the repo', () => {
+  const config = fileOf(launch.codexWorkerSpec(homeRequest({ cwd: '/work/repo' })), 'config.toml')
+  assert.equal(config.match(/\[projects\./g)?.length, 1)
 })
 
 test('the Drove hooks.json keeps the user groups first, at the indices their trust is keyed by, then Drove groups', () => {
@@ -554,7 +588,7 @@ test('the codex home config.toml carries the shared role as developer_instructio
   assert.ok(config.indexOf('developer_instructions') < config.indexOf('['), 'a root key, before any table')
   assert.ok(!spec.argv.some(arg => arg.includes('developer_instructions')))
   const other = launch.codexWorkerSpec(homeRequest({ roleText: ROLE, identity: { ...worker, seat: 'w-web' }, cwd: '/work/repo/.claude/worktrees/w-web' }))
-  assert.equal(fileOf(other, 'config.toml'), config, 'every seat writes the same config.toml')
+  assert.equal(fileOf(other, 'config.toml').replace('/work/repo/.claude/worktrees/w-web', '/work/repo/.claude/worktrees/w-api'), config, 'seats share the role and settings apart from their worktree trust key')
   const resumed = launch.codexWorkerSpec(homeRequest({ roleText: ROLE, resumeId: 'thread-1' }))
   assert.equal(fileOf(resumed, 'config.toml'), config, 'a resume keeps the role')
 })

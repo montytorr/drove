@@ -1,6 +1,6 @@
 import { DEFAULT_START_TIMEOUT_MS } from './herdr.ts'
 import { trustAttentionText } from './trust.ts'
-import type { Attention, Derived, HerdrAgent, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
+import type { AgentKind, Attention, Derived, HerdrAgent, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
 
 type Dialog = { pattern: RegExp; reason: Attention['reason']; detail: string; hint: string; detailOf?: (screen: string) => string }
 
@@ -40,18 +40,23 @@ export const DIALOGS: readonly Dialog[] = [
     hint: 'Codex CLI and its app-server daemon versions differ',
   },
   {
+    pattern: /^[^\w\n]*Trust this folder\?|Folder settings can run code automatically/im,
+    reason: 'trust',
+    detail: 'A folder-trust prompt is waiting in the pane.',
+    hint: 'Codex is asking to trust the folder',
+  },
+  {
     pattern: /trust (this|the files in this) folder|trust the contents of this directory|project you created or one you trust/i,
     reason: 'trust',
     detail: 'A folder-trust prompt is waiting in the pane.',
     hint: 'Claude is asking to trust the folder',
   },
   {
-    pattern: /hooks? needs? review|hooks? (is|are) new or changed/i,
+    pattern: /hooks? needs? review|hooks? (is|are) new or changed|Trust all and continue|Continue without trusting/i,
     reason: 'hook-trust',
     detail: "Codex is asking to review the Drove hooks before they can run; approve them once in the pane and Codex remembers them. Drove will not answer it.",
     hint: "approve Drove's hooks once in the pane; Codex remembers them",
   },
-  { pattern: /hook.*trust/i, reason: 'hook-trust', detail: 'A hook-trust prompt is waiting in the pane.', hint: 'the agent is asking to trust the Drove hooks' },
   {
     pattern: /Update available|Update now \(runs/,
     reason: 'dialog',
@@ -91,7 +96,10 @@ export const isRestarting = (seat: Seat, now: Date): boolean => {
   return !Number.isNaN(since) && now.getTime() - since < RESTART_BOUND_MS
 }
 
-export const findDialog = (screen: string): Dialog | undefined => DIALOGS.find(({ pattern }) => pattern.test(screen))
+export const findDialog = (screen: string, kind?: AgentKind): Dialog | undefined => {
+  const hit = DIALOGS.find(({ pattern }) => pattern.test(screen))
+  return hit?.reason === 'trust' && kind ? { ...hit, hint: `${kind === 'codex' ? 'Codex' : 'Claude'} is asking to trust the folder` } : hit
+}
 
 // A seat that stopped after working, with nothing reported since, may be sitting at a usage-limit screen.
 const isSilentSinceWork = (seat: Seat, reported: LastReport | undefined): boolean => {
@@ -109,8 +117,8 @@ export const shouldReadScreen = (agent: HerdrAgent | undefined, hooks: readonly 
   return (seat !== undefined && isSilentSinceWork(seat, undefined)) || !hooks.some(hook => hook.event === 'session-start' || hook.event === 'user-prompt-submit')
 }
 
-export const matchDialog = (seat: string, screen: string, at: Date): Attention | undefined => {
-  const hit = findDialog(screen)
+export const matchDialog = (seat: string, screen: string, at: Date, kind?: AgentKind): Attention | undefined => {
+  const hit = findDialog(screen, kind)
   return hit ? { seat, reason: hit.reason, detail: hit.detailOf?.(screen) ?? hit.detail, at: at.toISOString() } : undefined
 }
 
@@ -184,10 +192,10 @@ export const deriveState = (seat: Seat, signals: TurnSignals, now: Date): Derive
     return { state: 'gone', attention }
   }
 
-  const seen = (signals.screen ? matchDialog(seat.name, signals.screen, now) : undefined) ?? hookLimit(seat.name, hooks, at)
+  const seen = (signals.screen ? matchDialog(seat.name, signals.screen, now, seat.kind) : undefined) ?? hookLimit(seat.name, hooks, at)
   // DROVE-147: a seat whose start waits on the folder-trust prompt names the repo root and the one-time fix.
   const root = seat.pendingStart?.root
-  const dialog = seen?.reason === 'trust' && root ? { ...seen, detail: trustAttentionText(root, seat.paneId) } : seen
+  const dialog = seen?.reason === 'trust' && seat.kind === 'claude' && root ? { ...seen, detail: trustAttentionText(root, seat.paneId) } : seen
   const ask = pendingAsk(hooks, signals.transcriptAt)
   const isAskLive = ask !== undefined && (herdr?.status !== 'working' || nowMs - ms(ask.at) <= HOOK_FRESH_MS)
 
