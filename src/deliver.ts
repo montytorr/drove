@@ -1,3 +1,4 @@
+import { plannerPaneMatches } from './planner.ts'
 import { chmod, readFile, rename, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { agentPromptArgv, agentSendKeysArgv, getAgent, readPane, readScreen, retryWhileBusy, run as runHerdr } from './herdr.ts'
@@ -104,6 +105,7 @@ export const herdrPromptAdapter = (deps: Deps): DeliveryAdapter => ({
     let ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
     if (ran.ok) return { ok: true, via: 'herdr-prompt' }
     if (ran.code === 'timeout') return { ok: true, via: 'herdr-prompt', unconfirmed: true }
+    if (ran.code === 'planner_session_mismatch') return { ok: false, queued: true, reason: ran.output }
     if (ran.code === 'agent_blocked') return { ok: false, queued: true, reason: 'agent_blocked: the pane is waiting at a dialog' }
     if (ran.code === 'agent_prompt_stalled') {
       const live = await getAgent(deps.exec, target)
@@ -125,6 +127,7 @@ export const herdrPromptAdapter = (deps: Deps): DeliveryAdapter => ({
       ran = await retryWhileBusy(deps.exec, agentPromptArgv(target, text), BUSY_RETRY_MS)
       if (ran.ok) return { ok: true, via: 'herdr-prompt' }
       if (ran.code === 'timeout') return { ok: true, via: 'herdr-prompt', unconfirmed: true }
+      if (ran.code === 'planner_session_mismatch') return { ok: false, queued: true, reason: ran.output }
       if (ran.code === 'agent_blocked') return { ok: false, queued: true, reason: 'agent_blocked: the pane is waiting at a dialog' }
     }
     return { ok: false, queued: ran.code === 'agent_not_found' || ran.code === 'agent_pane_busy', reason: describeFailure(seat, ran.code, ran.output) }
@@ -376,11 +379,12 @@ export const plannerSessionId = async (deps: Deps, run: RunMeta): Promise<string
 }
 
 export const wakePlanner = async (deps: Deps, run: RunMeta, reports: readonly Report[], humanName = 'the human'): Promise<Delivery> => {
+  if (run.planner.unavailable) return { ok: false, queued: true, reason: run.planner.unavailable.detail }
   const text = renderReports(reports, humanName)
   let planner = plannerSeat(run)
   const live = planner.paneId ? await getAgent(deps.exec, planner.paneId) : undefined
   if (live?.ok && live.value.status === 'blocked') return { ok: false, queued: false, reason: 'the planner pane is blocked at a dialog' }
-  const sessionId = planner.sessionId ?? (await plannerSessionId(deps, run)) ?? (live?.ok ? live.value.sessionId : undefined)
+  const sessionId = planner.sessionId ?? (await plannerSessionId(deps, run)) ?? (planner.kind === 'codex' && live?.ok ? live.value.sessionId : undefined)
   if (sessionId) planner = { ...planner, sessionId }
   const mod = registered.get('mod')
   if (mod?.canDeliver(planner)) return mod.deliver(planner, text)
@@ -395,7 +399,16 @@ export const wakePlanner = async (deps: Deps, run: RunMeta, reports: readonly Re
   const since = plannerIdleSince.get(run.id) ?? nowMs
   plannerIdleSince.set(run.id, since)
   if (nowMs - since < PLANNER_QUIET_MS) return { ok: false, queued: false, reason: 'the planner has not been idle for 5 s yet' }
-  const delivery = await herdrPromptAdapter(deps).deliver(planner, text)
+  const ownership = await plannerPaneMatches(deps, run, sessionId)
+  if (!ownership.ok) return { ok: false, queued: true, reason: ownership.reason }
+  const guardedDeps: Deps = { ...deps, exec: async (argv, options) => {
+    if (argv[0] === 'herdr' && argv[1] === 'agent' && (argv[2] === 'prompt' || argv[2] === 'send-keys')) {
+      const checked = await plannerPaneMatches(deps, run, sessionId)
+      if (!checked.ok) return { code: 1, stdout: '', stderr: JSON.stringify({ error: { code: 'planner_session_mismatch', message: checked.reason } }) }
+    }
+    return deps.exec(argv, options)
+  } }
+  const delivery = await herdrPromptAdapter(guardedDeps).deliver(planner, text)
   if (delivery.ok) plannerIdleSince.delete(run.id)
   return delivery
 }

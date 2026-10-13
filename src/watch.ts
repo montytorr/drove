@@ -6,6 +6,7 @@ import * as commands from './commands.ts'
 import * as deliver from './deliver.ts'
 import * as detect from './detect.ts'
 import * as herdr from './herdr.ts'
+import { plannerPaneMatches } from './planner.ts'
 import * as light from './light.ts'
 import * as pendingLedger from './pending.ts'
 import * as paths from './paths.ts'
@@ -464,6 +465,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
 
   const wakeTransports = (run: RunMeta, text: string, reports: readonly Report[]): { name: string; attempt: () => Promise<(Delivery | deliver.UnconfirmedDelivery) | undefined> }[] => {
     const planner = run.planner
+    if (planner.unavailable) return [{ name: 'planner', attempt: async () => ({ ok: false, queued: true, reason: planner.unavailable!.detail }) }]
     return [
       {
         name: 'mod',
@@ -494,6 +496,12 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
           const status = plannerStatus
           if (!status || (status.status !== 'idle' && status.status !== 'done')) return { ok: false, queued: true, reason: `${WAIT}planner pane is ${status?.status ?? 'not observed yet'}` }
           if (clockMs() - status.since < IDLE_WAKE_MS) return { ok: false, queued: true, reason: `${WAIT}planner pane has not been idle for 5 s yet` }
+          const ownership = await plannerPaneMatches(deps, run, await plannerThread(run))
+          if (!ownership.ok) {
+            lightHold = undefined
+            lightTty = undefined
+            return { ok: false, queued: true, reason: ownership.reason }
+          }
           const result = await deps.exec(ports.agentPromptArgv(planner.paneId, text))
           if (result.code === 0) return { ok: true, via: 'herdr-prompt' }
           const output = result.stderr.trim() || result.stdout.trim()
@@ -642,6 +650,11 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const stepLight = async (run: RunMeta, planner: HerdrAgent | undefined, seats: readonly Seat[]) => {
     const paneId = run.planner.paneId
     if (!paneId || isStopped) return
+    if (run.planner.unavailable || (run.planner.sessionId && planner?.sessionId !== run.planner.sessionId)) {
+      lightHold = undefined
+      lightTty = undefined
+      return
+    }
     // A run that goes down while Drove holds the title gets Claude's idle title back like any other end of the wait.
     const isLit = run.planner.kind === 'claude' && run.status === 'up' && light.wantsWorking(seats, runBudgetRaised === true)
     const step = light.stepLight(lightHold, planner, isLit, clockMs())

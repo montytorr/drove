@@ -1,19 +1,20 @@
 import assert from 'node:assert/strict'
-import { realpath } from 'node:fs/promises'
+import { realpath, readdir } from 'node:fs/promises'
 import { beforeEach, test } from 'node:test'
 import { parseArgs } from 'node:util'
 import { COMMANDS, main, spawnRequestOf, splitGlobs } from '../src/cli.ts'
 import type { ProcessPlan } from '../src/commands.ts'
-import { saveRun } from '../src/roster.ts'
-import { makeRepo, makeRun, RUN, tmp } from './p3-helpers.ts'
+import { saveRun, loadRun } from '../src/roster.ts'
+import type { Deps } from '../src/types.ts'
+import { FakeHerdr, makeDeps, makeRepo, makeRun, RUN, tmp } from './p3-helpers.ts'
 
-const capture = (stdin = '') => {
+const capture = (stdin = '', deps?: Deps) => {
   const out: string[] = []
   const err: string[] = []
   const launched: ProcessPlan[] = []
   return {
     out, err, launched,
-    io: { out: (text: string) => out.push(text), err: (text: string) => err.push(text), stdin: async () => stdin, launch: async (plan: ProcessPlan) => (launched.push(plan), 7) },
+    io: { deps, out: (text: string) => out.push(text), err: (text: string) => err.push(text), stdin: async () => stdin, launch: async (plan: ProcessPlan) => (launched.push(plan), 7) },
   }
 }
 
@@ -140,7 +141,8 @@ test('drove guard with no Drove identity allows silently', async () => {
 
 test('drove plan prints the run line and hands the exec plan to the launcher, returning its exit code', async () => {
   process.env.HERDR_PANE_ID = 'w1:p5'
-  const { out, launched, io } = capture()
+  const deps = await makeDeps(new FakeHerdr())
+  const { out, launched, io } = capture('', deps)
   // In a repo of its own with a main branch: a CI checkout of a feature branch has no main, and drove plan needs a base.
   assert.equal(await inDir(await makeRepo('plan-repo'), () => main(['plan', '--kind', 'codex', '--goal', 'Do the goal'], io)), 7)
   assert.match(out.join('\n'), /^Run .* is up; starting the codex planner\./)
@@ -148,10 +150,13 @@ test('drove plan prints the run line and hands the exec plan to the launcher, re
   assert.equal(launched[0]?.argv[0], 'codex')
   assert.equal(launched[0]?.argv.at(-1), 'Do the goal')
   assert.equal(launched[0]?.env.DROVE_ROLE, 'planner')
+  const saved = await loadRun(deps.home, launched[0]!.env.DROVE_RUN!)
+  assert.match(saved?.planner.unavailable?.detail ?? '', /the planner exited; run `drove up --run/)
+  assert.equal(saved?.status, 'up', 'worker run remains resumable with the planner marked gone')
 })
 
 test('drove plan outside herdr fails with not-in-herdr and launches nothing', async () => {
-  const { err, launched, io } = capture()
+  const { err, launched, io } = capture('', await makeDeps(new FakeHerdr()))
   assert.equal(await main(['plan'], io), 1)
   assert.match(err.join('\n'), /not-in-herdr/)
   assert.equal(launched.length, 0)
@@ -192,4 +197,18 @@ test('drove board with no run anywhere names drove plan and --run', async () => 
   const { err, io } = capture()
   assert.equal(await inDir(await makeRepo('board-empty'), () => main(['board', '--once'], io)), 1)
   assert.match(err.join('\n'), /drove plan.*--run/)
+})
+
+
+test('drove plan --from-cairn refuses a non-TTY before creating or launching anything', async () => {
+  process.env.HERDR_PANE_ID = 'w31:p1'
+  const fake = new FakeHerdr()
+  const deps = await makeDeps(fake)
+  deps.terminal = { stdin: false, stdout: true }
+  const { err, launched, io } = capture('', deps)
+  assert.equal(await main(['plan', '--from-cairn', 'BOTHY-22'], io), 1)
+  assert.match(err.join('\n'), /drove plan needs a terminal of its own.*fresh herdr pane.*--detached/)
+  assert.deepEqual(launched, [])
+  assert.deepEqual(fake.calls, [])
+  assert.deepEqual(await readdir(deps.home), [])
 })

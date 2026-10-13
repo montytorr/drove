@@ -24,6 +24,8 @@ export type PlannerMeta = {
   model: string
   effort: Effort
   viaMod: boolean
+  launchId?: string
+  unavailable?: { at: string; detail: string }
 }
 
 export type RunMeta = {
