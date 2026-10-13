@@ -24,7 +24,7 @@ beforeEach(async () => {
 })
 
 test('cli knows the commands from the design', () => {
-  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'init', 'spawn', 'send', 'owns', 'prompt', 'promote', 'migrate', 'roster', 'reports', 'report', 'diagnose', 'trace', 'capture', 'close', 'merge', 'checks', 'board', 'down', 'up', 'attention', 'goal', 'policy', 'doctor', 'budget', 'guard', 'mcp', 'mod'])
+  assert.deepEqual(Object.keys(COMMANDS), ['plan', 'init', 'spawn', 'send', 'owns', 'prompt', 'promote', 'migrate', 'roster', 'reports', 'report', 'diagnose', 'trace', 'capture', 'close', 'merge', 'checks', 'board', 'down', 'up', 'attention', 'goal', 'policy', 'doctor', 'setup', 'budget', 'guard', 'mcp', 'mod'])
 })
 
 test('--owns splits on commas outside braces, and spawn reads --owns, --max-turns and --max-tokens', async () => {

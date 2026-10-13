@@ -6,6 +6,7 @@ import { parseArgs, type ParseArgsConfig } from 'node:util'
 import { attentionLine } from './attention.ts'
 import { runBoard } from './board.ts'
 import { formatReport, nodeDoctorDeps, runDoctor } from './doctor.ts'
+import { nodeSetupDeps, parseSteps, runSetup, SETUP_STEPS, type SetupDeps, type SetupStep } from './setup.ts'
 import { runWeb } from './web.ts'
 import * as commands from './commands.ts'
 import { HOOK_EVENTS, runHook } from './hooks.ts'
@@ -17,7 +18,7 @@ import { CONTROL_KINDS } from './protocol.ts'
 import type { AgentKind, CommandResult, Deps, Effort, HookEventName, Role, SeatRole, SendRequest, SpawnRequest } from './types.ts'
 
 type Values = Record<string, string | string[] | boolean | undefined>
-type Io = { deps?: Deps; out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number>; signal?: AbortSignal; pollMs?: number }
+type Io = { deps?: Deps; out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number>; signal?: AbortSignal; pollMs?: number; setupDeps?: Partial<SetupDeps> }
 type Handler = (values: Values, positionals: string[], io: Io) => Promise<number>
 type Spec = { usage: string; why: string; options?: ParseArgsConfig['options']; run: Handler }
 
@@ -413,13 +414,30 @@ export const COMMANDS: Record<string, Spec> = {
   },
   doctor: {
     usage: 'drove doctor [--json]',
-    why: 'check what this machine needs to run Drove (read-only): Node, git, herdr and its server, claude or codex, gh, cairn, DROVE_HOME; exits 1 when a check fails',
+    why: 'check what this machine needs to run Drove (read-only): Node, git, herdr and its server, claude or codex, gh, cairn, DROVE_HOME, whether CLAUDE_CODE_PLUGIN_DIRS loads the mod of this clone; exits 1 when a check fails',
     options: { json: { type: 'boolean' } },
     run: async (values, _positionals, io) => {
       const deps = commands.defaultDeps()
       const report = await runDoctor(nodeDoctorDeps(deps.exec, deps.home))
       io.out(values.json === true ? JSON.stringify(report, null, 2) : formatReport(report))
       return report.ok ? 0 : 1
+    },
+  },
+  setup: {
+    usage: `drove setup [${SETUP_STEPS.join('|')} ...] [--yes] [--dry-run] [--bin DIR] [--json]`,
+    why: "install Drove on this machine, idempotently: link the CLI into ~/.local/bin (or --bin), add this clone's mod to CLAUDE_CODE_PLUGIN_DIRS in Claude's settings.json (backed up first), create DROVE_HOME; asks before each write on a terminal, --yes writes without asking, then runs the doctor",
+    options: { yes: { type: 'boolean' }, 'dry-run': { type: 'boolean' }, bin: { type: 'string' }, json: { type: 'boolean' } },
+    run: async (values, positionals, io) => {
+      let steps: SetupStep[]
+      try {
+        steps = parseSteps(positionals)
+      } catch (error) {
+        throw new UsageError(error instanceof Error ? error.message : String(error))
+      }
+      const deps = commands.defaultDeps()
+      const doctor = () => runDoctor(nodeDoctorDeps(deps.exec, deps.home))
+      const setupDeps = { ...nodeSetupDeps(doctor, str(values, 'bin')), ...io.setupDeps }
+      return runSetup(setupDeps, { steps, yes: values.yes === true, dryRun: values['dry-run'] === true, json: values.json === true }, io)
     },
   },
   budget: {

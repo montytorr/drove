@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- `drove setup [cli|mod|home ...] [--yes] [--dry-run] [--bin DIR] [--json]` installs Drove on a machine: it links `~/.local/bin/drove` (or `--bin DIR`) to this clone's `src/cli.ts` when `drove` on PATH is missing or another clone, adds this clone's `mod` to `env.CLAUDE_CODE_PLUGIN_DIRS` in Claude's `settings.json` (under `CLAUDE_CONFIG_DIR` when set; other entries and keys kept, another clone's mod replaced, the file backed up next to itself first), and creates `DROVE_HOME`. Each change is shown and asked for on a terminal; `--yes` writes without asking, `--dry-run` only prints, and without a terminal or `--yes` it prints the plan, writes nothing and exits 1. A second run writes nothing. It ends with the doctor checks and what is left for the human (herdr, sign-ins, `cairn setup`, `gh auth login`, folder trust). It never writes `~/.claude.json`. `drove doctor` has a new `mod` check: ok when a `CLAUDE_CODE_PLUGIN_DIRS` entry (settings `env` or the process env) is this clone's mod, a warning naming `drove setup mod` when none is or one is another clone's; it now reads `settings.json` under `CLAUDE_CONFIG_DIR` too (DROVE-155).
+
 ## [0.7.0] - 2026-10-13
 
 Claude workers never run outside their worktree and wait out the folder-trust prompt, `drove plan` and `drove up` need a terminal of their own and can relaunch a lost planner alone, and a planner started by `drove plan` gets the mod's `/orchestrate board`.
