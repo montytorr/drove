@@ -1841,7 +1841,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
     }
     const notes = [
       seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined,
-      seat.cairn && runUsesCairn(run, await loadConfig(deps.home)) ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined,
+      seat.cairn && runUsesCairn(run, await loadConfig(deps.home)) ? await releaseCairnClaim(deps, seat.cairn, seat.kind) : undefined,
     ].filter((note): note is string => Boolean(note))
 
     const { sessionId: _session, codexHome: _home, pendingPromote: _pending, restartingSince: _since, ...kept } = seat
@@ -2131,7 +2131,7 @@ export const reports = async (deps: Deps, identity: Identity, ref: RunRef, reque
 
 // ---------- close ----------
 
-const BENIGN_RELEASE = /nothing was released|claim ownership changed|already (done|released)|is done\b/i
+const BENIGN_RELEASE = /nothing was released|already (done|released)|is done\b/i
 const cairnPreamble = /cairn: [^\n]*could not be checked[^\n]*\n?/gi
 
 const releaseCairnClaim = async (deps: Deps, ref: string, kind: AgentKind): Promise<string | undefined> => {
@@ -2139,7 +2139,16 @@ const releaseCairnClaim = async (deps: Deps, ref: string, kind: AgentKind): Prom
     const ran = await deps.exec(['cairn', 'release', ref, '--force'], { timeoutMs: 15_000, env: cairnEnv(kind) })
     if (ran.code === 0) return `Released the Cairn claim on ${ref}.`
     const output = `${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, '')
-    if (BENIGN_RELEASE.test(output)) return undefined
+    // Cairn's atomic release refusal omits the holder; read it before deciding the failure is benign.
+    const ownershipRefusal = /claim ownership changed|held by/i.test(output)
+    if (ownershipRefusal) {
+      const read = await cairnJson(deps, ['show', ref, '--json'], kind)
+      if ('value' in read) {
+        const holder = textOf(read.value.claimed_by)
+        return holder ? `Note: the Cairn claim on ${ref} is still held by ${holder}; it was not released.` : undefined
+      }
+    }
+    if (!ownershipRefusal && BENIGN_RELEASE.test(output)) return undefined
     return `Note: the Cairn claim on ${ref} was not released (cairn exited ${ran.code}: ${clip(output)}); release it by hand.`
   } catch (error) {
     return `Note: the Cairn claim on ${ref} was not released (${messageOf(error)}); release it by hand.`
@@ -2176,7 +2185,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 
   const notes = [`Closed ${seat.name}${seat.paneId ? ` (pane ${seat.paneId})` : ''}.`]
   if (lockNote) notes.push(`Note: ${lockNote}.`)
-  const releaseNote = seat.cairn && runUsesCairn(run, await loadConfig(deps.home)) ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined
+  const releaseNote = seat.cairn && runUsesCairn(run, await loadConfig(deps.home)) ? await releaseCairnClaim(deps, seat.cairn, seat.kind) : undefined
   if (releaseNote) notes.push(releaseNote)
   if (!removeWorktree) notes.push(`Its worktree ${seat.worktree} and branch ${seat.branch} are kept.`)
   else {
