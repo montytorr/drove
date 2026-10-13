@@ -142,6 +142,37 @@ test('migrate codex to claude: claude starts in the Drove worktree with --sessio
   assert.match(handoff, /## The brief it was given\nBuild the widget\./)
 })
 
+test('migrate releases Cairn as the pre-migration runtime, and skips it without Cairn (DROVE-162)', async () => {
+  const previous = process.env.CAIRN_AGENT
+  delete process.env.CAIRN_AGENT
+  try {
+    for (const [from, to, useCairn, expected] of [['codex', 'claude', true, 'codex'], ['claude', 'codex', true, 'claude-code'], ['codex', 'claude', false, undefined]] as const) {
+      const { deps, identity } = await setup()
+      const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: from, cairn: 'DROVE-5', brief })
+      assert.equal(spawned.ok, true, spawned.text)
+      if (!useCairn) {
+        const path = join(deps.home, 'runs', RUN, 'run.json')
+        const run = JSON.parse(await readFile(path, 'utf8'))
+        await writeFile(path, JSON.stringify({ ...run, useCairn: false }))
+      }
+      const base = deps.exec
+      const released: { argv: string[]; agent: string | undefined }[] = []
+      deps.exec = async (argv, options) => {
+        if (argv[0] !== 'cairn') return base(argv, options)
+        if (argv[1] === 'release') released.push({ argv: [...argv], agent: options?.env?.CAIRN_AGENT })
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      const migrated = await commands.migrate(deps, identity, { seat: 'w-api', kind: to })
+      assert.equal(migrated.ok, true, migrated.text)
+      assert.deepEqual(released, expected ? [{ argv: ['cairn', 'release', 'DROVE-5', '--force'], agent: expected }] : [])
+      if (useCairn) assert.match(migrated.text, /Released the Cairn claim on DROVE-5/)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAIRN_AGENT
+    else process.env.CAIRN_AGENT = previous
+  }
+})
+
 test('migrate refuses the same kind, an unknown seat, a worker caller and a bad kind, and touches nothing', async () => {
   const { fake, deps, identity } = await setup()
   await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
