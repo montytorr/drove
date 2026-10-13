@@ -89,8 +89,9 @@ test('AC4: a Claude spawn in a repo Claude has not trusted is refused with untru
   const refused = await commands.spawn(withConfig, identity, { seat: 'w-api', kind: 'claude', brief })
   assert.equal(!refused.ok && refused.code, 'untrusted-repo')
   assert.match(refused.text, new RegExp(`Claude Code has not trusted ${root.replaceAll('.', '\\.')}`))
-  assert.match(refused.text, /One-time fix: run `claude` once in .*, accept its folder-trust prompt, then quit it/)
-  assert.match(refused.text, /A Codex worker \(--kind codex\) is unaffected/)
+  assert.ok(refused.text.includes(`Fix: run \`drove trust ${root}\` (in a Claude Code session: \`! drove trust ${root} --yes\`)`), refused.text)
+  assert.match(refused.text, /or spawn this worker as Codex \(kind codex\)\. Drove only writes that key when you run drove trust or say yes/)
+  assert.doesNotMatch(refused.text, /--kind/)
   assert.equal(fake.calls.some(call => call[1] === 'agent' && call[2] === 'start'), false)
   assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
 
@@ -109,7 +110,7 @@ test('AC4: drove plan warns when Claude has not trusted the repo root, and not w
   process.env.HERDR_PANE_ID = 'w1:p5'
   const untrusted = await commands.plan({ ...deps, claudeUserConfig: await claudeJson(deps, {}) }, { repo, kind: 'claude', goal: 'Ship it' })
   assert.equal(untrusted.ok, true, untrusted.text)
-  assert.match(untrusted.text, /Warning: Claude Code has not trusted .*One-time fix: run `claude` once in/)
+  assert.match(untrusted.text, /Warning: Claude Code has not trusted .*so a Claude planner or worker launched there stops at its folder-trust prompt\. Fix: run `drove trust /)
   const trusted = await commands.plan({ ...deps, claudeUserConfig: await claudeJson(deps, { [await realpath(repo)]: { hasTrustDialogAccepted: true } }) }, { repo, kind: 'claude', goal: 'Ship it' })
   assert.doesNotMatch(trusted.text, /Warning/)
 })

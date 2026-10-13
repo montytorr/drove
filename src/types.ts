@@ -339,6 +339,8 @@ export type Deps = {
   clock: Clock
   home: string
   terminal?: { stdin: boolean; stdout: boolean }
+  // Asks the human a yes/no question on the terminal (the folder-trust question of plan and up); unset, nothing is asked.
+  ask?: (question: string) => Promise<boolean>
   codexUserHome?: string
   claudeUserConfig?: string
   claudeUserDir?: string

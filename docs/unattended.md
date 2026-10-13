@@ -48,18 +48,21 @@ It prints one JSON object (without `--json`, one sentence with the same facts):
 - `HERDR_SOCKET_PATH` when the socket is not the default. The command needs no herdr pane around it, so `HERDR_PANE_ID` is not read.
 - `herdr` on `PATH`, Node 22.18+, `git`, the planner's agent CLI (`claude` or `codex`) signed in, and `cairn` for `--from-cairn` and `--next`.
 - The same `DROVE_HOME` in every command that touches the run (default `~/.drove`).
-- **Dialogs answered once, by hand.** Drove never answers a dialog. A first launch in a folder may ask to trust it, a Claude planner on the development channel asks to confirm it, and a Codex planner may ask to approve Drove's hooks. Each shows as `planner.state: "blocked"` and as an attention item. Trust the repo and approve the hooks before leaving a job to run alone.
+- **Dialogs answered once, by hand.** Drove never answers a dialog. A first launch in a folder may ask to trust it, a Claude planner on the development channel asks to confirm it, and a Codex planner may ask to approve Drove's hooks. Each shows as `planner.state: "blocked"` and as an attention item. Trust the repo (`drove trust <repo>`) and approve the hooks before leaving a job to run alone.
 
 ### Claude folder trust
 
 Claude workers start at the repo root (`claude --worktree <seat>`), so Claude Code must trust the repo root itself: accept the trust prompt once in the root. A trusted parent folder does not count: Claude Code 2.1.296 looks for the repo's canonical root, then walks up from its cwd only as far as the git root, so a trusted folder above the repo never trusts it.
 
-Drove's preflight reads `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json` (`CLAUDE_CONFIG_DIR` moves it) for the exact canonical root, and only reads that file. A trusted parent folder alone gives the warning and `untrusted-repo`, as Claude would show the prompt.
+Drove's preflight reads `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json` (`CLAUDE_CONFIG_DIR` moves it) for the exact canonical root. A trusted parent folder alone gives the warning and `untrusted-repo`, as Claude would show the prompt.
 
-- When the root is not trusted, `drove plan` prints a warning and a Claude `spawn` is refused with `untrusted-repo`. Codex workers are unaffected.
-- The one-time fix: run `claude` in the repo root, accept the trust prompt, quit.
-- If a worker still stops at the prompt (a file Drove could not read, another Claude version), the seat goes `blocked` with a `trust` attention item naming the root, and keeps its pane.
-- Drove holds the brief and delivers it once the prompt is accepted in the pane and the worktree appears. When trust is given elsewhere instead, or the pane dies, Drove relaunches the seat once with the same name, branch and brief.
+- The one-time fix: `drove trust <repo>` (inside a Claude Code session, `! drove trust <repo> --yes`, since `!` has no terminal to ask on). It sets that one key for the canonical root, which is what accepting the prompt does, and touches nothing else in the file. Without a terminal and without `--yes` it prints the change and exits 1; `--dry-run` only prints it; `--json` prints `{ root, file, state, changed }`. Already trusted is fine and changes nothing.
+- The write mirrors Claude Code's own save (2.1.296): it takes Claude's lock (the directory `<file>.lock`, stale after 10s, retried for about 10 to 20s), re-reads the file under it, sets the key, writes a temp file beside it with the same mode, renames it over the file and reads it back. It fails with a clear message, writing nothing, when the lock stays held. It never sets `CLAUDE_CODE_SANDBOXED` and keeps no copy of the file (it holds account data).
+- Drove writes the key only on a person's explicit yes: `drove trust`, or the question `drove plan` and `drove up` ask on a terminal before they launch anything when the root is untrusted. Without a terminal they print a warning naming `drove trust`, for a Claude planner as well as Claude workers.
+- Every Claude launch is checked first: a `spawn`, a relaunch (`drove up --seat`, or the seats of `drove up`), a promote or demote restart and a `migrate` to Claude are refused with `untrusted-repo` before any pane is opened. The refusal names `drove trust <root>`, or a Codex worker; Codex workers are unaffected.
+- `drove doctor`, run inside a repo, has a `trust` check: a warning with the fix, never a failure.
+- If a worker still stops at the prompt (a file Drove could not read, another Claude version), the seat goes `blocked` with a `trust` attention item naming the root, and keeps its pane. A relaunch, a promote restart and a migrate do the same for any startup dialog: the seat is blocked with the attention, never marked gone, and its pane stays open.
+- For a new worker, Drove holds the brief and delivers it once the prompt is accepted in the pane and the worktree appears. When trust is given elsewhere instead (`drove trust`), or the pane dies, Drove relaunches the seat once with the same name, branch and brief. Claude reads trust only at startup, so any other agent already at the prompt needs it answered in its pane.
 
 ## What needs a person
 
@@ -144,7 +147,7 @@ With `--json`, a failure is one JSON object on stderr, `{"ok":false,"code":"herd
 | `no-task`, `task-closed` | the Cairn task does not exist, or is done or cancelled |
 | `not-a-repo` | the directory is not a git repo |
 | `not-down` | the run still has a live pane |
-| `untrusted-repo` | a Claude spawn in a repo root Claude Code does not trust |
+| `untrusted-repo` | a Claude spawn, relaunch, promote restart or migrate in a repo root Claude Code does not trust; fix with `drove trust <root>` or a Codex worker |
 | `no-worktree` | a Claude worker's worktree did not appear, or its pane is not inside it ([isolation](isolation.md#the-worktree)) |
 | `policy` | the spawn, promote, migrate, `owns` change or `up` breaks the `spawnPolicy` ([lean workers](lean-workers.md#spawn-policy)) |
 | `policy-change` | a merge changes `spawnPolicy`; a human must merge it |

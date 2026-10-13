@@ -177,6 +177,7 @@ drove board                        # in a spare pane
 | `drove policy [--run ID] [--json]` | the merged `spawnPolicy` and its errors, read from the committed run base |
 | `drove doctor [--json]` | check what this machine needs, including whether the mod is installed (`mod`); exits 1 when a check fails; read-only |
 | `drove setup [cli\|mod\|home ...] [--yes] [--dry-run] [--bin DIR] [--json]` | install Drove on this machine: link the CLI, add the mod to Claude's settings, create `DROVE_HOME`; asks before each write, safe to re-run |
+| `drove trust [DIR] [--yes] [--dry-run] [--json]` | trust a repo for Claude Code, as accepting its folder-trust prompt does: sets `projects[<root>].hasTrustDialogAccepted` in `~/.claude.json` (`$CLAUDE_CONFIG_DIR/.claude.json` when set) for the canonical root of `DIR`, under Claude's own lock, and nothing else; asks on a terminal, `--yes` writes without asking, without either it prints the plan and exits 1; `--json` prints `{ root, file, state, changed }` ([folder trust](docs/unattended.md#claude-folder-trust)) |
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
 

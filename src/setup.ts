@@ -219,8 +219,16 @@ const leftFor = (doctor: DoctorReport, steps: StepResult[]): string[] => {
     ...(ok('cairn') ? [] : [doctor.checks.find(item => item.id === 'cairn')?.status === 'fail' ? 'cairn setup --url <instance>' : 'optional, recommended: install Cairn and run cairn setup --url <instance>, for task tracking and shared memory']),
     ...(ok('gh') ? [] : ['gh auth login']),
     ...(steps.some(step => step.step === 'mod' && step.status === 'written') ? ['restart open Claude sessions so they load the mod'] : []),
-    'trust each repo folder in Claude Code once: open claude in the repo and accept the folder-trust prompt',
+    ...trustLeft(doctor),
   ]
+}
+
+// The doctor's trust check, run inside a repo, decides; elsewhere the line stays general unless Claude is missing.
+const trustLeft = (doctor: DoctorReport): string[] => {
+  const trust = doctor.checks.find(item => item.id === 'trust')
+  if (trust) return trust.status === 'ok' ? [] : [`${trust.fix ?? 'drove trust <repo>'}: ${trust.detail}`]
+  const claude = doctor.checks.find(item => item.id === 'claude')
+  return claude && claude.status !== 'ok' ? [] : ["trust each repo you run Claude in once with drove trust <repo>, which does what accepting Claude Code's folder-trust prompt there does"]
 }
 
 const describe = (step: StepResult): string => (step.status === 'done' ? step.detail : `${step.path}: ${step.before} -> ${step.after} (${step.detail})`)
@@ -273,7 +281,7 @@ export const parseSteps = (names: readonly string[]): SetupStep[] => {
   return names as SetupStep[]
 }
 
-const askOnTty = async (question: string): Promise<boolean> => {
+export const askOnTty = async (question: string): Promise<boolean> => {
   const rl = createInterface({ input: process.stdin, output: process.stderr })
   try {
     return /^y(es)?$/i.test((await rl.question(question)).trim())
