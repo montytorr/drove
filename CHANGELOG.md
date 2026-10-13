@@ -4,6 +4,10 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-10-13
+
+Claude workers never run outside their worktree and wait out the folder-trust prompt, `drove plan` and `drove up` need a terminal of their own and can relaunch a lost planner alone, and a planner started by `drove plan` gets the mod's `/orchestrate board`.
+
 - Attached `drove plan` and `drove up` require a terminal and refuse panes occupied by another agent or live planner; use `--detached` from inside another agent. Planner report delivery checks the pane’s session before pasting and keeps reports pending on a mismatch. An attached planner that exits is marked gone with one attention naming `drove up --run ID`, which can relaunch it while workers continue (DROVE-148).
 - The mod's `/orchestrate board` works in a planner started by `drove plan`: it opens (and, run again, closes) a read-only board of the session's own run (`DROVE_RUN`), polled every two seconds; `board bg`, `status` and `help` answer there too. It starts no wake bridge, registers no tools, and never switches model or effort or opens a dialog. `/orchestrate <goal>` and `off` still refuse there, and the message now names `/orchestrate board`; a worker session still refuses everything (DROVE-149).
 - A Claude worker never runs outside its worktree: before its brief goes in, Drove checks that the worktree exists and that herdr's foreground cwd for the pane is inside it. If not, the spawn fails with `no-worktree`, the screen is saved to `start-failure.txt` and the pane is closed, instead of a note and a brief delivered to a worker in the base checkout (DROVE-147).
@@ -212,6 +216,7 @@ See [Known limits](README.md#known-limits) in the README.
 
 Full history: see the commit log.
 
+[0.7.0]: https://github.com/montytorr/drove/releases/tag/v0.7.0
 [0.6.0]: https://github.com/montytorr/drove/releases/tag/v0.6.0
 [0.5.0]: https://github.com/montytorr/drove/releases/tag/v0.5.0
 [0.4.0]: https://github.com/montytorr/drove/releases/tag/v0.4.0
