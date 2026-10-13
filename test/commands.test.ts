@@ -312,22 +312,21 @@ const FOLDER_TRUST_SCREEN = ' Do you trust the files in this folder?\n\n /repo/.
 const readEvents = async (deps: Deps) =>
   (await readFile(join(deps.home, 'runs', RUN, 'events.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { type: string; seat?: string; data?: Record<string, unknown> })
 
-test('a failed start saves the pane output, logs seat.start_failed and hints at the folder-trust dialog', async () => {
+test('a start that times out at the folder-trust dialog saves the pane output, logs seat.start_failed and keeps the pane (DROVE-147)', async () => {
   const fake = new FakeHerdr({ startFails: 'timeout', screen: FOLDER_TRUST_SCREEN })
   const { deps, identity } = await setup(fake)
   const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
-  assert.equal(spawned.ok, false)
-  assert.match(spawned.text, /Hint: Claude is asking to trust the folder\./)
+  assert.equal(spawned.ok, true, spawned.text)
+  assert.match(spawned.text, /stopped on a dialog \(trust\)/)
   const file = join(seatDir(deps.home, RUN, 'w-api'), 'start-failure.txt')
-  assert.match(spawned.text, new RegExp(file.replaceAll('.', '\\.')))
   assert.equal(await readFile(file, 'utf8'), `== visible screen ==\n${FOLDER_TRUST_SCREEN.trimEnd()}\n\n== recent output ==\n${FOLDER_TRUST_SCREEN.trimEnd()}\n`)
   assert.equal((await stat(file)).mode & 0o777, 0o600)
   const reads = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'read')
-  assert.deepEqual(reads.map(call => call.slice(3)), [
+  assert.deepEqual(reads.map(call => call.slice(3)).slice(0, 2), [
     ['w-api-a3f1', '--source', 'visible', '--lines', '60'],
     ['w-api-a3f1', '--source', 'recent-unwrapped', '--lines', '60'],
   ])
-  assert.ok(fake.calls.findIndex(call => call[2] === 'read') < fake.calls.findIndex(call => call[1] === 'tab' && call[2] === 'close'))
+  assert.ok(!fake.herdrCalls().includes('tab close') && !fake.herdrCalls().includes('pane close'))
   const event = (await readEvents(deps)).find(item => item.type === 'seat.start_failed')
   assert.equal(event?.seat, 'w-api')
   assert.equal(event?.data?.code, 'timeout')
@@ -562,9 +561,20 @@ test('a start timeout with the agent screen up and no dialog registers the seat 
   assert.ok(!fake.herdrCalls().includes('tab close'))
 })
 
-test('a start timeout rolls back when the agent is absent, blocked, or the screen shows a dialog', async () => {
+test('a start timeout rolls back when the agent is absent', async () => {
+  const fake = new FakeHerdr({ startFails: 'timeout', screen: 'zsh: command not found: claude' })
+  const { deps, identity } = await setup(fake)
+  const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
+  assert.equal(spawned.ok, false)
+  assert.match(spawned.text, /no worker exists/)
+  assert.ok(fake.herdrCalls().includes('tab close'))
+  assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [])
+  assert.equal((await readEvents(deps)).filter(item => item.type === 'seat.start_failed').length, 1)
+})
+
+test('a start timeout at a dialog keeps the pane, blocks the seat and holds the brief, whether or not herdr lists the agent (DROVE-147)', async () => {
+  delete process.env.DROVE_BRIEF_VIA
   const cases: { name: string; fake: FakeHerdr }[] = [
-    { name: 'absent', fake: new FakeHerdr({ startFails: 'timeout', screen: 'zsh: command not found: claude' }) },
     { name: 'blocked', fake: new FakeHerdr({ startFails: 'timeout', startLeavesAgent: true, startStatus: 'blocked', screen: FOLDER_TRUST_SCREEN }) },
     { name: 'dialog on screen', fake: new FakeHerdr({ startFails: 'timeout', startLeavesAgent: true, startStatus: 'idle', screen: `Claude Code v2.1.295\n${FOLDER_TRUST_SCREEN}` }) },
     { name: 'dialog, no agent', fake: new FakeHerdr({ startFails: 'timeout', screen: `Claude Code v2.1.295\n${FOLDER_TRUST_SCREEN}` }) },
@@ -572,11 +582,12 @@ test('a start timeout rolls back when the agent is absent, blocked, or the scree
   for (const { name, fake } of cases) {
     const { deps, identity } = await setup(fake)
     const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', brief })
-    assert.equal(spawned.ok, false, name)
-    assert.match(spawned.text, /no worker exists/, name)
-    assert.ok(fake.herdrCalls().includes('tab close'), name)
-    assert.deepEqual((await loadRoster(deps.home, RUN)).seats, [], name)
-    assert.equal((await readEvents(deps)).filter(item => item.type === 'seat.start_failed').length, 1, name)
+    assert.equal(spawned.ok, true, `${name}: ${spawned.text}`)
+    assert.ok(!fake.herdrCalls().includes('tab close') && !fake.herdrCalls().includes('pane close'), name)
+    assert.equal(fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').length, 1, name)
+    const seat = (await loadRoster(deps.home, RUN)).seats[0]
+    assert.deepEqual([seat?.state, seat?.attention[0]?.reason, seat?.pendingStart?.via], ['blocked', 'trust', 'prompt'], name)
+    assert.deepEqual(fake.prompts, [], name)
   }
 })
 

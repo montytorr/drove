@@ -1,4 +1,5 @@
 import { DEFAULT_START_TIMEOUT_MS } from './herdr.ts'
+import { trustAttentionText } from './trust.ts'
 import type { Attention, Derived, HerdrAgent, HookRecord, LastReport, Seat, SeatSignals, SeatState } from './types.ts'
 
 type Dialog = { pattern: RegExp; reason: Attention['reason']; detail: string; hint: string; detailOf?: (screen: string) => string }
@@ -176,12 +177,17 @@ export const deriveState = (seat: Seat, signals: TurnSignals, now: Date): Derive
   const { herdr, hooks } = signals
   const reported = signals.lastReport
 
+  // A start held at a dialog may be one herdr does not list as an agent yet; applyPendingStarts owns its pane (DROVE-147).
+  if (!herdr && seat.pendingStart && seat.paneId) return { state: seat.state, attention: seat.attention.filter(item => DERIVED_REASONS.has(item.reason)) }
   if (!herdr && (seat.state !== 'starting' || seat.restartingSince !== undefined)) {
-    add('gone', `pane ${seat.paneId ?? '?'} is gone; run \`drove up --seat ${seat.name}\` to relaunch it`)
+    add('gone', `${seat.paneId ? `pane ${seat.paneId} is gone` : `its pane never started (Drove recorded none)`}; run \`drove up --seat ${seat.name}\` to relaunch it`)
     return { state: 'gone', attention }
   }
 
-  const dialog = (signals.screen ? matchDialog(seat.name, signals.screen, now) : undefined) ?? hookLimit(seat.name, hooks, at)
+  const seen = (signals.screen ? matchDialog(seat.name, signals.screen, now) : undefined) ?? hookLimit(seat.name, hooks, at)
+  // DROVE-147: a seat whose start waits on the folder-trust prompt names the repo root and the one-time fix.
+  const root = seat.pendingStart?.root
+  const dialog = seen?.reason === 'trust' && root ? { ...seen, detail: trustAttentionText(root, seat.paneId) } : seen
   const ask = pendingAsk(hooks, signals.transcriptAt)
   const isAskLive = ask !== undefined && (herdr?.status !== 'working' || nowMs - ms(ask.at) <= HOOK_FRESH_MS)
 

@@ -61,6 +61,12 @@ export class FakeHerdr {
   agentReadFails: boolean | string = false
   paneReadFails = ''
   paneCwds = new Map<string, string>()
+  // What `herdr pane get` reports as foreground_cwd; a Claude start with --worktree moves it into the worktree it made.
+  foregroundCwds = new Map<string, string>()
+  closedPanes = new Set<string>()
+  foregroundOverride: string | undefined
+  // A Claude that never gets past the folder-trust prompt makes no worktree (DROVE-147).
+  claudeSkipsWorktree = false
   claudeWorktrees: { path: string; branch: string }[] = []
   claudeWorktreeFrom = 'HEAD'
   private counter = 0
@@ -157,8 +163,15 @@ export class FakeHerdr {
     }
     if (action === 'close') {
       const paneId = argv[3] ?? ''
+      this.closedPanes.add(paneId)
       for (const [name, agent] of this.agents) if (agent.paneId === paneId) this.agents.delete(name)
       return this.json({ result: {} })
+    }
+    if (action === 'get') {
+      const paneId = argv[3] ?? ''
+      if (this.closedPanes.has(paneId) || !this.paneCwds.has(paneId)) return herdrFail('pane_not_found')
+      const cwd = this.paneCwds.get(paneId) ?? ''
+      return this.json({ result: { pane: { pane_id: paneId, cwd, foreground_cwd: this.foregroundOverride ?? this.foregroundCwds.get(paneId) ?? cwd } } })
     }
     if (action === 'read') return this.paneReadFails ? herdrFail(this.paneReadFails) : this.json({ result: { text: this.screen } })
     return herdrFail('unknown_command')
@@ -224,6 +237,9 @@ export class FakeHerdr {
     if (this.startFails) {
       if (this.startFails === 'agent_not_ready') this.agents.set(name, { name, paneId, tabId: `w1:t${this.counter}`, status: 'blocked' })
       else if (this.startLeavesAgent) this.agents.set(name, { name, paneId, tabId: `w1:t${this.counter}`, status: this.startStatus, kind: argv[argv.indexOf('--kind') + 1] ?? 'claude' })
+      // A Claude that got past startup made its worktree even though herdr's start failed; one at the trust prompt has not.
+      const isPastStartup = this.startLeavesAgent ? this.startStatus !== 'blocked' : /Claude Code v\d/.test(this.screen)
+      if (isPastStartup && !/trust/i.test(this.screen)) await this.claudeCreatesWorktree(paneId, argv)
       return herdrFail(this.startFails)
     }
     const tabId = [...this.tabs].at(-1) ?? 'w1:t1'
@@ -236,7 +252,7 @@ export class FakeHerdr {
 
   private async claudeCreatesWorktree(paneId: string, argv: readonly string[]): Promise<ExecResult | undefined> {
     const flag = argv.indexOf('--worktree')
-    if (flag < 0) return undefined
+    if (flag < 0 || this.claudeSkipsWorktree) return undefined
     const name = argv[flag + 1] ?? ''
     const cwd = this.paneCwds.get(paneId) ?? ''
     const path = join(cwd, '.claude', 'worktrees', name)
@@ -246,6 +262,7 @@ export class FakeHerdr {
       if (added.code !== 0) return herdrFail('agent_start_failed', added.stderr)
     }
     this.claudeWorktrees.push({ path, branch })
+    this.foregroundCwds.set(paneId, path)
     return undefined
   }
 

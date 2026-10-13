@@ -75,6 +75,7 @@ export const agentExplainArgv = (target: string): string[] => ['herdr', 'agent',
 export const paneCloseArgv = (paneId: string): string[] => ['herdr', 'pane', 'close', paneId]
 export const tabCloseArgv = (tabId: string): string[] => ['herdr', 'tab', 'close', tabId]
 export const tabGetArgv = (tabId: string): string[] => ['herdr', 'tab', 'get', tabId]
+export const paneGetArgv = (paneId: string): string[] => ['herdr', 'pane', 'get', paneId]
 export const paneProcessInfoArgv = (paneId: string): string[] => ['herdr', 'pane', 'process-info', '--pane', paneId]
 
 const parseJson = (text: string): unknown => {
@@ -188,6 +189,14 @@ export const getAgent = async (exec: Exec, target: string): Promise<HerdrResult<
   if (!ran.ok) return ran
   const agent = parseAgent(ran.value)
   return agent ? { ok: true, value: agent } : { ok: false, code: 'unparseable', output: ran.value.slice(0, 300) }
+}
+
+// The cwd of the process in the pane's foreground (a Claude worker that made its worktree runs inside it); undefined when herdr does not say.
+export const paneForegroundCwd = async (exec: Exec, paneId: string): Promise<HerdrResult<string | undefined>> => {
+  const ran = await run(exec, paneGetArgv(paneId), 10_000)
+  if (!ran.ok) return ran
+  const cwd = asRecord(asRecord(asRecord(parseJson(ran.value))?.result)?.pane)?.foreground_cwd
+  return { ok: true, value: typeof cwd === 'string' && cwd ? cwd : undefined }
 }
 
 const readOutput = async (exec: Exec, argv: readonly string[]): Promise<HerdrResult<string>> => {

@@ -55,6 +55,7 @@ export type WatchPorts = {
   deliverControl: typeof deliver.deliverControl
   flushPending: typeof deliver.flushPending
   applyPendingPromotes: typeof commands.applyPendingPromotes
+  applyPendingStarts: typeof commands.applyPendingStarts
   nudgeText: typeof prompts.nudgeText
   advanceTokens: typeof usage.advanceTokens
   findRollout: typeof usage.findRollout
@@ -91,6 +92,7 @@ export const defaultWatchPorts: WatchPorts = {
   deliverControl: deliver.deliverControl,
   flushPending: deliver.flushPending,
   applyPendingPromotes: commands.applyPendingPromotes,
+  applyPendingStarts: commands.applyPendingStarts,
   nudgeText: prompts.nudgeText,
   advanceTokens: usage.advanceTokens,
   findRollout: usage.findRollout,
@@ -812,6 +814,9 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     }
     await guarded('promote-pending', async () => {
       await ports.applyPendingPromotes(deps, run)
+    })
+    await guarded('start-pending', async () => {
+      await ports.applyPendingStarts(deps, run)
     })
   }
 

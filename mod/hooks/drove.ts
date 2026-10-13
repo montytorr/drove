@@ -77,6 +77,7 @@ export const isCutOff = (ran: Ran): boolean => ran.exitCode === -1 && /aborted: 
 export const checksArgs = (name: string, fresh?: boolean): string[] => ['checks', name, ...(fresh ? ['--fresh'] : [])]
 
 export const rosterArgs = (run: string): string[] => ['roster', '--run', run]
+export const rosterJsonArgs = (run: string): string[] => ['roster', '--json', '--run', run]
 
 export const reportsArgs = (run: string, seat?: string, all?: boolean): string[] => ['reports', ...(seat ? [seat] : []), ...(all ? ['--all'] : []), '--run', run]
 

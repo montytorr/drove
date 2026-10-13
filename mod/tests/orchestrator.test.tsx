@@ -259,6 +259,8 @@ describe('board model', () => {
 type Call = { args: string[]; stdin?: string; env?: Record<string, string>; cwd?: string }
 
 type World = {
+  holdRoster?: Promise<void>
+  rosterSeats?: Seat[]
   registeredTools: string[]
   toolSchemas: Record<string, unknown>
   commands: string[]
@@ -354,6 +356,7 @@ const fakeDrove = (world: World, call: Call) => {
     world.isOverBudget = false
     return ok(`Pane budget for run ${RUN} is now ${action}.`)
   }
+  if (command === 'roster' && call.args.includes('--json')) return ok(JSON.stringify({ run: runMeta({ id: RUN }), seats: world.rosterSeats ?? [], planner: { state: 'working' }, updatedAt: ISO }))
   if (command === 'roster') return ok(`run ${RUN} · repo · up · budget 5\nw-auth working`)
   if (command === 'reports') return ok('[worker w-auth · done · expects review]\nRate limiter added\nBranch worktree-w-auth, 12 tests pass\n→ Review the work')
   return ok(`${command} ok`)
@@ -415,11 +418,12 @@ const engine = (on: On, env: Record<string, string> = { HOME: '/Users/test', HER
     return { value: names } as never
   })
   on('fs.exists', ($, e) => ({ value: world.files[e.path] !== undefined }) as never)
-  on('process.run', ($, e) => {
+  on('process.run', async ($, e) => {
     const [, , ...args] = e.argv
     const init = e.init ?? {}
     const call: Call = { args, ...(init.stdin !== undefined ? { stdin: init.stdin } : {}), ...(init.env ? { env: { ...init.env } } : {}), ...(init.cwd ? { cwd: init.cwd } : {}) }
     world.calls.push(call)
+    if (args[0] === 'roster' && args.includes('--json') && world.holdRoster) await world.holdRoster
     return fakeDrove(world, call)
   })
   on('process.spawn', async function* ($, e, next) {
@@ -1430,6 +1434,95 @@ describe('the board', () => {
     await ui.press({ key: (button as { key: string }).key })
     expect(await ui.find({ type: 'Text', text: 'branch worktree-w-api' })).toBeUndefined()
     await ui.unmount()
+  })
+})
+
+describe('a planner started by drove plan', () => {
+  const PLAN_ENV = { HOME: '/Users/test', DROVE_HOME: '/Users/test/.drove', DROVE_RUN: RUN, DROVE_ROLE: 'planner', DROVE_SEAT: 'planner' }
+  const mountBoard = async ($: Engine) => {
+    const ui = await $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'Pane', requestId: 'orchestra', props: PANE_PROPS } as never)
+    const texts = [...(await ui.findAll({ type: 'Text' })), ...(await ui.findAll({ type: 'Button' }))].map(({ text }) => text ?? '')
+    await ui.unmount()
+    return texts
+  }
+
+  test('/orchestrate board opens the read-only board of DROVE_RUN and a second run closes it, with no bridge, tools or mode', async ($, on) => {
+    const { world, clock, panes } = engine(on, PLAN_ENV)
+    world.rosterSeats = [seat({ name: 'w-api' })]
+    world.files[`/Users/test/.drove/runs/${RUN}/events.jsonl`] = `${JSON.stringify({ at: ISO, type: 'report', seat: 'w-api', data: { kind: 'done', expects: 'review', summary: 'Token bucket added' } })}\n`
+    await $.session.start(START)
+    expect(world.commands).toEqual(['orchestrate'])
+    expect(((await runCommand($, 'board')) as { text: string }).text).toContain(RUN)
+    expect([...panes]).toEqual(['orchestra'])
+    await settle(clock)
+    const texts = await mountBoard($)
+    expect(texts).toContain('◆ orchestra')
+    expect(texts).toContain('w-api')
+    expect(texts.some(text => text.includes('expects review · Token bucket added'))).toBe(true)
+    expect(world.calls.find(({ args }) => args[0] === 'roster')?.args).toEqual(['roster', '--json', '--run', RUN])
+
+    world.rosterSeats = [seat({ name: 'w-api' }), seat({ name: 'w-ui' })]
+    await clock.advance(2_100)
+    await settle(clock)
+    expect(await mountBoard($)).toContain('w-ui')
+
+    await runCommand($, 'board')
+    expect([...panes]).toEqual([])
+    const polled = world.calls.length
+    await clock.advance(10_000)
+    expect(world.calls.length).toBe(polled)
+
+    await runCommand($, 'board')
+    expect([...panes]).toEqual(['orchestra'])
+    expect(world.spawned).toEqual([])
+    expect(world.registeredTools).toEqual([])
+    expect(world.stepped).toEqual([])
+    expect(world.asked).toEqual([])
+    expect(droveCalls(world, 'mod')).toEqual([])
+    expect(((await runCommand($, 'status')) as { text: string }).text).toContain(`run ${RUN}`)
+  })
+
+  test('a poll that is still running makes the next ticks skip, then polling resumes', async ($, on) => {
+    const { world, clock } = engine(on, PLAN_ENV)
+    await $.session.start(START)
+    const rosterCalls = () => world.calls.filter(({ args }) => args[0] === 'roster' && args.includes('--json')).length
+    await runCommand($, 'board')
+    await settle(clock)
+    expect(rosterCalls()).toBe(1)
+    let release = () => {}
+    world.holdRoster = new Promise<void>(resolve => (release = resolve))
+    for (let tick = 0; tick < 4; tick += 1) {
+      await clock.advance(2_000)
+      await settle(clock)
+    }
+    expect(rosterCalls()).toBe(2)
+    world.holdRoster = undefined
+    release()
+    await settle(clock)
+    await clock.advance(2_000)
+    await settle(clock)
+    expect(rosterCalls()).toBe(3)
+  })
+
+  test('/orchestrate <goal> and off refuse and name /orchestrate board; help and board bg answer', async ($, on) => {
+    const { world } = engine(on, PLAN_ENV)
+    await $.session.start(START)
+    for (const args of ['Ship rate limiting', 'off', '--repo /work/repo Ship it']) {
+      const { text } = (await runCommand($, args)) as { text: string }
+      expect(text).toContain('already a Drove planner')
+      expect(text).toContain('/orchestrate board')
+    }
+    expect(((await runCommand($, 'help')) as { text: string }).text).toContain('/orchestrate board')
+    expect(((await runCommand($, 'board bg')) as { text: string }).text).toContain('removed')
+    expect(droveCalls(world, 'mod')).toEqual([])
+    expect(world.registeredTools).toEqual([])
+  })
+
+  test('a worker session still refuses /orchestrate board', async ($, on) => {
+    const { panes } = engine(on, { ...PLAN_ENV, DROVE_ROLE: 'worker', DROVE_SEAT: 'w-auth', DROVE_TOKEN: 'tok' })
+    await $.session.start(START)
+    expect(((await runCommand($, 'board')) as { text: string }).text).toBe('This session is a Drove worker; it cannot orchestrate.')
+    expect([...panes]).toEqual([])
   })
 })
 

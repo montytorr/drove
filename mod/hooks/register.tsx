@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { AgentKind, Effort, HostAgents, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat, SeatRole } from '../types'
+import type { AgentKind, DroveEvent, Effort, HostAgents, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat, SeatRole } from '../types'
 import { BOARD_ID, EXPAND_INDENT, buildBoard, needsAnimation, timelineRoom } from './board'
 import type { BoardRow, Cell, Tone } from './board'
 import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeHeadlines } from './bridge'
@@ -28,6 +28,7 @@ const COLOR = {
 } as const
 
 const orchestratorAtom = atom({ plugin: 'orchestrator', key: 'orchestrator' } as const, null)
+const viewAtom = atom({ plugin: 'orchestrator', key: 'view' } as const, null)
 const seatsAtom = atom({ plugin: 'orchestrator', key: 'seats' } as const, [] as Seat[])
 const statusAtom = atom({ plugin: 'orchestrator', key: 'status' } as const, {} as Record<string, OrchModStatus>)
 const asksAtAtom = atom({ plugin: 'orchestrator', key: 'asksAt' } as const, {} as Record<string, number>)
@@ -1055,8 +1056,8 @@ let animatorRuns = false
 
 const animate = async ($: EngineInterface) => {
   try {
-    const [orchestrator, seats, asksAt, lead, now] = await Promise.all([read($, orchestratorAtom), read($, seatsAtom), read($, asksAtAtom), read($, leadAtom), $.clock.now()])
-    if (!orchestrator || !needsAnimation(lead, seats, asksAt, now) || !(await isBoardOpen($))) {
+    const [orchestrator, view, seats, asksAt, lead, now] = await Promise.all([read($, orchestratorAtom), read($, viewAtom), read($, seatsAtom), read($, asksAtAtom), read($, leadAtom), $.clock.now()])
+    if (!(orchestrator ?? view) || !needsAnimation(lead, seats, asksAt, now) || !(await isBoardOpen($))) {
       animator?.cancel()
       animator = undefined
       animatorRuns = false
@@ -1100,6 +1101,145 @@ const closeBoard = async ($: EngineInterface) => {
     // not open
   }
 }
+
+// ---------- the read-only board of a planner started by drove plan ----------
+
+// That session is not the mod's orchestrator: no bridge, no tools, no model switching. Its board follows DROVE_RUN by polling Drove's own files.
+
+const VIEW_MS = 2_000
+const VIEW_EVENTS_TAIL = 60
+const DROVE_PLANNER_REFUSAL = 'This session is already a Drove planner (started by drove plan); use its drove tools. `/orchestrate board` shows its board.'
+
+let viewer: { cancel: () => void } | undefined
+let viewPlanner: { model: string; effort: Effort } | undefined
+let viewStamp = ''
+let viewBusy = false
+
+const toggleBoardBg = async ($: EngineInterface) => {
+  const isOn = !(await read($, boardBgAtom))
+  await update($, boardBgAtom, () => isOn)
+  try {
+    await $.store.set('boardBg', isOn)
+  } catch {
+    // kept for this session only
+  }
+  return { text: isOn ? `Board background painted ${BOARD_BG} (Catppuccin Mocha base). \`/orchestrate board bg\` again to remove it.` : 'Board background removed.' }
+}
+
+const stopViewer = () => {
+  viewer?.cancel()
+  viewer = undefined
+}
+
+const viewFeedOf = (text: string): OrchFeedEntry[] => {
+  const lines = text.split('\n').filter(line => line.trim()).slice(-VIEW_EVENTS_TAIL)
+  return lines.flatMap((line, at) => {
+    try {
+      const event = JSON.parse(line) as DroveEvent
+      const draft = feedOf(event, new Map())
+      return draft ? [{ ...draft, id: event.id ?? `e${at}`, full: (draft.full ?? draft.summary).trim().slice(0, FULL_MAX), summary: oneLine(draft.summary) }] : []
+    } catch {
+      return []
+    }
+  })
+}
+
+const refreshView = async ($: EngineInterface, runId: string) => {
+  const [cwd, home, now] = await Promise.all([$.session.cwd(), droveHome($), $.clock.now()])
+  const ran = await runDrove($, drove.rosterJsonArgs(runId), { cwd, env: drove.plannerEnv(runId, home) })
+  if (ran.exitCode !== 0) return
+  const body = JSON.parse(ran.stdout) as { run: RunMeta; seats: Seat[]; planner?: { state?: string } }
+  const root = `${home ?? `${(await $.env.get('HOME')) ?? ''}/.drove`}/runs/${runId}`
+  const [events, status] = await Promise.all([
+    $.fs.read(`${root}/events.jsonl`).catch(() => ''),
+    Promise.all(openSeats(body.seats).map(async seat => [seat.name, JSON.parse(await $.fs.read(`${root}/seats/${seat.name}/mod.json`)) as OrchModStatus] as const).map(entry => entry.catch(() => undefined))),
+  ])
+  const feed = viewFeedOf(events)
+  const statuses = Object.fromEntries(status.filter((entry): entry is readonly [string, OrchModStatus] => entry !== undefined))
+  const activity = body.planner?.state === 'working' ? 'working' : 'idle'
+  const stamp = JSON.stringify([body.run, body.seats.map(({ name, state, lastReport }) => [name, state, lastReport?.id]), feed.length, feed.at(-1)?.id, statuses, activity])
+  if (stamp === viewStamp) return
+  viewStamp = stamp
+  viewPlanner = { model: body.run.planner.model, effort: body.run.planner.effort }
+  const current = await read($, viewAtom)
+  await update($, viewAtom, () => ({ run: body.run.id, repo: body.run.repo, goal: body.run.goal, startedAt: current?.startedAt ?? (Date.parse(body.run.createdAt) || now), budget: body.run.budget }) satisfies OrchOrchestrator)
+  await update($, seatsAtom, () => body.seats)
+  await update($, statusAtom, () => statuses)
+  await update($, feedAtom, () => feed)
+  const lead = await read($, leadAtom)
+  if (lead?.activity !== activity) await update($, leadAtom, () => ({ activity, since: now }))
+  ensureAnimator($)
+}
+
+// A refresh spawns drove and can outlast a tick on a loaded host: a tick that finds one running is skipped.
+const guardedRefresh = async ($: EngineInterface, runId: string) => {
+  if (viewBusy) return
+  viewBusy = true
+  try {
+    await refreshView($, runId)
+  } finally {
+    viewBusy = false
+  }
+}
+
+const pollView = async ($: EngineInterface) => {
+  try {
+    if (viewBusy) return
+    const run = (await read($, viewAtom))?.run
+    if (!run || !(await isBoardOpen($))) {
+      stopViewer()
+      return
+    }
+    await guardedRefresh($, run)
+  } catch {
+    // the next poll tries again
+  }
+}
+
+const hideViewBoard = async ($: EngineInterface) => {
+  stopViewer()
+  await closeBoard($)
+  viewStamp = ''
+}
+
+const showViewBoard = async ($: EngineInterface, runId: string) => {
+  viewStamp = ''
+  const now = await $.clock.now()
+  await update($, viewAtom, current => current ?? { run: runId, repo: '', startedAt: now, budget: 0 })
+  await openBoard($)
+  await quietly(() => guardedRefresh($, runId))
+  stopViewer()
+  viewer = $.clock.every(VIEW_MS, () => void pollView($))
+}
+
+const toggleViewBoard = async ($: EngineInterface) => {
+  const runId = (await $.env.get('DROVE_RUN'))?.trim()
+  if (!runId) return { text: 'DROVE_RUN is not set in this session, so there is no run to show.' }
+  if (await isBoardOpen($)) {
+    await hideViewBoard($)
+    return { text: 'Board hidden. `/orchestrate board` shows it again.' }
+  }
+  await showViewBoard($, runId)
+  return { text: `Board shown for run ${runId}, read-only.` }
+}
+
+const viewStatusText = async ($: EngineInterface): Promise<string> => {
+  const runId = (await $.env.get('DROVE_RUN'))?.trim()
+  if (!runId) return 'This session is a Drove planner (started by drove plan), but DROVE_RUN is not set.'
+  const [cwd, home] = await Promise.all([$.session.cwd(), droveHome($)])
+  const roster = await runDrove($, drove.rosterArgs(runId), { cwd, env: drove.plannerEnv(runId, home) })
+  return [
+    `This session is a Drove planner started by drove plan · run ${runId} · board ${(await isBoardOpen($)) ? 'shown' : 'hidden'}.`,
+    roster.exitCode === 0 ? roster.stdout.trim() : `roster unavailable: ${drove.failureOf(roster).text}`,
+  ].join('\n')
+}
+
+const viewHelpText = (): string =>
+  [
+    'This session is a Drove planner started by drove plan: it plans with its drove tools.',
+    '`/orchestrate board`: show or hide the read-only board of its run.',
+    '`/orchestrate board bg`, `/orchestrate status`.',
+  ].join('\n')
 
 type Attached = { ok: true; run: RunMeta } | { ok: false; text: string }
 
@@ -1456,22 +1596,24 @@ export const register: Register = (on, options) => {
     isDrovePlanner = role === 'planner'
     await $.command.register({
       name: 'orchestrate',
-      description: 'Turn this session into a Drove planner: Opus plans, delegates to Claude or Codex workers in herdr panes, and reviews; it never edits code',
-      argumentHint: '[goal] | --repo <dir> [goal] | status | board | board bg | off | help',
+      description: isDrovePlanner
+        ? 'This session is a Drove planner started by drove plan: `board` shows its run read-only'
+        : 'Turn this session into a Drove planner: Opus plans, delegates to Claude or Codex workers in herdr panes, and reviews; it never edits code',
+      argumentHint: isDrovePlanner ? 'board | board bg | status | help' : '[goal] | --repo <dir> [goal] | status | board | board bg | off | help',
     })
-    if (isDrovePlanner) return started
-    await restore($)
+    if (!isDrovePlanner) await restore($)
     try {
       if ((await $.store.get('boardBg')) === false) await update($, boardBgAtom, () => false)
     } catch {
       // default: no background
     }
-    void pruneStore($)
+    if (!isDrovePlanner) void pruneStore($)
     return started
   })
 
   on('session.end', async ($, e, next) => {
     endBridge()
+    stopViewer()
     animator?.cancel()
     animator = undefined
     animatorRuns = false
@@ -1480,20 +1622,16 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'orchestrate' }, async ($, e) => {
     if (await read($, workerAtom)) return { text: 'This session is a Drove worker; it cannot orchestrate.' }
-    if (isDrovePlanner) return { text: 'This session is already a Drove planner (started by drove plan); use its drove tools.' }
     const args = e.args.trim()
+    if (isDrovePlanner) {
+      if (args === 'board') return toggleViewBoard($)
+      if (args === 'board bg') return toggleBoardBg($)
+      if (args === 'status') return { text: await viewStatusText($) }
+      return { text: args === 'help' ? viewHelpText() : DROVE_PLANNER_REFUSAL }
+    }
     if (args === 'status') return { text: await statusText($) }
     if (args === 'off') return turnOff($)
-    if (args === 'board bg') {
-      const isOn = !(await read($, boardBgAtom))
-      await update($, boardBgAtom, () => isOn)
-      try {
-        await $.store.set('boardBg', isOn)
-      } catch {
-        // kept for this session only
-      }
-      return { text: isOn ? `Board background painted ${BOARD_BG} (Catppuccin Mocha base). \`/orchestrate board bg\` again to remove it.` : 'Board background removed.' }
-    }
+    if (args === 'board bg') return toggleBoardBg($)
     if (args === 'board') {
       if (!(await read($, orchestratorAtom))) return { text: 'Orchestrator mode is off. `/orchestrate <goal>` turns it on.' }
       if (await isBoardOpen($)) {
@@ -1725,8 +1863,9 @@ export const register: Register = (on, options) => {
 
   on('ui.render', { component: 'Pane', requestId: BOARD_ID }, async ($, e) => {
     const { Box, Button, Text } = $.ui.resolve(e)
-    const [orchestrator, seats, status, asksAt, bridge, feed, lead, frame, isPainted, scrollBack, expanded, now] = await Promise.all([
+    const [modOrchestrator, view, seats, status, asksAt, bridge, feed, lead, frame, isPainted, scrollBack, expanded, now] = await Promise.all([
       read($, orchestratorAtom),
+      read($, viewAtom),
       read($, seatsAtom),
       read($, statusAtom),
       read($, asksAtAtom),
@@ -1739,6 +1878,7 @@ export const register: Register = (on, options) => {
       read($, expandedAtom),
       $.clock.now(),
     ])
+    const orchestrator = modOrchestrator ?? view
     if (!orchestrator) return <Text dimColor>Orchestrator mode is off.</Text>
     const columns = e.props.bodyColumns
     const rows = e.props.scroll.bodyRows
@@ -1750,8 +1890,8 @@ export const register: Register = (on, options) => {
       bridge,
       feed,
       lead,
-      leadModel: config.orchestratorModel,
-      leadEffort: config.orchestratorEffort,
+      leadModel: modOrchestrator ? config.orchestratorModel : (viewPlanner?.model ?? config.orchestratorModel),
+      leadEffort: modOrchestrator ? config.orchestratorEffort : (viewPlanner?.effort ?? config.orchestratorEffort),
       now,
       frame,
       scrollBack,
