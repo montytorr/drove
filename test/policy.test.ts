@@ -113,7 +113,7 @@ test('planner role shows policy and doctor rejects malformed repo policy', async
   assert.match(plannerRole(run, { ...DEFAULT_CONFIG, spawnPolicy: { model: { choice: ['sonnet'] } } }, 'codex'), /Spawn policy.*\n.*sonnet/)
   const mod = await readFile(new URL('../mod/hooks/prompts.ts', import.meta.url), 'utf8')
   assert.match(mod, /spawnPolicyText/)
-  const deps: DoctorDeps = { exec: async () => ({ code: 127, stdout: '', stderr: '' }), cwd: '/repo', home: '/home', claudeSettings: '/none', nodeVersion: '22.18.0', isWritable: async () => true, readText: async path => path === '/repo/.drove.json' ? JSON.stringify({ spawnPolicy: { model: { max: 5 } } }) : undefined }
+  const deps: DoctorDeps = { exec: async () => ({ code: 127, stdout: '', stderr: '' }), cwd: '/repo', home: '/home', claudeSettings: '/none', nodeVersion: '22.18.0', isWritable: async () => true, readText: async path => path === '/repo/.drove.json' ? JSON.stringify({ spawnPolicy: { model: { max: 5 } } }) : undefined, userHome: '/home', modDir: '/drove/mod', realpath: async path => path }
   const check = (await runDoctor(deps)).checks.find(item => item.id === 'spawn-policy')
   assert.equal(check?.status, 'fail'); assert.match(check!.detail, /numeric setting/)
 })

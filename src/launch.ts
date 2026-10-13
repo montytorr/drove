@@ -51,7 +51,7 @@ const hookCommand = (droveEntry: string, event: string): string => `node ${shell
 const claudeHook = (droveEntry: string, event: string) => ({ type: 'command', command: hookCommand(droveEntry, event), timeout: HOOK_TIMEOUT_S })
 
 // The mod Drove ships is plugin "orchestrator" (mod/.claude-plugin/plugin.json); a plugin allowlist never turns it off.
-const DROVE_PLUGIN = 'orchestrator'
+export const DROVE_PLUGIN = 'orchestrator'
 const INLINE_MARKETPLACE = 'inline'
 const CLAUDE_MD_FILES = ['CLAUDE.md', 'CLAUDE.local.md', '.claude/CLAUDE.md'] as const
 
@@ -183,12 +183,32 @@ export const readClaudeMcp = async (configPath: string, repo: string): Promise<R
   return { ...serversOf(config), ...serversOf(await readJsonFile(join(repo, '.mcp.json'))), ...serversOf(projects?.[repo]) }
 }
 
-const expandHome = (path: string): string => (path === '~' ? homedir() : path.startsWith('~/') ? join(homedir(), path.slice(2)) : path)
+// Claude expands a leading ~ in a CLAUDE_CODE_PLUGIN_DIRS entry to the user's home.
+export const expandHome = (path: string, home: string = homedir()): string => (path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path)
 
-const pluginNameOfDir = async (dir: string): Promise<string> => {
-  const name = recordOf(await readJsonFile(join(dir, '.claude-plugin', 'plugin.json'))).name
+const readTextFile = async (path: string): Promise<string | undefined> => {
+  try {
+    return await readFile(path, 'utf8')
+  } catch {
+    return undefined
+  }
+}
+
+// The plugin name a mod dir holds: its .claude-plugin/plugin.json name, else the dir's basename.
+export const pluginNameOfDir = async (dir: string, readText: (path: string) => Promise<string | undefined> = readTextFile): Promise<string> => {
+  let manifest: unknown
+  try {
+    manifest = JSON.parse((await readText(join(dir, '.claude-plugin', 'plugin.json'))) ?? 'null')
+  } catch {
+    manifest = undefined
+  }
+  const name = recordOf(manifest).name
   return typeof name === 'string' && name.trim() ? name.trim() : basename(dir)
 }
+
+// The entries of a CLAUDE_CODE_PLUGIN_DIRS value, as Claude splits it; undefined when it is not a string.
+export const pluginDirEntries = (raw: unknown): string[] | undefined =>
+  typeof raw === 'string' ? raw.split(delimiter).map(entry => entry.trim()).filter(Boolean) : undefined
 
 // Reads only: the plugins the user enabled, and the mod dirs they load through env.CLAUDE_CODE_PLUGIN_DIRS, each with
 // the plugin name from its .claude-plugin/plugin.json (the dir's basename when it has none).
@@ -196,7 +216,7 @@ export const readClaudePlugins = async (settingsPath: string): Promise<UserPlugi
   const settings = recordOf(await readJsonFile(settingsPath))
   const enabled = Object.entries(recordOf(settings.enabledPlugins)).filter(([, on]) => on === true).map(([key]) => key)
   const raw = recordOf(settings.env).CLAUDE_CODE_PLUGIN_DIRS
-  const entries = typeof raw === 'string' ? raw.split(delimiter).map(entry => entry.trim()).filter(Boolean) : undefined
+  const entries = pluginDirEntries(raw)
   const dirs = entries ? await Promise.all(entries.map(async entry => ({ entry, name: await pluginNameOfDir(expandHome(entry)) }))) : undefined
   return { enabled, ...(dirs ? { dirs } : {}) }
 }

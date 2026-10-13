@@ -36,6 +36,10 @@ const depsWith = (overrides: Record<string, ExecResult> = {}, extra: Partial<Doc
     nodeVersion: 'v22.18.0',
     isWritable: async () => true,
     readText: async () => undefined,
+    userHome: '/home/me',
+    modDir: '/drove/mod',
+    envPluginDirs: '/drove/mod',
+    realpath: async path => path,
     ...extra,
   }
 }
@@ -143,6 +147,32 @@ test("the mod's nodePath is checked only when the mod is installed", async () =>
   const gone = await withMod(settings('/nope/node'), {})
   assert.equal(statusOf(gone.checks, 'mod-node'), 'fail')
   assert.equal(gone.ok, false)
+})
+
+test('AC6: with no mod entry the mod check warns and names drove setup mod', async () => {
+  const report = await runDoctor(depsWith({}, { envPluginDirs: undefined }))
+  const mod = report.checks.find(item => item.id === 'mod')
+  assert.equal(mod?.status, 'warn')
+  assert.match(mod?.fix ?? '', /drove setup mod/)
+  assert.equal(report.ok, true)
+  assert.match(formatReport(report), /fix: run drove setup mod/)
+})
+
+test('the mod check reads the settings env (with ~) and the process env, and warns on another clone', async () => {
+  const settings = (dirs: string) => JSON.stringify({ env: { CLAUDE_CODE_PLUGIN_DIRS: dirs } })
+  const files = (dirs: string, extra: Record<string, string> = {}) => ({ claudeSettings: '/s', envPluginDirs: undefined, readText: async (path: string) => ({ '/s': settings(dirs), ...extra })[path] })
+  const fromSettings = await runDoctor(depsWith({}, { ...files('/a/plugin:~/drove/mod'), modDir: '/home/me/drove/mod' }))
+  assert.equal(statusOf(fromSettings.checks, 'mod'), 'ok')
+  assert.match(fromSettings.checks.find(item => item.id === 'mod')?.detail ?? '', /~\/drove\/mod \(CLAUDE_CODE_PLUGIN_DIRS in \/s\)/)
+  const linked = await runDoctor(depsWith({}, { ...files('/link/mod'), realpath: async path => (path === '/link/mod' ? '/drove/mod' : path) }))
+  assert.equal(statusOf(linked.checks, 'mod'), 'ok')
+  const fromEnv = await runDoctor(depsWith({}, { envPluginDirs: '/x:/drove/mod' }))
+  assert.match(fromEnv.checks.find(item => item.id === 'mod')?.detail ?? '', /process env/)
+  const other = await runDoctor(depsWith({}, files('/old/drove/mod', { '/old/drove/mod/.claude-plugin/plugin.json': '{"name":"orchestrator"}' })))
+  const otherCheck = other.checks.find(item => item.id === 'mod')
+  assert.equal(otherCheck?.status, 'warn')
+  assert.match(otherCheck?.detail ?? '', /another clone: \/old\/drove\/mod/)
+  assert.match(otherCheck?.fix ?? '', /drove setup mod/)
 })
 
 test('a failed report prints the fix lines and a count', async () => {

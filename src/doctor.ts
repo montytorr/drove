@@ -1,10 +1,12 @@
-import { access, constants, readFile } from 'node:fs/promises'
+import { access, constants, readFile, realpath } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { toplevel } from './git.ts'
 import { loadPolicy } from './policy.ts'
 import { probeServer } from './herdr.ts'
 import { detectAgents, nodeAgentDeps } from './agents.ts'
+import { DROVE_PLUGIN, expandHome, pluginDirEntries, pluginNameOfDir, userClaudeDir } from './launch.ts'
 import { userCodexHome } from './paths.ts'
 import type { Exec, ExecResult } from './types.ts'
 
@@ -25,7 +27,16 @@ export type DoctorDeps = {
   nodeVersion: string
   isWritable: (path: string) => Promise<boolean>
   readText: (path: string) => Promise<string | undefined>
+  // The user's home (Claude expands ~ in a plugin dir against it), this clone's mod dir, and the process's own
+  // CLAUDE_CODE_PLUGIN_DIRS.
+  userHome: string
+  modDir: string
+  envPluginDirs?: string
+  realpath: (path: string) => Promise<string>
 }
+
+// This clone's mod: the mod/ beside src/.
+export const CLONE_MOD_DIR = fileURLToPath(new URL('../mod', import.meta.url))
 
 const TIMEOUT_MS = 10_000
 
@@ -149,8 +160,36 @@ const checkHome = async (deps: DoctorDeps): Promise<Check> => {
   return check('drove-home', 'fail', `${deps.home} is not writable`, 'point DROVE_HOME at a folder this user can write')
 }
 
+const record = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' ? (value as Record<string, unknown>) : {})
+
+const parseSettings = (raw: string | undefined): Record<string, unknown> => {
+  try {
+    return record(JSON.parse(raw ?? '{}'))
+  } catch {
+    return {}
+  }
+}
+
+// Installed means a CLAUDE_CODE_PLUGIN_DIRS entry, in the settings env or the process env, resolves to this clone's mod.
+const checkModInstalled = async (deps: DoctorDeps): Promise<Check> => {
+  const settingsEntries = pluginDirEntries(record(parseSettings(await deps.readText(deps.claudeSettings)).env).CLAUDE_CODE_PLUGIN_DIRS) ?? []
+  const entries = [
+    ...settingsEntries.map(entry => ({ entry, from: deps.claudeSettings })),
+    ...(pluginDirEntries(deps.envPluginDirs) ?? []).map(entry => ({ entry, from: 'the process env' })),
+  ]
+  const mine = await deps.realpath(deps.modDir)
+  for (const { entry, from } of entries) {
+    if (await deps.realpath(expandHome(entry, deps.userHome)) === mine) return check('mod', 'ok', `the Claude mod loads from ${entry} (CLAUDE_CODE_PLUGIN_DIRS in ${from})`)
+  }
+  const named = await Promise.all(entries.map(async item => ({ ...item, name: await pluginNameOfDir(expandHome(item.entry, deps.userHome), deps.readText) })))
+  const other = named.find(item => item.name === DROVE_PLUGIN)
+  return other
+    ? check('mod', 'warn', `the Claude mod loads from another clone: ${other.entry} (CLAUDE_CODE_PLUGIN_DIRS in ${other.from}), not ${deps.modDir}`, 'run drove setup mod from this clone to point it here')
+    : check('mod', 'warn', `the Claude mod is not installed: no CLAUDE_CODE_PLUGIN_DIRS entry is ${deps.modDir}`, 'run drove setup mod')
+}
+
 // The mod keeps its settings in Claude Code's user settings, under the plugin's key. Not installed is not a problem.
-const checkMod = async (deps: DoctorDeps): Promise<Check | undefined> => {
+const checkModNode = async (deps: DoctorDeps): Promise<Check | undefined> => {
   const raw = await deps.readText(deps.claudeSettings)
   if (raw === undefined) return undefined
   const unread = check('mod-node', 'warn', "nodePath not checked (could not read the mod's options)", `fix or remove ${deps.claudeSettings}, then run drove doctor again`)
@@ -160,7 +199,6 @@ const checkMod = async (deps: DoctorDeps): Promise<Check | undefined> => {
   } catch {
     return unread
   }
-  const record = (value: unknown): Record<string, unknown> => (value && typeof value === 'object' ? (value as Record<string, unknown>) : {})
   const enabled = record(record(settings).enabledPlugins)
   const configs = record(record(settings).pluginConfigs)
   const name = Object.keys({ ...enabled, ...configs }).find(key => key.startsWith('orchestrator@'))
@@ -176,12 +214,12 @@ const checkMod = async (deps: DoctorDeps): Promise<Check | undefined> => {
 }
 
 export const runDoctor = async (deps: DoctorDeps): Promise<DoctorReport> => {
-  const [git, herdr, agents, gh, cairn, home, mod] = await Promise.all([
-    checkGit(deps), checkHerdr(deps), checkAgents(deps), checkGh(deps), checkCairn(deps), checkHome(deps), checkMod(deps),
+  const [git, herdr, agents, gh, cairn, home, mod, modNode] = await Promise.all([
+    checkGit(deps), checkHerdr(deps), checkAgents(deps), checkGh(deps), checkCairn(deps), checkHome(deps), checkModInstalled(deps), checkModNode(deps),
   ])
   const root = await toplevel(deps.exec, deps.cwd) ?? deps.cwd
   const policy = await loadPolicy(deps.home, root, deps.readText)
-  const checks = [check('spawn-policy', policy.errors.length ? 'fail' : 'ok', policy.errors.length ? policy.errors.join('; ') : 'spawn policy valid'), checkNode(deps), ...git, ...herdr, ...agents, gh, cairn, home, ...(mod ? [mod] : [])]
+  const checks = [check('spawn-policy', policy.errors.length ? 'fail' : 'ok', policy.errors.length ? policy.errors.join('; ') : 'spawn policy valid'), checkNode(deps), ...git, ...herdr, ...agents, gh, cairn, home, mod, ...(modNode ? [modNode] : [])]
   return { ok: checks.every(item => item.status !== 'fail'), checks }
 }
 
@@ -196,12 +234,22 @@ export const formatReport = (report: DoctorReport): string => {
   return [...lines, '', failed > 0 ? `${failed} failed, ${warned} warning${warned === 1 ? '' : 's'}` : warned > 0 ? `ready, ${warned} warning${warned === 1 ? '' : 's'}` : 'ready'].join('\n')
 }
 
-export const nodeDoctorDeps = (exec: Exec, home: string, cwd: string = process.cwd()): DoctorDeps => ({
+export const nodeDoctorDeps = (exec: Exec, home: string, cwd: string = process.cwd(), env: NodeJS.ProcessEnv = process.env): DoctorDeps => ({
   exec,
   cwd,
   home,
-  claudeSettings: join(homedir(), '.claude', 'settings.json'),
+  claudeSettings: join(userClaudeDir(env), 'settings.json'),
   nodeVersion: process.version,
+  userHome: homedir(),
+  modDir: CLONE_MOD_DIR,
+  ...(env.CLAUDE_CODE_PLUGIN_DIRS === undefined ? {} : { envPluginDirs: env.CLAUDE_CODE_PLUGIN_DIRS }),
+  realpath: async path => {
+    try {
+      return await realpath(path)
+    } catch {
+      return resolve(path)
+    }
+  },
   isWritable: async path => {
     try {
       await access(path, constants.W_OK)
