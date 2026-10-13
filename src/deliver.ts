@@ -357,7 +357,7 @@ export const flushPending = async (deps: Deps, run: RunMeta, seatName: string): 
     return results
   })
 
-const plannerSeat = (run: RunMeta): Seat => ({
+export const plannerSeat = (run: RunMeta): Seat => ({
   name: PLANNER_SEAT,
   kind: run.planner.kind,
   model: run.planner.model,

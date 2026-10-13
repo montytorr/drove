@@ -10,7 +10,7 @@ import { detectRunAgents, detectRunCairn, modelLabelOf, noCairnReason, runUsesCa
 import { attentionCandidates, type AttentionDelta, attentionLine, closeItems, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
 import { type CheckPlan, checksOf, renderOutcome, repoVerifyCommands, reusedText, runChecks } from './checks.ts'
-import { BUSY_RETRY_MS, POINTER_LINES, briefForSend, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
+import { BUSY_RETRY_MS, POINTER_LINES, briefForSend, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSeat, plannerSessionId, recordEvent } from './deliver.ts'
 import * as git from './git.ts'
 import * as herdr from './herdr.ts'
 import { markPlannerUnavailable } from './planner.ts'
@@ -26,7 +26,7 @@ import { buildReport, noteLines, renderReport, type RunReport } from './report.t
 import { type Folded, readFolded } from './pending.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { steeringNotes } from './steer.ts'
-import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
+import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, withLock, writeJsonAtomic, writeToken } from './store.ts'
 import { canonicalRoot, readRepoTrust, type RepoTrust, trustAttentionText, untrustedText } from './trust.ts'
 import type {
   AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HostAgents, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PendingStart, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
@@ -722,7 +722,7 @@ const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[]
 
 type Failed = Extract<CommandResult, { ok: false }>
 type OpenedWorkspace = herdr.NewWorkspace
-type DetachedPlanner = { state: Seat['state']; name: string; sessionId?: string; attention?: Attention; notes: string[] }
+type DetachedPlanner = { state: Seat['state']; name: string; sessionId?: string; attention?: Attention; notes: string[]; isGoalHeld?: boolean }
 
 // --detached talks to a herdr server that is already running and never starts one: a server comes with a person's
 // session, and its panes are the person's to lose.
@@ -740,6 +740,9 @@ const openDetachedWorkspace = async (deps: Deps, run: RunMeta, env: Record<strin
   return opened ?? (failed('herdr', `herdr could not open a workspace for run ${run.id}: ${clip(made.ok ? made.value : made.output)}`) as Failed)
 }
 
+const heldGoalText = (run: string): string =>
+  `The goal was not typed: the planner is at a dialog. Answer it in the pane, and the watcher types the goal once the dialog clears; \`drove goal --run ${run} --deliver\` types it now.`
+
 // The planner is started the way a worker is: into the root pane of the workspace, as a named herdr agent, so the
 // watcher, the wake and the board reach it by the pane id the run records.
 const startDetachedPlanner = async (deps: Deps, run: RunMeta, spec: LaunchSpec, paneId: string, typedPrompt: string | undefined): Promise<DetachedPlanner | Failed> => {
@@ -752,18 +755,21 @@ const startDetachedPlanner = async (deps: Deps, run: RunMeta, spec: LaunchSpec, 
     const dialog = screen.ok ? matchDialog(PLANNER_SEAT, screen.value, deps.clock.now()) : undefined
     const attention: Attention = dialog ?? { seat: PLANNER_SEAT, reason: 'dialog', detail: 'The planner stopped on a startup dialog; answer it in the pane. Drove will not.', at: deps.clock.now().toISOString() }
     await recordEvent(deps, run.id, { type: 'attention', seat: PLANNER_SEAT, data: { reason: attention.reason, detail: attention.detail } })
-    return { state: 'blocked', name, attention, notes: typedPrompt ? ['The goal was not typed: the planner is at a dialog. Answer it, then give the planner its goal in the pane.'] : [] }
+    return { state: 'blocked', name, attention, notes: typedPrompt ? [heldGoalText(run.id)] : [], isGoalHeld: typedPrompt !== undefined }
   }
   const adopted = started.ok ? undefined : await adoptFailedStart(deps, name, kind, paneId)
   if (!started.ok && !adopted) return failed('herdr', `herdr could not start the ${kind} planner in pane ${paneId}: ${clip(started.output)}`) as Failed
   const live = started.ok ? await herdr.getAgent(deps.exec, paneId) : undefined
   const sessionId = (live?.ok ? live.value.sessionId : undefined) ?? adopted?.sessionId
   const notes: string[] = []
+  let isGoalHeld = false
   if (typedPrompt) {
     const typed = await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, typedPrompt, 15_000), BUSY_RETRY_MS)
-    if (!typed.ok && !herdr.isPromptUnconfirmed(typed.output)) notes.push(`The goal was not delivered (${clip(typed.output, 160)}); give the planner its goal in the pane.`)
+    isGoalHeld = !typed.ok && typed.code === 'agent_blocked'
+    if (isGoalHeld) notes.push(heldGoalText(run.id))
+    else if (!typed.ok && !herdr.isPromptUnconfirmed(typed.output)) notes.push(`The goal was not delivered (${clip(typed.output, 160)}); give the planner its goal in the pane.`)
   }
-  return { state: adopted ? adopted.state : live?.ok ? stateOfHerdr(live.value.status) : 'working', name, ...(sessionId ? { sessionId } : {}), notes }
+  return { state: adopted ? adopted.state : live?.ok ? stateOfHerdr(live.value.status) : 'working', name, ...(sessionId ? { sessionId } : {}), notes, isGoalHeld }
 }
 
 // A detached start that did not come up leaves nothing half-open: the workspace Drove made is closed, and the run is
@@ -881,7 +887,9 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
       planner: { kind, paneId, model, effort, viaMod: false, ...(sessionId ? { sessionId } : {}) },
     }
   }
-  run = { ...run, planner: { ...run.planner, launchId: randomUUID(), unavailable: undefined } }
+  // A new planner gets its own goal: one held for the last one is not typed into it.
+  const { pendingGoal: _held, goalDelivered: _delivered, ...fresh } = run
+  run = { ...fresh, planner: { ...run.planner, launchId: randomUUID(), unavailable: undefined } }
   await saveRun(deps.home, run)
   await updateRoster(deps.home, run.id, roster => roster)
   if (!isDetached) await recordEvent(deps, run.id, { type: 'run.up', data: { planner: kind, pane: paneId, attached: Boolean(request.run) } })
@@ -915,6 +923,10 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     await writeLaunchFiles(spec)
     const started = await startDetachedPlanner(deps, run, spec, opened.paneId, typedPrompt)
     if ('code' in started) return abandonDetached(deps, run, previous, started, opened.workspaceId)
+    if (started.isGoalHeld && typedPrompt) {
+      run = { ...run, pendingGoal: { text: typedPrompt, since: deps.clock.now().toISOString() } }
+      await saveRun(deps.home, run)
+    }
     return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.${trustWarning}${cairnWarning}`)
   }
   await writeLaunchFiles(spec)
@@ -2860,6 +2872,74 @@ export const setGoal = async (deps: Deps, ref: RunRef, request: GoalRequest): Pr
   await saveRun(deps.home, next)
   await recordEvent(deps, run.id, { type: 'goal.set', data: { goal, ...(request.cairn ? { cairn: request.cairn } : {}), ...(run.goal ? { previous: run.goal } : {}) } })
   return ok(`Goal of run ${run.id} set${request.cairn ? ` (Cairn task ${request.cairn})` : ''}: ${goal}`, { goal, run: next })
+}
+
+// ---------- held goal (DROVE-157) ----------
+
+type HeldGoal = { state: 'delivered' | 'already' | 'none' | 'dialog' | 'waiting' | 'failed'; detail: string }
+
+// The planner's own hooks say whether it took a prompt since the goal was held: one typed in the pane by hand is the goal.
+const promptedSince = async (deps: Deps, run: string, since: string): Promise<boolean> =>
+  (await readJsonlFrom<HookRecord>(join(plannerDir(deps.home, run), 'hooks.jsonl'), { offset: 0 })).items.some(hook => hook.event === 'user-prompt-submit' && hook.at >= since)
+
+const settleGoal = async (deps: Deps, runId: string, by: NonNullable<RunMeta['goalDelivered']>['by'], data: Record<string, unknown>): Promise<void> => {
+  const latest = await loadRun(deps.home, runId)
+  if (!latest) return
+  const { pendingGoal: _sent, ...rest } = latest
+  await saveRun(deps.home, { ...rest, goalDelivered: { at: deps.clock.now().toISOString(), by } })
+  await recordEvent(deps, runId, { type: 'planner.goal-delivered', seat: PLANNER_SEAT, data: { by, ...data } })
+}
+
+// Types a held goal into the planner pane once the pane shows the agent at its input with no dialog, the way
+// applyPendingStarts hands a held brief to a worker. The lock keeps the watcher and `drove goal --deliver` from both typing it.
+const typeHeldGoal = (deps: Deps, runId: string, by: 'watcher' | 'command'): Promise<HeldGoal> =>
+  withLock(join(runDir(deps.home, runId), 'goal.lock'), async (): Promise<HeldGoal> => {
+    const run = await loadRun(deps.home, runId)
+    const pending = run?.pendingGoal
+    if (!run || !pending) {
+      const done = run?.goalDelivered
+      return done ? { state: 'already', detail: `the goal of run ${runId} was already delivered (${done.by === 'pane' ? 'given in the pane' : `typed by ${done.by === 'watcher' ? 'the watcher' : 'drove goal --deliver'}`} at ${done.at})` } : { state: 'none', detail: `run ${runId} has no goal waiting to be typed` }
+    }
+    const paneId = run.planner.paneId
+    if (run.status !== 'up' || !paneId) return { state: 'waiting', detail: `run ${runId} is ${run.status === 'up' ? 'up with no planner pane' : 'down'}` }
+    const pane = await herdr.run(deps.exec, herdr.paneGetArgv(paneId), 10_000)
+    if (!pane.ok) return { state: 'waiting', detail: `planner pane ${paneId} is not reachable (${clip(pane.output, 120) || pane.code})` }
+    const screen = await herdr.readPane(deps.exec, paneId, 40, 'visible')
+    if (!screen.ok) return { state: 'waiting', detail: `planner pane ${paneId} could not be read (${clip(screen.output, 120) || screen.code})` }
+    const dialog = findDialog(screen.value)
+    if (dialog) return { state: 'dialog', detail: `the planner is still at a dialog (${dialog.reason}): answer it in pane ${paneId} first` }
+    const live = await herdr.getAgent(deps.exec, paneId)
+    if (!live.ok) return { state: 'waiting', detail: `herdr lists no agent in planner pane ${paneId} yet` }
+    if (live.value.status === 'blocked') return { state: 'dialog', detail: `the planner is still at a dialog: answer it in pane ${paneId} first` }
+    if (await promptedSince(deps, runId, pending.since)) {
+      await settleGoal(deps, runId, 'pane', { pane: paneId })
+      return { state: 'already', detail: `the planner was given a prompt in pane ${paneId} since its goal was held, so the goal was not typed again` }
+    }
+    if (live.value.status === 'working') return { state: 'waiting', detail: 'the planner is working' }
+    const delivery = await herdrPromptAdapter(deps).deliver(plannerSeat(run), pending.text)
+    if (!delivery.ok) return { state: delivery.queued ? 'waiting' : 'failed', detail: delivery.reason }
+    await settleGoal(deps, runId, by, { pane: paneId, via: delivery.via, ...('unconfirmed' in delivery && delivery.unconfirmed ? { unconfirmed: true } : {}), ...('submitted' in delivery && delivery.submitted ? { submitted: true } : {}) })
+    return { state: 'delivered', detail: `the goal was typed into planner pane ${paneId}` }
+  })
+
+// The watcher runs this on each flush: a planner that started at a dialog gets its goal within a tick of the dialog clearing.
+export const applyPendingGoal = async (deps: Deps, run: RunMeta): Promise<CommandResult | undefined> => {
+  if (!(await loadRun(deps.home, run.id))?.pendingGoal) return undefined
+  const held = await typeHeldGoal(deps, run.id, 'watcher')
+  return held.state === 'delivered' ? ok(`Run ${run.id}: ${held.detail}.`) : held.state === 'failed' ? failed('goal', `Run ${run.id}: the held goal was not typed: ${held.detail}`) : undefined
+}
+
+// `drove goal --deliver`: the human's way to type a held goal from outside the planner pane.
+export const deliverGoal = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
+  if (process.env[ENV.role] === 'worker') return failed('forbidden', 'only the planner or the human can deliver the run goal')
+  const located = await locateRun(deps, ref, 'up')
+  if ('error' in located) return located.error
+  const { id } = located.run
+  const held = await typeHeldGoal(deps, id, 'command')
+  if (held.state === 'delivered' || held.state === 'already') return ok(`${held.detail[0]?.toUpperCase()}${held.detail.slice(1)}.`, { run: id, state: held.state })
+  if (held.state === 'none') return failed('no-goal', `Nothing to deliver: ${held.detail}. Set one with \`drove goal --run ${id} <text>\`, or type it in the planner pane.`)
+  if (held.state === 'dialog') return failed('at-dialog', `Nothing was typed: ${held.detail}, then run \`drove goal --run ${id} --deliver\` again (the watcher also types it once the dialog clears).`)
+  return failed(held.state === 'waiting' ? 'not-ready' : 'goal', `Nothing was typed: ${held.detail}. The goal stays held; run this again, or type it in the pane.`)
 }
 
 // ---------- budget ----------

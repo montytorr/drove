@@ -45,6 +45,10 @@ export type RunMeta = {
   agents?: HostAgents
   // False when the run has no Cairn (none on the host, or the cairn setting is off); a run saved before DROVE-159 has none and uses it.
   useCairn?: boolean
+  // DROVE-157: the goal a detached planner did not get because it started at a dialog, exactly as `drove plan` would have
+  // typed it. The watcher types it once the dialog clears (or the human runs `drove goal --deliver`), then records who did.
+  pendingGoal?: { text: string; since: string }
+  goalDelivered?: { at: string; by: 'watcher' | 'command' | 'pane' }
 }
 
 export type LastReport = {
@@ -131,6 +135,7 @@ export type DroveEventType =
   | 'run.down'
   | 'run.recovered'
   | 'goal.set'
+  | 'planner.goal-delivered'
   | 'seat.spawn'
   | 'seat.start_failed'
   | 'seat.relaunch'
