@@ -68,3 +68,30 @@ test('a Lab ref sends no beat: a subject holds no claim', async () => {
   await roster.call({})
   assert.deepEqual(beats(), [])
 })
+
+
+test('claim beats use the run planner kind and preserve CAIRN_AGENT (DROVE-160)', async () => {
+  const previous = process.env.CAIRN_AGENT
+  try {
+    for (const [kind, explicit, expected] of [
+      ['claude', undefined, 'claude-code'], ['codex', undefined, 'codex'], ['claude', 'maintenance', 'maintenance'],
+    ] as const) {
+      if (explicit === undefined) delete process.env.CAIRN_AGENT
+      else process.env.CAIRN_AGENT = explicit
+      const ctx = await setup()
+      await saveRun(ctx.home, { ...ctx.run, cairn: 'DROVE-160', planner: { ...ctx.run.planner, kind } })
+      let agent: string | undefined
+      const base = ctx.deps.exec
+      const deps = { ...ctx.deps, exec: async (argv: readonly string[], options?: import('../src/types.ts').ExecOptions) => {
+        if (argv[0] === 'cairn') agent = options?.env?.CAIRN_AGENT
+        return base(argv, options)
+      } }
+      const roster = plannerTools(deps, { home: ctx.home, run: ctx.run.id, role: 'planner', seat: 'planner' }, ports).find(tool => tool.name === 'roster')!
+      assert.deepEqual(await roster.call({}), { text: 'roster lines' })
+      assert.equal(agent, expected)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAIRN_AGENT
+    else process.env.CAIRN_AGENT = previous
+  }
+})

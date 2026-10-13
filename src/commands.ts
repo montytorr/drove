@@ -5,6 +5,7 @@ import { chmod, mkdir, readdir, readFile, realpath, writeFile } from 'node:fs/pr
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
+import { cairnEnv, cairnKeyHint } from './cairn.ts'
 import { detectRunAgents, modelLabelOf } from './agents.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, closeItems, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
@@ -600,30 +601,30 @@ type CairnRead = { task: CairnTask } | { missing: string } | { skipped: string }
 const CAIRN_CLOSED = ['done', 'cancelled']
 const PROJECT_RE = /^[A-Z][A-Z0-9]*$/
 
-const cairnJson = async (deps: Deps, argv: string[]): Promise<{ value: Record<string, unknown> } | { missing: string } | { skipped: string }> => {
+const cairnJson = async (deps: Deps, argv: string[], kind: AgentKind): Promise<{ value: Record<string, unknown> } | { missing: string } | { skipped: string }> => {
   try {
-    const ran = await deps.exec(['cairn', ...argv], { timeoutMs: 15_000 })
+    const ran = await deps.exec(['cairn', ...argv], { timeoutMs: 15_000, env: cairnEnv(kind) })
     const output = `${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, '')
     const gone = /^No (task|project|subject) /m.exec(output)
     if (gone) return { missing: clip(output) }
-    if (ran.code !== 0) return { skipped: `cairn exited ${ran.code}: ${clip(output)}` }
+    if (ran.code !== 0) return { skipped: `cairn exited ${ran.code}: ${clip(output)}${cairnKeyHint(output)}` }
     const value: unknown = JSON.parse(ran.stdout)
     return value && typeof value === 'object' ? { value: value as Record<string, unknown> } : { skipped: 'cairn printed no JSON object' }
   } catch (error) {
-    return { skipped: `cairn could not be run: ${messageOf(error)}` }
+    return { skipped: `cairn could not be run: ${messageOf(error)}${cairnKeyHint(messageOf(error))}` }
   }
 }
 
 const textOf = (value: unknown): string => (typeof value === 'string' ? value : '')
 
-const readCairnTask = async (deps: Deps, ref: string): Promise<CairnRead> => {
-  const read = await cairnJson(deps, ['show', ref, '--full', '--json'])
+const readCairnTask = async (deps: Deps, ref: string, kind: AgentKind): Promise<CairnRead> => {
+  const read = await cairnJson(deps, ['show', ref, '--full', '--json'], kind)
   if ('value' in read) return { task: { ref: textOf(read.value.ref) || ref, title: textOf(read.value.title), status: textOf(read.value.status), body: textOf(read.value.description), labels: Array.isArray(read.value.labels) ? read.value.labels.filter((label): label is string => typeof label === 'string') : [] } }
   return read
 }
 
-const checkSpawnCairn = async (deps: Deps, ref: string): Promise<{ error: CommandResult } | { note?: string }> => {
-  const read = await readCairnTask(deps, ref)
+const checkSpawnCairn = async (deps: Deps, ref: string, kind: AgentKind): Promise<{ error: CommandResult } | { note?: string }> => {
+  const read = await readCairnTask(deps, ref, kind)
   if ('missing' in read) return { error: failed('no-task', `Cairn task ${ref} does not exist (${read.missing}); pass an open task's ref`) }
   if ('skipped' in read) return { note: `the Cairn task ${ref} was not checked (${read.skipped}).` }
   if (CAIRN_CLOSED.includes(read.task.status)) return { error: failed('task-closed', `Cairn task ${ref} is ${read.task.status}; a worker needs an open task, so file one or reopen it`) }
@@ -632,9 +633,9 @@ const checkSpawnCairn = async (deps: Deps, ref: string): Promise<{ error: Comman
 
 type GoalTask = { ref: string; goal: string; prompt: string }
 
-const pickNextTask = async (deps: Deps, project: string): Promise<{ ref: string } | { error: CommandResult }> => {
+const pickNextTask = async (deps: Deps, project: string, kind: AgentKind): Promise<{ ref: string } | { error: CommandResult }> => {
   if (!PROJECT_RE.test(project)) return { error: failed('usage', `--next takes a Cairn project key like DROVE; got "${project}"`) }
-  const read = await cairnJson(deps, ['next', '--project', project, '--json'])
+  const read = await cairnJson(deps, ['next', '--project', project, '--json'], kind)
   if ('missing' in read) return { error: failed('no-task', `Cairn has no project ${project}`) }
   if ('skipped' in read) return { error: failed('cairn', `could not ask Cairn for the next task in ${project}: ${read.skipped}`) }
   const pick = read.value.pick
@@ -642,8 +643,8 @@ const pickNextTask = async (deps: Deps, project: string): Promise<{ ref: string 
   return ref ? { ref } : { error: failed('no-task', `Cairn has no task to pick up in ${project}`) }
 }
 
-const readLabSubject = async (deps: Deps, instance: string, ref: string): Promise<{ subject: LabSubject } | { error: CommandResult }> => {
-  const read = await cairnJson(deps, ['--instance', instance, 'subject', 'show', ref, '--json'])
+const readLabSubject = async (deps: Deps, instance: string, ref: string, kind: AgentKind): Promise<{ subject: LabSubject } | { error: CommandResult }> => {
+  const read = await cairnJson(deps, ['--instance', instance, 'subject', 'show', ref, '--json'], kind)
   if ('missing' in read) return { error: failed('no-task', `Lab subject ${ref} does not exist on the ${instance} instance (${read.missing})`) }
   if ('skipped' in read) return { error: failed('cairn', `could not read Lab subject ${ref}: ${read.skipped}`) }
   const { value } = read
@@ -656,24 +657,24 @@ const readLabSubject = async (deps: Deps, instance: string, ref: string): Promis
   return { subject: { ref: textOf(value.ref) || ref, title, body: textOf(value.body), todos } }
 }
 
-const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next'>, labInstance: string, agents?: HostAgents): Promise<GoalTask | { error: CommandResult } | undefined> => {
+const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next' | 'kind'>, labInstance: string, agents?: HostAgents): Promise<GoalTask | { error: CommandResult } | undefined> => {
   if (request.cairn === undefined && request.next === undefined) return undefined
   if (request.cairn !== undefined && request.next !== undefined) return { error: failed('usage', '--from-cairn and --next are exclusive') }
   if (request.goal) return { error: failed('usage', '--goal cannot be combined with --from-cairn or --next: the goal is the task') }
   let ref = request.cairn
   if (request.next !== undefined) {
-    const picked = await pickNextTask(deps, request.next)
+    const picked = await pickNextTask(deps, request.next, request.kind)
     if ('error' in picked) return picked
     ref = picked.ref
   }
   if (ref && LAB_RE.test(ref)) {
-    const read = await readLabSubject(deps, labInstance, ref)
+    const read = await readLabSubject(deps, labInstance, ref, request.kind)
     if ('error' in read) return read
     const { subject } = read
     return { ref, goal: `${ref}: ${subject.title}`, prompt: labSubjectPrompt(subject, labInstance) }
   }
   if (!ref || !CAIRN_RE.test(ref)) return { error: failed('usage', `--from-cairn must look like DROVE-5 or LAB-21; got "${request.cairn ?? ''}"`) }
-  const read = await readCairnTask(deps, ref)
+  const read = await readCairnTask(deps, ref, request.kind)
   if ('missing' in read) return { error: failed('no-task', `Cairn task ${ref} does not exist (${read.missing})`) }
   if ('skipped' in read) return { error: failed('cairn', `could not read Cairn task ${ref}: ${read.skipped}`) }
   const { task } = read
@@ -702,7 +703,7 @@ const reportRunToCairn = async (deps: Deps, run: RunMeta, seats: readonly Seat[]
   const lab = LAB_RE.test(run.cairn)
   try {
     const argv = lab ? ['cairn', '--instance', labInstance, 'subject', 'note', run.cairn, lines.join('\n')] : ['cairn', 'note', run.cairn, lines.join('\n')]
-    const ran = await deps.exec(argv, { timeoutMs: 15_000 })
+    const ran = await deps.exec(argv, { timeoutMs: 15_000, env: cairnEnv(run.planner.kind) })
     if (ran.code === 0) return `Wrote a summary note on the goal ${lab ? 'subject' : 'task'} ${run.cairn}.`
     return `Note: the summary note on ${run.cairn} was not written (cairn exited ${ran.code}: ${clip(`${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, ''))}).`
   } catch (error) {
@@ -1081,7 +1082,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (unavailable) return unavailable
   const trust = kind === 'claude' ? await repoTrustOf(deps, run.repo) : undefined
   if (trust?.state === 'untrusted') return failed('untrusted-repo', untrustedText(trust))
-  const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn) : {}
+  const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn, run.planner.kind) : {}
   if ('error' in cairnCheck) return cairnCheck.error
   const targetSeat = request.target ? findSeat(await loadRoster(deps.home, run.id), request.target) : undefined
   if (request.target && !targetSeat) return failed('no-seat', `--target ${request.target}: no seat of run ${run.id} has that name (a reviewer or tester works on a seat that exists)`)
@@ -1829,7 +1830,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
     }
     const notes = [
       seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined,
-      seat.cairn ? await releaseCairnClaim(deps, seat.cairn) : undefined,
+      seat.cairn ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined,
     ].filter((note): note is string => Boolean(note))
 
     const { sessionId: _session, codexHome: _home, pendingPromote: _pending, restartingSince: _since, ...kept } = seat
@@ -2122,9 +2123,9 @@ export const reports = async (deps: Deps, identity: Identity, ref: RunRef, reque
 const BENIGN_RELEASE = /nothing was released|claim ownership changed|already (done|released)|is done\b/i
 const cairnPreamble = /cairn: [^\n]*could not be checked[^\n]*\n?/gi
 
-const releaseCairnClaim = async (deps: Deps, ref: string): Promise<string | undefined> => {
+const releaseCairnClaim = async (deps: Deps, ref: string, kind: AgentKind): Promise<string | undefined> => {
   try {
-    const ran = await deps.exec(['cairn', 'release', ref, '--force'], { timeoutMs: 15_000 })
+    const ran = await deps.exec(['cairn', 'release', ref, '--force'], { timeoutMs: 15_000, env: cairnEnv(kind) })
     if (ran.code === 0) return `Released the Cairn claim on ${ref}.`
     const output = `${ran.stderr}\n${ran.stdout}`.replace(cairnPreamble, '')
     if (BENIGN_RELEASE.test(output)) return undefined
@@ -2164,7 +2165,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 
   const notes = [`Closed ${seat.name}${seat.paneId ? ` (pane ${seat.paneId})` : ''}.`]
   if (lockNote) notes.push(`Note: ${lockNote}.`)
-  const releaseNote = seat.cairn ? await releaseCairnClaim(deps, seat.cairn) : undefined
+  const releaseNote = seat.cairn ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined
   if (releaseNote) notes.push(releaseNote)
   if (!removeWorktree) notes.push(`Its worktree ${seat.worktree} and branch ${seat.branch} are kept.`)
   else {

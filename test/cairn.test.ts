@@ -296,3 +296,65 @@ esac
   const missing = await commands.plan(withPath, { repo, kind: 'claude', cairn: 'DROVE-10' })
   assert.equal(!missing.ok && missing.code, 'no-task')
 })
+
+
+test('plan Cairn reads carry the planner kind and preserve an explicit CAIRN_AGENT (DROVE-160)', async () => {
+  const previous = process.env.CAIRN_AGENT
+  try {
+    for (const [kind, explicit, expected] of [
+      ['claude', undefined, 'claude-code'],
+      ['codex', undefined, 'codex'],
+      ['claude', 'maintenance', 'maintenance'],
+      ['codex', '', ''],
+    ] as const) {
+      if (explicit === undefined) delete process.env.CAIRN_AGENT
+      else process.env.CAIRN_AGENT = explicit
+      const fake = new FakeHerdr()
+      const base = fake.exec
+      let agent: string | undefined
+      fake.exec = async (argv, options) => {
+        if (argv[0] !== 'cairn') return base(argv, options)
+        agent = options?.env?.CAIRN_AGENT
+        return { code: 1, stdout: '', stderr: 'CAIRN_API_KEY is not set (~/.cairn/instances/croft/env).' }
+      }
+      const deps = await makeDeps(fake)
+      process.env.HERDR_PANE_ID = 'w1:p5'
+      const result = await commands.plan(deps, { repo: await makeRepo(), kind, cairn: 'DROVE-160' })
+      assert.equal(agent, expected)
+      assert.equal(result.ok, false)
+      assert.match(result.text, /set CAIRN_AGENT=claude-code or codex \(the runtime whose key the instance holds\)/)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAIRN_AGENT
+    else process.env.CAIRN_AGENT = previous
+  }
+})
+
+test('spawn Cairn check uses the run planner kind, independently of worker kind (DROVE-160)', async () => {
+  const previous = process.env.CAIRN_AGENT
+  try {
+    for (const [kind, explicit, expected] of [
+      ['claude', undefined, 'claude-code'], ['codex', undefined, 'codex'], ['codex', 'maintenance', 'maintenance'],
+    ] as const) {
+      if (explicit === undefined) delete process.env.CAIRN_AGENT
+      else process.env.CAIRN_AGENT = explicit
+      const fake = new FakeHerdr()
+      const base = fake.exec
+      let agent: string | undefined
+      fake.exec = async (argv, options) => {
+        if (argv[0] !== 'cairn') return base(argv, options)
+        agent = options?.env?.CAIRN_AGENT
+        return { code: 0, stdout: JSON.stringify({ title: 'Closed', status: 'done' }), stderr: '' }
+      }
+      const repo = await makeRepo()
+      const deps = await makeDeps(fake)
+      await seedRun(deps, repo, [], { planner: { kind, paneId: 'w1:p5', model: '', effort: 'high', viaMod: false } })
+      const result = await commands.spawn(deps, planner(deps), { seat: 'w-check', kind: kind === 'codex' ? 'claude' : 'codex', cairn: 'DROVE-160', brief })
+      assert.equal(agent, expected)
+      assert.equal(!result.ok && result.code, 'task-closed')
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAIRN_AGENT
+    else process.env.CAIRN_AGENT = previous
+  }
+})

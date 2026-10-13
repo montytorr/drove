@@ -199,3 +199,29 @@ test('spawn policy is checked at the git root and rejects empty choices from a s
   const policy = report.checks.find(item => item.id === 'spawn-policy')
   assert.equal(policy?.status, 'fail'); assert.match(policy!.detail, /non-empty/)
 })
+
+
+test('doctor Cairn calls choose a detected host runtime and name the missing-key workaround (DROVE-160)', async () => {
+  const previous = process.env.CAIRN_AGENT
+  delete process.env.CAIRN_AGENT
+  try {
+    for (const [missing, expected] of [
+      [[], 'claude-code'], [['claude --version'], 'codex'], [['claude --version', 'codex --version'], undefined],
+    ] as const) {
+      const base = depsWith(Object.fromEntries(missing.map(command => [command, MISSING])))
+      const agents: (string | undefined)[] = []
+      const report = await runDoctor({ ...base, exec: async (argv, options) => {
+        if (argv[0] === 'cairn') {
+          agents.push(options?.env?.CAIRN_AGENT)
+          if (argv[1] === 'projects') return FAIL('CAIRN_API_KEY is not set')
+        }
+        return base.exec(argv, options)
+      } })
+      assert.deepEqual(agents, [expected, expected])
+      assert.match(report.checks.find(check => check.id === 'cairn')?.detail ?? '', /set CAIRN_AGENT=claude-code or codex/)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAIRN_AGENT
+    else process.env.CAIRN_AGENT = previous
+  }
+})
