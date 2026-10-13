@@ -366,6 +366,23 @@ test('queued promotes are applied on the flush tick', async () => {
   assert.deepEqual(applied, [ctx.run.id, ctx.run.id])
 })
 
+test('starts held at a startup dialog are continued on the flush tick (DROVE-147)', async () => {
+  const ctx = await setup({ seats: ['w-api'] })
+  const applied: string[] = []
+  const { ports } = fakePorts({
+    applyPendingStarts: async (_deps, run) => {
+      applied.push(run.id)
+      return []
+    },
+  })
+  const watcher = createWatcher(ctx.deps, ctx.run, { ports, loop: false })
+  for (let i = 0; i < 4; i++) {
+    await watcher.tick()
+    ctx.clock.advance(1500)
+  }
+  assert.deepEqual(applied, [ctx.run.id, ctx.run.id])
+})
+
 test('a throwing step is reported and does not stop the other steps', async () => {
   const ctx = await setup()
   const errors: string[] = []

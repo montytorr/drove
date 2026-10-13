@@ -207,6 +207,19 @@ export const settleItems = async (home: string, run: string, candidates: readonl
   })
 }
 
+// An item Drove knows is over (a seat respawned under the same name is no longer gone, DROVE-147) closes now, not at
+// the next poll, so the ledger never holds it open past the change.
+export const closeItems = async (home: string, run: string, keys: readonly string[]): Promise<void> => {
+  const file = ledgerPath(home, run)
+  if (!(await readJson<Ledger>(file))) return
+  await withLock(`${file}.lock`, async () => {
+    const entries: Record<string, LedgerEntry> = { ...((await readJson<Ledger>(file))?.entries ?? {}) }
+    const open = keys.filter(key => entries[key]?.open)
+    for (const key of open) entries[key] = { ...(entries[key] as LedgerEntry), open: false }
+    if (open.length > 0) await writeJsonAtomic(file, { v: 1, entries } satisfies Ledger)
+  })
+}
+
 // ---------- reading ----------
 
 export const attentionLine = (item: AttentionItem): string => {
