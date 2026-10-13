@@ -874,22 +874,82 @@ test('close stops a Claude seat by closing its pane, never /exit, then closes th
   assert.equal((await loadRun(deps.home, RUN))?.tabId, undefined)
 })
 
-test('close releases the seat\'s Cairn claim with --force, best effort, and says so', async () => {
-  const fake = new FakeHerdr()
-  const base = fake.exec
-  const released: string[][] = []
-  fake.exec = async (argv, options) => (argv[0] === 'cairn' ? (argv[1] === 'release' && released.push([...argv]), { code: 0, stdout: '', stderr: '' }) : base(argv, options))
-  const { deps, identity } = await setup(fake)
-  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'claude', cairn: 'DROVE-5', brief })
+test('close releases each seat as its own runtime and preserves explicit CAIRN_AGENT (DROVE-162)', async () => {
+  const previous = process.env.CAIRN_AGENT
+  try {
+    for (const [kind, explicit, expected] of [['codex', undefined, 'codex'], ['claude', undefined, 'claude-code'], ['codex', 'custom', 'custom']] as const) {
+      if (explicit === undefined) delete process.env.CAIRN_AGENT
+      else process.env.CAIRN_AGENT = explicit
+      const fake = new FakeHerdr()
+      const base = fake.exec
+      const released: { argv: string[]; agent: string | undefined }[] = []
+      fake.exec = async (argv, options) => {
+        if (argv[0] !== 'cairn') return base(argv, options)
+        if (argv[1] === 'release') released.push({ argv: [...argv], agent: options?.env?.CAIRN_AGENT })
+        return { code: 0, stdout: '', stderr: '' }
+      }
+      const { deps, identity, run } = await setup(fake)
+      assert.equal(run.planner.kind, 'claude')
+      const spawned = await commands.spawn(deps, identity, { seat: 'w-api', kind, cairn: 'DROVE-5', brief })
+      assert.equal(spawned.ok, true, spawned.text)
+      const closed = await commands.close(deps, identity, 'w-api', false)
+      assert.equal(closed.ok, true, closed.text)
+      assert.deepEqual(released, [{ argv: ['cairn', 'release', 'DROVE-5', '--force'], agent: expected }])
+      assert.match(closed.text, /Released the Cairn claim on DROVE-5/)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAIRN_AGENT
+    else process.env.CAIRN_AGENT = previous
+  }
+})
+
+test('close names the holder when Cairn refuses ownership (DROVE-162)', async () => {
+  const { deps, identity } = await setup()
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'codex', cairn: 'DROVE-5', brief })
+  const base = deps.exec
+  const reads: string[][] = []
+  deps.exec = async (argv, options) => {
+    if (argv[0] !== 'cairn') return base(argv, options)
+    if (argv[1] === 'release') return { code: 1, stdout: '', stderr: 'Claim ownership changed; nothing was released.' }
+    reads.push([...argv])
+    return { code: 0, stdout: JSON.stringify({ claimed_by: 'claude-code · Cal' }), stderr: '' }
+  }
   const closed = await commands.close(deps, identity, 'w-api', false)
   assert.equal(closed.ok, true, closed.text)
-  assert.deepEqual(released, [['cairn', 'release', 'DROVE-5', '--force']])
-  assert.match(closed.text, /Released the Cairn claim on DROVE-5/)
+  assert.match(closed.text, /Note: the Cairn claim on DROVE-5 is still held by claude-code · Cal; it was not released\./)
+  assert.deepEqual(reads, [['cairn', 'show', 'DROVE-5', '--json']])
+})
+
+test('close stays silent after an ownership refusal when the worker already released or finished its claim (DROVE-162)', async () => {
+  for (const claimed_by of [null, '']) {
+    const { deps, identity } = await setup()
+    await commands.spawn(deps, identity, { seat: 'w-api', kind: 'codex', cairn: 'DROVE-5', brief })
+    const base = deps.exec
+    deps.exec = async (argv, options) => {
+      if (argv[0] !== 'cairn') return base(argv, options)
+      if (argv[1] === 'release') return { code: 1, stdout: '', stderr: 'Claim ownership changed; nothing was released.' }
+      return { code: 0, stdout: JSON.stringify({ claimed_by }), stderr: '' }
+    }
+    const closed = await commands.close(deps, identity, 'w-api', false)
+    assert.equal(closed.ok, true, closed.text)
+    assert.doesNotMatch(closed.text, /Cairn claim|release it by hand/)
+  }
+})
+
+test('close skips Cairn release when the run does not use Cairn (DROVE-159)', async () => {
+  const { deps, identity, fake } = await setup(new FakeHerdr(), { useCairn: false })
+  await commands.spawn(deps, identity, { seat: 'w-api', kind: 'codex', brief })
+  await updateRoster(deps.home, RUN, roster => ({ ...roster, seats: roster.seats.map(seat => ({ ...seat, cairn: 'DROVE-5' })) }))
+  const closed = await commands.close(deps, identity, 'w-api', false)
+  assert.equal(closed.ok, true, closed.text)
+  assert.equal(fake.calls.filter(call => call[0] === 'cairn').length, 0)
 })
 
 test('close adds no note when cairn has nothing to release, and keeps one for a real failure', async () => {
   const cases = [
-    { stderr: 'cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record\nClaim ownership changed; nothing was released.', note: false },
+    { stderr: 'cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record\nNothing was released.', note: false },
+    { stderr: 'Claim ownership changed; nothing was released.', note: true },
+    { stderr: 'Cannot release DROVE-5: it is already released.', note: false },
     { stderr: 'Cannot release DROVE-5: it is already done.', note: false },
     { stderr: 'cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record\ndatabase locked', note: true },
   ]

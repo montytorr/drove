@@ -52,10 +52,18 @@ const acceptTrust = async (fake: FakeHerdr, repo: string, paneId: string) => {
   return worktree
 }
 
-test('readRepoTrust: a trusted root or parent is trusted, an absent entry is untrusted, a file without projects says nothing', async () => {
+test('readRepoTrust: a trusted parent folder does not trust the repo, as Claude Code 2.1.296 stops its walk at the git root (DROVE-156)', async () => {
+  const dir = await tmp('trust-parent')
+  const file = join(dir, 'claude.json')
+  await writeFile(file, JSON.stringify({ projects: { '/Users/cal/maestro-dev': { hasTrustDialogAccepted: true }, '/': { hasTrustDialogAccepted: true } } }))
+  assert.equal((await readRepoTrust(file, '/Users/cal/maestro-dev/drove-site')).state, 'untrusted')
+  assert.equal((await readRepoTrust(file, '/Users/cal/maestro-dev')).state, 'trusted')
+})
+
+test('readRepoTrust: an exact trusted root is trusted, an absent entry is untrusted, a file without projects says nothing', async () => {
   const dir = await tmp('trust')
   const file = join(dir, 'claude.json')
-  await writeFile(file, JSON.stringify({ projects: { '/work': { hasTrustDialogAccepted: true }, '/work/other': { hasTrustDialogAccepted: false } } }))
+  await writeFile(file, JSON.stringify({ projects: { '/work/repo': { hasTrustDialogAccepted: true }, '/work/other': { hasTrustDialogAccepted: false } } }))
   assert.equal((await readRepoTrust(file, '/work/repo')).state, 'trusted')
   assert.equal((await readRepoTrust(file, '/elsewhere/repo')).state, 'untrusted')
   await writeFile(file, JSON.stringify({ projects: { '/work/repo': { hasTrustDialogAccepted: false } } }))
