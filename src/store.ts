@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path'
 export type Cursor = { offset: number }
 
 export const LINE_MAX_BYTES = 8192
+// What a worker's report may take of a line: Drove adds its own lines to a report (steering, autocheck) and wraps it in the ledger.
+export const REPORT_MAX_BYTES = LINE_MAX_BYTES - 2048
 const LOCK_POLL_MS = 20
 const HEARTBEAT_MS = 2000
 
@@ -112,6 +114,18 @@ export const withLock = async <T>(lockDir: string, body: () => Promise<T>, stale
   }
 }
 
+// The bytes `value` takes as a jsonl line, its newline included.
+export const jsonlBytes = (value: unknown): number => Buffer.byteLength(`${JSON.stringify(value)}\n`)
+
+// The longest start of `text` that is at most `maxBytes` of UTF-8, never cut inside a character.
+export const clipUtf8 = (text: string, maxBytes: number): string => {
+  const bytes = Buffer.from(text, 'utf8')
+  if (bytes.length <= maxBytes) return text
+  let end = Math.max(0, Math.floor(maxBytes))
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1
+  return bytes.subarray(0, end).toString('utf8')
+}
+
 export const appendJsonl = async (path: string, value: unknown): Promise<void> => {
   const line = Buffer.from(`${JSON.stringify(value)}\n`)
   if (line.length > LINE_MAX_BYTES) throw new Error(`jsonl line is ${line.length} bytes, the cap is ${LINE_MAX_BYTES}`)
@@ -124,7 +138,8 @@ export const appendJsonl = async (path: string, value: unknown): Promise<void> =
   }
 }
 
-export const readJsonlFrom = async <T>(path: string, cursor: Cursor): Promise<{ items: T[]; cursor: Cursor }> => {
+// `ends[i]` is the offset just past the line of `items[i]`, for a reader that moves its cursor one item at a time.
+export const readJsonlFrom = async <T>(path: string, cursor: Cursor): Promise<{ items: T[]; cursor: Cursor; ends?: number[] }> => {
   let handle
   try {
     handle = await open(path, 'r')
@@ -140,15 +155,21 @@ export const readJsonlFrom = async <T>(path: string, cursor: Cursor): Promise<{ 
     const end = buffer.subarray(0, bytesRead).lastIndexOf(0x0a) + 1
     if (end === 0) return { items: [], cursor }
     const items: T[] = []
-    for (const line of buffer.subarray(0, end).toString('utf8').split('\n')) {
+    const ends: number[] = []
+    let start = 0
+    while (start < end) {
+      const stop = buffer.indexOf(0x0a, start) + 1
+      const line = buffer.subarray(start, stop).toString('utf8')
+      start = stop
       if (!line.trim()) continue
       try {
         items.push(JSON.parse(line) as T)
+        ends.push(cursor.offset + stop)
       } catch {
         continue
       }
     }
-    return { items, cursor: { offset: cursor.offset + end } }
+    return { items, cursor: { offset: cursor.offset + end }, ends }
   } finally {
     await handle.close()
   }
