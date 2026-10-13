@@ -25,7 +25,6 @@ test('dialog table: folder trust, hook trust, channel confirm, and no match', ()
   assert.equal(detect.matchDialog('s', 'Do you trust the files in this folder?', NOW)?.reason, 'trust')
   assert.equal(detect.matchDialog('s', 'Quick safety check: Is this a project you created or one you trust?', NOW)?.reason, 'trust')
   assert.equal(detect.findDialog('Do you trust the files in this folder?')?.hint, 'Claude is asking to trust the folder')
-  assert.equal(detect.matchDialog('s', '2 hooks need trust before they run', NOW)?.reason, 'hook-trust')
   assert.equal(detect.matchDialog('s', 'Loading development channels', NOW)?.reason, 'channel-confirm')
   assert.equal(detect.matchDialog('s', '1 hook needs review before it can run.', NOW)?.reason, 'hook-trust')
   assert.equal(detect.matchDialog('s', 'Hooks need review\n2 hooks are new or changed.', NOW)?.reason, 'hook-trust')
@@ -34,6 +33,43 @@ test('dialog table: folder trust, hook trust, channel confirm, and no match', ()
   assert.equal(detect.matchDialog('s', 'Codex just got an upgrade. Introducing gpt-x.', NOW)?.reason, 'dialog')
   assert.equal(detect.matchDialog('s', 'Do you trust the contents of this directory?', NOW)?.reason, 'trust')
   assert.equal(detect.matchDialog('s', 'just a normal prompt', NOW), undefined)
+})
+
+test('Codex hook-review texts match, but webhook prose does not', () => {
+  for (const screen of ['Hooks need review', 'Trust all and continue', "Continue without trusting (hooks won't run)", '1 hook is new or changed.', '2 hooks are new or changed.']) {
+    assert.equal(detect.matchDialog('s', screen, NOW)?.reason, 'hook-trust', screen)
+  }
+  const prose = 'I will validate webhook signatures and reject untrusted input on webhook routes.'
+  assert.equal(detect.findDialog(prose), undefined)
+  assert.equal(detect.deriveState(seatOf({ kind: 'codex' }), { herdr: live('working'), hooks: [], screen: prose }, NOW).state, 'working')
+})
+
+const CODEX_TRUST = `Trust this folder?
+Codex can read, edit, and run files here, subject to your permission settings.
+Folder settings can run code automatically, even without a model request. Continue only if you trust these files. Your trust decision will be saved.
+Trust and continue
+Open restricted`
+
+test('Codex folder trust is detected and folder hints use the known seat kind', () => {
+  for (const screen of [CODEX_TRUST, 'Trust this folder?', 'Folder settings can run code automatically, even without a model request.']) {
+    assert.equal(detect.matchDialog('planner', screen, NOW)?.reason, 'trust')
+    assert.equal(detect.findDialog(screen)?.hint, 'Codex is asking to trust the folder')
+  }
+  assert.equal(detect.findDialog('Do you trust the files in this folder?', 'codex')?.hint, 'Codex is asking to trust the folder')
+  assert.equal(detect.findDialog('Trust this folder?', 'claude')?.hint, 'Claude is asking to trust the folder')
+  const derived = detect.deriveState(seatOf({ kind: 'codex' }), { herdr: live('unknown'), hooks: [], screen: CODEX_TRUST }, NOW)
+  assert.equal(derived.state, 'blocked')
+  assert.equal(derived.attention[0]?.reason, 'trust')
+})
+
+test('Claude folder trust keeps its hint and pending-start root detail', () => {
+  const screen = 'Quick safety check: Is this a project you created or one you trust?'
+  assert.equal(detect.findDialog(screen, 'claude')?.hint, 'Claude is asking to trust the folder')
+  assert.equal(detect.findDialog('Do you trust this folder?')?.hint, 'Claude is asking to trust the folder')
+  const derived = detect.deriveState(seatOf({ kind: 'claude', state: 'starting', paneId: 'w1:p1', pendingStart: { root: '/work/repo', since: ago(5), via: 'prompt' } }), { herdr: live('unknown'), hooks: [], screen }, NOW)
+  assert.equal(derived.attention[0]?.reason, 'trust')
+  assert.match(derived.attention[0]?.detail ?? '', /\/work\/repo/)
+  assert.match(derived.attention[0]?.detail ?? '', /w1:p1/)
 })
 
 test('a blocked pane with the mismatch dialog on screen is blocked with that attention item', () => {

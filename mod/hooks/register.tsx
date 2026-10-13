@@ -1241,7 +1241,7 @@ const viewHelpText = (): string =>
     '`/orchestrate board bg`, `/orchestrate status`.',
   ].join('\n')
 
-type Attached = { ok: true; run: RunMeta } | { ok: false; text: string }
+type Attached = { ok: true; run: RunMeta; trust?: drove.AttachTrust } | { ok: false; text: string }
 
 const attachRun = async ($: EngineInterface, input: { goal?: string; run?: string; budget?: number; cwd?: string }): Promise<Attached> => {
   const [sessionId, paneId, sessionCwd, home] = await Promise.all([$.session.id(), herdrPane($), $.session.cwd(), droveHome($)])
@@ -1251,9 +1251,10 @@ const attachRun = async ($: EngineInterface, input: { goal?: string; run?: strin
     drove.attachArgs({ sessionId, paneId, goal: input.goal, model: config.orchestratorModel, effort: config.orchestratorEffort, budget: input.budget, run: input.run }),
     { cwd, env: home ? { DROVE_HOME: home } : {} },
   )
-  const result = drove.jsonResultOf<{ run: RunMeta }>(ran)
+  const result = drove.jsonResultOf<{ run: RunMeta; trust?: drove.AttachTrust }>(ran)
   const run = drove.runOf(result)
-  return run ? { ok: true, run } : { ok: false, text: result.ok ? 'Drove returned no run' : `${result.text} [${result.code}]` }
+  const trust = drove.trustOf(result)
+  return run ? { ok: true, run, ...(trust ? { trust } : {}) } : { ok: false, text: result.ok ? 'Drove returned no run' : `${result.text} [${result.code}]` }
 }
 
 // The mod held a goal the run never got: write it through Drove, so run.json, the board and the other planners see it.
@@ -1456,6 +1457,37 @@ const startRun = async ($: EngineInterface, run: RunMeta, goal: string, previous
   }
 }
 
+// DROVE-168: an untrusted repo stops every Claude worker at Claude's folder-trust prompt, and the person is here to answer it. Asked once per attach.
+const trustNotice = async ($: EngineInterface, run: RunMeta, trust: drove.AttachTrust | undefined): Promise<{ line: string; context?: string }> => {
+  if (trust?.state !== 'untrusted') return { line: '' }
+  const fix = `drove trust ${trust.root}`
+  let answer = ''
+  try {
+    answer = await $.ui.ask(`Claude Code has not trusted \`${trust.root}\`, so Claude workers there stop at its folder-trust prompt. Trust it now? (the same as accepting that prompt)`, { header: 'Claude trust', options: ['Trust it', 'Use Codex workers', 'Not now'] })
+  } catch {
+    answer = ''
+  }
+  if (answer === 'Trust it') {
+    const home = await droveHome($)
+    const ran = await runDrove($, drove.trustArgs(trust.root), { cwd: run.repo, env: home ? { DROVE_HOME: home } : {} })
+    if (ran.exitCode === 0) {
+      const result = drove.jsonResultOf<{ changed?: boolean }>(ran)
+      return result.ok
+        ? { line: `Trusted \`${trust.root}\` for Claude Code${result.data?.changed === false ? ' (it already was)' : ''}.` }
+        : { line: `Trusting \`${trust.root}\` failed: ${result.text} [${result.code}]. Run \`${fix}\` yourself.` }
+    }
+    const failure = drove.failureOf(ran)
+    return { line: `Trusting \`${trust.root}\` failed: ${failure.text} [${failure.code}]. Run \`${fix}\` yourself.` }
+  }
+  if (answer === 'Use Codex workers') {
+    return {
+      line: `Claude Code has not trusted \`${trust.root}\`: this run's workers will be Codex.`,
+      context: `Claude Code has not trusted \`${trust.root}\`, so a Claude worker there stops at its folder-trust prompt and spawn refuses it (untrusted-repo). ${await humanNameOf($)} chose Codex workers: spawn every worker in this run with kind codex.`,
+    }
+  }
+  return { line: `Claude Code has not trusted \`${trust.root}\`, so Claude workers there stop at its folder-trust prompt. Run \`${fix}\` to trust it.` }
+}
+
 const turnOn = async ($: EngineInterface, goal: string, options: { repo?: string } = {}) => {
   const current = await read($, orchestratorAtom)
   if (current && !options.repo) {
@@ -1500,7 +1532,9 @@ const turnOn = async ($: EngineInterface, goal: string, options: { repo?: string
     return { text: `Orchestrator mode is already on (Drove run ${current.run} on \`${current.repo}\`).` }
   }
   if (current) await clearOrchestration($)
-  return startRun($, attached.run, goal, current)
+  const notice = await trustNotice($, attached.run, attached.trust)
+  const started = await startRun($, attached.run, goal, current)
+  return notice.line ? { ...started, text: `${started.text}\n${notice.line}`, context: [...started.context, ...(notice.context ? [notice.context] : [])] } : started
 }
 
 const turnOff = async ($: EngineInterface) => {

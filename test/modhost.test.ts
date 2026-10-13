@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdtemp } from 'node:fs/promises'
+import { mkdtemp, realpath, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -222,4 +222,25 @@ test('attach keeps a re-attached run\'s saved useCairn and never looks for cairn
   assert.equal(again.ok && (again.data as { run: { id: string } }).run.id, id)
   assert.equal((await loadRun(deps.home, id))?.useCairn, false)
   assert.deepEqual(cairnCalls.filter(call => call[1] === '--version'), [])
+})
+
+test('attach reports the repo\'s Claude trust from the configured file, and nothing when none is configured (DROVE-168)', async () => {
+  const deps = await realDeps()
+  const repo = await gitRepo()
+  const dir = await mkdtemp(join(tmpdir(), 'drove-claude-config-'))
+  const file = join(dir, 'claude.json')
+  const trustOf = async (d: Deps, session: string) => {
+    const made = await attach(d, { repo, sessionId: session, paneId: 'w1:p1' })
+    return made.ok ? (made.data as { trust?: { state: string; root: string; file: string } }).trust : undefined
+  }
+  assert.equal(await trustOf(deps, 's-0'), undefined)
+  const withFile = { ...deps, claudeUserConfig: file }
+  assert.equal((await trustOf(withFile, 's-1'))?.state, 'unknown')
+  await writeFile(file, JSON.stringify({ projects: {} }))
+  const untrusted = await trustOf(withFile, 's-2')
+  assert.equal(untrusted?.state, 'untrusted')
+  assert.equal(untrusted?.file, file)
+  assert.equal(untrusted?.root, await realpath(repo))
+  await writeFile(file, JSON.stringify({ projects: { [await realpath(repo)]: { hasTrustDialogAccepted: true } } }))
+  assert.equal((await trustOf(withFile, 's-3'))?.state, 'trusted')
 })

@@ -21,6 +21,8 @@
     "-m",
     "gpt-x",
     "-c",
+    "projects.\"/work/repo\".trust_level=\"trusted\"",
+    "-c",
     "model_reasoning_effort=\"high\"",
     "-c",
     "sandbox_workspace_write.network_access=true",
