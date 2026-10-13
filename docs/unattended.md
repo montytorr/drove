@@ -52,13 +52,13 @@ It prints one JSON object (without `--json`, one sentence with the same facts):
 
 ### Claude folder trust
 
-Claude workers start at the repo root (`claude --worktree <seat>`), so Claude Code must trust the repo root itself: accept the trust prompt once in the root. A trusted parent folder is not reliable; Claude Code can still show the prompt.
+Claude workers start at the repo root (`claude --worktree <seat>`), so Claude Code must trust the repo root itself: accept the trust prompt once in the root. A trusted parent folder does not count: Claude Code 2.1.296 looks for the repo's canonical root, then walks up from its cwd only as far as the git root, so a trusted folder above the repo never trusts it.
 
-Drove's preflight reads `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json` (`CLAUDE_CONFIG_DIR` moves it), and only reads that file. It currently also accepts a trusted parent folder, so it can miss a prompt Claude still shows; the `blocked` seat and `trust` attention below handle that case.
+Drove's preflight reads `projects["<root>"].hasTrustDialogAccepted` in `~/.claude.json` (`CLAUDE_CONFIG_DIR` moves it) for the exact canonical root, and only reads that file. A trusted parent folder alone gives the warning and `untrusted-repo`, as Claude would show the prompt.
 
 - When the root is not trusted, `drove plan` prints a warning and a Claude `spawn` is refused with `untrusted-repo`. Codex workers are unaffected.
 - The one-time fix: run `claude` in the repo root, accept the trust prompt, quit.
-- If a worker still stops at the prompt (only a parent folder trusted, a file Drove could not read, another Claude version), the seat goes `blocked` with a `trust` attention item naming the root, and keeps its pane.
+- If a worker still stops at the prompt (a file Drove could not read, another Claude version), the seat goes `blocked` with a `trust` attention item naming the root, and keeps its pane.
 - Drove holds the brief and delivers it once the prompt is accepted in the pane and the worktree appears. When trust is given elsewhere instead, or the pane dies, Drove relaunches the seat once with the same name, branch and brief.
 
 ## What needs a person
