@@ -283,9 +283,11 @@ export const createSteering = (deps: Deps, ports: SteerPorts): Steering => {
 }
 
 // The R2 lines the run's event log holds, by report id: `drove reports` reads reports from the outbox, which has none.
-export const steeringNotes = async (runEventsPath: string): Promise<Map<string, string>> => {
-  const events = await readJsonlTail<DroveEvent>(runEventsPath, 256 * 1024).catch(() => [] as DroveEvent[])
+export const steeringNotesOf = (events: readonly DroveEvent[]): Map<string, string> => {
   const notes = new Map<string, string>()
   for (const event of events) if (event.type === 'steer.nudged' && event.id && event.data?.rule === 'R2' && typeof event.data.detail === 'string') notes.set(event.id, event.data.detail)
   return notes
 }
+
+export const steeringNotes = async (runEventsPath: string): Promise<Map<string, string>> =>
+  steeringNotesOf(await readJsonlTail<DroveEvent>(runEventsPath, 256 * 1024).catch(() => [] as DroveEvent[]))

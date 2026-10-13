@@ -132,7 +132,7 @@ type Ledger = pendingLedger.LedgerLine
 
 const isEnoent = (error: unknown): boolean => (error as NodeJS.ErrnoException | undefined)?.code === 'ENOENT'
 
-const readFrom = async <T>(ports: WatchPorts, path: string, cursor: store.Cursor): Promise<{ items: T[]; cursor: store.Cursor }> => {
+const readFrom = async <T>(ports: WatchPorts, path: string, cursor: store.Cursor): Promise<{ items: T[]; cursor: store.Cursor; ends?: number[] }> => {
   try {
     return await ports.readJsonlFrom<T>(path, cursor)
   } catch (error) {
@@ -149,7 +149,8 @@ const isReportShape = (value: unknown): value is Report => {
   return typeof item === 'object' && item !== null && item.v === 1 && typeof item.id === 'string' && typeof item.seat === 'string' && typeof item.token === 'string' && typeof item.summary === 'string' && protocol.REPORT_KINDS.includes(item.kind as Report['kind'])
 }
 
-type Scan = { reports: Report[]; rejected: { seat: string; id?: string; why: string }[]; commit: () => Promise<void> }
+// `advance` moves a seat's cursor past one report, so a report that cannot be recorded is still read only once (DROVE-170).
+type Scan = { reports: Report[]; rejected: { seat: string; id?: string; why: string }[]; advance: (report: Report) => Promise<void>; commit: () => Promise<void> }
 
 const scanOutboxes = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promise<Scan> => {
   const known = await ports.loadRoster(deps.home, run.id)
@@ -157,25 +158,37 @@ const scanOutboxes = async (deps: Deps, run: RunMeta, ports: WatchPorts): Promis
   const next: Cursors = { ...cursors }
   const reports: Report[] = []
   const rejected: Scan['rejected'] = []
+  const ends = new Map<Report, { seat: string; end: number }>()
   for (const seat of known.seats) {
     const dir = ports.seatDir(deps.home, run.id, seat.name)
     const read = await readFrom<unknown>(ports, join(dir, 'outbox.jsonl'), cursors[seat.name] ?? { offset: 0 })
     next[seat.name] = read.cursor
     if (read.items.length === 0) continue
     const token = await ports.readToken(join(dir, 'token'))
-    for (const item of read.items) {
+    for (const [index, item] of read.items.entries()) {
       const id = (item as Partial<Report> | null)?.id
       if (!isReportShape(item)) rejected.push({ seat: seat.name, id, why: 'malformed report' })
       else if (item.run !== run.id || item.seat !== seat.name) rejected.push({ seat: seat.name, id, why: 'run or seat does not match the outbox' })
       else if (!token || item.token !== token) rejected.push({ seat: seat.name, id, why: 'token mismatch' })
       // `autocheck` is Drove's own line on a report: a worker's outbox does not get to write it.
-      else reports.push((({ autocheck: _, ...own }) => own)(item))
+      else {
+        const { autocheck: _, ...own } = item
+        reports.push(own)
+        ends.set(own, { seat: seat.name, end: read.ends?.[index] ?? read.cursor.offset })
+      }
     }
+  }
+  const moved: Cursors = { ...cursors }
+  const advance = async (report: Report) => {
+    const at = ends.get(report)
+    if (!at) return
+    moved[at.seat] = { offset: at.end }
+    await ports.writeJsonAtomic(cursorsPath(ports, deps, run), moved)
   }
   const commit = async () => {
     await ports.writeJsonAtomic(cursorsPath(ports, deps, run), next)
   }
-  return { reports, rejected, commit }
+  return { reports, rejected, advance, commit }
 }
 
 export const readNewReports = async (deps: Deps, run: RunMeta, ports: WatchPorts = defaultWatchPorts): Promise<Report[]> => {
@@ -248,6 +261,8 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   const knownThrash = new Set<string>()
   const startedAt = deps.clock.now().toISOString()
   let freshAttention: Attention[] = []
+  // Reports Drove could not record: the planner hears of each once, in the next wake (DROVE-170).
+  let rejections: string[] = []
   const hookWindows = new Map<string, { cursor: store.Cursor; records: HookRecord[]; turns: number; transcript?: string }>()
   const tokenCounters = new Map<string, usage.TokenCounter>()
   const transcriptPaths = new Map<string, Set<string>>()
@@ -291,27 +306,60 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
 
   const attentionText = (): string => {
     const human = freshAttention.filter(isForHuman)
-    const planner = freshAttention.filter(item => !isForHuman(item))
-    return `${human.length === 0 ? '' : `\n\nNeeds the human:\n${human.map(attentionLine).join('\n')}`}${planner.length === 0 ? '' : `\n\nFor you to act on:\n${planner.map(attentionLine).join('\n')}`}`
+    const planner = [...freshAttention.filter(item => !isForHuman(item)).map(attentionLine), ...rejections]
+    return `${human.length === 0 ? '' : `\n\nNeeds the human:\n${human.map(attentionLine).join('\n')}`}${planner.length === 0 ? '' : `\n\nFor you to act on:\n${planner.join('\n')}`}`
   }
 
   // R2 (DROVE-127): a done report with no check after its worker's last edit carries a line for the planner. The line is
   // Drove's alone, so one a worker put in its own report is dropped, and steering never holds a report back.
-  const steered = async (run: RunMeta, { steering: _forged, ...report }: Report): Promise<Report> => {
+  // A report read again keeps the line it got the first time, and R2 is recorded once per report (DROVE-170).
+  const steered = async (run: RunMeta, { steering: _forged, ...report }: Report, notes: Map<string, string>): Promise<Report> => {
+    const known = notes.get(report.id)
+    if (known !== undefined) return { ...report, steering: known }
     try {
       // The hook window knows the seat's transcript; a report can arrive before any poll has read it.
       if (report.kind === 'done') await hooksFor(run, report.seat)
-      return await steering.annotate(run, report, steerOptions())
+      const annotated = await steering.annotate(run, report, steerOptions())
+      if (annotated.steering) notes.set(report.id, annotated.steering)
+      return annotated
     } catch (error) {
       onError(error, 'steer')
       return report
     }
   }
 
+  // A report Drove could not record wakes the planner; one it refused (forged, malformed) never does.
+  const rejectReport = async (seat: string, id: string | undefined, why: string, wakes: boolean) => {
+    if (wakes) rejections.push(`⚠ ${seat}: report-rejected: ${id ? `${id}: ` : ''}${why}`)
+    await guarded('report-rejected', () => emit('attention', seat, id, { reason: 'report-rejected', why: clip(why) }))
+  }
+
+  type Recording = { seen: Set<string>; reported: Set<string>; notes: Map<string, string>; holding: Set<string>; checked: boolean; seats: readonly Seat[] }
+
+  const recordReport = async (run: RunMeta, report: Report, at: Recording) => {
+    if (!at.reported.has(report.id)) {
+      await emit('report', report.seat, report.id, { kind: report.kind, expects: report.expects, summary: clip(report.summary) })
+      at.reported.add(report.id)
+    }
+    if (!shouldWake(report) || at.seen.has(report.id)) return
+    // A done report of an implementer is held while Drove runs its checks; the planner is woken by the outcome (DROVE-126).
+    // R2 still fires here, once, at ingest: the steered report is what the ledger holds and later releases.
+    const held = at.holding.has(report.seat) || (at.checked && autocheck.isCheckable(report, at.seats.find(seat => seat.name === report.seat)))
+    const t = held ? 'hold' : 'add'
+    const fitted = pendingLedger.fitReport(await steered(run, report, at.notes), clippedReport => ({ t, report: clippedReport }))
+    if (!fitted) throw new Error(`it is over the ${store.LINE_MAX_BYTES}-byte ledger line even with its details and summary clipped. drove reports ${report.seat} shows it; ask for a shorter one`)
+    await ports.appendJsonl(ledgerPath(ports, deps, run), { t, report: fitted } satisfies Ledger)
+    at.seen.add(report.id)
+    if (held) at.holding.add(report.seat)
+  }
+
+  const recentEvents = async (run: RunMeta): Promise<DroveEvent[]> =>
+    store.readJsonlTail<DroveEvent>(join(ports.runDir(deps.home, run.id), 'events.jsonl'), 256 * 1024).catch(() => [])
+
   const ingest = async (run: RunMeta) => {
     const scan = await scanOutboxes(deps, run, ports)
     if (scan.reports.length === 0 && scan.rejected.length === 0) return
-    for (const item of scan.rejected) await emit('attention', item.seat, item.id, { reason: 'report-rejected', why: item.why })
+    for (const item of scan.rejected) await rejectReport(item.seat, item.id, item.why, false)
     const { seen, held: heldNow } = await readLedger(deps, run, ports)
     await ports.updateRoster(deps.home, run.id, (current) => ({
       ...current,
@@ -332,16 +380,25 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     }))
     const seats = (await ports.loadRoster(deps.home, run.id)).seats
     const checked = scan.reports.some(report => report.kind === 'done') ? await autocheck.autoCheckSettings(deps.home, run.repo) : undefined
-    // A seat with a held report holds its later ones too, so the planner never reads a report before the one it follows.
-    const holding = new Set(heldNow.map(report => report.seat))
+    // What an earlier pass recorded: a report read twice still gets one `report` event and one R2 line.
+    const events = scan.reports.length > 0 ? await recentEvents(run) : []
+    const recording: Recording = {
+      seen,
+      reported: new Set(events.filter(event => event.type === 'report' && event.id).map(event => event.id as string)),
+      notes: steer.steeringNotesOf(events),
+      // A seat with a held report holds its later ones too, so the planner never reads a report before the one it follows.
+      holding: new Set(heldNow.map(report => report.seat)),
+      checked: checked !== undefined,
+      seats,
+    }
     for (const report of scan.reports) {
-      await emit('report', report.seat, report.id, { kind: report.kind, expects: report.expects, summary: clip(report.summary) })
-      if (!shouldWake(report) || seen.has(report.id)) continue
-      // A done report of an implementer is held while Drove runs its checks; the planner is woken by the outcome (DROVE-126).
-      // R2 still fires here, once, at ingest: the steered report is what the ledger holds and later releases.
-      const held = holding.has(report.seat) || (checked !== undefined && autocheck.isCheckable(report, seats.find(seat => seat.name === report.seat)))
-      if (held) holding.add(report.seat)
-      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: held ? 'hold' : 'add', report: await steered(run, report) } satisfies Ledger)
+      try {
+        await recordReport(run, report, recording)
+      } catch (error) {
+        onError(error, 'ingest-report')
+        await rejectReport(report.seat, report.id, error instanceof Error ? error.message : String(error), true)
+      }
+      await scan.advance(report)
     }
     await scan.commit()
   }
@@ -354,9 +411,12 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
   type Noter = (report: Report) => string | undefined
 
   const release = async (run: RunMeta, reports: readonly Report[], noteOf: Noter = () => undefined) => {
+    const line = (report: Report): Ledger => ({ t: 'add', report })
     for (const report of reports) {
       const note = noteOf(report)
-      await ports.appendJsonl(ledgerPath(ports, deps, run), { t: 'add', report: note ? { ...report, autocheck: note } : report } satisfies Ledger)
+      // A held report fit its hold line, a byte longer than this one, so without the note it always fits.
+      const fitted = (note ? pendingLedger.fitReport({ ...report, autocheck: note }, line) : undefined) ?? pendingLedger.fitReport(report, line) ?? report
+      await ports.appendJsonl(ledgerPath(ports, deps, run), line(fitted))
     }
   }
 
@@ -523,7 +583,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
 
   const wake = async (run: RunMeta) => {
     const reports = await dropClosed(run, await unackedReports(deps, run, ports))
-    if (reports.length === 0) {
+    if (reports.length === 0 && rejections.length === 0) {
       batchStartedAt = undefined
       lastWakeFailAt = undefined
       return
@@ -532,7 +592,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     batchStartedAt ??= now
     if (now - batchStartedAt < BATCH_MS) return
     if (lastWakeFailAt !== undefined && now - lastWakeFailAt < WAKE_RETRY_MS && !lastWakeReason.includes(WAIT)) return
-    const text = `${await render(reports)}${attentionText()}`
+    const text = reports.length > 0 ? `${await render(reports)}${attentionText()}` : attentionText().trimStart()
     const failures: string[] = []
     let delivered: Delivery | undefined
     for (const transport of wakeTransports(run, text, reports)) {
@@ -553,6 +613,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
       lastWakeFailAt = undefined
       lastWakeReason = ''
       freshAttention = []
+      rejections = []
       return
     }
     lastWakeFailAt = now
@@ -859,6 +920,7 @@ export const createWatcher = (deps: Deps, initial: RunMeta, options: WatchOption
     const reports = await takePending()
     const attention = attentionText()
     freshAttention = []
+    rejections = []
     if (reports.length === 0) return `${text}${attention}`
     return `${withReports(text, await render(reports), reports.length)}${attention}`
   }

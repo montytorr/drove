@@ -447,6 +447,9 @@ export const workerTools = (deps: Deps, identity: Identity, ports: ToolPorts = d
       // The seat's criteria count rides on the report, so a done without answers shows the planner a reminder (DROVE-123).
       const given = (await ports.loadRoster(identity.home, identity.run).catch(() => undefined))?.seats.find(entry => entry.name === identity.seat)?.acceptance?.length
       const report = ports.stampReport(checked.value as ReportInput, { id: protocol.newReportId(identity.seat, at.getTime()), run: identity.run, seat: identity.seat, token: identity.token, at: at.toISOString(), ...(given ? { acceptance: given } : {}) })
+      // Drove adds its own lines to a report and must still fit it in one ledger line (DROVE-170).
+      const bytes = store.jsonlBytes(report)
+      if (bytes > store.REPORT_MAX_BYTES) return { text: `Not recorded: this report is ${bytes} bytes, over the ${store.REPORT_MAX_BYTES}-byte limit (Drove keeps 2 KiB of its ${store.LINE_MAX_BYTES}-byte line for its own notes). Shorten details and criteria evidence: name files, lines and test names instead of pasting output, then send it again.`, isError: true }
       await ports.appendJsonl(join(ports.seatDir(identity.home, identity.run, identity.seat), 'outbox.jsonl'), report)
       return { text: `report ${report.id} recorded (${report.kind}, expects ${report.expects}). ${afterReport(report.kind, report.expects)}` }
     },

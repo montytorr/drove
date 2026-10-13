@@ -1,6 +1,6 @@
 import { join } from 'node:path'
 import { plannerDir } from './paths.ts'
-import { readJsonlFrom } from './store.ts'
+import { clipUtf8, jsonlBytes, LINE_MAX_BYTES, readJsonlFrom } from './store.ts'
 import type { Report } from './types.ts'
 
 // The planner's pending ledger (<run>/planner/pending.jsonl): what the watcher has for the planner and not yet delivered.
@@ -8,6 +8,31 @@ import type { Report } from './types.ts'
 // and waits for it: on disk, so a restart still has it, and not the planner's yet. `add` is what the planner reads (a held
 // report moves to it, with Drove's line in `report.autocheck`), `ack` takes ids off both.
 export type LedgerLine = { t: 'hold'; report: Report } | { t: 'add'; report: Report } | { t: 'ack'; ids: string[] }
+
+export const clippedMarker = (seat: string): string => ` … [clipped by Drove to fit its ${LINE_MAX_BYTES}-byte ledger line: drove reports ${seat} shows it in full]`
+
+// What gives way when a ledger line is over the cap: the worker's details, then its summary, then Drove's own check line.
+const CLIPPABLE = ['details', 'summary', 'autocheck'] as const
+
+const clipped = (text: string, excess: number, marker: string): string => {
+  // JSON escapes only add bytes, so cutting k bytes of the text takes at least k bytes off the line.
+  const keep = Buffer.byteLength(text) - excess - (Buffer.byteLength(JSON.stringify(marker)) - 2)
+  return `${clipUtf8(text, keep)}${marker}`
+}
+
+// The report as `line` can write it under the jsonl cap (DROVE-170), or undefined when even clipped it is over.
+export const fitReport = (report: Report, line: (report: Report) => LedgerLine): Report | undefined => {
+  const marker = clippedMarker(report.seat)
+  let fitted = report
+  for (const field of CLIPPABLE) {
+    const excess = jsonlBytes(line(fitted)) - LINE_MAX_BYTES
+    if (excess <= 0) return fitted
+    const text = fitted[field]
+    // A field no longer than the marker gains nothing from a clip.
+    if (text && Buffer.byteLength(text) > Buffer.byteLength(marker)) fitted = { ...fitted, [field]: clipped(text, excess, marker) }
+  }
+  return jsonlBytes(line(fitted)) <= LINE_MAX_BYTES ? fitted : undefined
+}
 
 export const pendingFile = (home: string, run: string): string => join(plannerDir(home, run), 'pending.jsonl')
 
