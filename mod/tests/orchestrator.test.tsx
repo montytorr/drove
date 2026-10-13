@@ -274,6 +274,8 @@ type World = {
   answer: string
   isOverBudget: boolean
   runGoal?: string
+  trust?: Record<string, 'trusted' | 'untrusted' | 'unknown'>
+  trustFail?: boolean
   runAgents?: HostAgents
   isGuardBroken: boolean
   isSpawnCwdGone?: boolean
@@ -335,7 +337,11 @@ const fakeDrove = (world: World, call: Call) => {
     const repo = call.cwd ?? '/work/repo'
     if (repo.startsWith('/work/plain')) return ok(JSON.stringify({ ok: false, code: 'not-a-repo', text: `${repo} is not inside a git repository` }), 1)
     const id = repo === '/work/repo' || call.args.includes('--run') ? RUN : `${repo.split('/').at(-1)}-20261006-1000-abcd`
-    return ok(JSON.stringify({ ok: true, text: `Run ${id} is up`, data: { run: runMeta({ id, ...(call.args.includes('--run') ? {} : { repo }), ...(at > 0 ? { goal: call.args[at + 1] } : world.runGoal && call.args.includes('--run') ? { goal: world.runGoal } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}), ...(world.runAgents ? { agents: world.runAgents } : {}) }) } }))
+    return ok(JSON.stringify({ ok: true, text: `Run ${id} is up`, data: { run: runMeta({ id, ...(call.args.includes('--run') ? {} : { repo }), ...(at > 0 ? { goal: call.args[at + 1] } : world.runGoal && call.args.includes('--run') ? { goal: world.runGoal } : {}), ...(budget > 0 ? { budget: Number(call.args[budget + 1]) } : {}), ...(world.runAgents ? { agents: world.runAgents } : {}) }), ...(world.trust?.[repo] ? { trust: { state: world.trust[repo], root: repo, file: '/tmp/claude.json' } } : {}) } }))
+  }
+  if (command === 'trust') {
+    if (world.trustFail) return ok('', 1, 'trust-failed: /tmp/claude.json is not writable')
+    return ok(JSON.stringify({ ok: true, text: `Trusted ${action}`, data: { root: action, file: '/tmp/claude.json', state: 'trusted', changed: true } }))
   }
   if (command === 'mod' && action === 'report') return ok(JSON.stringify({ ok: true, text: 'report r-1 recorded (done, expects review).' }))
   if (command === 'guard') {
@@ -1230,6 +1236,68 @@ describe('orchestrator session', () => {
     expect(world.asked).toHaveLength(2)
     expect(attached.text).toContain(`Drove run ${RUN} on \`/work/repo\``)
     expect(droveCalls(world, 'mod')[0]?.cwd).toBe('/work/repo')
+  })
+
+  describe('Claude trust (DROVE-168)', () => {
+    const ASK = 'Claude Code has not trusted `/work/repo`, so Claude workers there stop at its folder-trust prompt. Trust it now? (the same as accepting that prompt)'
+
+    test('Trust it runs exactly drove trust <root> --yes --json and reports the result', async ($, on) => {
+      const { world } = engine(on)
+      world.trust = { '/work/repo': 'untrusted' }
+      world.answer = 'Trust it'
+      await $.session.start(START)
+      const ran = (await runCommand($, 'Ship it')) as { text: string }
+      expect(world.asked).toEqual([ASK])
+      expect(droveCalls(world, 'trust').map(({ args }) => args)).toEqual([['trust', '/work/repo', '--yes', '--json']])
+      expect(ran.text).toContain('Trusted `/work/repo` for Claude Code.')
+    })
+
+    test('a failed trust call is reported with its code, not swallowed', async ($, on) => {
+      const { world } = engine(on)
+      world.trust = { '/work/repo': 'untrusted' }
+      world.trustFail = true
+      world.answer = 'Trust it'
+      await $.session.start(START)
+      const ran = (await runCommand($, 'Ship it')) as { text: string }
+      expect(ran.text).toContain('failed: /tmp/claude.json is not writable [trust-failed]')
+      expect(ran.text).toContain('drove trust /work/repo')
+    })
+
+    test('Use Codex workers tells the planner; Not now names drove trust <root>', async ($, on) => {
+      const { world } = engine(on)
+      world.trust = { '/work/repo': 'untrusted' }
+      await $.session.start(START)
+      world.answer = 'Use Codex workers'
+      const codex = (await runCommand($, 'Ship it')) as { text: string; context: string[] }
+      expect(droveCalls(world, 'trust')).toHaveLength(0)
+      expect(codex.context.join('\n')).toContain('spawn every worker in this run with kind codex')
+      expect(codex.text).toContain('workers will be Codex')
+      await runCommand($, 'off')
+      world.answer = 'Not now'
+      const later = (await runCommand($, 'Ship it')) as { text: string; context: string[] }
+      expect(later.text).toContain('Run `drove trust /work/repo` to trust it.')
+      expect(later.context.join('\n')).not.toContain('codex')
+      expect(droveCalls(world, 'trust')).toHaveLength(0)
+    })
+
+    test('trusted, unknown and no trust field do not ask; a --repo switch asks for the new repo only when untrusted', async ($, on) => {
+      const { world } = engine(on)
+      await $.session.start(START)
+      for (const state of ['trusted', 'unknown', undefined] as const) {
+        world.trust = state ? { '/work/repo': state } : undefined
+        await runCommand($, 'Ship it')
+        await runCommand($, 'off')
+      }
+      expect(world.asked).toEqual([])
+      world.root = '/home/cal'
+      world.trust = { '/work/other': 'trusted', '/work/untrusted': 'untrusted' }
+      world.answer = 'Not now'
+      await runCommand($, '--repo /work/other Ship it')
+      expect(world.asked).toEqual([])
+      await runCommand($, 'off')
+      await runCommand($, '--repo /work/untrusted Ship it')
+      expect(world.asked).toEqual([ASK.replace('/work/repo', '/work/untrusted')])
+    })
   })
 
   test('no ask when the session started inside the repo its cwd resolves to, or when the cwd is in no repo', async ($, on) => {

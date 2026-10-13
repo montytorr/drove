@@ -7,6 +7,7 @@ import { newRunId, plannerDir, runDir, seatDir } from './paths.ts'
 import { latestRunFor, loadRoster, loadRun, saveRun, updateRoster } from './roster.ts'
 import { readJson, readJsonlFrom, withLock, writeJsonAtomic } from './store.ts'
 import { workerTools } from './tools.ts'
+import { canonicalRoot, readRepoTrust } from './trust.ts'
 import { createWatcher } from './watch.ts'
 import type { CommandResult, Deps, DroveEvent, Effort, Identity, Roster, RunMeta } from './types.ts'
 
@@ -104,7 +105,9 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
   await updateRoster(deps.home, run.id, roster => roster)
   await recordEvent(deps, run.id, { type: 'run.up', data: { planner: 'claude', pane: paneId, viaMod: true, attached: Boolean(existing) } })
   if (existing && request.goal && request.goal !== existing.goal) await recordEvent(deps, run.id, { type: 'goal.set', data: { goal: request.goal, ...(existing.goal ? { previous: existing.goal } : {}) } })
-  return ok(`Run ${run.id} is up with this session as its planner${existing ? ' (re-attached)' : ''}.${cairn.warning ? ` ${cairn.warning}` : ''}`, { run })
+  // DROVE-168: read only, so the mod can offer to trust the repo; `unknown` (no config path, no readable file) never blocks.
+  const trust = deps.claudeUserConfig ? await readRepoTrust(deps.claudeUserConfig, await canonicalRoot(deps.exec, repo)).catch(() => undefined) : undefined
+  return ok(`Run ${run.id} is up with this session as its planner${existing ? ' (re-attached)' : ''}.${cairn.warning ? ` ${cairn.warning}` : ''}`, { run, ...(trust ? { trust } : {}) })
 }
 
 // ---------- report (the worker's mcp__orchestrator__report alias) ----------

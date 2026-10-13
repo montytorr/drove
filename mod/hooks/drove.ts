@@ -114,6 +114,12 @@ export const jsonResultOf = <T>(ran: Ran): JsonResult<T> => {
   return { ok: false, code: failure.code, text: failure.text }
 }
 
+export type AttachTrust = { state: 'trusted' | 'untrusted' | 'unknown'; root: string; file: string }
+
+export const trustOf = (result: JsonResult<{ trust?: AttachTrust }>): AttachTrust | undefined => (result.ok ? result.data?.trust : undefined)
+
+export const trustArgs = (root: string): string[] => ['trust', root, '--yes', '--json']
+
 export const runOf = (result: JsonResult<{ run: RunMeta }>): RunMeta | undefined => (result.ok ? result.data?.run : undefined)
 
 // ---------- the planner guard: `drove guard pre-tool-use`, fed the Claude PreToolUse hook JSON ----------
