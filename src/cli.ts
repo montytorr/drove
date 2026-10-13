@@ -14,10 +14,10 @@ import { serveMcp } from './mcp.ts'
 import * as modhost from './modhost.ts'
 import { ENV, identityFromEnv } from './paths.ts'
 import { CONTROL_KINDS } from './protocol.ts'
-import type { AgentKind, CommandResult, Effort, HookEventName, Role, SeatRole, SendRequest, SpawnRequest } from './types.ts'
+import type { AgentKind, CommandResult, Deps, Effort, HookEventName, Role, SeatRole, SendRequest, SpawnRequest } from './types.ts'
 
 type Values = Record<string, string | string[] | boolean | undefined>
-type Io = { out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number>; signal?: AbortSignal; pollMs?: number }
+type Io = { deps?: Deps; out: (text: string) => void; err: (text: string) => void; stdin: () => Promise<string>; launch?: (plan: commands.ProcessPlan) => Promise<number>; signal?: AbortSignal; pollMs?: number }
 type Handler = (values: Values, positionals: string[], io: Io) => Promise<number>
 type Spec = { usage: string; why: string; options?: ParseArgsConfig['options']; run: Handler }
 
@@ -116,7 +116,12 @@ const launchProcess = (plan: commands.ProcessPlan): Promise<number> =>
 const printThenLaunch = async (result: CommandResult, io: Io): Promise<number> => {
   const code = print(result, io)
   const plan = result.ok ? (result.data as commands.ProcessPlan | undefined) : undefined
-  return plan?.argv ? (io.launch ?? launchProcess)(plan) : code
+  if (!plan?.argv) return code
+  try {
+    return await (io.launch ?? launchProcess)(plan)
+  } finally {
+    if (plan.planner) await commands.attachedPlannerExited(io.deps ?? commands.defaultDeps(), plan.planner)
+  }
 }
 
 const RUN_ID_RE = /^[a-z0-9_-]+-\d{8}-\d{4}-[0-9a-f]+$/
@@ -136,7 +141,7 @@ export const COMMANDS: Record<string, Spec> = {
     run: async (values, _positionals, io) => {
       const isDetached = values.detached === true
       if (values.json === true && !isDetached) throw new UsageError('--json needs --detached: an in-pane plan hands the pane to the planner')
-      const result = await commands.plan(commands.defaultDeps(), {
+      const result = await commands.plan(io.deps ?? commands.defaultDeps(), {
         repo: process.cwd(),
         kind: (str(values, 'kind') ?? 'claude') as AgentKind,
         model: str(values, 'model'),
@@ -352,7 +357,7 @@ export const COMMANDS: Record<string, Spec> = {
       if (values.json === true && !isDetached) throw new UsageError('--json needs --detached: an in-pane up hands the pane to the planner')
       if (positionals[0] !== undefined && str(values, 'run') !== undefined && positionals[0] !== str(values, 'run')) throw new UsageError(`the run is given twice: ${positionals[0]} and --run ${str(values, 'run')}`)
       const run = positionals[0] ?? str(values, 'run')
-      const result = await commands.up(commands.defaultDeps(), { run, repo: process.cwd() }, str(values, 'seat'), { detached: isDetached, json: values.json === true })
+      const result = await commands.up(io.deps ?? commands.defaultDeps(), { run, repo: process.cwd() }, str(values, 'seat'), { detached: isDetached, json: values.json === true })
       return isDetached ? printMachine(result, io, values.json === true) : printThenLaunch(result, io)
     },
   },

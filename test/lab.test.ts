@@ -149,6 +149,7 @@ fi
   assert.equal(planned.ok, true, planned.text)
   const processPlan = (planned.ok ? planned.data : undefined) as commands.ProcessPlan
   assert.equal((await loadRun(deps.home, processPlan.env.DROVE_RUN as string))?.goal, 'LAB-9: Drove as a software factory')
+  process.env.HERDR_PANE_ID = 'w1:p6'
   const missing = await commands.plan(withPath, { repo, kind: 'claude', cairn: 'LAB-10' })
   assert.equal(!missing.ok && missing.code, 'no-task')
 })

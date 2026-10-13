@@ -77,6 +77,8 @@ export type PlannerMeta = {
   model: string
   effort: Effort
   viaMod: boolean
+  launchId?: string
+  unavailable?: { at: string; detail: string }
 }
 
 export type RunMeta = {
@@ -323,6 +325,7 @@ export type Deps = {
   exec: Exec
   clock: Clock
   home: string
+  terminal?: { stdin: boolean; stdout: boolean }
   codexUserHome?: string
   claudeUserConfig?: string
   claudeUserDir?: string

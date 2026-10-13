@@ -147,13 +147,13 @@ const plannerCandidates = (input: AttentionInput): AttentionCandidate[] => {
   if (planner.state === 'gone') {
     // The planner agent is recognised a moment after its process starts; a run that has only just come up is not gone.
     const upAt = Date.parse(input.events.findLast(event => event.type === 'run.up')?.at ?? '')
-    if (!Number.isNaN(upAt) && Date.parse(input.at) - upAt < PLANNER_GRACE_MS) return []
+    if (!run.planner.unavailable && !Number.isNaN(upAt) && Date.parse(input.at) - upAt < PLANNER_GRACE_MS) return []
     return [{
       key: 'planner:gone',
       seat: 'planner',
       kind: 'gone',
-      text: `The planner pane${pane ? ` ${pane}` : ''} is gone while run ${run.id} is up.`,
-      since: input.at,
+      text: planner.detail ?? run.planner.unavailable?.detail ?? `The planner pane${pane ? ` ${pane}` : ''} is gone while run ${run.id} is up.`,
+      since: run.planner.unavailable?.at ?? input.at,
       answer: { type: 'command', command: `drove up --run ${run.id} --detached`, note: 'Resumes the run in a workspace of its own: the planner session and the seats come back with resume.' },
     }]
   }

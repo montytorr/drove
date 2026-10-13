@@ -18,7 +18,8 @@ export const makeExec = (respond: (argv: readonly string[]) => Partial<ExecResul
   const calls: string[][] = []
   const exec = async (argv: readonly string[]): Promise<ExecResult> => {
     calls.push([...argv])
-    return { code: 0, stdout: '', stderr: '', ...respond(argv) }
+    const stdout = argv[0] === 'herdr' && argv[2] === 'get' && argv[3] === 'p-planner' ? JSON.stringify({ result: { agent: { pane_id: 'p-planner', agent_status: 'idle', agent_session: { value: 'thread-1' } } } }) : ''
+    return { code: 0, stdout, stderr: '', ...respond(argv) }
   }
   return { calls, exec }
 }
@@ -90,7 +91,7 @@ export const fakePorts = (overrides: Partial<WatchPorts> & { agents?: () => Herd
   const { agents, ...rest } = overrides
   const ports: WatchPorts = {
     ...defaultWatchPorts,
-    listAgents: async () => ({ ok: true, value: agents?.() ?? [] }),
+    listAgents: async () => ({ ok: true, value: (agents?.() ?? []).map(agent => agent.paneId === 'p-planner' && agent.sessionId === undefined ? { ...agent, sessionId: 'thread-1' } : agent) }),
     deriveState: (seat, signals) => ({ state: signals.herdr?.status === 'working' ? 'working' : seat.state, attention: [] }),
     needsNudge: () => false,
     codexQueueArgv: (thread, text) => ['codex', 'queue', '--thread', thread, '--message', text],

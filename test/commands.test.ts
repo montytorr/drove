@@ -1625,6 +1625,7 @@ test('plan for codex has an initial prompt and no session id yet; it needs a her
   assert.equal(plan.argv[0], 'codex')
   assert.equal(plan.argv.at(-1), 'Read the roster and wait for the human.')
   assert.equal((await loadRun(deps.home, plan.env.DROVE_RUN as string))?.planner.sessionId, undefined)
+  process.env.HERDR_PANE_ID = 'w1:p6'
   const notRepo = await commands.plan(deps, { repo: deps.home, kind: 'claude' })
   assert.equal(!notRepo.ok && notRepo.code, 'not-a-repo')
 })
@@ -1895,6 +1896,7 @@ test('up refuses an up run that still has a live pane and names it', async () =>
   assert.ok(livePane)
   process.env.HERDR_PANE_ID = 'w1:p77'
   const startsBefore = fake.calls.filter(call => call[1] === 'agent' && call[2] === 'start').length
+  fake.agents.set('planner', { name: 'planner', paneId: 'w1:p0', tabId: 'w1:t1', status: 'idle', sessionId: 'planner-session' })
 
   const refused = await commands.up(deps, { run: RUN, repo: '/x' })
   assert.equal(!refused.ok && refused.code, 'not-down')
@@ -1905,7 +1907,7 @@ test('up refuses an up run that still has a live pane and names it', async () =>
   assert.equal((await readEvents(deps)).filter(item => item.type === 'run.recovered').length, 0)
 
   fake.agents.clear()
-  fake.agents.set('planner', { name: 'planner', paneId: 'w1:p0', tabId: 'w1:t1', status: 'idle' })
+  fake.agents.set('planner', { name: 'planner', paneId: 'w1:p0', tabId: 'w1:t1', status: 'idle', sessionId: 'planner-session' })
   const plannerLive = await commands.up(deps, { run: RUN, repo: '/x' })
   assert.equal(!plannerLive.ok && plannerLive.code, 'not-down')
   assert.match(plannerLive.text, /the planner pane w1:p0/)

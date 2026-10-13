@@ -192,6 +192,7 @@ test('plan --next picks the first task cairn ranks for the project and goes on a
   assert.deepEqual([run?.cairn, run?.goal], ['DROVE-69', 'DROVE-69: Migrate'])
   assert.match(processPlan.argv.at(-1) ?? '', /Body 69/)
 
+  process.env.HERDR_PANE_ID = 'w1:p6'
   const none = await commands.plan(deps, { repo, kind: 'claude', next: 'EMPTY' })
   assert.equal(!none.ok && none.code, 'no-task')
   const bad = await commands.plan(deps, { repo, kind: 'claude', next: 'drove' })
@@ -291,6 +292,7 @@ esac
   const processPlan = (planned.ok ? planned.data : undefined) as commands.ProcessPlan
   assert.equal((await loadRun(deps.home, processPlan.env.DROVE_RUN as string))?.goal, 'DROVE-9: From PATH')
   assert.match(processPlan.argv.at(-1) ?? '', /Real body/)
+  process.env.HERDR_PANE_ID = 'w1:p6'
   const missing = await commands.plan(withPath, { repo, kind: 'claude', cairn: 'DROVE-10' })
   assert.equal(!missing.ok && missing.code, 'no-task')
 })

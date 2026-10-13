@@ -527,7 +527,7 @@ const report = (seat: string): Report => ({ v: 1, id: 'r-1', run: 'drove-2026100
 const plannerRun = async (fake: FakeHerdr, overrides: Partial<RunMeta['planner']> = {}) => {
   const deps = await makeDeps(fake)
   const run = await seedRun(deps, '/repo', [], { planner: { kind: 'codex', paneId: 'w1:p0', sessionId: 'planner-thread', model: '', effort: 'high', viaMod: false, ...overrides } })
-  fake.agents.set('planner', { name: 'planner', paneId: 'w1:p0', tabId: 'w1:t0', status: 'working' })
+  fake.agents.set('planner', { name: 'planner', paneId: 'w1:p0', tabId: 'w1:t0', status: 'working', sessionId: run.planner.sessionId })
   return { deps, run }
 }
 

@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- Attached `drove plan` and `drove up` require a terminal and refuse panes occupied by another agent or live planner; use `--detached` from inside another agent. Planner report delivery checks the pane’s session before pasting and keeps reports pending on a mismatch. An attached planner that exits is marked gone with one attention naming `drove up --run ID`, which can relaunch it while workers continue (DROVE-148).
+
 ## [0.6.0] - 2026-10-13
 
 Planners keep their Cairn claim through long runs, Ctrl-C cleans up child processes, and Cairn kind labels steer the choice of worker.
