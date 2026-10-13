@@ -6,7 +6,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
 import { cairnEnv, cairnKeyHint } from './cairn.ts'
-import { detectRunAgents, modelLabelOf } from './agents.ts'
+import { detectRunAgents, detectRunCairn, modelLabelOf, noCairnReason, runUsesCairn } from './agents.ts'
 import { attentionCandidates, type AttentionDelta, attentionLine, closeItems, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
 import { type CheckPlan, checksOf, renderOutcome, repoVerifyCommands, reusedText, runChecks } from './checks.ts'
@@ -53,6 +53,7 @@ export const DEFAULT_CONFIG: DroveConfig = {
   plannerEffort: 'high',
   workerModel: { claude: 'claude-sonnet-5-5', codex: '' },
   workerKind: 'auto',
+  cairn: 'auto',
   workerEffort: 'medium',
   promotedModel: { claude: 'claude-opus-5-5', codex: '' },
   budget: 5,
@@ -184,7 +185,7 @@ const portsOf = (value: unknown): DroveConfig['workerPorts'] => {
 }
 
 export const loadConfig = async (home: string, repo?: string, source?: { exec: Exec; base: string }): Promise<DroveConfig> => {
-  const { workerKind, workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, reviewLoopLimit, runMaxCost, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
+  const { workerKind, cairn, workerMcp, workerSkills, workerAgents, workerPlugins, workerUserMemory, workerUserHooks, maxTurns, reviewLoopLimit, runMaxCost, workerPorts, workerCopy, labInstance, ...file } = (await readJson<Partial<DroveConfig>>(join(home, 'config.json')).catch(() => undefined)) ?? {}
   const ports = portsOf(workerPorts)
   const copy = namesOf(workerCopy)
   const mcp = namesOf(workerMcp)
@@ -195,6 +196,7 @@ export const loadConfig = async (home: string, repo?: string, source?: { exec: E
     ...DEFAULT_CONFIG,
     ...file,
     workerKind: workerKind === 'claude' || workerKind === 'codex' ? workerKind : 'auto',
+    cairn: cairn === 'on' || cairn === 'off' ? cairn : 'auto',
     ...(repo ? await configPolicy(home, repo, source, file) : {}),
     ...(ports ? { workerPorts: ports } : {}),
     ...(copy && copy.length > 0 ? { workerCopy: copy } : {}),
@@ -657,10 +659,15 @@ const readLabSubject = async (deps: Deps, instance: string, ref: string, kind: A
   return { subject: { ref: textOf(value.ref) || ref, title, body: textOf(value.body), todos } }
 }
 
-const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next' | 'kind'>, labInstance: string, agents?: HostAgents): Promise<GoalTask | { error: CommandResult } | undefined> => {
+const resolveGoalTask = async (deps: Deps, request: Pick<PlanRequest, 'goal' | 'cairn' | 'next' | 'kind'>, config: Pick<DroveConfig, 'labInstance' | 'cairn'>, useCairn: boolean, agents?: HostAgents): Promise<GoalTask | { error: CommandResult } | undefined> => {
   if (request.cairn === undefined && request.next === undefined) return undefined
   if (request.cairn !== undefined && request.next !== undefined) return { error: failed('usage', '--from-cairn and --next are exclusive') }
   if (request.goal) return { error: failed('usage', '--goal cannot be combined with --from-cairn or --next: the goal is the task') }
+  if (!useCairn) {
+    const asked = request.next !== undefined ? `--next ${request.next}` : `--from-cairn ${request.cairn}${LAB_RE.test(request.cairn ?? '') ? ' (a Lab subject)' : ''}`
+    return { error: failed('cairn', `${asked} needs Cairn, and this run has none: ${noCairnReason(config)}. Pass the goal with --goal instead`) }
+  }
+  const { labInstance } = config
   let ref = request.cairn
   if (request.next !== undefined) {
     const picked = await pickNextTask(deps, request.next, request.kind)
@@ -841,18 +848,20 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const model = request.model ?? config.plannerModel[kind]
   const effort = request.effort ?? config.plannerEffort
   const sessionId = kind === 'claude' ? randomUUID() : undefined
-  const agents = await detectRunAgents(deps)
-  const goalTask = await resolveGoalTask(deps, request, config.labInstance, agents)
+  const existing = request.run ? await loadRun(deps.home, request.run) : undefined
+  if (request.run && !existing) return failed('no-run', `no run named ${request.run}`)
+  const [agents, cairn] = await Promise.all([detectRunAgents(deps), detectRunCairn(deps, config.cairn, kind, existing?.useCairn)])
+  const { useCairn } = cairn
+  const cairnWarning = cairn.warning ? ` ${cairn.warning}` : ''
+  const goalTask = await resolveGoalTask(deps, request, config, runUsesCairn({ useCairn }, config), agents)
   if (goalTask && 'error' in goalTask) return goalTask.error
   const goal = goalTask?.goal ?? request.goal
 
   let run: RunMeta
   let previous: RunMeta | undefined
-  if (request.run) {
-    const existing = await loadRun(deps.home, request.run)
-    if (!existing) return failed('no-run', `no run named ${request.run}`)
+  if (existing) {
     previous = existing
-    run = { ...existing, agents, goal: goal ?? existing.goal, cairn: goalTask?.ref ?? existing.cairn, planner: { ...existing.planner, kind, paneId, model, effort, ...(sessionId ? { sessionId } : { sessionId: undefined }) } }
+    run = { ...existing, agents, useCairn, goal: goal ?? existing.goal, cairn: goalTask?.ref ?? existing.cairn, planner: { ...existing.planner, kind, paneId, model, effort, ...(sessionId ? { sessionId } : { sessionId: undefined }) } }
   } else {
     const base = await git.baseRef(deps.exec, repo).catch(() => undefined)
     if (!base) return failed('no-base', `no main or master branch found in ${repo}`)
@@ -865,6 +874,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
       createdAt: now.toISOString(),
       status: 'up',
       agents,
+      useCairn,
       ...(goal ? { goal } : {}),
       ...(goalTask ? { cairn: goalTask.ref } : {}),
       budget: config.budget,
@@ -905,10 +915,10 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     await writeLaunchFiles(spec)
     const started = await startDetachedPlanner(deps, run, spec, opened.paneId, typedPrompt)
     if ('code' in started) return abandonDetached(deps, run, previous, started, opened.workspaceId)
-    return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.${trustWarning}`)
+    return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.${trustWarning}${cairnWarning}`)
   }
   await writeLaunchFiles(spec)
-  return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.${trustWarning}`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd, planner: run } satisfies ProcessPlan)
+  return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.${trustWarning}${cairnWarning}`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd, planner: run } satisfies ProcessPlan)
 }
 
 // ---------- spawn ----------
@@ -1082,6 +1092,7 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (unavailable) return unavailable
   const trust = kind === 'claude' ? await repoTrustOf(deps, run.repo) : undefined
   if (trust?.state === 'untrusted') return failed('untrusted-repo', untrustedText(trust))
+  if (request.cairn && !runUsesCairn(run, config)) return failed('cairn', `--cairn ${request.cairn}: this run has no Cairn (${noCairnReason(config)}); spawn with no task ref`)
   const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn, run.planner.kind) : {}
   if ('error' in cairnCheck) return cairnCheck.error
   const targetSeat = request.target ? findSeat(await loadRoster(deps.home, run.id), request.target) : undefined
@@ -1830,7 +1841,7 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
     }
     const notes = [
       seat.kind === 'claude' ? await releaseStaleLock(deps, run, seat) : undefined,
-      seat.cairn ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined,
+      seat.cairn && runUsesCairn(run, await loadConfig(deps.home)) ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined,
     ].filter((note): note is string => Boolean(note))
 
     const { sessionId: _session, codexHome: _home, pendingPromote: _pending, restartingSince: _since, ...kept } = seat
@@ -2165,7 +2176,7 @@ export const close = async (deps: Deps, identity: Identity, seatName: string, re
 
   const notes = [`Closed ${seat.name}${seat.paneId ? ` (pane ${seat.paneId})` : ''}.`]
   if (lockNote) notes.push(`Note: ${lockNote}.`)
-  const releaseNote = seat.cairn ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined
+  const releaseNote = seat.cairn && runUsesCairn(run, await loadConfig(deps.home)) ? await releaseCairnClaim(deps, seat.cairn, run.planner.kind) : undefined
   if (releaseNote) notes.push(releaseNote)
   if (!removeWorktree) notes.push(`Its worktree ${seat.worktree} and branch ${seat.branch} are kept.`)
   else {
@@ -2593,7 +2604,8 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
       if (trace) await postTrace(trace, endpoint, 2_000)
     }
   } catch { /* best effort */ }
-  const cairnNote = await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString(), (await loadConfig(deps.home)).labInstance)
+  const downConfig = await loadConfig(deps.home)
+  const cairnNote = runUsesCairn(run, downConfig) ? await reportRunToCairn(deps, run, (await loadRoster(deps.home, run.id)).seats, deps.clock.now().toISOString(), downConfig.labInstance) : undefined
   return ok(
     [`Run ${run.id} is down: ${saved.length} seat(s) saved for resume${saved.length ? ` (${saved.join(', ')})` : ''}.`, ...(unsaved.length ? [`No session id for ${unsaved.join(', ')}: they cannot be resumed.`] : []), `Resume with \`drove up --run ${run.id}\`.`, ...(cairnNote ? [cairnNote] : [])].join(' '),
     { saved, unsaved },
@@ -2727,7 +2739,8 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
     if (refusal) return refusal
   }
   const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
-  run = { ...run, agents: await detectRunAgents(deps) }
+  const [agents, cairn] = await Promise.all([detectRunAgents(deps), detectRunCairn(deps, config.cairn, run.planner.kind, run.useCairn)])
+  run = { ...run, agents, useCairn: cairn.useCairn }
   let recovery: { seats: Seat[]; plannerOnly: boolean } | undefined
   if (!seatName && run.status === 'up') {
     const plannerId = run.planner.sessionId ?? (await plannerSessionId(deps, run))
@@ -2807,7 +2820,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
   await recordEvent(deps, run.id, { type: 'run.up', data: { resumed, lost, pane: paneId, ...(opened ? { workspace: opened.workspaceId, detached: true } : {}) } })
 
   await writeLaunchFiles(spec)
-  const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}`
+  const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}${cairn.warning ? ` ${cairn.warning}` : ''}`
   if (opened) {
     const started = await startDetachedPlanner(deps, run, spec, opened.paneId, undefined)
     if ('code' in started) return failed(started.code, `${started.text} The seats were resumed in workspace ${opened.workspaceId} and pane ${opened.paneId} is left open for you; close it with drove down --run ${run.id} and try again.`)
@@ -2830,6 +2843,10 @@ export const setGoal = async (deps: Deps, ref: RunRef, request: GoalRequest): Pr
   const located = await locateRun(deps, ref, 'up')
   if ('error' in located) return located.error
   const { run } = located
+  if (request.cairn) {
+    const config = await loadConfig(deps.home)
+    if (!runUsesCairn(run, config)) return failed('cairn', `--cairn ${request.cairn}: this run has no Cairn (${noCairnReason(config)}); set the goal without a task ref`)
+  }
   const next: RunMeta = { ...run, goal, ...(request.cairn ? { cairn: request.cairn } : {}) }
   await saveRun(deps.home, next)
   await recordEvent(deps, run.id, { type: 'goal.set', data: { goal, ...(request.cairn ? { cairn: request.cairn } : {}), ...(run.goal ? { previous: run.goal } : {}) } })

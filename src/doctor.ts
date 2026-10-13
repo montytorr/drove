@@ -140,14 +140,35 @@ const checkGh = async (deps: DoctorDeps): Promise<Check> => {
     : check('gh', 'warn', 'gh is installed but not signed in', 'run gh auth login (the human does this; Drove never signs in)')
 }
 
+export const CAIRN_OPTIONAL = 'optional: task tracking and shared memory'
+
+// The cairn setting of ~/.drove/config.json (DROVE-159); a value that is not auto, on or off counts as auto, as loadConfig reads it.
+const cairnSetting = async (deps: DoctorDeps): Promise<{ setting: 'auto' | 'on' | 'off'; invalid?: string }> => {
+  const text = await deps.readText(join(deps.home, 'config.json'))
+  let value: unknown
+  try {
+    value = text === undefined ? undefined : (JSON.parse(text) as { cairn?: unknown }).cairn
+  } catch {
+    value = undefined
+  }
+  if (value === undefined || value === 'auto' || value === 'on' || value === 'off') return { setting: (value ?? 'auto') as 'auto' | 'on' | 'off' }
+  return { setting: 'auto', invalid: JSON.stringify(value) }
+}
+
+// Cairn is optional: missing or unreadable is a warning, unless the cairn setting is on; off never runs it.
 const checkCairn = async (deps: DoctorDeps, kind?: AgentKind): Promise<Check> => {
+  const { setting, invalid } = await cairnSetting(deps)
+  const bad = invalid === undefined ? '' : ` (the cairn setting ${invalid} is not auto, on or off, so it counts as auto)`
+  if (setting === 'off') return check('cairn', 'ok', 'the cairn setting is off: Drove does not use Cairn')
+  const missing = setting === 'on' ? 'fail' : 'warn'
+  const why = setting === 'on' ? 'the cairn setting is on' : CAIRN_OPTIONAL
   const exec: Exec = (argv, options) => deps.exec(argv, { ...options, env: cairnEnv(kind) })
   const version = await attempt(exec, ['cairn', '--version'])
-  if (version.code !== 0) return check('cairn', 'fail', 'cairn is not installed', 'install the Cairn CLI: cairn setup --url <instance> (see "Running Drove on another machine")')
+  if (version.code !== 0) return check('cairn', missing, `cairn is not installed (${why})${bad}`, 'install the Cairn CLI: cairn setup --url <instance> (see "Running Drove on another machine")')
   const read = await attempt(exec, ['cairn', 'projects'])
   return read.code === 0
-    ? check('cairn', 'ok', `${firstLine(version)}, read works`)
-    : check('cairn', 'fail', `cairn is installed but a read failed: ${firstLine(read)}${cairnKeyHint(`${read.stderr}\n${read.stdout}`)}`, 'sign in: cairn setup --url <instance>; or set CAIRN_BASE_URL and CAIRN_API_KEY')
+    ? check('cairn', invalid === undefined ? 'ok' : 'warn', `${firstLine(version)}, read works${bad}`)
+    : check('cairn', missing, `cairn is installed but a read failed (${why}): ${firstLine(read)}${cairnKeyHint(`${read.stderr}\n${read.stdout}`)}${bad}`, 'sign in: cairn setup --url <instance>; or set CAIRN_BASE_URL and CAIRN_API_KEY')
 }
 
 const checkHome = async (deps: DoctorDeps): Promise<Check> => {

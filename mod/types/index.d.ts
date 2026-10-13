@@ -43,6 +43,8 @@ export type RunMeta = {
   budget: number
   planner: PlannerMeta
   agents?: HostAgents
+  // False when the run has no Cairn (none on the host, or the cairn setting is off); a run saved before DROVE-159 has none and uses it.
+  useCairn?: boolean
 }
 
 export type LastReport = {

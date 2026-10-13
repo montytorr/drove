@@ -330,7 +330,7 @@ const pruneStore = async ($: EngineInterface) => {
 
 const codexNameOf = (agents?: HostAgents): string => (agents?.codex?.model ? `Codex (${agents.codex.model})` : 'Codex')
 
-const orchestratorTools = (agents?: HostAgents) => [
+const orchestratorTools = (agents?: HostAgents, useCairn?: boolean) => [
   {
     name: 'spawn_worker',
     description:
@@ -343,7 +343,7 @@ const orchestratorTools = (agents?: HostAgents) => [
         kind: { type: 'string', enum: ['claude', 'codex'], description: 'optional: claude or codex. Left out, Drove’s workerKind setting decides; the rules for choosing are in your instructions' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh'], description: 'low: mechanical; medium: standard (default); high: tricky logic or debugging' },
         model: { type: 'string', description: `Claude: sonnet (default) or opus, or a full model id. Codex: a model id, or leave out for its default${agents?.codex?.model ? ` (${agents.codex.model})` : ''}` },
-        cairn: { type: 'string', description: 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
+        cairn: { type: 'string', description: useCairn === false ? 'leave out: this run has no Cairn, and Drove refuses a ref' : 'the Cairn task ref for this piece (e.g. CCS-12), filed first with cairn add --no-start; the worker claims it' },
         mcp: { type: 'array', items: { type: 'string' }, description: 'optional: the user MCP servers this worker needs, by name; [] for Drove’s alone. Left out, Drove’s workerMcp setting decides' },
         plugins: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: the user plugins this worker needs, by name; [] for Drove’s mod alone. Left out, Drove’s workerPlugins setting decides (every enabled plugin when unset)' },
         skills: { type: 'array', items: { type: 'string' }, description: 'optional, Claude workers: the user skills this worker needs, by name; [] loads no skill at all, plugin skills follow plugins. Left out, Drove’s workerSkills setting decides (every skill when unset)' },
@@ -502,7 +502,7 @@ const orchestratorTools = (agents?: HostAgents) => [
 ] as const
 
 const registerOrchestratorTools = async ($: EngineInterface) => {
-  for (const tool of orchestratorTools(lastRun?.agents)) await $.tool.register(tool as never)
+  for (const tool of orchestratorTools(lastRun?.agents, lastRun?.useCairn)) await $.tool.register(tool as never)
 }
 
 const record = async ($: EngineInterface, entry: FeedDraft) => {
@@ -1737,7 +1737,7 @@ export const register: Register = (on, options) => {
   on('prompt.compose', async ($, e, next) => {
     const composed = await next(e)
     const [orchestrator, self] = await Promise.all([read($, orchestratorAtom), read($, workerAtom)])
-    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, { ...config, humanName: await humanNameOf($), trims: await trimsOf($), agents: lastRun?.agents }), scope: 'session' as const }] }
+    if (orchestrator) return { sections: [...composed.sections, { id: 'orchestrator:role', text: orchestratorSection(orchestrator, { ...config, humanName: await humanNameOf($), trims: await trimsOf($), agents: lastRun?.agents, useCairn: lastRun?.useCairn }), scope: 'session' as const }] }
     const model = self ? workerModelSection(self) : undefined
     if (model) return { sections: [...composed.sections, { id: 'orchestrator:worker-model', text: model, scope: 'session' as const }] }
     return composed

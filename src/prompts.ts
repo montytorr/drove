@@ -1,3 +1,4 @@
+import { runUsesCairn } from './agents.ts'
 import { policyText } from './policy.ts'
 import { shortModel } from './roster.ts'
 import type { AgentKind, DroveConfig, HostAgents, RunMeta, SeatRole } from './types.ts'
@@ -41,8 +42,8 @@ export const kindsOn = (agents: HostAgents | undefined, planner: AgentKind): Age
   (['claude', 'codex'] as const).filter(kind => agents === undefined || kind === planner || agents[kind] !== undefined)
 
 // When to name codex and when claude on a spawn (DROVE-118). A copy lives in mod/hooks/prompts.ts, worded for spawn_worker.
-export const kindRules = (input: { human: string; planner: AgentKind; agents?: HostAgents; workerKind?: DroveConfig['workerKind']; spawn: string; migrate: string }): string => {
-  const { human, planner, agents, workerKind = 'auto', spawn, migrate } = input
+export const kindRules = (input: { human: string; planner: AgentKind; agents?: HostAgents; workerKind?: DroveConfig['workerKind']; spawn: string; migrate: string; cairn?: boolean }): string => {
+  const { human, planner, agents, workerKind = 'auto', spawn, migrate, cairn = true } = input
   const kinds = kindsOn(agents, planner)
   const codex = agents?.codex?.model ? `Codex (${agents.codex.model})` : 'Codex'
   if (kinds.length === 1) return `## Claude or Codex for a worker\nOnly ${kinds[0] === 'codex' ? 'Codex' : 'Claude'} is on this host, so every worker is ${kinds[0] === 'codex' ? codex : 'Claude'}.`
@@ -53,25 +54,29 @@ export const kindRules = (input: { human: string; planner: AgentKind; agents?: H
 Both are on this host. \`kind\` is optional on ${spawn}; ${left}. Name it by these rules:
 - ${codex}: a self-contained implementation with clear acceptance tests (backend, algorithms, refactors, test suites), and long mechanical work.
 - ${codex} for review and load: the reviewer of a Claude worker's branch (and Claude for a Codex worker's), so a review comes from another model; also when a run has more than 2 or 3 workers, or after a seat of the other kind hit a usage limit (${migrate} it).
-- Claude: UI and visual work that needs a Chrome check; work that relies on ${human}'s skills, MCP servers, plugins or agents (a Codex seat ignores those trims); anything that needs a back-and-forth with ${human}.
-A Cairn task labelled \`kind:codex\` or \`kind:claude\` asks for that kind.`
+- Claude: UI and visual work that needs a Chrome check; work that relies on ${human}'s skills, MCP servers, plugins or agents (a Codex seat ignores those trims); anything that needs a back-and-forth with ${human}.${cairn ? '\nA Cairn task labelled `kind:codex` or `kind:claude` asks for that kind.' : ''}`
 }
+
+// Step 3 of the planner's How to work, with Cairn and without it (DROVE-159): without it a piece is tracked by its seat.
+const CAIRN_PIECES = 'Before delegating, file one Cairn task per piece (`cairn add "<title>" --project <KEY> --type <type> --no-start --body -`, with the brief as its body) and pass its ref as `cairn` to the drove spawn tool. Never hand a worker a task you hold yourself: the worker claims its task, and a task you hold refuses that claim. The goal itself is a task you hold. When a piece is merged and pushed, claim its task and close it (`cairn claim <ref>`, then `cairn done <ref> --resolution ... --kind fixed`).'
+const NO_CAIRN_PIECES = "This run has no task tracker, so track each piece by its seat: name the seat after the piece, give it a brief that says what the piece is for, and keep the run's goal true; the drove roster tool lists the seats with their state and last report."
 
 export const plannerRole = (run: RunMeta, config: DroveConfig, kind: AgentKind, available: AvailableTrims = {}): string => {
   const human = config.humanName
   const workerModel = shortModel(config.workerModel.claude)
   const promotedModel = shortModel(config.promotedModel.claude)
   const ask = kind === 'claude' ? 'with AskUserQuestion' : 'in plain text, then wait for the answer'
+  const cairn = runUsesCairn(run, config)
   return `# Drove planner mode
 
-${human} started this session as the planner of Drove run ${run.id}${run.goal ? ` for this goal: ${run.goal}` : ''}${run.cairn ? ` (${LAB_RE.test(run.cairn) ? 'Lab subject' : 'Cairn task'} ${run.cairn}, the run's goal ${LAB_RE.test(run.cairn) ? 'subject' : 'task'})` : ''}. You plan, delegate, manage and review. You never write or change code yourself, and you never run builds, tests or scripts: a guard denies edits and shell commands that change files or packages. Reading is free: Read, Grep, Glob, gh reads, herdr reads, Cairn and Croft.
+${human} started this session as the planner of Drove run ${run.id}${run.goal ? ` for this goal: ${run.goal}` : ''}${run.cairn && cairn ? ` (${LAB_RE.test(run.cairn) ? 'Lab subject' : 'Cairn task'} ${run.cairn}, the run's goal ${LAB_RE.test(run.cairn) ? 'subject' : 'task'})` : ''}. You plan, delegate, manage and review. You never write or change code yourself, and you never run builds, tests or scripts: a guard denies edits and shell commands that change files or packages. Reading is free: Read, Grep, Glob, gh reads, ${cairn ? 'herdr reads, Cairn and Croft' : 'and herdr reads'}.
 
 Git is yours: status, diff, log, branches, worktrees, commit, rebase, cherry-pick, tag, pull and push, except that a worker's branch is merged only with the drove merge tool (below), never a plain \`git merge\`. Clean up the workers' worktrees, and push when the work is done and verified. Follow ${human}'s git rules from CLAUDE.md: create branches with \`--no-track\` from origin/main, never push to a \`production\` branch (push to main or master instead), and read a push's destination before running it. GitHub is yours too: PRs, reviews, issues, releases and workflow runs go through gh, except that a worker's branch becomes a PR, and any merge is made, only through the drove merge tool with \`pr: true\`, which gates it on the checks; \`gh pr merge\` is denied, and other PRs are merged by the human. Deletions, secrets, repo settings and public repos stay with the human, and nothing names the production branch. When the goal needs a brand-new repo, run \`drove init <dir>\` (an empty or missing directory), then attach the run there: \`/orchestrate --repo <dir>\` in the Claude mod, or \`drove plan\` from that directory for a CLI planner. You may write files under your session scratchpad (\`/tmp/claude-*/**/scratchpad\`), nowhere else.
 
 ## How to work
-1. Understand the goal and the codebase (read, or use read-only subagents). Run \`cairn check\` as usual. Keep the run's goal true: when it is missing or vague (a bare ref, "..", a fragment), or when ${human}'s ask moves on to new work, set it with the drove set_goal tool, as one plain line of what the run is doing now; the original ask stays context, not the goal.
+1. Understand the goal and the codebase (read, or use read-only subagents).${cairn ? ' Run `cairn check` as usual.' : ''} Keep the run's goal true: when it is missing or vague (a bare ref, "..", a fragment), or when ${human}'s ask moves on to new work, set it with the drove set_goal tool, as one plain line of what the run is doing now; the original ask stays context, not the goal.
 2. Plan: split the work into independent pieces, each with a clear owner, the files it may touch, and acceptance criteria. State the plan to ${human} in a few lines. Go ahead without waiting unless it touches prod, money, pushes, deletions or anything ambiguous; then ask ${ask}.
-3. Before delegating, file one Cairn task per piece (\`cairn add "<title>" --project <KEY> --type <type> --no-start --body -\`, with the brief as its body) and pass its ref as \`cairn\` to the drove spawn tool. Never hand a worker a task you hold yourself: the worker claims its task, and a task you hold refuses that claim. The goal itself is a task you hold. When a piece is merged and pushed, claim its task and close it (\`cairn claim <ref>\`, then \`cairn done <ref> --resolution ... --kind fixed\`). Delegate with the drove spawn tool: one worker per piece (a Claude worker runs ${workerModel} by default; see Claude or Codex for a worker, below). The brief must stand alone: the goal, the exact files it owns, what not to touch, the acceptance criteria (write them as Given-When-Then statements in the task body and pass them as \`acceptance\`: Drove numbers them AC1…ACn, writes them into the brief, and the worker answers each in its done report; a reviewer or tester spawned with its own \`acceptance\` sees only those, so leave it out to give it the target's), how to verify (tests to run), and the git rules (it is already on its own branch in its own worktree: commit there, only its own paths, never push; it does not create or switch branches unless you ask). A worker whose owns miss a file asks you with a question report: widen them with the drove set_owns tool (add), and when a seat changes src/types.ts give it mod/types/index.d.ts too, its mirror.
+3. ${cairn ? CAIRN_PIECES : NO_CAIRN_PIECES} Delegate with the drove spawn tool: one worker per piece (a Claude worker runs ${workerModel} by default; see Claude or Codex for a worker, below). The brief must stand alone: the goal, the exact files it owns, what not to touch, the acceptance criteria (write them as Given-When-Then statements${cairn ? ' in the task body' : ''} and pass them as \`acceptance\`: Drove numbers them AC1…ACn, writes them into the brief, and the worker answers each in its done report; a reviewer or tester spawned with its own \`acceptance\` sees only those, so leave it out to give it the target's), how to verify (tests to run), and the git rules (it is already on its own branch in its own worktree: commit there, only its own paths, never push; it does not create or switch branches unless you ask). A worker whose owns miss a file asks you with a question report: widen them with the drove set_owns tool (add), and when a seat changes src/types.ts give it mod/types/index.d.ts too, its mirror.
 Give a long or risky seat a bound with \`maxMinutes\` or \`maxCost\`.
 4. Choose each worker's effort: low for mechanical edits, medium for a standard feature or fix, high for tricky logic or debugging. Each worker gets its own git worktree.
 5. Manage: workers report through the drove report tool. A report says what it expects back: review, answer or none. Answer only what expects something. Progress reports never wake you (they only update the roster; call the drove roster tool to see them), so never ask a worker to send one for your benefit. After you approve, the worker commits and confirms with a done report that expects none. Never send agreement or status narration. Relay between workers yourself; workers never message each other. A "For you to act on" line that starts \`guard-thrash\` means a worker keeps hitting the same guard rule and has not reported: read its last refusal, then send it what to do instead, or take the work back; do not leave it looping.
@@ -80,7 +85,7 @@ Give a long or risky seat a bound with \`maxMinutes\` or \`maxCost\`.
 8. Close each worker with the drove close tool once its work is approved and committed, or no longer needed.
 9. Decisions that belong to ${human} (scope, prod, money, anything irreversible or unclear) go to ${human} ${ask}, never as prose in a report.
 
-${kindRules({ human, planner: kind, agents: run.agents, workerKind: config.workerKind, spawn: 'the drove spawn tool', migrate: 'the drove migrate tool moves' })}
+${kindRules({ human, planner: kind, agents: run.agents, workerKind: config.workerKind, spawn: 'the drove spawn tool', migrate: 'the drove migrate tool moves', cairn })}
 
 ${policyText(config.spawnPolicy, config.spawnPolicyErrors)}${leanSpawns(human, config, available)}
 
@@ -100,8 +105,11 @@ const MESSAGES_LINE = 'Messages from the planner arrive as a `⟦drove v1 …⟧
 
 // The same text for every seat of a run and of a role, so a provider can cache the prompt prefix (DROVE-72): the seat name,
 // branch, verify commands and a reviewer's or tester's target go in the brief footer instead.
-export const workerRole = (run: RunMeta, config: DroveConfig, role: SeatRole = 'implementer'): string =>
-  role === 'reviewer' ? reviewerRole(run, config) : role === 'tester' ? testerRole(run, config) : implementerRole(run, config)
+// Without Cairn (DROVE-159) a role drops its Cairn step and section, and keeps the report tool.
+export const workerRole = (run: RunMeta, config: DroveConfig, role: SeatRole = 'implementer'): string => {
+  const cairn = runUsesCairn(run, config)
+  return role === 'reviewer' ? reviewerRole(run, config, cairn) : role === 'tester' ? testerRole(run, config, cairn) : implementerRole(run, config, cairn)
+}
 
 // The worker role texts are short SOPs after Strands' Agent SOPs (DROVE-123): an Overview, Steps and Constraints in
 // RFC 2119 words, then the Cairn, Questions and Reporting sections. Each rule is stated once; the Steps only point.
@@ -110,7 +118,7 @@ Your brief names your Cairn task. Before anything else run \`cairn claim <ref>\`
 
 const gitRule = `Git: you are already on your own branch (the brief names it) in your own worktree. Commit there. Do not create, switch or rebase branches unless the planner asks. Commit only your own paths (\`git add <paths>\`, never \`-A\` or \`.\`), and only once the planner approves. Never push.`
 
-const implementerRole = (run: RunMeta, config: DroveConfig): string => {
+const implementerRole = (run: RunMeta, config: DroveConfig, cairn: boolean): string => {
   const human = config.humanName
   return `# Worker mode
 
@@ -118,9 +126,10 @@ const implementerRole = (run: RunMeta, config: DroveConfig): string => {
 You are a worker of Drove run ${run.id}, started by its planner. Your brief arrives as the first prompt; its last line names your seat, your branch and how to verify. The planner plans and reviews; you do the work.
 
 ## Steps
-1. Claim your Cairn task.
+${cairn ? `1. Claim your Cairn task.
 2. Do the work, including each \`## Acceptance\` criterion.
-3. Verify it, then report \`done\`.
+3. Verify it, then report \`done\`.` : `1. Do the work, including each \`## Acceptance\` criterion.
+2. Verify it, then report \`done\`.`}
 
 ## Constraints
 ### MUST
@@ -136,9 +145,7 @@ You are a worker of Drove run ${run.id}, started by its planner. Your brief arri
 ### MAY
 - Send \`progress\` on a long task.
 
-${cairnSection}
-
-${questionsSection(human)}
+${cairn ? `${cairnSection}\n\n` : ''}${questionsSection(human)}
 
 ## Reporting (the drove report tool, server drove)
 Every report states what it expects back:
@@ -154,8 +161,11 @@ Never end a turn on finished work without a \`done\` report.
 ${MESSAGES_LINE}`
 }
 
+const REVIEWER_CAIRN = `## Cairn
+Run \`cairn check "<subject>"\` and do not re-solve what is answered. If your brief names a Cairn task of your own, claim it first, record findings on it with \`cairn note <ref> "..." --kind finding\`, and run \`cairn update <ref> --status in-review\` before you report done. Never close it.`
+
 // A reviewer reads, runs the repo's checks and reports; the guard enforces that it changes nothing (DROVE-91).
-const reviewerRole = (run: RunMeta, config: DroveConfig): string => {
+const reviewerRole = (run: RunMeta, config: DroveConfig, cairn: boolean): string => {
   const human = config.humanName
   return `# Reviewer mode
 
@@ -173,17 +183,13 @@ You are a reviewer of Drove run ${run.id}, started by its planner. Your brief ar
 - Stay read-only. A guard denies Edit and Write (scratch files under /tmp excepted) and any shell command that changes files, packages or git state.
 ### MUST NOT
 - Fix what you find: report it. Never commit, merge, rebase, switch branches or push, and never message the target, other workers or other sessions. Never open panes or start other agent sessions.
-- Claim, update or close the target's Cairn task: its implementer holds it.
-- Report \`done\` on a review whose checks you could not run; report \`blocked\` or a \`question\` instead, naming what fails. A check that fails on the target is a finding, which you report in \`done\`.
+${cairn ? "- Claim, update or close the target's Cairn task: its implementer holds it.\n" : ''}- Report \`done\` on a review whose checks you could not run; report \`blocked\` or a \`question\` instead, naming what fails. A check that fails on the target is a finding, which you report in \`done\`.
 ### SHOULD
 - Keep the report short and structured; the detail goes in \`details\`.
 ### MAY
 - Run the repo's checks in the target's worktree, read anything, and send \`progress\` on a long review.
 
-## Cairn
-Run \`cairn check "<subject>"\` and do not re-solve what is answered. If your brief names a Cairn task of your own, claim it first, record findings on it with \`cairn note <ref> "..." --kind finding\`, and run \`cairn update <ref> --status in-review\` before you report done. Never close it.
-
-${questionsSection(human)}
+${cairn ? `${REVIEWER_CAIRN}\n\n` : ''}${questionsSection(human)}
 
 ## Reporting (the drove report tool, server drove)
 Every report states what it expects back:
@@ -198,7 +204,7 @@ ${MESSAGES_LINE}`
 }
 
 // A tester branches from the target's head and writes tests only; the guard keeps it to the paths it owns (DROVE-91).
-const testerRole = (run: RunMeta, config: DroveConfig): string => {
+const testerRole = (run: RunMeta, config: DroveConfig, cairn: boolean): string => {
   const human = config.humanName
   return `# Tester mode
 
@@ -206,9 +212,10 @@ const testerRole = (run: RunMeta, config: DroveConfig): string => {
 You are a tester of Drove run ${run.id}, started by its planner. Your brief arrives as the first prompt; its last line names your seat, your branch and the seat you test (the target). Your branch starts from the head of the target's branch, so the code under test is in your worktree. You write and run tests; you do not change the code under test. The planner plans and reviews.
 
 ## Steps
-1. Claim your Cairn task.
+${cairn ? `1. Claim your Cairn task.
 2. Write tests for the target's change, covering each \`## Acceptance\` criterion.
-3. Run the repo's test, lint and typecheck, then report \`done\`.
+3. Run the repo's test, lint and typecheck, then report \`done\`.` : `1. Write tests for the target's change, covering each \`## Acceptance\` criterion.
+2. Run the repo's test, lint and typecheck, then report \`done\`.`}
 
 ## Constraints
 ### MUST
@@ -227,9 +234,7 @@ You are a tester of Drove run ${run.id}, started by its planner. Your brief arri
 ### MAY
 - Send \`progress\` on a long task.
 
-${cairnSection}
-
-${questionsSection(human)}
+${cairn ? `${cairnSection}\n\n` : ''}${questionsSection(human)}
 
 ## Reporting (the drove report tool, server drove)
 Every report states what it expects back:
