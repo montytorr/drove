@@ -24,6 +24,7 @@ The same board, in three places. It lists each seat with its kind, model, state 
 
 - **In a spare pane:** `drove board` is a live, coloured board that uses your terminal's own background. Piped, or with `--once`, it prints one frame.
 - **Inside Claude:** with the mod loaded, the planner session shows the same board, with pills and toasts, and the dialogs that need your answer.
+- **Inside a `drove plan` Claude:** with the mod loaded, `/orchestrate board` in that planner shows the board of its own run (`DROVE_RUN`), read-only, and a second `/orchestrate board` hides it. `board bg`, `status` and `help` work there too; `/orchestrate <goal>` and `off` still refuse, because the session is already a planner.
 - **In a browser:** `drove board --web` serves a read-only page on `127.0.0.1`, behind a token made at each start. It opens on a graph of the lead and its workers, with a dot labelled brief, report or verdict travelling along the edge when one arrives. A Graph | Board switch goes to the rows, a click on a seat opens its state, branch, worktree and the tail of its pane, and the timeline has chips to show only what needs you, only reports, or everything. It runs only while the command does: Drove has no daemon.
 
 The [commands section](#commands) has the full reference for `drove board --web`.
@@ -72,6 +73,8 @@ drove board --web           # the same board in a browser, read-only
 `drove plan` creates a run, records the pane as the planner pane and replaces itself with `claude` or `codex`, with Drove's MCP server, guard hooks and role text attached.
 
 A run started without `--goal` takes the first prompt you type to the planner as its goal, the same way, in the mod and in the planner's `user-prompt-submit` hook. The planner keeps the goal true afterwards: `set_goal` (`drove goal`) replaces it with one plain line of what the run is doing now when it is missing or vague, or when your ask moves on, and records a `goal.set` event. The board header (terminal and web) shows it. When the Claude mod is re-attached, a goal only the mod holds is written to the run, and a run goal fills an empty mod goal.
+
+With the mod loaded in a `drove plan --kind claude` session, `/orchestrate board` opens the same board inside Claude for that run: seats, timeline and what needs you, polled from the run's files every two seconds. It starts no wake bridge, adds no tools and never switches the model or effort; the planner keeps waking through `drove plan`'s own path.
 
 `--from-cairn REF` and `--next PROJECT` start a run from a Cairn task. The planner's first prompt carries the task's title and body and says it is the run's goal task, which the planner holds; Drove stores the ref as the run's `cairn`. The task must exist and be open (a done or cancelled one is refused), and `--goal` cannot be combined with either flag. `drove down` then writes a summary note on that task: the seats, which are closed, their branches and what is still open (best effort: a failure to write it never holds the run up).
 

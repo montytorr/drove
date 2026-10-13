@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- The mod's `/orchestrate board` works in a planner started by `drove plan`: it opens (and, run again, closes) a read-only board of the session's own run (`DROVE_RUN`), polled every two seconds; `board bg`, `status` and `help` answer there too. It starts no wake bridge, registers no tools, and never switches model or effort or opens a dialog. `/orchestrate <goal>` and `off` still refuse there, and the message now names `/orchestrate board`; a worker session still refuses everything (DROVE-149).
+
 ## [0.6.0] - 2026-10-13
 
 Planners keep their Cairn claim through long runs, Ctrl-C cleans up child processes, and Cairn kind labels steer the choice of worker.

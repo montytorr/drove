@@ -200,6 +200,7 @@ declare module 'claude-code' {
   interface PluginState {
     orchestrator: {
       orchestrator: OrchOrchestrator | null
+      view: OrchOrchestrator | null
       seats: Seat[]
       status: Record<string, OrchModStatus>
       asksAt: Record<string, number>
