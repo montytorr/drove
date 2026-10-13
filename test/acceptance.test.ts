@@ -204,7 +204,7 @@ test('AC4: the planner texts in src and in the mod say the same rules about acce
   const src = readFileSync(new URL('../src/prompts.ts', import.meta.url), 'utf8')
   const mod = readFileSync(new URL('../mod/hooks/prompts.ts', import.meta.url), 'utf8')
   const rules = [
-    'write them as Given-When-Then statements in the task body and pass them as \\`acceptance\\`: Drove numbers them AC1…ACn, writes them into the brief, and the worker answers each in its done report; a reviewer or tester spawned with its own \\`acceptance\\` sees only those, so leave it out to give it the target\'s',
+    'write them as Given-When-Then statements${cairn ? \' in the task body\' : \'\'} and pass them as \\`acceptance\\`: Drove numbers them AC1…ACn, writes them into the brief, and the worker answers each in its done report; a reviewer or tester spawned with its own \\`acceptance\\` sees only those, so leave it out to give it the target\'s',
     'check it against the brief and each acceptance criterion (the done report lists them as \\`criteria\\`, met or unmet with evidence; a criterion it leaves unmet or unanswered is \\`changes\\`)',
   ]
   for (const rule of rules) {

@@ -1,6 +1,6 @@
 import { cairnEnv } from './cairn.ts'
 import { join } from 'node:path'
-import { modelLabelOf } from './agents.ts'
+import { modelLabelOf, runUsesCairn } from './agents.ts'
 import * as commands from './commands.ts'
 import * as paths from './paths.ts'
 import { LAB_RE } from './prompts.ts'
@@ -139,8 +139,8 @@ const claimBeater = (deps: Deps, identity: Identity, ports: ToolPorts) => {
       const previous = last
       last = now
       const run = await ports.loadRun(deps.home, identity.run)
-      // A Lab subject is not a claim target (DROVE-94), so a LAB run has nothing to beat.
-      if (!run?.cairn || LAB_RE.test(run.cairn)) {
+      // A Lab subject is not a claim target (DROVE-94), so a LAB run has nothing to beat; nor has a run without Cairn (DROVE-159).
+      if (!run?.cairn || LAB_RE.test(run.cairn) || !runUsesCairn(run, await commands.loadConfig(deps.home))) {
         last = previous
         return
       }

@@ -6,7 +6,7 @@ import * as commands from '../src/commands.ts'
 import * as deliver from '../src/deliver.ts'
 import { loadRun } from '../src/roster.ts'
 import type { Deps, ExecResult } from '../src/types.ts'
-import { FakeHerdr, makeDeps, makeRepo, RUN, seedRun, tmp } from './p3-helpers.ts'
+import { cairnProbe, FakeHerdr, makeDeps, makeRepo, RUN, seedRun, tmp } from './p3-helpers.ts'
 
 beforeEach(() => {
   Object.assign(deliver.confirmTiming, { waitMs: 30, pollMs: 5 })
@@ -35,6 +35,8 @@ const stubLab = (fake: FakeHerdr, instances: Record<string, Record<string, unkno
   const base = fake.exec
   fake.exec = async (argv, options) => {
     if (argv[0] !== 'cairn') return base(argv, options)
+    const probe = cairnProbe(argv)
+    if (probe) return probe
     calls.push([...argv])
     const flag = argv.indexOf('--instance')
     const instance = flag >= 0 ? argv[flag + 1] : undefined
@@ -128,7 +130,11 @@ test('a real cairn executable on PATH: --instance subject show --json is parsed'
     script,
     `#!/bin/sh
 echo "cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record" >&2
-if [ "$1 $2 $3 $4 $5" = "--instance croft subject show LAB-9" ]; then
+if [ "$1" = "--version" ]; then
+  echo "cairn 0.22.3"
+elif [ "$1" = "projects" ]; then
+  echo "LAB"
+elif [ "$1 $2 $3 $4 $5" = "--instance croft subject show LAB-9" ]; then
   printf '%s' '${JSON.stringify(LAB_SUBJECT).replace(/LAB-21/, 'LAB-9')}'
 else
   echo "No subject $5." >&2; exit 1

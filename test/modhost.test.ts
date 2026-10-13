@@ -21,7 +21,8 @@ const gitRepo = async (): Promise<string> => {
   return execFileSync('git', ['-C', repo, 'rev-parse', '--show-toplevel']).toString().trim()
 }
 
-const realDeps = async (): Promise<Deps> => ({ exec: nodeExec, clock: makeClock(), home: await mkdtemp(join(tmpdir(), 'drove-mod-home-')) })
+// Real git, but no real cairn: attach looks for Cairn (DROVE-159), and a test must not reach the user's instance.
+const realDeps = async (): Promise<Deps> => ({ exec: async (argv, options) => (argv[0] === 'cairn' ? { code: 127, stdout: '', stderr: 'not found' } : nodeExec(argv, options)), clock: makeClock(), home: await mkdtemp(join(tmpdir(), 'drove-mod-home-')) })
 
 test('attach creates a viaMod run with this session as the Claude planner, and re-attaches the same session', async () => {
   const deps = await realDeps()
@@ -207,4 +208,18 @@ test('the bridge stands down when another session holds the run, refuses a run n
     await saveRun(ctx.home, { ...run!, planner: { ...run!.planner, sessionId: 's-2' } })
   })
   assert.equal(await runBridge(ctx.deps, ctx.run.id, { sessionId: 's-1', watch: (() => ({ stop: () => {} })) as never }, moved, new AbortController().signal), EXIT.detached)
+})
+
+test('attach keeps a re-attached run\'s saved useCairn and never looks for cairn again; a new run is detected (DROVE-159)', async () => {
+  const deps = await realDeps()
+  const repo = await gitRepo()
+  const first = await attach(deps, { repo, sessionId: 's-1', paneId: 'w1:p1' })
+  const id = (first.ok ? (first.data as { run: { id: string } }).run.id : '')
+  assert.equal((await loadRun(deps.home, id))?.useCairn, false, 'no cairn on this fake host')
+  const cairnCalls: string[][] = []
+  const installed: Deps = { ...deps, exec: async (argv, options) => (argv[0] === 'cairn' ? (cairnCalls.push([...argv]), { code: 0, stdout: 'cairn 0.22.3', stderr: '' }) : deps.exec(argv, options)) }
+  const again = await attach(installed, { repo, sessionId: 's-1', paneId: 'w1:p7' })
+  assert.equal(again.ok && (again.data as { run: { id: string } }).run.id, id)
+  assert.equal((await loadRun(deps.home, id))?.useCairn, false)
+  assert.deepEqual(cairnCalls.filter(call => call[1] === '--version'), [])
 })

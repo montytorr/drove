@@ -315,6 +315,10 @@ export const seedRun = async (deps: Deps, repo: string, seats: Seat[] = [], over
   return run
 }
 
+// The two calls a run makes to see whether Cairn works on the host (DROVE-159): a cairn stand-in answers them as a working Cairn.
+export const cairnProbe = (argv: readonly string[]): ExecResult | undefined =>
+  argv[0] !== 'cairn' ? undefined : argv[1] === '--version' && argv.length === 2 ? { code: 0, stdout: 'cairn 0.22.3\n', stderr: '' } : argv[1] === 'projects' && argv.length === 2 ? { code: 0, stdout: 'DROVE\n', stderr: '' } : undefined
+
 // codexUserHome points at an empty folder, so no test reads the real ~/.codex.
 export const makeDeps = async (fake: FakeHerdr, prefix = 'deps'): Promise<Deps & { clock: ReturnType<typeof makeClock> }> => ({
   exec: fake.exec,

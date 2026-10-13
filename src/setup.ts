@@ -216,7 +216,7 @@ const leftFor = (doctor: DoctorReport, steps: StepResult[]): string[] => {
     ...(cli?.note ? [`${cli.note}: put ${dirname(cli.path)} first on PATH (shell profile), so drove runs this clone`] : []),
     ...(ok('herdr') && ok('herdr-server') ? [] : ['install herdr 0.9 or newer and start it (Drove never starts it)']),
     'sign in to Claude Code (claude, then /login) or Codex (codex login)',
-    ...(ok('cairn') ? [] : ['cairn setup --url <instance>']),
+    ...(ok('cairn') ? [] : [doctor.checks.find(item => item.id === 'cairn')?.status === 'fail' ? 'cairn setup --url <instance>' : 'optional, recommended: install Cairn and run cairn setup --url <instance>, for task tracking and shared memory']),
     ...(ok('gh') ? [] : ['gh auth login']),
     ...(steps.some(step => step.step === 'mod' && step.status === 'written') ? ['restart open Claude sessions so they load the mod'] : []),
     'trust each repo folder in Claude Code once: open claude in the repo and accept the folder-trust prompt',

@@ -1,5 +1,5 @@
 import { join } from 'node:path'
-import { detectRunAgents, modelLabelOf } from './agents.ts'
+import { detectRunAgents, detectRunCairn, modelLabelOf } from './agents.ts'
 import { EFFORTS, loadConfig } from './commands.ts'
 import { recordEvent } from './deliver.ts'
 import * as git from './git.ts'
@@ -66,8 +66,6 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
   const model = request.model ?? config.plannerModel.claude
   const effort = request.effort ?? config.plannerEffort
   const planner = { kind: 'claude' as const, paneId, sessionId: request.sessionId, model, effort, viaMod: true }
-  const agents = await detectRunAgents(deps)
-
   let existing: RunMeta | undefined
   if (request.run) {
     existing = await loadRun(deps.home, request.run)
@@ -78,9 +76,11 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
     existing = latest?.planner.viaMod && latest.planner.sessionId === request.sessionId ? latest : undefined
   }
 
+  const [agents, cairn] = await Promise.all([detectRunAgents(deps), detectRunCairn(deps, config.cairn, 'claude', existing?.useCairn)])
+  const { useCairn } = cairn
   let run: RunMeta
   if (existing) {
-    run = { ...existing, agents, goal: request.goal ?? existing.goal, ...(request.budget ? { budget: request.budget } : {}), planner }
+    run = { ...existing, agents, useCairn, goal: request.goal ?? existing.goal, ...(request.budget ? { budget: request.budget } : {}), planner }
   } else {
     const base = await git.baseRef(deps.exec, repo).catch(() => undefined)
     if (!base) return failed('no-base', `no main or master branch found in ${repo}`)
@@ -94,6 +94,7 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
       createdAt: now.toISOString(),
       status: 'up',
       agents,
+      useCairn,
       ...(request.goal ? { goal: request.goal } : {}),
       budget: request.budget ?? config.budget,
       planner,
@@ -103,7 +104,7 @@ export const attach = async (deps: Deps, request: AttachRequest): Promise<Comman
   await updateRoster(deps.home, run.id, roster => roster)
   await recordEvent(deps, run.id, { type: 'run.up', data: { planner: 'claude', pane: paneId, viaMod: true, attached: Boolean(existing) } })
   if (existing && request.goal && request.goal !== existing.goal) await recordEvent(deps, run.id, { type: 'goal.set', data: { goal: request.goal, ...(existing.goal ? { previous: existing.goal } : {}) } })
-  return ok(`Run ${run.id} is up with this session as its planner${existing ? ' (re-attached)' : ''}.`, { run })
+  return ok(`Run ${run.id} is up with this session as its planner${existing ? ' (re-attached)' : ''}.${cairn.warning ? ` ${cairn.warning}` : ''}`, { run })
 }
 
 // ---------- report (the worker's mcp__orchestrator__report alias) ----------

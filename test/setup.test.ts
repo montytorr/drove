@@ -252,3 +252,11 @@ test('a settings.json that is a link is written through to its target', async ()
   assert.ok((await lstat(m.settings)).isSymbolicLink())
   assert.equal(JSON.parse(await readFile(join(dotfiles, 'settings.json'), 'utf8')).env.CLAUDE_CODE_PLUGIN_DIRS, join(m.droveRoot, 'mod'))
 })
+
+test('the left-for-you cairn line follows the doctor: optional on warn, required on fail, gone on ok', async () => {
+  const withCairn = (status: 'ok' | 'warn' | 'fail'): DoctorReport => ({ ...DOCTOR, checks: [...DOCTOR.checks, { id: 'cairn', status, detail: 'cairn' }] })
+  const leftWith = async (status: 'ok' | 'warn' | 'fail') => (await runJson((await machine({ doctor: async () => withCairn(status) })).deps, { dryRun: true })).result.left.filter(item => /cairn/i.test(item))
+  assert.deepEqual(await leftWith('ok'), [])
+  assert.deepEqual(await leftWith('warn'), ['optional, recommended: install Cairn and run cairn setup --url <instance>, for task tracking and shared memory'])
+  assert.deepEqual(await leftWith('fail'), ['cairn setup --url <instance>'])
+})

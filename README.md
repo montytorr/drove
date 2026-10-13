@@ -59,13 +59,13 @@ There is no daemon. The planner's own MCP server (or, for a Claude planner with 
 
 ## Requirements
 
-- **[Cairn](https://cairn.montytorr.com)**, signed in. Drove has no work queue of its own: every worker is spawned with one Cairn task ref (`--cairn APP-12`) and claims it. The planner's tool calls keep the run's own Cairn claim alive (at most one `cairn beat` every 10 minutes), so a long run does not lose its task.
 - Node 22.18 or newer. Drove runs its TypeScript directly, so there is no build step.
 - herdr 0.9 or newer, with its server running. An attached planner runs inside a herdr pane (`HERDR_ENV=1`).
 - `claude` and/or `codex` on `PATH`, signed in.
 - `gh`, signed in, only for `drove merge --pr`.
+- **[Cairn](https://cairn.montytorr.com)**, signed in: optional, recommended. With it, each worker is spawned with one Cairn task ref (`--cairn APP-12`) and claims it, workers note their dead ends and findings on it, the planner checks what is already answered before it plans, and its tool calls keep the run's own claim alive (at most one `cairn beat` every 10 minutes). Without it you lose those claims and notes, `drove plan --from-cairn` and `--next`, and Lab subjects; the planner tracks each piece by its seat name, its brief and the run goal instead, and no agent is told to run `cairn`. Drove looks for the `cairn` CLI when a run starts and keeps that answer for the run's life (a failed read only warns, so a network blip never turns Cairn off); the `cairn` setting below can require it or turn it off.
 
-`drove doctor` checks all of this (and that the mod is installed) and prints a one-line fix for anything missing.
+`drove doctor` checks all of this (and that the mod is installed) and prints a one-line fix for anything missing. A missing Cairn is a warning, not a failure, unless `cairn` is `on`.
 
 ## Install
 
@@ -130,7 +130,7 @@ drove board                        # in a spare pane
 
 **The goal.** Without `--goal`, the first prompt you type becomes the goal (its first line, up to 120 characters). The planner keeps it true afterwards with `set_goal` (`drove goal`) when it is vague or your ask moves on; the board header shows it.
 
-**Runs from Cairn.** `--from-cairn` and `--next` need an open task; `--goal` cannot be combined with them. The planner holds that task, and `drove down` writes a summary note on it: seats, branches, cost and rework, what is still open.
+**Runs from Cairn.** `--from-cairn` and `--next` need Cairn (they refuse with code `cairn` on a run without it, before anything is created) and an open task; `--goal` cannot be combined with them. The planner holds that task, and `drove down` writes a summary note on it: seats, branches, cost and rework, what is still open.
 
 **Lab subjects.** `--from-cairn LAB-21` reads the subject from the `croft` instance (`labInstance` changes it). The goal is "LAB-21: <title>", each open todo gets a worker spawned with its own ref, and the run never closes the subject: that needs your conclusion.
 
@@ -200,6 +200,7 @@ State lives in `~/.drove` (`DROVE_HOME` overrides it): one folder per run with `
 | `claudeChannel` | `config.json` | `false` | wake a Claude planner without the mod through the development channel instead of keystrokes |
 | `codexWorkerSandbox` | `config.json` | `bypass` | `workspace-write` runs Codex workers in Codex's sandbox |
 | `codexBypassHookTrust` | `config.json` | `false` | let Codex seats skip the hook-review question for Drove's hooks |
+| `cairn` | `config.json` | `auto` | whether runs use Cairn: `auto` (when the `cairn` CLI is on `PATH` as the run starts; a failed read warns and keeps Cairn), `on` (required: `drove doctor` fails without it) or `off` (never run, even when installed); any other value counts as `auto` |
 | `labInstance` | `config.json` | `croft` | the Cairn instance that holds Lab subjects |
 | `workerEnv`, `workerPorts`, `workerCopy` | `config.json` | unset | per-seat environment, ports and copied files ([isolation](docs/isolation.md)) |
 | `workerMcp`, `workerPlugins`, `workerSkills`, `workerAgents`, `workerUserMemory`, `workerUserHooks` | `config.json` | everything loaded | what a Claude or Codex worker loads ([lean workers](docs/lean-workers.md)) |

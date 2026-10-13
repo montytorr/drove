@@ -46,6 +46,9 @@ const depsWith = (overrides: Record<string, ExecResult> = {}, extra: Partial<Doc
 
 const statusOf = (checks: { id: string; status: string }[], id: string) => checks.find(item => item.id === id)?.status
 
+// A config.json in Drove's home with this cairn setting (DROVE-159).
+const withCairnSetting = (deps: DoctorDeps, cairn: unknown): DoctorDeps => ({ ...deps, readText: async path => (path === `${deps.home}/config.json` ? JSON.stringify({ cairn }) : deps.readText(path)) })
+
 test('a healthy machine is ready and every check is ok', async () => {
   const report = await runDoctor(depsWith())
   assert.equal(report.ok, true)
@@ -119,10 +122,13 @@ test('gh missing or signed out warns, never fails', async () => {
   assert.equal(out.ok, true)
 })
 
-test('cairn missing or unable to read fails', async () => {
-  assert.equal(statusOf((await runDoctor(depsWith({ 'cairn --version': MISSING }))).checks, 'cairn'), 'fail')
+test('cairn missing or unable to read warns, since Cairn is optional', async () => {
+  const missing = await runDoctor(depsWith({ 'cairn --version': MISSING }))
+  assert.equal(statusOf(missing.checks, 'cairn'), 'warn')
+  assert.equal(missing.ok, true)
+  assert.match(missing.checks.find(item => item.id === 'cairn')?.detail ?? '', /optional: task tracking and shared memory/)
   const unread = await runDoctor(depsWith({ 'cairn projects': FAIL('401 unauthorized') }))
-  assert.equal(statusOf(unread.checks, 'cairn'), 'fail')
+  assert.equal(statusOf(unread.checks, 'cairn'), 'warn')
   assert.match(unread.checks.find(item => item.id === 'cairn')?.detail ?? '', /401/)
 })
 
@@ -176,7 +182,7 @@ test('the mod check reads the settings env (with ~) and the process env, and war
 })
 
 test('a failed report prints the fix lines and a count', async () => {
-  const report = await runDoctor(depsWith({ 'cairn --version': MISSING }))
+  const report = await runDoctor(withCairnSetting(depsWith({ 'cairn --version': MISSING }), 'on'))
   assert.equal(report.ok, false)
   assert.match(formatReport(report), /fix: .*cairn setup/)
   assert.match(formatReport(report), /1 failed/)
@@ -224,4 +230,34 @@ test('doctor Cairn calls choose a detected host runtime and name the missing-key
     if (previous === undefined) delete process.env.CAIRN_AGENT
     else process.env.CAIRN_AGENT = previous
   }
+})
+
+test('AC5: no cairn and no cairn setting: the cairn check is warn and the report is ok', async () => {
+  const report = await runDoctor(depsWith({ 'cairn --version': MISSING }))
+  assert.equal(statusOf(report.checks, 'cairn'), 'warn')
+  assert.equal(report.ok, true)
+  assert.match(formatReport(report), /^ready, \d+ warnings?$/m)
+  const auto = await runDoctor(withCairnSetting(depsWith({ 'cairn --version': MISSING }), 'auto'))
+  assert.equal(statusOf(auto.checks, 'cairn'), 'warn')
+})
+
+test('the cairn setting on makes a missing or unreadable cairn fail', async () => {
+  const missing = await runDoctor(withCairnSetting(depsWith({ 'cairn --version': MISSING }), 'on'))
+  assert.equal(statusOf(missing.checks, 'cairn'), 'fail')
+  assert.equal(missing.ok, false)
+  assert.match(missing.checks.find(item => item.id === 'cairn')?.detail ?? '', /the cairn setting is on/)
+  assert.equal(statusOf((await runDoctor(withCairnSetting(depsWith({ 'cairn projects': FAIL('401') }), 'on'))).checks, 'cairn'), 'fail')
+  assert.equal(statusOf((await runDoctor(withCairnSetting(depsWith(), 'on'))).checks, 'cairn'), 'ok')
+})
+
+test('the cairn setting off is ok and never runs cairn; a bad value counts as auto and says so', async () => {
+  const calls: string[] = []
+  const base = withCairnSetting(depsWith(), 'off')
+  const report = await runDoctor({ ...base, exec: async (argv, options) => (calls.push(argv.join(' ')), base.exec(argv, options)) })
+  assert.equal(statusOf(report.checks, 'cairn'), 'ok')
+  assert.match(report.checks.find(item => item.id === 'cairn')?.detail ?? '', /off/)
+  assert.deepEqual(calls.filter(call => call.startsWith('cairn')), [])
+  const bad = await runDoctor(withCairnSetting(depsWith(), 'yes'))
+  assert.equal(statusOf(bad.checks, 'cairn'), 'warn')
+  assert.match(bad.checks.find(item => item.id === 'cairn')?.detail ?? '', /"yes" is not auto, on or off/)
 })

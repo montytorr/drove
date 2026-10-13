@@ -36,6 +36,8 @@ export type DroveConfig = {
   plannerEffort: Effort
   workerModel: Record<AgentKind, string>
   workerKind?: 'auto' | 'claude' | 'codex'
+  // Whether runs use Cairn: auto detects it on the host, on requires it, off never runs it (DROVE-159).
+  cairn?: 'auto' | 'on' | 'off'
   workerEffort: Effort
   promotedModel: Record<AgentKind, string>
   budget: number
@@ -96,6 +98,8 @@ export type RunMeta = {
   budget: number
   planner: PlannerMeta
   agents?: HostAgents
+  // False when the run has no Cairn (none on the host, or the cairn setting is off); a run saved before DROVE-159 has none and uses it.
+  useCairn?: boolean
 }
 
 export type LastReport = {

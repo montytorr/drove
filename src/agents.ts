@@ -1,8 +1,9 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { cairnEnv, cairnKeyHint } from './cairn.ts'
 import { userCodexHome } from './paths.ts'
-import type { AgentKind, Deps, Exec, HostAgent, HostAgents } from './types.ts'
+import type { AgentKind, Deps, DroveConfig, Exec, HostAgent, HostAgents, RunMeta } from './types.ts'
 
 export type AgentDeps = {
   exec: Exec
@@ -86,3 +87,40 @@ export const detectRunAgents = async (deps: Deps): Promise<HostAgents | undefine
 // A display fallback only: stored models stay empty so a default Codex launch never gains -m.
 export const modelLabelOf = (kind: AgentKind, model: string, agents?: HostAgents): string =>
   model || (kind === 'codex' ? agents?.codex?.model ?? '' : '')
+
+export type CairnDetection = { useCairn: boolean; warning?: string }
+
+const firstLineOf = (text: string): string => (text.split('\n').map(line => line.trim()).find(Boolean) ?? 'no output').slice(0, 160)
+
+// Cairn is on the host when its CLI runs (DROVE-159). Its server is remote, so a failed read is a blip to warn about, never a
+// reason to run without Cairn: the run keeps it, and its cairn calls degrade as they always have.
+export const probeCairn = async (exec: Exec, kind?: AgentKind): Promise<CairnDetection> => {
+  try {
+    if ((await exec(['cairn', '--version'], { timeoutMs: 10_000, env: cairnEnv(kind) })).code !== 0) return { useCairn: false }
+  } catch {
+    return { useCairn: false }
+  }
+  try {
+    const read = await exec(['cairn', 'projects'], { timeoutMs: 10_000, env: cairnEnv(kind) })
+    if (read.code === 0) return { useCairn: true }
+    const output = `${read.stderr}\n${read.stdout}`
+    return { useCairn: true, warning: `Warning: cairn is installed but a read failed (${firstLineOf(output)}${cairnKeyHint(output)}); the run keeps Cairn.` }
+  } catch (error) {
+    return { useCairn: true, warning: `Warning: cairn is installed but a read failed (${firstLineOf(error instanceof Error ? error.message : String(error))}); the run keeps Cairn.` }
+  }
+}
+
+// Whether a run uses Cairn, decided once: a run that saved useCairn keeps it (a later outage must not flip it mid-run), and
+// only a new run or one saved before DROVE-159 is detected. on and off never run cairn; auto asks the host.
+export const detectRunCairn = async (deps: Pick<Deps, 'exec'>, setting: DroveConfig['cairn'] = 'auto', kind?: AgentKind, saved?: boolean): Promise<CairnDetection> =>
+  saved !== undefined ? { useCairn: saved } : setting === 'on' ? { useCairn: true } : setting === 'off' ? { useCairn: false } : probeCairn(deps.exec, kind)
+
+// The setting wins over what a run saved: off never uses Cairn, on always does. A run saved before DROVE-159 has no useCairn and keeps it.
+export const runUsesCairn = (run: Pick<RunMeta, 'useCairn'>, config?: Pick<DroveConfig, 'cairn'>): boolean =>
+  config?.cairn === 'off' ? false : config?.cairn === 'on' ? true : run.useCairn !== false
+
+// Why a run has no Cairn, for the refusals that need it.
+export const noCairnReason = (config: Pick<DroveConfig, 'cairn'>): string =>
+  config.cairn === 'off'
+    ? 'the cairn setting is off in ~/.drove/config.json'
+    : 'the cairn setting is auto and no cairn CLI was found on this host when the run started (drove doctor)'

@@ -6,7 +6,7 @@ import * as commands from '../src/commands.ts'
 import * as deliver from '../src/deliver.ts'
 import { loadRoster, loadRun } from '../src/roster.ts'
 import type { Deps, ExecResult, Identity } from '../src/types.ts'
-import { FakeHerdr, makeDeps, makeRepo, RUN, seedRun, tmp } from './p3-helpers.ts'
+import { cairnProbe, FakeHerdr, makeDeps, makeRepo, RUN, seedRun, tmp } from './p3-helpers.ts'
 
 beforeEach(() => {
   Object.assign(deliver.confirmTiming, { waitMs: 30, pollMs: 5 })
@@ -25,6 +25,8 @@ const stubCairn = (fake: FakeHerdr, tasks: Record<string, Task>, next: string[] 
   const base = fake.exec
   fake.exec = async (argv, options) => {
     if (argv[0] !== 'cairn') return base(argv, options)
+    const probe = cairnProbe(argv)
+    if (probe) return probe
     calls.push([...argv])
     const [, verb, ref] = argv
     const reply = (stdout: string, code = 0, stderr = ''): ExecResult => ({ code, stdout, stderr: `${NOISE}${stderr}` })
@@ -272,6 +274,8 @@ test('a real cairn executable on PATH is read as JSON, so the goal comes from it
     `#!/bin/sh
 echo "cairn: acme could not be checked (stale project cache); routing DROVE to personal on its own record" >&2
 case "$1 $2" in
+  "--version ") echo "cairn 0.22.3" ;;
+  "projects ") echo "DROVE" ;;
   "show DROVE-9") printf '%s' '{"ref":"DROVE-9","title":"From PATH","status":"todo","description":"Real body"}' ;;
   *) echo "No task $2." >&2; exit 1 ;;
 esac
@@ -315,6 +319,8 @@ test('plan Cairn reads carry the planner kind and preserve an explicit CAIRN_AGE
       fake.exec = async (argv, options) => {
         if (argv[0] !== 'cairn') return base(argv, options)
         agent = options?.env?.CAIRN_AGENT
+        const probe = cairnProbe(argv)
+        if (probe) return (assert.equal(agent, expected, 'the Cairn detection carries the planner kind too'), probe)
         return { code: 1, stdout: '', stderr: 'CAIRN_API_KEY is not set (~/.cairn/instances/croft/env).' }
       }
       const deps = await makeDeps(fake)
