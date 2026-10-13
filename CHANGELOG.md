@@ -4,6 +4,11 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- A Claude worker never runs outside its worktree: before its brief goes in, Drove checks that the worktree exists and that herdr's foreground cwd for the pane is inside it. If not, the spawn fails with `no-worktree`, the screen is saved to `start-failure.txt` and the pane is closed, instead of a note and a brief delivered to a worker in the base checkout (DROVE-147).
+- A Claude worker stopped at the folder-trust prompt at start is `blocked` with a `trust` attention naming the repo root and the one-time fix, and keeps its pane; it is no longer retried, timed out and marked `gone`. Drove holds the brief and, from the watcher, delivers it once the prompt clears and the worktree is verified; trust given outside the pane, or a pane that dies, gets one relaunch with the same name, branch and brief (DROVE-147).
+- Preflight: Drove reads `projects[<root>].hasTrustDialogAccepted` in `~/.claude.json` for the repo's canonical root (or a parent), read-only. `drove plan` warns when it is not true, and a Claude `spawn` is refused with `untrusted-repo` and the fix; Codex spawns are unaffected (DROVE-147).
+- Respawning a seat under the name of one that went `gone` closes its open `gone` item in `attention.json`, and a `gone` item for a seat with no recorded pane says its pane never started instead of printing `?` (DROVE-147).
+
 ## [0.6.0] - 2026-10-13
 
 Planners keep their Cairn claim through long runs, Ctrl-C cleans up child processes, and Cairn kind labels steer the choice of worker.

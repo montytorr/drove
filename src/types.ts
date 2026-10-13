@@ -159,10 +159,14 @@ export type Seat = {
   owes: Expects
   hasNudged?: boolean
   pendingPromote?: { model: string; effort: Effort; reason?: string }
+  // DROVE-147: a Claude seat that stopped at a startup dialog holds its brief here until the dialog clears and its worktree is verified.
+  pendingStart?: PendingStart
   restartingSince?: string
   migratedFrom?: { kind: AgentKind; sessionId?: string; model: string; at: string; reason?: string }
   attention: Attention[]
 }
+
+export type PendingStart = { since: string; via: 'prompt' | 'launch-arg'; root?: string; base?: string; clearedAt?: string; relaunched?: boolean }
 
 export type Roster = {
   v: 1

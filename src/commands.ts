@@ -1,12 +1,12 @@
 import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readdir, readFile, realpath, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
 import { detectRunAgents, modelLabelOf } from './agents.ts'
-import { attentionCandidates, type AttentionDelta, attentionLine, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
+import { attentionCandidates, type AttentionDelta, attentionLine, closeItems, diffItems, PANE_BUDGET_REASON, settleItems } from './attention.ts'
 import { applyDerived, deriveState, EXIT_WAIT_MS, findDialog, isRestarting, matchDialog, reviewLoopText, shouldReadScreen } from './detect.ts'
 import { type CheckPlan, checksOf, renderOutcome, repoVerifyCommands, reusedText, runChecks } from './checks.ts'
 import { BUSY_RETRY_MS, POINTER_LINES, briefForSend, confirmedByHook, deliverControl, herdrPromptAdapter, isDeliverable, plannerSessionId, recordEvent } from './deliver.ts'
@@ -25,8 +25,9 @@ import { type Folded, readFolded } from './pending.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { steeringNotes } from './steer.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, writeJsonAtomic, writeToken } from './store.ts'
+import { canonicalRoot, readRepoTrust, type RepoTrust, trustAttentionText, untrustedText } from './trust.ts'
 import type {
-  AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HostAgents, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
+  AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HostAgents, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PendingStart, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
 
 export type PlanRequest = { repo: string; kind: AgentKind; model?: string; effort?: Effort; goal?: string; run?: string; cairn?: string; next?: string; detached?: boolean; json?: boolean }
@@ -154,7 +155,7 @@ export const nodeExec: Exec = (argv, options = {}) =>
     child.stdin.end(options.input ?? '')
   })
 
-export const defaultDeps = (env: NodeJS.ProcessEnv = process.env): Deps => ({ exec: nodeExec, clock: { now: () => new Date() }, home: defaultHome(env) })
+export const defaultDeps = (env: NodeJS.ProcessEnv = process.env): Deps => ({ exec: nodeExec, clock: { now: () => new Date() }, home: defaultHome(env), claudeUserConfig: userClaudeConfig(env) })
 
 export const identityOrPlanner = (env: NodeJS.ProcessEnv = process.env): Identity =>
   identityFromEnv(env) ?? { home: defaultHome(env), run: '', role: 'planner', seat: PLANNER_SEAT }
@@ -855,6 +856,9 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     config,
   )
   const spec = specFor(launch)
+  // DROVE-147: Claude workers start at the repo root, so a root Claude has not trusted stops each one at the trust prompt.
+  const trust = config.workerKind !== 'codex' ? await repoTrustOf(deps, repo) : undefined
+  const trustWarning = trust?.state === 'untrusted' ? ` Warning: ${untrustedText(trust)}` : ''
   if (isDetached) {
     const opened = await openDetachedWorkspace(deps, run, spec.env)
     if ('code' in opened) return abandonDetached(deps, run, previous, opened)
@@ -864,10 +868,10 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     await writeLaunchFiles(spec)
     const started = await startDetachedPlanner(deps, run, spec, opened.paneId, typedPrompt)
     if ('code' in started) return abandonDetached(deps, run, previous, started, opened.workspaceId)
-    return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.`)
+    return detachedResult(run, opened, started, request.json === true, `Run ${run.id} is up in its own herdr workspace ${opened.workspaceId}; the ${kind} planner is ${started.state}${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.${trustWarning}`)
   }
   await writeLaunchFiles(spec)
-  return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
+  return ok(`Run ${run.id} is up; starting the ${kind} planner${goalTask ? ` on ${LAB_RE.test(goalTask.ref) ? 'Lab subject' : 'Cairn task'} ${goalTask.ref}` : ''}.${trustWarning}`, { argv: execArgv(spec), env: spec.env, cwd: spec.cwd } satisfies ProcessPlan)
 }
 
 // ---------- spawn ----------
@@ -923,23 +927,30 @@ const awaitShellPrompt = async (deps: Deps, paneId: string): Promise<boolean> =>
   return false
 }
 
-type StartAttempt = { started: herdr.HerdrResult<string>; adopted: Adopted | undefined; paneId: string; createdTab: string | undefined }
+type StartAttempt = { started: herdr.HerdrResult<string>; adopted: Adopted | undefined; dialog?: Attention['reason']; paneId: string; createdTab: string | undefined }
 
-// Waits for the shell, starts the agent and, when it never shows up, resets the pane once and tries again.
+const dialogOnPane = async (deps: Deps, paneId: string): Promise<Attention['reason'] | undefined> => {
+  const screen = await herdr.readPane(deps.exec, paneId, 40, 'visible')
+  return screen.ok ? findDialog(screen.value)?.reason : undefined
+}
+
+// Waits for the shell, starts the agent and, when it never shows up, resets the pane once and tries again. An agent
+// that is up at a startup dialog (the folder-trust prompt, DROVE-147) is not lost: a fresh pane would only ask again.
 const startWithRetry = async (
   deps: Deps,
   run: RunMeta,
   start: { seat: string; kind: AgentKind; argv: readonly string[]; paneId: string; createdTab?: string; place: () => Promise<Placement | CommandResult> },
 ): Promise<StartAttempt> => {
-  const attempt = async (paneId: string): Promise<Pick<StartAttempt, 'started' | 'adopted'>> => {
+  const attempt = async (paneId: string): Promise<Pick<StartAttempt, 'started' | 'adopted' | 'dialog'>> => {
     await awaitShellPrompt(deps, paneId)
     const name = herdr.agentName(run.id, start.seat)
     const started = await herdr.retryWhileBusy(deps.exec, herdr.agentStartArgv(name, start.kind, paneId, start.argv), BUSY_RETRY_MS)
     const adopted = !started.ok && started.code !== 'agent_not_ready' ? await adoptFailedStart(deps, name, start.kind, paneId) : undefined
-    return { started, adopted }
+    const dialog = !started.ok && !adopted && started.code !== 'agent_not_ready' ? await dialogOnPane(deps, paneId) : undefined
+    return { started, adopted, ...(dialog ? { dialog } : {}) }
   }
   const first = await attempt(start.paneId)
-  const isLost = !first.started.ok && !first.adopted && first.started.code !== 'agent_not_ready'
+  const isLost = !first.started.ok && !first.adopted && !first.dialog && first.started.code !== 'agent_not_ready'
   const result: StartAttempt = { ...first, paneId: start.paneId, createdTab: start.createdTab }
   if (!isLost) return result
   await recordEvent(deps, run.id, { type: 'seat.state', seat: start.seat, data: { startRetry: true, code: first.started.ok ? '' : first.started.code, pane: start.paneId } })
@@ -1032,6 +1043,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   if (!kind) return failed('agent-unavailable', 'neither claude nor codex is on this host (drove doctor)')
   const unavailable = requireAgent(run, kind)
   if (unavailable) return unavailable
+  const trust = kind === 'claude' ? await repoTrustOf(deps, run.repo) : undefined
+  if (trust?.state === 'untrusted') return failed('untrusted-repo', untrustedText(trust))
   const cairnCheck = request.cairn ? await checkSpawnCairn(deps, request.cairn) : {}
   if ('error' in cairnCheck) return cairnCheck.error
   const targetSeat = request.target ? findSeat(await loadRoster(deps.home, run.id), request.target) : undefined
@@ -1087,6 +1100,8 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     }
     throw error
   }
+  // A seat respawned under the name of one that went gone is no longer gone (DROVE-147).
+  await closeItems(deps.home, run.id, [`${seat.name}:gone`])
 
   let isWorktreeNew = false
   const rollback = async (paneId: string | undefined, createdTab: string | undefined): Promise<void> => {
@@ -1177,27 +1192,42 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
     await rollback(undefined, undefined)
     return placement
   }
-  const { started, adopted, paneId, createdTab } = await startWithRetry(deps, run, {
+  const { started, adopted, dialog: startDialog, paneId, createdTab } = await startWithRetry(deps, run, {
     seat: seat.name, kind, argv: spec.argv, paneId: placement.paneId, createdTab: placement.createdTab,
     place: () => placePane(deps, run, placed, launchCwd, spec.env),
   })
   const live = started.ok ? await herdr.getAgent(deps.exec, paneId) : undefined
   const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
 
-  if (!started.ok && started.code === 'agent_not_ready') {
+  if (!started.ok && (started.code === 'agent_not_ready' || startDialog)) {
     const screen = await herdr.readScreen(deps.exec, paneId, 40, 'visible')
     const dialog = screen.ok ? matchDialog(seat.name, screen.value, now) : undefined
-    const attention = dialog ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at: iso }
-    await updateRoster(deps.home, run.id, current => upsertSeat(current, { ...seat, paneId, state: 'blocked', attention: [attention] }))
-    await recordEvent(deps, run.id, { type: 'attention', seat: seat.name, data: { reason: attention.reason } })
-    if (isViaPrompt) await queueBrief(deps, run, seat.name, briefText, config)
-    return ok(`Worker ${seat.name} started in pane ${paneId} but stopped on a dialog (${attention.reason}): ${attention.detail} ${isViaPrompt ? 'The brief is queued.' : 'The brief is part of its launch and runs once the dialog is answered.'}`, { state: 'blocked', paneId })
+    const stopped: Attention = dialog ?? { seat: seat.name, reason: startDialog ?? 'dialog', detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at: iso }
+    // DROVE-147: a Claude worker at a dialog has not made its worktree yet, so its brief waits for applyPendingStarts.
+    const root = isClaude && stopped.reason === 'trust' ? trust?.root ?? (await canonicalRoot(deps.exec, run.repo)) : undefined
+    const attention = root ? { ...stopped, detail: trustAttentionText(root, paneId) } : stopped
+    const pendingStart: PendingStart | undefined = isClaude ? { since: iso, via: isViaPrompt ? 'prompt' : 'launch-arg', ...(root ? { root } : {}), ...(claudeBase ? { base: claudeBase } : {}) } : undefined
+    await updateRoster(deps.home, run.id, current => upsertSeat(current, { ...seat, paneId, state: 'blocked', attention: [attention], ...(pendingStart ? { pendingStart } : {}) }))
+    await recordEvent(deps, run.id, { type: 'attention', seat: seat.name, data: { reason: attention.reason, pane: paneId, ...(root ? { root } : {}) } })
+    if (isViaPrompt && !isClaude) await queueBrief(deps, run, seat.name, briefText, config)
+    const held = isClaude
+      ? isViaPrompt ? 'Drove holds the brief and delivers it once the dialog clears and the worktree is there; no command is needed.' : 'The brief is part of its launch and runs once the dialog is answered; Drove then checks the worktree.'
+      : isViaPrompt ? 'The brief is queued.' : 'The brief is part of its launch and runs once the dialog is answered.'
+    return ok(`Worker ${seat.name} started in pane ${paneId} but stopped on a dialog (${attention.reason}): ${attention.detail} ${held}`, { state: 'blocked', paneId })
   }
   if (!started.ok && !adopted) {
     await rollback(paneId, createdTab)
     return failed('herdr', `herdr could not start ${kind} in pane ${paneId}, so the pane was closed again and no worker exists: ${clip(started.output)}.${captured ? hintText(captured) : ''}`)
   }
 
+  if (isClaude) {
+    const outside = await claudeOutsideWorktree(deps, worktree, paneId, timing.worktreeWaitMs)
+    if (outside) {
+      const failure = await captureStartFailure(deps, run, seat.name, paneId, { code: 'no-worktree', output: outside })
+      await rollback(paneId, createdTab)
+      return failed('no-worktree', `${outside}, so ${seat.name} would work in the base checkout: no brief was delivered and pane ${paneId} was closed.${hintText(failure)}`)
+    }
+  }
   if (isClaude && claudeBase) baseNotes.push(...(await alignClaudeWorktree(deps, worktree, branch, claudeBase)))
   if (isClaude && copyPlan && copyPlan.files.length > 0 && existsSync(worktree)) baseNotes.push(...copyNotes({ files: [], refused: [] }, await applyCopy(run.repo, worktree, copyPlan.files)))
 
@@ -1224,10 +1254,24 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
   return ok(`${isReview ? `${role === 'reviewer' ? 'Reviewer' : 'Tester'}` : 'Worker'} ${seat.name} (${kind}${modelLabel ? ` ${modelLabel}` : ''} ${effort}${isReview ? `, ${role === 'reviewer' ? 'reviewing' : 'testing'} ${request.target}` : ''}) is running in pane ${paneId}, worktree ${worktree} on branch ${branch}. Brief: ${via}. Its reports will come to you.${startNote ? ` Note: ${startNote}` : ''}${baseNotes.map(note => ` Note: ${note}`).join('')}`, { paneId, worktree, branch, model: modelLabel })
 }
 
+const repoTrustOf = async (deps: Deps, repo: string): Promise<RepoTrust | undefined> =>
+  deps.claudeUserConfig ? readRepoTrust(deps.claudeUserConfig, await canonicalRoot(deps.exec, repo)) : undefined
+
+const realOf = async (path: string): Promise<string> => realpath(path).catch(() => resolve(path))
+
+// DROVE-147: a Claude worker whose worktree never appeared runs in the base checkout (it started from the repo root),
+// so it must not get a brief. herdr's foreground cwd is checked too when herdr reports it.
+const claudeOutsideWorktree = async (deps: Deps, worktree: string, paneId: string, waitMs: number): Promise<string | undefined> => {
+  for (let waited = 0; !existsSync(worktree) && waited < waitMs; waited += timing.pollMs) await sleep(timing.pollMs)
+  if (!existsSync(worktree)) return `Claude's worktree ${worktree} did not appear${waitMs > 0 ? ` within ${Math.round(waitMs / 1000)}s` : ''}`
+  const cwd = await herdr.paneForegroundCwd(deps.exec, paneId)
+  if (!cwd.ok || !cwd.value) return undefined
+  const [inside, home] = await Promise.all([realOf(cwd.value), realOf(worktree)])
+  return inside === home || inside.startsWith(`${home}${sep}`) ? undefined : `pane ${paneId} runs in ${cwd.value}, outside Claude's worktree ${worktree}`
+}
+
 // Claude creates its worktree from origin/main once the agent is up; bring it to the run base before the brief goes in.
 const alignClaudeWorktree = async (deps: Deps, worktree: string, branch: string, base: string): Promise<string[]> => {
-  for (let waited = 0; !existsSync(worktree) && waited < timing.worktreeWaitMs; waited += timing.pollMs) await sleep(timing.pollMs)
-  if (!existsSync(worktree)) return [`Claude's worktree ${worktree} did not appear within ${Math.round(timing.worktreeWaitMs / 1000)}s, so ${branch} was not moved to ${base}; run \`git merge --ff-only ${base}\` in it if the base matters.`]
   const moved = await git.fastForwardToBase(deps.exec, worktree, base)
   switch (moved.outcome) {
     case 'at-base': return []
@@ -1499,6 +1543,147 @@ export const applyPendingPromotes = async (deps: Deps, run: RunMeta): Promise<Co
     if (pending) results.push(await promote(deps, identity, { seat: seat.name, ...pending }))
   }
   return results
+}
+
+// ---------- pending starts ----------
+
+// DROVE-147: a Claude seat that stopped at a startup dialog gets its brief once the dialog has cleared and its worktree
+// is there with the pane inside it. The watcher runs this on each flush, like applyPendingPromotes. A pane that died, or
+// a folder-trust prompt that was accepted outside the pane, gets one relaunch with the same name, branch and brief.
+export const applyPendingStarts = async (deps: Deps, run: RunMeta): Promise<CommandResult[]> => {
+  const waiting = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.pendingStart && !['closed', 'closing', 'down'].includes(seat.state))
+  const results: CommandResult[] = []
+  for (const seat of waiting) {
+    const result = await continueStart(deps, run, seat)
+    if (result) results.push(result)
+  }
+  return results
+}
+
+const savedBrief = async (deps: Deps, run: string, seat: string): Promise<string | undefined> =>
+  (await readFile(join(seatDir(deps.home, run, seat), 'brief.md'), 'utf8').catch(() => undefined))?.replace(/\n$/, '')
+
+const withoutPendingStart = (seat: Seat): Seat => {
+  const { pendingStart: _done, restartingSince: _since, ...rest } = seat
+  return rest
+}
+
+const endPendingStart = async (deps: Deps, run: RunMeta, seat: Seat, detail: string): Promise<CommandResult> => {
+  const iso = deps.clock.now().toISOString()
+  await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...withoutPendingStart(findSeat(roster, seat.name) ?? seat), state: 'gone', stateAt: iso, attention: [{ seat: seat.name, reason: 'gone', detail, at: iso }] }))
+  return failed('start', detail)
+}
+
+const continueStart = async (deps: Deps, run: RunMeta, seat: Seat): Promise<CommandResult | undefined> => {
+  const pending = seat.pendingStart
+  const now = deps.clock.now()
+  if (!pending || isRestarting(seat, now)) return undefined
+  const pane = seat.paneId && seat.state !== 'gone' ? await herdr.run(deps.exec, herdr.paneGetArgv(seat.paneId), 10_000) : undefined
+  if (!seat.paneId || !pane || (!pane.ok && /not.?found|no such/i.test(`${pane.code} ${pane.output}`))) {
+    const where = seat.paneId ? `pane ${seat.paneId}` : 'its pane'
+    return pending.relaunched
+      ? endPendingStart(deps, run, seat, `${where} is gone before ${seat.name} got its brief, and its one relaunch is used; close the seat and spawn it again`)
+      : relaunchPendingStart(deps, run, seat, `${where} is gone`)
+  }
+  if (!pane.ok) return undefined
+  const paneId = seat.paneId
+  const screen = await herdr.readPane(deps.exec, paneId, 40, 'visible')
+  if (!screen.ok) return undefined
+  const dialog = findDialog(screen.value)
+  if (dialog) {
+    // Claude reads trust once, at startup: a prompt accepted in another session stays on this pane's screen.
+    const isTrustedElsewhere = dialog.reason === 'trust' && !pending.relaunched && pending.root !== undefined && deps.claudeUserConfig !== undefined
+      && (await readRepoTrust(deps.claudeUserConfig, pending.root)).state === 'trusted'
+    return isTrustedElsewhere ? relaunchPendingStart(deps, run, seat, `${pending.root} was trusted outside pane ${paneId}`) : undefined
+  }
+  const clearedAt = pending.clearedAt ?? now.toISOString()
+  if (!existsSync(seat.worktree) && now.getTime() - Date.parse(clearedAt) < timing.worktreeWaitMs) {
+    if (!pending.clearedAt) await updateRoster(deps.home, run.id, roster => {
+      const entry = findSeat(roster, seat.name)
+      return entry?.pendingStart ? upsertSeat(roster, { ...entry, pendingStart: { ...entry.pendingStart, clearedAt } }) : roster
+    })
+    return undefined
+  }
+  const outside = await claudeOutsideWorktree(deps, seat.worktree, paneId, 0)
+  if (outside) {
+    const failure = await captureStartFailure(deps, run, seat.name, paneId, { code: 'no-worktree', output: outside })
+    await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
+    return endPendingStart(deps, run, seat, `${outside}, so ${seat.name} would work in the base checkout: no brief was delivered and pane ${paneId} was closed; close the seat and spawn it again.${hintText(failure)}`)
+  }
+
+  const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
+  const notes = pending.base ? await alignClaudeWorktree(deps, seat.worktree, seat.branch, pending.base) : []
+  const copyPlan = config.workerCopy ? await planCopy(deps.exec, run.repo, config.workerCopy) : undefined
+  if (copyPlan && copyPlan.files.length > 0) notes.push(...copyNotes({ files: [], refused: [] }, await applyCopy(run.repo, seat.worktree, copyPlan.files)))
+  const isInline = pending.via === 'launch-arg'
+  const iso = deps.clock.now().toISOString()
+  await updateRoster(deps.home, run.id, roster => {
+    const entry = findSeat(roster, seat.name)
+    if (!entry) return roster
+    const rest = withoutPendingStart(entry)
+    return upsertSeat(roster, { ...rest, state: isInline ? 'working' : 'idle', stateAt: iso, ...(isInline ? { lastWorkingAt: iso } : {}), attention: rest.attention.filter(item => item.reason !== 'trust' && item.reason !== 'dialog') })
+  })
+  await closeItems(deps.home, run.id, [`${seat.name}:trust`, `${seat.name}:dialog`])
+  await recordEvent(deps, run.id, { type: 'seat.state', seat: seat.name, data: { pendingStart: 'cleared', pane: paneId, worktree: seat.worktree, ...(notes.length > 0 ? { notes } : {}) } })
+  const tail = notes.map(note => ` Note: ${note}`).join('')
+  if (isInline) {
+    await recordEvent(deps, run.id, { type: 'control.sent', seat: seat.name, data: { kind: 'brief', via: 'launch-arg' } })
+    return ok(`${seat.name}'s dialog cleared and it runs in worktree ${seat.worktree} on branch ${seat.branch}; its brief was part of its launch.${tail}`)
+  }
+  const brief = await savedBrief(deps, run.id, seat.name)
+  if (!brief) return failed('no-brief', `${seat.name}'s dialog cleared but its saved brief is missing; send it the brief with drove send`)
+  const via = await queueBrief(deps, run, seat.name, brief, config)
+  return ok(`${seat.name}'s dialog cleared and it runs in worktree ${seat.worktree} on branch ${seat.branch}. Brief: ${via}.${tail}`)
+}
+
+const relaunchPendingStart = async (deps: Deps, staleRun: RunMeta, seat: Seat, why: string): Promise<CommandResult> => {
+  const run = (await loadRun(deps.home, staleRun.id).catch(() => undefined)) ?? staleRun
+  const pending = seat.pendingStart as PendingStart
+  const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
+  const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
+  if (!token) return endPendingStart(deps, run, seat, `${why} before ${seat.name} got its brief, and it has no token to relaunch with; close the seat and spawn it again`)
+  const sessionId = randomUUID()
+  const fresh: Seat = { ...withoutPendingStart(seat), sessionId }
+  const initialPrompt = pending.via === 'launch-arg' ? await savedBrief(deps, run.id, seat.name) : undefined
+  const spec = specFor(launchRequest(deps, { identity: identityOfSeat(deps, run, fresh, token), kind: 'claude', repo: run.repo, cwd: run.repo, model: seat.model, effort: seat.effort, roleText: seatRoleText(run, config, seat), initialPrompt, sessionId, ...(await launchExtrasOf(deps, run, config, seat)).parts }, config))
+  await writeLaunchFiles(spec)
+  await writeLaunchJson(deps, run.id, seat.name, spec)
+  await markRestarting(deps, run.id, seat.name)
+  try {
+    if (seat.paneId) await herdr.run(deps.exec, herdr.paneCloseArgv(seat.paneId))
+    const placed = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
+    const current = (await loadRun(deps.home, run.id).catch(() => undefined)) ?? run
+    const placement = await placePane(deps, current, placed, run.repo, spec.env)
+    if (!isPlacement(placement)) {
+      await recordEvent(deps, run.id, { type: 'seat.relaunch', seat: seat.name, data: { ok: false, pendingStart: true, reason: why, error: clip(placement.text, 200) } })
+      return endPendingStart(deps, run, seat, `${why} before ${seat.name} got its brief, and no pane could be placed for its one relaunch (${clip(placement.text, 160)}); close the seat and spawn it again`)
+    }
+    const attempt = await startWithRetry(deps, placement.createdTab ? { ...current, tabId: placement.createdTab } : current, {
+      seat: seat.name, kind: 'claude', argv: spec.argv, paneId: placement.paneId, ...(placement.createdTab ? { createdTab: placement.createdTab } : {}),
+      place: () => placePane(deps, current, placed, run.repo, spec.env),
+    })
+    const { started, adopted, paneId } = attempt
+    const isAtDialog = !started.ok && (started.code === 'agent_not_ready' || attempt.dialog !== undefined)
+    if (!started.ok && !adopted && !isAtDialog) {
+      const failure = await captureStartFailure(deps, run, seat.name, paneId, started)
+      await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
+      await recordEvent(deps, run.id, { type: 'seat.relaunch', seat: seat.name, data: { ok: false, pendingStart: true, reason: why, error: clip(started.output, 200) } })
+      return endPendingStart(deps, run, seat, `${why} before ${seat.name} got its brief, and its one relaunch did not start (${clip(started.output, 160)}); close the seat and spawn it again.${hintText(failure)}`)
+    }
+    const iso = deps.clock.now().toISOString()
+    const screen = isAtDialog ? await herdr.readPane(deps.exec, paneId, 40, 'visible') : undefined
+    const seen = screen?.ok ? matchDialog(seat.name, screen.value, deps.clock.now()) : undefined
+    const blocked: Attention | undefined = isAtDialog ? seen ?? { seat: seat.name, reason: attempt.dialog ?? 'dialog', detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at: iso } : undefined
+    const attention = blocked?.reason === 'trust' && pending.root ? { ...blocked, detail: trustAttentionText(pending.root, paneId) } : blocked
+    await updateRoster(deps.home, run.id, roster => upsertSeat(roster, {
+      ...fresh, paneId, state: attention ? 'blocked' : 'idle', stateAt: iso, attention: attention ? [attention] : [],
+      pendingStart: { since: iso, via: pending.via, ...(pending.root ? { root: pending.root } : {}), ...(pending.base ? { base: pending.base } : {}), relaunched: true },
+    }))
+    await recordEvent(deps, run.id, { type: 'seat.relaunch', seat: seat.name, data: { ok: true, pendingStart: true, reason: why, pane: paneId } })
+    return ok(`${why}, so ${seat.name} was relaunched once in pane ${paneId} with the same branch and brief${attention ? `; it stopped on a dialog again (${attention.reason})` : ''}.`)
+  } finally {
+    await clearRestarting(deps, run.id, seat.name)
+  }
 }
 
 // ---------- migrate ----------
