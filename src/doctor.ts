@@ -7,7 +7,8 @@ import { toplevel } from './git.ts'
 import { loadPolicy } from './policy.ts'
 import { probeServer } from './herdr.ts'
 import { detectAgents, nodeAgentDeps } from './agents.ts'
-import { DROVE_PLUGIN, expandHome, pluginDirEntries, pluginNameOfDir, userClaudeDir } from './launch.ts'
+import { DROVE_PLUGIN, expandHome, pluginDirEntries, pluginNameOfDir, userClaudeConfig, userClaudeDir } from './launch.ts'
+import { canonicalRoot, readRepoTrust } from './trust.ts'
 import { userCodexHome } from './paths.ts'
 import type { AgentKind, Exec, ExecResult } from './types.ts'
 
@@ -34,6 +35,8 @@ export type DoctorDeps = {
   modDir: string
   envPluginDirs?: string
   realpath: (path: string) => Promise<string>
+  // Claude's user config (~/.claude.json): unset, the trust check is skipped.
+  claudeConfig?: string
 }
 
 // This clone's mod: the mod/ beside src/.
@@ -129,6 +132,19 @@ const checkAgents = async (deps: DoctorDeps): Promise<{ checks: Check[]; kind?: 
   else if (onPath.has('codex')) checks.push(check('codex', hasClaude ? 'warn' : 'fail', 'codex is on PATH but its version could not be read', 'run codex --version; update Codex if needed'))
   else checks.push(hasClaude ? check('codex', 'warn', 'codex is not on PATH (Codex workers are unavailable)', 'install Codex if you want Codex seats') : check('codex', 'fail', 'codex is not on PATH and neither is claude', 'install Claude Code or Codex and sign in'))
   return { checks, kind: hasClaude ? 'claude' : hasCodex ? 'codex' : undefined }
+}
+
+// DROVE-166: warn only. Inside a repo, whether Claude Code trusts its canonical root (a Claude agent stops at the prompt if not).
+const checkTrust = async (deps: DoctorDeps, kind?: AgentKind): Promise<Check | undefined> => {
+  if (!deps.claudeConfig || kind !== 'claude') return undefined
+  const inside = await attempt(deps.exec, ['git', 'rev-parse', '--is-inside-work-tree'], deps.cwd)
+  if (inside.code !== 0 || inside.stdout.trim() !== 'true') return undefined
+  const root = await canonicalRoot(deps.exec, deps.cwd)
+  const trust = await readRepoTrust(deps.claudeConfig, root)
+  if (trust.state === 'trusted') return check('trust', 'ok', `Claude Code trusts ${root}`)
+  return trust.state === 'untrusted'
+    ? check('trust', 'warn', `Claude Code has not trusted ${root}, so a Claude planner or worker started there stops at its folder-trust prompt`, `drove trust ${root}`)
+    : check('trust', 'warn', `${deps.claudeConfig} has no projects Drove can read, so whether Claude Code trusts ${root} is unknown`, `start claude once and sign in, then drove trust ${root}`)
 }
 
 const checkGh = async (deps: DoctorDeps): Promise<Check> => {
@@ -238,12 +254,12 @@ const checkModNode = async (deps: DoctorDeps): Promise<Check | undefined> => {
 
 export const runDoctor = async (deps: DoctorDeps): Promise<DoctorReport> => {
   const agentChecks = checkAgents(deps)
-  const [git, herdr, agents, gh, cairn, home, mod, modNode] = await Promise.all([
-    checkGit(deps), checkHerdr(deps), agentChecks, checkGh(deps), agentChecks.then(({ kind }) => checkCairn(deps, kind)), checkHome(deps), checkModInstalled(deps), checkModNode(deps),
+  const [git, herdr, agents, gh, cairn, home, mod, modNode, trust] = await Promise.all([
+    checkGit(deps), checkHerdr(deps), agentChecks, checkGh(deps), agentChecks.then(({ kind }) => checkCairn(deps, kind)), checkHome(deps), checkModInstalled(deps), checkModNode(deps), agentChecks.then(({ kind }) => checkTrust(deps, kind)),
   ])
   const root = await toplevel(deps.exec, deps.cwd) ?? deps.cwd
   const policy = await loadPolicy(deps.home, root, deps.readText)
-  const checks = [check('spawn-policy', policy.errors.length ? 'fail' : 'ok', policy.errors.length ? policy.errors.join('; ') : 'spawn policy valid'), checkNode(deps), ...git, ...herdr, ...agents.checks, gh, cairn, home, mod, ...(modNode ? [modNode] : [])]
+  const checks = [check('spawn-policy', policy.errors.length ? 'fail' : 'ok', policy.errors.length ? policy.errors.join('; ') : 'spawn policy valid'), checkNode(deps), ...git, ...herdr, ...agents.checks, gh, cairn, home, mod, ...(modNode ? [modNode] : []), ...(trust ? [trust] : [])]
   return { ok: checks.every(item => item.status !== 'fail'), checks }
 }
 
@@ -263,6 +279,7 @@ export const nodeDoctorDeps = (exec: Exec, home: string, cwd: string = process.c
   cwd,
   home,
   claudeSettings: join(userClaudeDir(env), 'settings.json'),
+  claudeConfig: userClaudeConfig(env),
   nodeVersion: process.version,
   userHome: homedir(),
   modDir: CLONE_MOD_DIR,

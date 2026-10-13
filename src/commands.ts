@@ -27,7 +27,8 @@ import { type Folded, readFolded } from './pending.ts'
 import { attentionOf, findSeat, gridSlot, isOverBudget, latestRunFor, loadRoster, loadRun, openSeats, rosterLines, saveRun, updateRoster, upsertSeat } from './roster.ts'
 import { steeringNotes } from './steer.ts'
 import { appendJsonl, mintToken, readJson, readJsonlFrom, readToken, withLock, writeJsonAtomic, writeToken } from './store.ts'
-import { canonicalRoot, readRepoTrust, type RepoTrust, trustAttentionText, untrustedText } from './trust.ts'
+import { askOnTty } from './setup.ts'
+import { canonicalRoot, readRepoTrust, type RepoTrust, trustAttentionText, trustQuestion, trustRepo, untrustedText } from './trust.ts'
 import type {
   AgentKind, Attention, AttentionItem, CommandResult, Control, Deps, DetachedStart, DroveConfig, DroveEvent, Effort, Exec, ExecResult, HerdrStatus, HostAgents, HookRecord, Identity, LaunchRequest, LaunchSpec, MergeGate, MergeRequest, MigrateRequest, PendingStart, PlannerState, PromoteRequest, Report, RunMeta, Seat, SeatRole, SendRequest, SpawnRequest, Transport,
 } from './types.ts'
@@ -158,7 +159,7 @@ export const nodeExec: Exec = (argv, options = {}) =>
     child.stdin.end(options.input ?? '')
   })
 
-export const defaultDeps = (env: NodeJS.ProcessEnv = process.env): Deps => ({ exec: nodeExec, clock: { now: () => new Date() }, home: defaultHome(env), claudeUserConfig: userClaudeConfig(env) })
+export const defaultDeps = (env: NodeJS.ProcessEnv = process.env): Deps => ({ exec: nodeExec, clock: { now: () => new Date() }, home: defaultHome(env), claudeUserConfig: userClaudeConfig(env), ask: askOnTty })
 
 export const identityOrPlanner = (env: NodeJS.ProcessEnv = process.env): Identity =>
   identityFromEnv(env) ?? { home: defaultHome(env), run: '', role: 'planner', seat: PLANNER_SEAT }
@@ -802,10 +803,27 @@ const detachedResult = (run: RunMeta, opened: OpenedWorkspace, started: Detached
 
 // Attached planners need their own terminal and an unoccupied pane. Probe only:
 // refusals must happen before a run, roster, workspace or child is created.
-const requirePlannerTerminal = (deps: Deps, command: 'plan' | 'up'): Failed | undefined => {
+const isTerminal = (deps: Deps): boolean => {
   const terminal = deps.terminal ?? { stdin: process.stdin.isTTY === true, stdout: process.stdout.isTTY === true }
-  return terminal.stdin && terminal.stdout ? undefined : failed('no-terminal', `drove ${command} needs a terminal of its own: run it in a fresh herdr pane, or use \`--detached\``) as Failed
+  return terminal.stdin && terminal.stdout
 }
+
+const requirePlannerTerminal = (deps: Deps, command: 'plan' | 'up'): Failed | undefined =>
+  isTerminal(deps) ? undefined : failed('no-terminal', `drove ${command} needs a terminal of its own: run it in a fresh herdr pane, or use \`--detached\``) as Failed
+
+// DROVE-166: on a terminal, plan and up ask before they launch anything; a yes writes trust the way accepting the prompt does.
+const askTrust = async (deps: Deps, trust: RepoTrust | undefined): Promise<{ trust?: RepoTrust; note?: string }> => {
+  if (trust?.state !== 'untrusted' || !deps.ask || !isTerminal(deps) || !(await deps.ask(trustQuestion(trust.root)))) return { trust }
+  try {
+    const written = await trustRepo(trust.file, trust.root)
+    return { trust: written, note: `Trusted ${written.root} for Claude Code in ${written.file}.` }
+  } catch (error) {
+    return { trust, note: `Could not trust ${trust.root}: ${messageOf(error)}.` }
+  }
+}
+
+const trustWarningOf = (asked: { trust?: RepoTrust; note?: string }): string =>
+  `${asked.note ? ` ${asked.note}` : ''}${asked.trust?.state === 'untrusted' ? ` Warning: ${untrustedText(asked.trust, 'run')}` : ''}`
 
 const requirePlannerPane = async (deps: Deps, command: 'plan' | 'up', pane: string, ownRun?: string, sessionId?: string): Promise<Failed | undefined> => {
   const live = await herdr.getAgent(deps.exec, pane)
@@ -851,6 +869,8 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
   const kind = request.kind
   if (kind !== 'claude' && kind !== 'codex') return failed('usage', '--kind must be claude or codex')
   if (request.effort && !EFFORTS.includes(request.effort)) return failed('usage', `--effort must be one of ${EFFORTS.join(', ')}`)
+  // DROVE-147: Claude starts at the repo root, so a root Claude has not trusted stops a Claude planner and each Claude worker at the prompt.
+  const trustWarning = trustWarningOf(kind === 'claude' || config.workerKind !== 'codex' ? await askTrust(deps, await repoTrustOf(deps, repo)) : {})
   const model = request.model ?? config.plannerModel[kind]
   const effort = request.effort ?? config.plannerEffort
   const sessionId = kind === 'claude' ? randomUUID() : undefined
@@ -911,9 +931,6 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     config,
   )
   const spec = specFor(launch)
-  // DROVE-147: Claude workers start at the repo root, so a root Claude has not trusted stops each one at the trust prompt.
-  const trust = config.workerKind !== 'codex' ? await repoTrustOf(deps, repo) : undefined
-  const trustWarning = trust?.state === 'untrusted' ? ` Warning: ${untrustedText(trust)}` : ''
   if (isDetached) {
     const opened = await openDetachedWorkspace(deps, run, spec.env)
     if ('code' in opened) return abandonDetached(deps, run, previous, opened)
@@ -1317,6 +1334,20 @@ export const spawn = async (deps: Deps, identity: Identity, request: SpawnReques
 const repoTrustOf = async (deps: Deps, repo: string): Promise<RepoTrust | undefined> =>
   deps.claudeUserConfig ? readRepoTrust(deps.claudeUserConfig, await canonicalRoot(deps.exec, repo)) : undefined
 
+// The preflight of every Claude launch (spawn, relaunch, promote, migrate): refused before any pane is touched.
+const untrustedRefusal = async (deps: Deps, repo: string): Promise<Failed | undefined> => {
+  const trust = await repoTrustOf(deps, repo)
+  return trust?.state === 'untrusted' ? failed('untrusted-repo', untrustedText(trust)) as Failed : undefined
+}
+
+// An agent restarted into a pane that stopped at a startup dialog: the pane is kept and the seat waits on what it shows.
+const startupAttention = async (deps: Deps, run: RunMeta, seat: string, paneId: string, seen: Attention['reason'] | undefined, after: string): Promise<Attention> => {
+  const screen = await herdr.readScreen(deps.exec, paneId, 40, 'visible')
+  const now = deps.clock.now()
+  const dialog = (screen.ok ? matchDialog(seat, screen.value, now) : undefined) ?? { seat, reason: seen ?? 'dialog', detail: `The agent stopped on a startup dialog; answer it in the pane. Drove will not. Once it clears, ${after}`, at: now.toISOString() }
+  return dialog.reason === 'trust' ? { ...dialog, detail: trustAttentionText(await canonicalRoot(deps.exec, run.repo), paneId, `once it clears, ${after}`) } : dialog
+}
+
 const realOf = async (path: string): Promise<string> => realpath(path).catch(() => resolve(path))
 
 // DROVE-147: a Claude worker whose worktree never appeared runs in the base checkout (it started from the repo root),
@@ -1525,6 +1556,10 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
       ? ok(`${seat.name} now runs on ${model} at ${request.effort} effort from its next request.`)
       : failed('delivery', `not delivered to ${seat.name}: ${delivery.reason}`)
   }
+  if (seat.kind === 'claude') {
+    const refusal = await untrustedRefusal(deps, run.repo)
+    if (refusal) return refusal
+  }
 
   if (!isSettled(seat) && seat.owes === 'none') {
     await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...seat, pendingPromote: { ...change, ...(request.reason ? { reason: request.reason } : {}) } }))
@@ -1572,6 +1607,14 @@ export const promote = async (deps: Deps, identity: Identity, request: PromoteRe
     const { started, adopted } = attempt
     paneId = attempt.paneId
     updated.paneId = paneId
+    if (!started.ok && !adopted && (started.code === 'agent_not_ready' || attempt.dialog !== undefined)) {
+      const after = isInline ? `the ${control.kind} notice, part of its launch, runs.` : `tell ${seat.name} to carry on: the ${control.kind} notice was not typed.`
+      const attention = await startupAttention(deps, run, seat.name, paneId, attempt.dialog, after)
+      const at = deps.clock.now().toISOString()
+      await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'blocked', stateAt: at, attention: [...updated.attention.filter(item => item.reason !== attention.reason), attention] }))
+      await recordEvent(deps, run.id, { type: 'attention', seat: seat.name, data: { reason: attention.reason, pane: paneId } })
+      return ok(`${seat.name} restarted on ${model || 'the default model'} at ${request.effort} effort in pane ${paneId}, but stopped on a dialog (${attention.reason}): ${attention.detail}`, { state: 'blocked', paneId })
+    }
     if (!started.ok && !adopted) {
       const captured = await captureStartFailure(deps, run, seat.name, paneId, started)
       await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...updated, state: 'gone', attention: [{ seat: seat.name, reason: 'gone', detail: `restart for promote failed (${clip(started.output, 160)}); run \`drove up --seat ${seat.name}\``, at: deps.clock.now().toISOString() }] }))
@@ -1826,6 +1869,10 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
   const policyUnavailable = requireAgent(run, request.kind)
   if (policyUnavailable) return policyUnavailable
   if (seat.kind === request.kind) return failed('usage', `${seat.name} is already a ${seat.kind} worker; use promote to change its model or effort`)
+  if (request.kind === 'claude') {
+    const refusal = await untrustedRefusal(deps, run.repo)
+    if (refusal) return refusal
+  }
   if (!existsSync(seat.worktree)) return failed('no-worktree', `${seat.name}'s worktree ${seat.worktree} is missing, so there is nothing to hand over; close the seat and spawn a new worker`)
   const token = await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))
   if (!token) return failed('no-token', `no token for ${seat.name}`)
@@ -1884,16 +1931,16 @@ export const migrate = async (deps: Deps, identity: Identity, request: MigrateRe
       await lost(placement.text)
       return failed('migrate', `${seat.name} stopped but no pane could be placed for ${kind}: ${clip(placement.text)}. \`drove up --seat ${seat.name}\` resumes the ${seat.kind} session.`)
     }
-    const { started, adopted, paneId } = await startWithRetry(deps, run, {
+    const attempt = await startWithRetry(deps, run, {
       seat: seat.name, kind, argv: spec.argv, paneId: placement.paneId, ...(placement.createdTab ? { createdTab: placement.createdTab } : {}),
       place: () => placePane(deps, run, others, seat.worktree, spec.env),
     })
+    const { started, adopted, paneId } = attempt
     const event = { from: seat.kind, to: kind, model, effort, pane: paneId, worktree: seat.worktree, branch: seat.branch, ...(request.reason ? { reason: request.reason } : {}) }
 
-    if (!started.ok && started.code === 'agent_not_ready') {
-      const screen = await herdr.readScreen(deps.exec, paneId, 40, 'visible')
+    if (!started.ok && !adopted && (started.code === 'agent_not_ready' || attempt.dialog !== undefined)) {
       const at = deps.clock.now().toISOString()
-      const attention = (screen.ok ? matchDialog(seat.name, screen.value, deps.clock.now()) : undefined) ?? { seat: seat.name, reason: 'dialog' as const, detail: 'The agent stopped on a startup dialog; answer it in the pane. Drove will not.', at }
+      const attention = await startupAttention(deps, run, seat.name, paneId, attempt.dialog, 'the queued handoff brief goes in.')
       await updateRoster(deps.home, run.id, roster => upsertSeat(roster, { ...migrated, paneId, state: 'blocked', stateAt: at, attention: [attention] }))
       await recordEvent(deps, run.id, { type: 'seat.migrate', seat: seat.name, data: { ...event, blocked: attention.reason } })
       await queueBrief(deps, run, seat.name, briefText, config)
@@ -2636,10 +2683,12 @@ export const down = async (deps: Deps, ref: RunRef): Promise<CommandResult> => {
 const resumePrompt = (seat: Seat): string | undefined =>
   seat.lastWorkingAt && (!seat.lastReport || Date.parse(seat.lastReport.at) < Date.parse(seat.lastWorkingAt)) ? resumedText() : undefined
 
-type Relaunched = { seat: Seat; note?: string } | { error: string }
+type Relaunched = { seat: Seat; note?: string } | { error: string; code?: string }
 
 const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, seat: Seat, placed: readonly Seat[]): Promise<Relaunched> => {
   if (!seat.sessionId) return { error: `${seat.name} has no saved session id, so it cannot be resumed; close it and spawn a new one` }
+  const refusal = seat.kind === 'claude' ? await untrustedRefusal(deps, run.repo) : undefined
+  if (refusal) return { error: refusal.text, code: refusal.code }
   const token = (await readToken(join(seatDir(deps.home, run.id, seat.name), 'token'))) ?? mintToken()
   await writeToken(join(seatDir(deps.home, run.id, seat.name), 'token'), token)
   const identity = identityOfSeat(deps, run, seat, token)
@@ -2664,7 +2713,8 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
     const { started, adopted, paneId } = attempt
     if (attempt.createdTab) run.tabId = attempt.createdTab
     const captured = started.ok || adopted ? undefined : await captureStartFailure(deps, run, seat.name, paneId, started)
-    if (!started.ok && !adopted && started.code !== 'agent_not_ready') {
+    const isAtDialog = !started.ok && !adopted && (started.code === 'agent_not_ready' || attempt.dialog !== undefined)
+    if (!started.ok && !adopted && !isAtDialog) {
       await herdr.run(deps.exec, herdr.paneCloseArgv(paneId))
       await restoreState(deps, run.id, seat.name, before)
       return { error: `herdr could not start ${seat.name}: ${clip(started.output)}.${captured ? hintText(captured) : ''}` }
@@ -2674,11 +2724,12 @@ const launchRelaunch = async (deps: Deps, run: RunMeta, config: DroveConfig, sea
     const typed = isUp && resumeText && !isInline ? await herdr.retryWhileBusy(deps.exec, herdr.agentPromptArgv(paneId, resumeText), BUSY_RETRY_MS) : undefined
     const isUndelivered = typed !== undefined && !typed.ok && typed.code !== 'timeout'
     const isResumed = Boolean(resumeText) && isUp && !isUndelivered
+    const blocked = !isUp ? await startupAttention(deps, run, seat.name, paneId, attempt.dialog, resumeText && !isInline ? `tell ${seat.name} to carry on: the resume notice was not typed.` : 'the resumed session goes on.') : undefined
     const next: Seat = {
       ...seat, paneId, state: !isUp ? 'blocked' : isResumed ? 'working' : adopted?.state === 'working' ? 'working' : adopted?.state === 'starting' ? 'starting' : 'idle', stateAt: iso,
       ...(isResumed ? { lastWorkingAt: iso } : {}),
-      attention: !isUp
-        ? [{ seat: seat.name, reason: 'dialog', detail: 'The resumed agent stopped on a startup dialog; answer it in the pane.', at: iso }]
+      attention: blocked
+        ? [blocked]
         : isUndelivered
           ? [{ seat: seat.name, reason: 'pending-delivery', detail: `the resume notice was not delivered (${clip(typed.output, 120)}); tell ${seat.name} to carry on`, at: iso }]
           : [],
@@ -2760,6 +2811,9 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
     if (refusal) return refusal
   }
   const config = await loadConfig(deps.home, run.repo, { exec: deps.exec, base: run.base })
+  const relaunching = (await loadRoster(deps.home, run.id)).seats.filter(seat => seat.state !== 'closed' && (!seatName || seat.name === seatName))
+  const needsTrust = relaunching.some(seat => seat.kind === 'claude') || (!seatName && (run.planner.kind === 'claude' || config.workerKind !== 'codex'))
+  const trustWarning = trustWarningOf(needsTrust ? await askTrust(deps, await repoTrustOf(deps, run.repo)) : {})
   const [agents, cairn] = await Promise.all([detectRunAgents(deps), detectRunCairn(deps, config.cairn, run.planner.kind, run.useCairn)])
   run = { ...run, agents, useCairn: cairn.useCairn }
   let recovery: { seats: Seat[]; plannerOnly: boolean } | undefined
@@ -2792,7 +2846,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
     }
     const placed = openSeats(await loadRoster(deps.home, run.id)).filter(entry => entry.name !== seat.name && entry.paneId)
     const relaunched = await relaunchSeat(deps, run, config, seat, placed)
-    return 'error' in relaunched ? failed('relaunch', relaunched.error) : ok(`Relaunched ${seatName} in pane ${relaunched.seat.paneId} with resume.${relaunched.note ? ` Note: ${relaunched.note}.` : ''}`,{ paneId: relaunched.seat.paneId })
+    return 'error' in relaunched ? failed(relaunched.code ?? 'relaunch', relaunched.error) : ok(`Relaunched ${seatName} in pane ${relaunched.seat.paneId} with resume.${relaunched.note ? ` Note: ${relaunched.note}.` : ''}`,{ paneId: relaunched.seat.paneId })
   }
 
   const hostPane = process.env.HERDR_PANE_ID
@@ -2831,7 +2885,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
   for (const seat of seats) {
     const relaunched = await relaunchSeat(deps, run, config, seat, placed)
     if ('error' in relaunched) {
-      lost.push(`${seat.name} (${relaunched.error})`)
+      lost.push(`${seat.name} (${relaunched.code === 'untrusted-repo' ? 'untrusted-repo: see the warning' : relaunched.error})`)
       continue
     }
     placed.push(relaunched.seat)
@@ -2841,7 +2895,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
   await recordEvent(deps, run.id, { type: 'run.up', data: { resumed, lost, pane: paneId, ...(opened ? { workspace: opened.workspaceId, detached: true } : {}) } })
 
   await writeLaunchFiles(spec)
-  const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}${cairn.warning ? ` ${cairn.warning}` : ''}`
+  const summary = `Run ${run.id} is up${recovered ? ` (recovered after a crash: ${recovered.length} seat(s) adopted)` : ''}: resumed ${resumed.length ? resumed.join(', ') : 'no workers'}${lost.length ? `; could not resume ${lost.join('; ')}` : ''}.${resumeId ? '' : ' The planner had no saved session id, so it starts fresh.'}${trustWarning}${cairn.warning ? ` ${cairn.warning}` : ''}`
   if (opened) {
     const started = await startDetachedPlanner(deps, run, spec, opened.paneId, undefined)
     if ('code' in started) return failed(started.code, `${started.text} The seats were resumed in workspace ${opened.workspaceId} and pane ${opened.paneId} is left open for you; close it with drove down --run ${run.id} and try again.`)
@@ -2940,6 +2994,38 @@ export const deliverGoal = async (deps: Deps, ref: RunRef): Promise<CommandResul
   if (held.state === 'none') return failed('no-goal', `Nothing to deliver: ${held.detail}. Set one with \`drove goal --run ${id} <text>\`, or type it in the planner pane.`)
   if (held.state === 'dialog') return failed('at-dialog', `Nothing was typed: ${held.detail}, then run \`drove goal --run ${id} --deliver\` again (the watcher also types it once the dialog clears).`)
   return failed(held.state === 'waiting' ? 'not-ready' : 'goal', `Nothing was typed: ${held.detail}. The goal stays held; run this again, or type it in the pane.`)
+}
+
+// ---------- trust ----------
+
+export type TrustRequest = { dir: string; yes?: boolean; dryRun?: boolean; json?: boolean }
+export type TrustResult = { root: string; file: string; state: RepoTrust['state']; changed: boolean }
+
+// `drove trust` (DROVE-166): the human's explicit yes to what Claude Code's folder-trust prompt asks, for a repo's canonical
+// root. On a terminal it asks; --yes writes without asking; with neither it prints the plan and writes nothing, as setup does.
+export const trust = async (deps: Deps, request: TrustRequest): Promise<CommandResult> => {
+  const dir = resolve(request.dir)
+  if (!existsSync(dir)) return failed('usage', `${dir} does not exist`)
+  const root = await canonicalRoot(deps.exec, dir)
+  const file = deps.claudeUserConfig ?? userClaudeConfig()
+  const done = (state: RepoTrust['state'], changed: boolean, text: string): CommandResult => {
+    const data: TrustResult = { root, file, state, changed }
+    return ok(request.json ? JSON.stringify(data) : text, data)
+  }
+  const before = await readRepoTrust(file, root)
+  if (before.state === 'trusted') return done('trusted', false, `Claude Code already trusts ${root} (${file}); nothing changed.`)
+  const plan = `set projects["${root}"].hasTrustDialogAccepted to true in ${file}, which is what accepting Claude Code's folder-trust prompt in ${root} does`
+  if (request.dryRun) return done(before.state, false, `Would ${plan}. Nothing written (--dry-run).`)
+  if (!request.yes) {
+    if (!deps.ask || !isTerminal(deps)) return failed('no-terminal', `Would ${plan}. Not a terminal and no --yes: nothing written. Run \`drove trust ${root} --yes\` to write it, or --dry-run to only print it.`)
+    if (!(await deps.ask(trustQuestion(root)))) return failed('declined', `Nothing written: Claude Code still does not trust ${root}.`)
+  }
+  try {
+    const written = await trustRepo(file, root)
+    return done(written.state, written.changed, `Claude Code now trusts ${root}: projects["${root}"].hasTrustDialogAccepted is true in ${file}. A Claude agent already waiting at the prompt still needs it answered in its pane.`)
+  } catch (error) {
+    return failed('trust', messageOf(error))
+  }
 }
 
 // ---------- budget ----------

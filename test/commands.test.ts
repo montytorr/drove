@@ -1524,15 +1524,20 @@ test('up --seat keeps a seat whose agent start timed out but is up in the pane, 
   assert.ok(absent.herdrCalls().includes('pane close'))
 })
 
-test('up --seat rolls back when the agent in the pane is blocked at a dialog', async () => {
+test('AC7: up --seat that stops at the folder-trust prompt keeps the pane and blocks the seat on trust, not a generic dialog (DROVE-167)', async () => {
   const fake = new FakeHerdr()
   const { deps, identity } = await setup(fake)
   await commands.spawn(deps, identity, { seat: 'w-a', kind: 'claude', brief })
   await killedMidTurn(fake, deps)
   Object.assign(fake, { startFails: 'timeout', startLeavesAgent: true, startStatus: 'blocked', screen: FOLDER_TRUST_SCREEN })
   const relaunched = await commands.up(deps, { run: RUN, repo: '/x' }, 'w-a')
-  assert.equal(!relaunched.ok && relaunched.code, 'relaunch')
-  assert.match(relaunched.text, /Hint: Claude is asking to trust the folder/)
+  assert.equal(relaunched.ok, true, relaunched.text)
+  const paneId = (relaunched.data as { paneId: string }).paneId
+  const seat = (await loadRoster(deps.home, RUN)).seats.find(entry => entry.name === 'w-a')
+  assert.deepEqual([seat?.state, seat?.paneId, seat?.attention.map(item => item.reason)], ['blocked', paneId, ['trust']])
+  assert.match(seat?.attention[0]?.detail ?? '', new RegExp(`folder-trust prompt is waiting in pane ${paneId}\\. Accept it in the pane`))
+  assert.match(seat?.attention[0]?.detail ?? '', /run `drove trust /)
+  assert.equal(fake.calls.some(call => call[1] === 'pane' && call[2] === 'close' && call[3] === paneId), false, 'the pane at the prompt is kept')
 })
 
 test('promote with a slow resumed turn still succeeds: the notice is typed and unconfirmed', async () => {

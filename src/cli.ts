@@ -444,6 +444,15 @@ export const COMMANDS: Record<string, Spec> = {
       return runSetup(setupDeps, { steps, yes: values.yes === true, dryRun: values['dry-run'] === true, json: values.json === true }, io)
     },
   },
+  trust: {
+    usage: 'drove trust [DIR] [--yes] [--dry-run] [--json]',
+    why: "trust a repo for Claude Code, as accepting its folder-trust prompt does: sets projects[<root>].hasTrustDialogAccepted in ~/.claude.json ($CLAUDE_CONFIG_DIR/.claude.json when set) for the canonical root of DIR (default: here), under Claude's own lock; asks on a terminal, --yes writes without asking, --json prints { root, file, state, changed }",
+    options: { yes: { type: 'boolean' }, 'dry-run': { type: 'boolean' }, json: { type: 'boolean' } },
+    run: async (values, positionals, io) => {
+      if (positionals.length > 1) throw new UsageError('drove trust takes one directory')
+      return print(await commands.trust(io.deps ?? commands.defaultDeps(), { dir: positionals[0] ?? process.cwd(), yes: values.yes === true, dryRun: values['dry-run'] === true, json: values.json === true }), io)
+    },
+  },
   budget: {
     usage: 'drove budget <n> [--run ID]',
     why: "raise the pane budget (the human's OK; agents are denied)",

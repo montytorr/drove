@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import { mkdtemp, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
 import { main } from '../src/cli.ts'
 import { atLeast, CLAUDE_MIN, formatReport, runDoctor, type DoctorDeps } from '../src/doctor.ts'
@@ -188,7 +191,11 @@ test('a failed report prints the fix lines and a count', async () => {
   assert.match(formatReport(report), /1 failed/)
 })
 
-test('drove doctor --json prints one report and exits 1 exactly when it did not pass', async () => {
+test('drove doctor --json prints one report and exits 1 exactly when it did not pass', async t => {
+  // The trust check reads Claude's user config: point it at an empty folder, never the real ~/.claude.json.
+  const saved = process.env.CLAUDE_CONFIG_DIR
+  process.env.CLAUDE_CONFIG_DIR = await mkdtemp(join(tmpdir(), 'drove-doctor-claude-'))
+  t.after(() => { if (saved === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = saved })
   const out: string[] = []
   const code = await main(['doctor', '--json'], { out: text => out.push(text), err: () => undefined, stdin: async () => '' })
   const report = JSON.parse(out.join('\n')) as { ok: boolean; checks: unknown[] }
@@ -260,4 +267,28 @@ test('the cairn setting off is ok and never runs cairn; a bad value counts as au
   const bad = await runDoctor(withCairnSetting(depsWith(), 'yes'))
   assert.equal(statusOf(bad.checks, 'cairn'), 'warn')
   assert.match(bad.checks.find(item => item.id === 'cairn')?.detail ?? '', /"yes" is not auto, on or off/)
+})
+
+// DROVE-167: inside a repo, a warn-only trust check for the canonical root, read from a temp Claude config.
+const withTrust = async (projects: Record<string, unknown> | undefined, overrides: Record<string, ExecResult> = {}): Promise<DoctorDeps> => {
+  const file = join(await mkdtemp(join(tmpdir(), 'drove-doctor-trust-')), '.claude.json')
+  await writeFile(file, JSON.stringify(projects === undefined ? { theme: 'dark' } : { projects }))
+  return depsWith({ 'git -C /repo rev-parse --path-format=absolute --git-common-dir': OK('/repo/.git\n'), ...overrides }, { claudeConfig: file })
+}
+
+test('doctor warns, never fails, when Claude Code has not trusted the repo, and names drove trust as the fix', async () => {
+  const untrusted = await runDoctor(await withTrust({ '/elsewhere': { hasTrustDialogAccepted: true } }))
+  const check = untrusted.checks.find(item => item.id === 'trust')
+  assert.equal(check?.status, 'warn')
+  assert.match(check?.detail ?? '', /has not trusted \/repo/)
+  assert.equal(check?.fix, 'drove trust /repo')
+  assert.equal(untrusted.ok, true)
+  assert.equal(statusOf((await runDoctor(await withTrust({ '/repo': { hasTrustDialogAccepted: true } }))).checks, 'trust'), 'ok')
+  assert.equal(statusOf((await runDoctor(await withTrust(undefined))).checks, 'trust'), 'warn', 'a config with no projects is unknown')
+})
+
+test('doctor has no trust check outside a repo, without claude, or with no Claude config given', async () => {
+  assert.equal(statusOf((await runDoctor(await withTrust({}, { 'git rev-parse --is-inside-work-tree': FAIL('fatal: not a git repository') }))).checks, 'trust'), undefined)
+  assert.equal(statusOf((await runDoctor(await withTrust({}, { 'claude --version': MISSING }))).checks, 'trust'), undefined)
+  assert.equal(statusOf((await runDoctor(depsWith())).checks, 'trust'), undefined)
 })
