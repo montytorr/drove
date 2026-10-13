@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- Codex planners receive a per-process repo trust override, and Drove-owned Codex homes trust both the repo and worker worktree without writing to `~/.codex`. Claude launches forward `CLAUDE_CONFIG_DIR` when set. Startup detection recognises Codex folder and hook review prompts, uses provider-specific folder hints, and no longer mistakes webhook prose for hook trust (DROVE-169).
+
 ## [0.8.0] - 2026-10-13
 
 Drove installs with one command, works without Cairn, and reads Claude's folder trust the way Claude does; the README now leads with what Drove is.
