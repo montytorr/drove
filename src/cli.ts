@@ -391,11 +391,15 @@ export const COMMANDS: Record<string, Spec> = {
     },
   },
   goal: {
-    usage: 'drove goal [--run ID] [--cairn REF] <text>|-',
-    why: "set the run's goal: one plain line of what it is doing now (the planner or the human)",
-    options: { run: { type: 'string' }, cairn: { type: 'string' } },
+    usage: 'drove goal [--run ID] [--cairn REF] <text>|- | drove goal --run ID --deliver',
+    why: "set the run's goal: one plain line of what it is doing now (the planner or the human); --deliver types the goal a detached planner did not get because it started at a dialog",
+    options: { run: { type: 'string' }, cairn: { type: 'string' }, deliver: { type: 'boolean' } },
     run: async (values, positionals, io) => {
       const [first, ...rest] = positionals
+      if (values.deliver === true) {
+        if (rest.length > 0 || (first !== undefined && !RUN_ID_RE.test(first))) return print({ ok: false, code: 'usage', text: 'drove goal --deliver takes no text: it types the goal held for the planner' }, io)
+        return print(await commands.deliverGoal(commands.defaultDeps(), { run: first ?? str(values, 'run') ?? process.env[ENV.run], repo: process.cwd() }), io)
+      }
       const named = rest.length > 0 && first !== undefined && RUN_ID_RE.test(first)
       const ref = { run: named ? first : str(values, 'run') ?? process.env[ENV.run], repo: process.cwd() }
       const goal = await textArg(positionals, named ? 1 : 0, io)

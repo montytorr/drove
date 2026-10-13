@@ -173,7 +173,7 @@ drove board                        # in a spare pane
 | `drove board [--once] [--web [--port N]] [--run ID]` | the live board in a pane, one frame with `--once` or when piped, or read-only in a browser with `--web` |
 | `drove down [--run ID]` | save every session id and stop the run |
 | `drove up [--run ID] [--seat SEAT] [--detached [--json]]` | resume a run, relaunch one dead seat, or relaunch a lost planner |
-| `drove goal [--run ID] [--cairn REF] <text>\|-` | set the run's goal (the planner or the human; a worker is denied) |
+| `drove goal [--run ID] [--cairn REF] <text>\|-` · `drove goal --run ID --deliver` | set the run's goal (the planner or the human; a worker is denied); `--deliver` types the goal a detached planner did not get because it started at a dialog (the watcher also types it once the dialog clears) |
 | `drove policy [--run ID] [--json]` | the merged `spawnPolicy` and its errors, read from the committed run base |
 | `drove doctor [--json]` | check what this machine needs, including whether the mod is installed (`mod`); exits 1 when a check fails; read-only |
 | `drove setup [cli\|mod\|home ...] [--yes] [--dry-run] [--bin DIR] [--json]` | install Drove on this machine: link the CLI, add the mod to Claude's settings, create `DROVE_HOME`; asks before each write, safe to re-run |
