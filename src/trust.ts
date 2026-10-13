@@ -2,8 +2,10 @@ import { readFile, realpath } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import type { Exec } from './types.ts'
 
-// DROVE-147: Claude Code shows its folder-trust prompt unless `projects[<dir>].hasTrustDialogAccepted` is true in
-// ~/.claude.json for the canonical git root or one of its parents (Claude Code 2.1.296). Drove only reads that file.
+// DROVE-147, DROVE-156: Claude Code 2.1.296 shows its folder-trust prompt unless `projects[<dir>].hasTrustDialogAccepted`
+// is true in ~/.claude.json for the canonical git root, or for a directory from the cwd up to the cwd's own git root; the
+// walk stops at the git root, so a trusted folder above the repo does not count. Drove launches Claude at the canonical
+// root, so only that exact entry counts. Drove only reads that file.
 
 export type RepoTrust = { state: 'trusted' | 'untrusted' | 'unknown'; root: string; file: string }
 
@@ -19,11 +21,6 @@ export const canonicalRoot = async (exec: Exec, repo: string): Promise<string> =
   return realpath(dir).catch(() => dir)
 }
 
-const ancestors = (dir: string): string[] => {
-  const parent = dirname(dir)
-  return parent === dir ? [dir] : [dir, ...ancestors(parent)]
-}
-
 // A file Drove cannot read, or one without a projects map, says nothing: the start-time prompt check still covers it.
 export const readRepoTrust = async (file: string, root: string): Promise<RepoTrust> => {
   const text = await readFile(file, 'utf8').catch(() => undefined)
@@ -35,8 +32,7 @@ export const readRepoTrust = async (file: string, root: string): Promise<RepoTru
   }
   const projects = isRecord(parsed) ? (parsed as ClaudeConfig).projects : undefined
   if (!isRecord(projects)) return { state: 'unknown', root, file }
-  const isTrusted = ancestors(root).some(dir => projects[dir]?.hasTrustDialogAccepted === true)
-  return { state: isTrusted ? 'trusted' : 'untrusted', root, file }
+  return { state: projects[root]?.hasTrustDialogAccepted === true ? 'trusted' : 'untrusted', root, file }
 }
 
 export const trustFix = (root: string): string =>
