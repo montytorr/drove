@@ -4,6 +4,10 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-16
+
+In a planner session, worker traffic is one line each way, so the planner's own text to you stands out.
+
 - In a planner session, the transcript separates worker traffic from the planner's own text to the person. A `message_worker`, `spawn_worker` or `review_verdict` call draws as one `→ <workers> · <expects, brief or verdict>  <text…>` line, not the full brief; the board keeps the full text, and an errored or interrupted call keeps Claude Code's own row. A wake draws as one `← <worker> · <kind> · expects … — <summary>` line per report, without Claude Code's "Prompt from the orchestrator plugin" framing; ctrl+o shows the original row. Only the drawing changes; the planner reads the same text. `message_worker` takes `also: [...]` to send one text to several workers in one call, and says which were not sent (DROVE-172).
 
 ## [0.9.0] - 2026-10-14
@@ -239,6 +243,7 @@ See [Known limits](README.md#known-limits) in the README.
 
 Full history: see the commit log.
 
+[0.10.0]: https://github.com/montytorr/drove/releases/tag/v0.10.0
 [0.9.0]: https://github.com/montytorr/drove/releases/tag/v0.9.0
 [0.8.0]: https://github.com/montytorr/drove/releases/tag/v0.8.0
 [0.7.0]: https://github.com/montytorr/drove/releases/tag/v0.7.0
