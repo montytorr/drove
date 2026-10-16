@@ -4,6 +4,10 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-16
+
+A Codex worker in a repo whose name contains "openclaw" can use Cairn again: every seat tells Cairn its own runtime.
+
 - Every Claude and Codex seat launches with `CAIRN_AGENT` set to its own runtime, so Cairn uses the right key even when a run path contains "openclaw". Workers keep an explicit `workerEnv.CAIRN_AGENT` override (DROVE-174).
 
 ## [0.10.0] - 2026-10-16
@@ -245,6 +249,7 @@ See [Known limits](README.md#known-limits) in the README.
 
 Full history: see the commit log.
 
+[0.10.1]: https://github.com/montytorr/drove/releases/tag/v0.10.1
 [0.10.0]: https://github.com/montytorr/drove/releases/tag/v0.10.0
 [0.9.0]: https://github.com/montytorr/drove/releases/tag/v0.9.0
 [0.8.0]: https://github.com/montytorr/drove/releases/tag/v0.8.0
