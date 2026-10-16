@@ -1796,12 +1796,14 @@ describe('worker session', () => {
 describe('worker traffic in the transcript', () => {
   const TOOL_USE = { tool_use_id: 'tu-1', tool: 'mcp__orchestrator__message_worker', input: { name: 'w-auth', also: ['w-api'], text: 'w-infra has landed on main.\nRun git merge main.', expects: 'none' }, isRunning: false, isErrored: false, isInterrupted: false }
   const engineRows = (on: On) => {
-    for (const component of ['ToolUse', 'UserMessage'] as const) {
-      on('ui.render', { component }, ($, e) => {
-        const { Text } = $.ui.resolve(e)
-        return <Text>engine row</Text>
-      })
-    }
+    on('ui.render', { component: 'ToolUse' }, ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return <Text>engine row</Text>
+    })
+    on('ui.render', { component: 'UserMessage' }, ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return <Text>engine row</Text>
+    })
   }
   const WAKE = 'w-testinfra · question · expects answer — Main checkout backend: yarn install done\nw-auth · done · expects review — Rate limiter added'
 
