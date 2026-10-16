@@ -7,6 +7,7 @@ import { buildBoard, fixedRows, gauge, needsAnimation, progressOf } from '../hoo
 import { HEADLINE_SUMMARY_MAX, backoffMs, feedOf, parseLine, splitLines, splitWake, wakeHeadlines } from '../hooks/bridge'
 import { attachArgs, failureOf, guardStdin, guardVerdictOf, jsonResultOf, spawnArgs } from '../hooks/drove'
 import { defaultKindOf, modelLabelOf } from '../hooks/prompts'
+import { fitText, incomingOf, outgoingOf } from '../hooks/traffic'
 import { UNVERIFIED, hmacSha256, locateEnvelope, macOf, parseEnvelope, raiseEffort, renderControl, repoFlagOf, shortModel, verifyEnvelope } from '../hooks/protocol'
 
 const NOW = Date.parse('2026-10-06T10:00:00Z')
@@ -358,6 +359,7 @@ const fakeDrove = (world: World, call: Call) => {
     if (world.isOverBudget) return ok('', 1, 'over-budget: the pane budget of 5 is full; ask the human to run `drove budget 6`')
     return ok(`Worker ${action} (claude claude-sonnet-5-5 low) is running in pane w1:p10, worktree /work/repo/.claude/worktrees/${action} on branch worktree-${action}. Brief: herdr-prompt. Its reports will come to you.`)
   }
+  if (command === 'send' && action === 'w-gone') return ok('', 1, 'no-seat: no open worker w-gone')
   if (command === 'budget') {
     world.isOverBudget = false
     return ok(`Pane budget for run ${RUN} is now ${action}.`)
@@ -1788,5 +1790,95 @@ describe('worker session', () => {
     expect(world.registeredTools).toEqual([])
     expect(denial(await $.tool.call({ tool: 'Bash', command: 'npm test' } as never))).toBeUndefined()
     expect(droveCalls(world, 'guard')).toHaveLength(0)
+  })
+})
+
+describe('worker traffic in the transcript', () => {
+  const TOOL_USE = { tool_use_id: 'tu-1', tool: 'mcp__orchestrator__message_worker', input: { name: 'w-auth', also: ['w-api'], text: 'w-infra has landed on main.\nRun git merge main.', expects: 'none' }, isRunning: false, isErrored: false, isInterrupted: false }
+  const engineRows = (on: On) => {
+    on('ui.render', { component: 'ToolUse' }, ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return <Text>engine row</Text>
+    })
+    on('ui.render', { component: 'UserMessage' }, ($, e) => {
+      const { Text } = $.ui.resolve(e)
+      return <Text>engine row</Text>
+    })
+  }
+  const WAKE = 'w-testinfra · question · expects answer — Main checkout backend: yarn install done\nw-auth · done · expects review — Rate limiter added'
+
+  test('a worker-facing call reads as recipients, a tag and its text', () => {
+    expect(outgoingOf('mcp__orchestrator__message_worker', TOOL_USE.input)).toEqual({ names: ['w-auth', 'w-api'], tag: 'expects none', text: 'w-infra has landed on main.\nRun git merge main.' })
+    expect(outgoingOf('mcp__orchestrator__spawn_worker', { name: 'w-auth', brief: 'Add a limiter', kind: 'codex', role: 'reviewer' })).toEqual({ names: ['w-auth'], tag: 'brief · codex · reviewer', text: 'Add a limiter' })
+    expect(outgoingOf('mcp__orchestrator__review_verdict', { name: 'w-auth', verdict: 'changes', notes: 'Cover the reset' })).toEqual({ names: ['w-auth'], tag: 'changes', text: 'Cover the reset' })
+    expect(outgoingOf('mcp__orchestrator__roster', {})).toBeUndefined()
+    expect(outgoingOf('mcp__orchestrator__message_worker', { text: 'no one' })).toBeUndefined()
+    expect(fitText('a'.repeat(300), 80, 20)).toHaveLength(56)
+  })
+
+  test('a wake reads as one line per report, with or without the engine framing; anything else is not a wake', () => {
+    const lines = [
+      { seat: 'w-testinfra', tag: 'question · expects answer', summary: 'Main checkout backend: yarn install done' },
+      { seat: 'w-auth', tag: 'done · expects review', summary: 'Rate limiter added' },
+    ]
+    expect(incomingOf(WAKE)).toEqual(lines)
+    expect(incomingOf(`The orchestrator plugin sent a message:\n${WAKE}\n\nThis is how Claude Code surfaces a prompt a plugin submits between turns.`)).toEqual(lines)
+    expect(incomingOf('w-auth · done · expects review')).toEqual([{ seat: 'w-auth', tag: 'done · expects review', summary: '' }])
+    expect(incomingOf('not a report block')).toBeUndefined()
+    expect(incomingOf(`${WAKE}\nand a stray line`)).toBeUndefined()
+    expect(incomingOf('')).toBeUndefined()
+  })
+
+  test('message_worker sends one text to each worker in name and also, and says which were not sent', async ($, on) => {
+    const { world, clock } = engine(on)
+    await $.session.start(START)
+    await runCommand($, '')
+    await settle(clock)
+    const sent = await callTool($, 'message_worker', { name: 'w-auth', also: ['w-api', 'w-auth', 'w-gone'], text: 'Merge main', expects: 'none' })
+    expect(droveCalls(world, 'send').map(({ args, stdin }) => [args[1], stdin])).toEqual([['w-auth', 'Merge main'], ['w-api', 'Merge main'], ['w-gone', 'Merge main']])
+    expect(denial(sent as never)).toBeUndefined()
+    expect(String(sent.result)).toContain('w-gone: not sent: Drove: no open worker w-gone')
+    expect(denial((await callTool($, 'message_worker', { name: 'w-gone', text: 'x' })) as never)).toContain('no open worker')
+    expect(denial((await callTool($, 'message_worker', { name: ' ', text: 'x' })) as never)).toContain('Name the worker')
+  })
+
+  for (const surface of ['terminal', 'desktop'] as const) {
+    test(`a worker-facing call is one → line on ${surface}; an errored one keeps the engine's row`, async ($, on) => {
+      engine(on)
+      engineRows(on)
+      await $.session.start(START)
+      const ui = await $.ui.mount({ plugin: 'orchestrator', surface, component: 'ToolUse', requestId: 'tu-1', props: TOOL_USE } as never)
+      expect(await ui.find({ type: 'Text', text: '→ ' })).toBeDefined()
+      expect(await ui.find({ type: 'Text', text: 'w-auth, w-api' })).toBeDefined()
+      expect((await ui.find({ type: 'Text', text: /w-infra has landed/ }))?.text).toBe('  w-infra has landed on main. Run git merge main.')
+      await ui.unmount()
+      const errored = await $.ui.mount({ plugin: 'orchestrator', surface, component: 'ToolUse', requestId: 'tu-2', props: { ...TOOL_USE, isErrored: true } } as never)
+      expect(await errored.find({ type: 'Text', text: '→ ' })).toBeUndefined()
+      expect(await errored.find({ type: 'Text', text: 'engine row' })).toBeDefined()
+      await errored.unmount()
+    })
+  }
+
+  test('a wake is one ← line per report in planner mode; ctrl+o, other text and a session not planning keep the engine row', async ($, on) => {
+    const { clock } = engine(on)
+    engineRows(on)
+    await $.session.start(START)
+    const props = { text: WAKE, origin: { kind: 'plugin', name: 'orchestrator' }, isExpanded: false }
+    const mount = (overrides: Record<string, unknown>, requestId: string) => $.ui.mount({ plugin: 'orchestrator', surface: 'terminal', component: 'UserMessage', requestId, props: { ...props, ...overrides } } as never)
+    const idle = await mount({}, 'm-0')
+    expect(await idle.find({ type: 'Text', text: 'engine row' })).toBeDefined()
+    await idle.unmount()
+    await runCommand($, '')
+    await settle(clock)
+    const ui = await mount({}, 'm-1')
+    expect(await ui.find({ type: 'Text', text: 'w-testinfra' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: ' · done · expects review' })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: ' — Rate limiter added' })).toBeDefined()
+    await ui.unmount()
+    for (const [overrides, id] of [[{ isExpanded: true }, 'm-2'], [{ text: 'not a report block' }, 'm-3']] as const) {
+      const kept = await mount(overrides, id)
+      expect(await kept.find({ type: 'Text', text: 'engine row' })).toBeDefined()
+      await kept.unmount()
+    }
   })
 })
