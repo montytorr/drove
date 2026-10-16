@@ -3,6 +3,7 @@
   "role": "worker",
   "cwd": "/work/repo/.claude/worktrees/w-api",
   "env": {
+    "CAIRN_AGENT": "codex",
     "DROVE_HOME": "/home/user/.drove",
     "DROVE_RUN": "drove-20261009-1042-a3f1",
     "DROVE_ROLE": "worker",

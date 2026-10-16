@@ -108,13 +108,41 @@ test('codex worker spec matches the golden file', () => {
 const shimOf = (spec: { files: readonly { path: string }[] }): string => spec.files[0]?.path ?? ''
 
 test('workerEnv reaches Claude and Codex workers, never planners, and never overrides Drove\'s own variables', () => {
-  const workerEnv = { WORKER_FLAG: '1', DROVE_TOKEN: 'forged', DROVE_AGENT: 'other' }
+  const workerEnv = { WORKER_FLAG: '1', CAIRN_AGENT: 'openclaw', DROVE_TOKEN: 'forged', DROVE_AGENT: 'other', DROVE_HOME: '/forged', DROVE_RUN: 'forged', DROVE_ROLE: 'planner', DROVE_SEAT: 'forged' }
   for (const kind of ['claude', 'codex'] as const) {
     const spec = launch.specFor(request({ kind, workerEnv }))
     assert.equal(spec.env.WORKER_FLAG, '1', kind)
+    assert.equal(spec.env.CAIRN_AGENT, 'openclaw', kind)
     assert.equal(spec.env.DROVE_TOKEN, TOKEN, kind)
     assert.equal(spec.env.DROVE_AGENT, kind, kind)
-    assert.equal(launch.specFor(request({ kind, identity: planner, workerEnv })).env.WORKER_FLAG, undefined, kind)
+    assert.equal(spec.env.DROVE_HOME, HOME, kind)
+    assert.equal(spec.env.DROVE_RUN, RUN, kind)
+    assert.equal(spec.env.DROVE_ROLE, 'worker', kind)
+    assert.equal(spec.env.DROVE_SEAT, worker.seat, kind)
+    const plannerSpec = launch.specFor(request({ kind, identity: planner, workerEnv }))
+    assert.equal(plannerSpec.env.WORKER_FLAG, undefined, kind)
+    assert.equal(plannerSpec.env.CAIRN_AGENT, kind === 'claude' ? 'claude-code' : 'codex', kind)
+  }
+})
+
+test('Claude and Codex seats use their own Cairn runtime regardless of the parent env or run path', () => {
+  const previous = process.env.CAIRN_AGENT
+  const run = 'openclaw-dashboard-20261016-1854-0abb'
+  try {
+    for (const parentAgent of [undefined, 'claude-code', 'codex', 'openclaw']) {
+      if (parentAgent === undefined) delete process.env.CAIRN_AGENT
+      else process.env.CAIRN_AGENT = parentAgent
+      for (const identity of [worker, planner]) {
+        const claude = launch.specFor(request({ identity: { ...identity, run } }))
+        assert.equal(claude.env.CAIRN_AGENT, 'claude-code', `${identity.role}, parent=${parentAgent}`)
+        const codex = launch.specFor(request({ kind: 'codex', identity: { ...identity, run }, codexHome: codexHome({ dir: join(HOME, 'runs', run, 'codex-home') }) }))
+        assert.ok(codex.env.CODEX_HOME?.includes('openclaw'))
+        assert.equal(codex.env.CAIRN_AGENT, 'codex', `${identity.role}, parent=${parentAgent}`)
+      }
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CAIRN_AGENT
+    else process.env.CAIRN_AGENT = previous
   }
 })
 
@@ -290,6 +318,10 @@ test('redactSpec removes the token from env, argv and files but keeps the struct
   const codex = launch.redactSpec(launch.codexWorkerSpec(request({ kind: 'codex' })))
   assert.ok(!JSON.stringify(codex).includes(TOKEN))
   assert.equal(codex.env.DROVE_TOKEN, '<redacted>')
+  assert.equal(codex.env.CAIRN_AGENT, 'codex')
+  const claude = launch.redactSpec(launch.claudeWorkerSpec(request({})))
+  assert.equal(claude.env.DROVE_TOKEN, '<redacted>')
+  assert.equal(claude.env.CAIRN_AGENT, 'claude-code')
   assert.ok(!codex.argv.some(arg => arg.includes('DROVE_TOKEN=')))
   const plannerSpec = launch.claudePlannerSpec(request({ identity: planner }))
   assert.equal(launch.redactSpec(plannerSpec), plannerSpec)
