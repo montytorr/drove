@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- In a planner session, the transcript separates worker traffic from the planner's own text to the person. A `message_worker`, `spawn_worker` or `review_verdict` call draws as one `→ <workers> · <expects, brief or verdict>  <text…>` line, not the full brief; the board keeps the full text, and an errored or interrupted call keeps Claude Code's own row. A wake draws as one `← <worker> · <kind> · expects … — <summary>` line per report, without Claude Code's "Prompt from the orchestrator plugin" framing; ctrl+o shows the original row. Only the drawing changes; the planner reads the same text. `message_worker` takes `also: [...]` to send one text to several workers in one call, and says which were not sent (DROVE-172).
+
 ## [0.9.0] - 2026-10-14
 
 Drove can trust a repo for Claude Code on a person's yes, `/orchestrate` asks for it, Codex workers skip their trust prompt, and an over-long worker report no longer stalls the watcher.
