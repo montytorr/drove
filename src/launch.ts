@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs'
 import { chmod, lstat, mkdir, readdir, readFile, readlink, realpath, rename, stat, symlink, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, delimiter, dirname, join } from 'node:path'
+import { cairnEnv } from './cairn.ts'
 import { ENV, identityEnv, plannerDir, seatDir } from './paths.ts'
 import type { Identity, LaunchFile, LaunchLink, LaunchRequest, LaunchSpec, Role, UserPlugins } from './types.ts'
 
@@ -318,7 +319,7 @@ const claudeSpec = (request: LaunchRequest): LaunchSpec => {
     kind: 'claude',
     role: identity.role,
     cwd: request.cwd,
-    env: { ...(isWorker ? request.workerEnv : {}), ...identityEnv(identity), DROVE_AGENT: 'claude', ...(process.env.CLAUDE_CONFIG_DIR ? { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR } : {}), ...(!isWorker && request.channel ? { DROVE_CHANNEL: '1' } : {}) },
+    env: { ...cairnEnv('claude', {}), ...(isWorker ? request.workerEnv : {}), ...identityEnv(identity), DROVE_AGENT: 'claude', ...(process.env.CLAUDE_CONFIG_DIR ? { CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR } : {}), ...(!isWorker && request.channel ? { DROVE_CHANNEL: '1' } : {}) },
     argv,
     files: [
       jsonFile(mcpPath, claudeMcpConfig(request.droveEntry, identityEnv(identity), isWorker ? allowedMcp(request) : {})),
@@ -643,7 +644,7 @@ const codexSpec = (request: CodexLaunchRequest): LaunchSpec => {
     kind: 'codex',
     role: identity.role,
     cwd: request.cwd,
-    env: { ...(isWorker ? request.workerEnv : {}), ...env, DROVE_AGENT: 'codex', ...(codexHome ? { CODEX_HOME: codexHome.dir } : {}) },
+    env: { ...cairnEnv('codex', {}), ...(isWorker ? request.workerEnv : {}), ...env, DROVE_AGENT: 'codex', ...(codexHome ? { CODEX_HOME: codexHome.dir } : {}) },
     argv,
     files: [shim, ...(home?.files ?? [])],
     ...(home ? { links: home.links } : {}),
@@ -718,7 +719,7 @@ const redactFile = (file: LaunchFile): LaunchFile => {
   return file
 }
 
-const KEPT_ENV = /^(DROVE_|CODEX_HOME$|PORT$)/
+const KEPT_ENV = /^(DROVE_|CAIRN_AGENT$|CODEX_HOME$|PORT$)/
 
 // A planner has no token and carries none of the user's env, so its spec is returned as it is.
 export const redactSpec = (spec: LaunchSpec): LaunchSpec => {

@@ -3,6 +3,7 @@
   "role": "worker",
   "cwd": "/work/repo",
   "env": {
+    "CAIRN_AGENT": "claude-code",
     "WORKER_FLAG": "1",
     "DROVE_HOME": "/home/user/.drove",
     "DROVE_RUN": "drove-20261009-1042-a3f1",

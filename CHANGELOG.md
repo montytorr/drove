@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- Every Claude and Codex seat launches with `CAIRN_AGENT` set to its own runtime, so Cairn uses the right key even when a run path contains "openclaw". Workers keep an explicit `workerEnv.CAIRN_AGENT` override (DROVE-174).
+
 ## [0.10.0] - 2026-10-16
 
 In a planner session, worker traffic is one line each way, so the planner's own text to you stands out.
