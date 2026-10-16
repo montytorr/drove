@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { AgentKind, DroveEvent, Effort, HostAgents, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat, SeatRole } from '../types'
+import type { AgentKind, DroveEvent, Effort, Expects, HostAgents, OrchBridge, OrchFeedEntry, OrchModStatus, OrchOrchestrator, OrchWorkerSelf, RunMeta, Seat, SeatRole } from '../types'
 import { BOARD_ID, EXPAND_INDENT, buildBoard, needsAnimation, timelineRoom } from './board'
 import type { BoardRow, Cell, Tone } from './board'
 import { BRIDGE_EXIT, backoffMs, feedOf, parseLine, splitLines, splitWake, toastOf, wakeHeadlines } from './bridge'
@@ -10,6 +10,7 @@ import * as drove from './drove'
 import { type LeanSpawnTrims, defaultKindOf, modelLabelOf, modelNotice, orchestratorSection, workerModelSection } from './prompts'
 import { CAIRN_RE, DEFAULT_HUMAN_NAME, DROVE_OPEN, HUMAN, NAME_RE, isEffort, isExpects, locateEnvelope, goalFromPrompt, oneLine, raiseEffort, renderControl, repoFlagOf, shortModel, verifyEnvelope } from './protocol'
 import { effortLetter, findSeat, isAsking, modelLetter, openSeats, pushFeed, statusGlyph } from './roster'
+import { fitText, incomingOf, outgoingOf, recipientsOf } from './traffic'
 
 const STORE_PREFIX = 'drove:session:'
 const LEGACY_PREFIX = 'session:'
@@ -364,11 +365,12 @@ const orchestratorTools = (agents?: HostAgents, useCairn?: boolean) => [
   },
   {
     name: 'message_worker',
-    description: 'Orchestrator mode: send a worker a message (an answer, a correction, extra context). Say what you expect back.',
+    description: 'Orchestrator mode: send a worker a message (an answer, a correction, extra context). Say what you expect back. The same text for several workers is one call: the first in name, the rest in also.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string' },
+        also: { type: 'array', items: { type: 'string' }, description: 'more workers to send the same text to' },
         text: { type: 'string' },
         expects: { type: 'string', enum: ['review', 'answer', 'none'], description: 'what the worker owes you back; none for a plain answer it can act on' },
       },
@@ -523,7 +525,7 @@ const setLead = async ($: EngineInterface, activity: string) => {
 
 const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__spawn_worker: input => `starting worker ${String(input.name ?? '')}`,
-  mcp__orchestrator__message_worker: input => `messaging ${String(input.name ?? '')}`,
+  mcp__orchestrator__message_worker: input => `messaging ${recipientsOf(input).join(', ')}`,
   mcp__orchestrator__review_verdict: input => `sending ${String(input.verdict ?? '')} to ${String(input.name ?? '')}`,
   mcp__orchestrator__promote_worker: input => `promoting ${String(input.name ?? '')}`,
   mcp__orchestrator__demote_worker: input => `moving ${String(input.name ?? '')} back down`,
@@ -622,15 +624,24 @@ const spawnWorker = async ($: EngineInterface, input: Record<string, unknown>): 
   return { result: `${ran.stdout.trim()} Its reports will arrive here as messages; do not poll.` }
 }
 
-const messageWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
-  const name = String(input.name ?? '').trim()
-  const text = String(input.text ?? '').trim()
-  if (!text) return { deny: 'The message is empty.' }
-  const expects = isExpects(input.expects) ? input.expects : 'none'
+const messageOne = async ($: EngineInterface, name: string, text: string, expects: Expects): Promise<ToolAnswer> => {
   pushBody(`${name}:message`, text)
   const ran = await plannerRun($, drove.messageArgs(name, expects), { stdin: text })
   if (ran.exitCode !== 0) dropBody(`${name}:message`)
   return answerOf(ran)
+}
+
+const messageWorker = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  const names = recipientsOf(input)
+  const text = String(input.text ?? '').trim()
+  if (!text) return { deny: 'The message is empty.' }
+  if (names.length === 0) return { deny: 'Name the worker to message.' }
+  const expects = isExpects(input.expects) ? input.expects : 'none'
+  if (names.length === 1) return messageOne($, names[0] ?? '', text, expects)
+  const answers: { name: string; answer: ToolAnswer }[] = []
+  for (const name of names) answers.push({ name, answer: await messageOne($, name, text, expects) })
+  const lines = answers.map(({ name, answer }) => ('deny' in answer ? `${name}: not sent: ${answer.deny}` : answer.result))
+  return answers.every(({ answer }) => 'deny' in answer) ? { deny: lines.join('\n') } : { result: lines.join('\n') }
 }
 
 const reviewVerdict = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
@@ -1830,6 +1841,45 @@ export const register: Register = (on, options) => {
       if (model !== e.model || effort !== e.effort) return yield* next({ ...e, model, effort })
     }
     return yield* next(e)
+  })
+
+  // A worker-facing call is one `→` line; an error or an interrupt keeps the engine's row, and the board keeps the full text.
+  for (const tool of ['mcp__orchestrator__message_worker', 'mcp__orchestrator__spawn_worker', 'mcp__orchestrator__review_verdict']) {
+    on('ui.render', { component: 'ToolUse', props: { tool } }, async ($, e, next) => {
+      const outgoing = outgoingOf(e.props.tool, e.props.input)
+      if (!outgoing || e.props.isErrored || e.props.isInterrupted) return next(e)
+      const { Box, Text } = $.ui.resolve(e)
+      const to = outgoing.names.join(', ')
+      const head = `→ ${to} · ${outgoing.tag}`
+      return (
+        <Box flexDirection="row">
+          <Text color={e.props.isRunning ? COLOR.overlay : COLOR.blue}>{'→ '}</Text>
+          <Text color={COLOR.blue} bold>{to}</Text>
+          <Text color={COLOR.overlay}>{` · ${outgoing.tag}`}</Text>
+          {outgoing.text ? <Text dimColor>{`  ${fitText(outgoing.text, e.viewport?.columns, head.length)}`}</Text> : null}
+        </Box>
+      )
+    })
+  }
+
+  // A wake is one `←` line per report, without the engine's framing; ctrl+o draws the engine's own row.
+  on('ui.render', { component: 'UserMessage', props: { origin: { kind: 'plugin' } } }, async ($, e, next) => {
+    if (e.props.isExpanded || !(await read($, orchestratorAtom))) return next(e)
+    const incoming = incomingOf(e.props.text)
+    if (!incoming) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box flexDirection="column">
+        {incoming.map(({ seat, tag, summary }, at) => (
+          <Box key={`${at}`} flexDirection="row">
+            <Text color={COLOR.mauve}>{'← '}</Text>
+            <Text color={COLOR.mauve} bold>{seat}</Text>
+            <Text color={COLOR.overlay}>{` · ${tag}`}</Text>
+            {summary ? <Text dimColor>{` — ${fitText(summary, e.viewport?.columns, seat.length + tag.length + 8)}`}</Text> : null}
+          </Box>
+        ))}
+      </Box>
+    )
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
