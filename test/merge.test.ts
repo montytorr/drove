@@ -204,6 +204,58 @@ test('a repo that defines no checks refuses; an empty checks list declares there
   assert.match(merged.text, /no local checks/)
 })
 
+test('planner-approved checks are committed on the clean base and remove the no-checks merge dead end', async () => {
+  const w = await world({ checks: null })
+  const saved = process.env.DROVE_ROLE
+  process.env.DROVE_ROLE = 'planner'
+  try {
+    const configured = await commands.setChecks(w.deps, w.planner, { run: RUN, repo: w.repo }, { checks: ['test -f feature.txt'] })
+    assert.equal(configured.ok, true, configured.text)
+    assert.match(configured.text, /Committed \.drove\.json on main/)
+    assert.deepEqual(JSON.parse(await readFile(join(w.repo, '.drove.json'), 'utf8')), { checks: ['test -f feature.txt'] })
+    assert.match(await git(w.repo, 'log', '-1', '--format=%s'), /configure Drove merge checks/)
+    const merged = await w.merge()
+    assert.equal(merged.ok, true, merged.text)
+  } finally {
+    if (saved === undefined) delete process.env.DROVE_ROLE
+    else process.env.DROVE_ROLE = saved
+  }
+})
+
+test('an explicitly approved empty list is persisted as an intentional no-checks gate', async () => {
+  const w = await world({ checks: null })
+  const saved = process.env.DROVE_ROLE
+  process.env.DROVE_ROLE = 'planner'
+  try {
+    const configured = await commands.setChecks(w.deps, w.planner, { run: RUN, repo: w.repo }, { checks: [] })
+    assert.equal(configured.ok, true, configured.text)
+    assert.match(configured.text, /human explicitly declared no checks/)
+    assert.deepEqual(JSON.parse(await readFile(join(w.repo, '.drove.json'), 'utf8')), { checks: [] })
+    const merged = await w.merge()
+    assert.equal(merged.ok, true, merged.text)
+    assert.match(merged.text, /no local checks/)
+  } finally {
+    if (saved === undefined) delete process.env.DROVE_ROLE
+    else process.env.DROVE_ROLE = saved
+  }
+})
+
+test('planner check configuration refuses a dirty base without touching it', async () => {
+  const w = await world({ checks: null })
+  await writeFile(join(w.repo, 'notes.txt'), 'keep me\n')
+  const saved = process.env.DROVE_ROLE
+  process.env.DROVE_ROLE = 'planner'
+  try {
+    const result = await commands.setChecks(w.deps, w.planner, { run: RUN, repo: w.repo }, { checks: ['true'] })
+    assert.equal(result.ok, false)
+    assert.equal(result.ok ? '' : result.code, 'dirty-base')
+    assert.equal(existsSync(join(w.repo, '.drove.json')), false)
+  } finally {
+    if (saved === undefined) delete process.env.DROVE_ROLE
+    else process.env.DROVE_ROLE = saved
+  }
+})
+
 test('the base defines the checks: a branch that rewrites .drove.json does not loosen its own gate', async () => {
   const w = await world({ checks: ['test -f required.txt'] })
   await writeFile(join(w.worktree, '.drove.json'), JSON.stringify({ checks: [] }))

@@ -1,7 +1,7 @@
 import { spawn as spawnProcess } from 'node:child_process'
 import { randomBytes, randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { chmod, mkdir, readdir, readFile, realpath, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, readdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises'
 import { basename, dirname, join, resolve, sep } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { OrchModStatus } from '../mod/types/index.d.ts'
@@ -166,6 +166,13 @@ export const identityOrPlanner = (env: NodeJS.ProcessEnv = process.env): Identit
 
 const ok = (text: string, data?: unknown): CommandResult => ({ ok: true, text, ...(data === undefined ? {} : { data }) })
 const failed = (code: string, text: string): CommandResult => ({ ok: false, code, text })
+const plannerRoleForRun = async (deps: Deps, run: RunMeta, config: DroveConfig, kind: AgentKind, trims: AvailableTrims): Promise<string> => {
+  const role = plannerRole(run, config, kind, trims)
+  const plan = await checksOf(run.repo)
+  return plan.commands.length === 0 && plan.source !== '.drove.json'
+    ? `${role}\n\n## Merge gate needs a decision\nDrove detected that this base repo has no declared or detectable merge checks. Before spawning workers, propose suitable commands with the \`set_checks\` tool; the human must approve the exact list, and Drove commits it on the clean base branch. An explicitly empty list in \`.drove.json\` already means the human chose to have no local checks.`
+    : role
+}
 const sleep = (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms))
 const clip = (text: string, max = 300): string => text.replace(/\s+/g, ' ').trim().slice(0, max)
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error))
@@ -923,7 +930,7 @@ export const plan = async (deps: Deps, request: PlanRequest): Promise<CommandRes
     deps,
     {
       identity, kind, repo, cwd: repo, model, effort,
-      roleText: plannerRole(run, await loadConfig(deps.home, repo, { exec: deps.exec, base: run.base }), kind, await availableTrimsOf(deps, run)),
+      roleText: await plannerRoleForRun(deps, run, await loadConfig(deps.home, repo, { exec: deps.exec, base: run.base }), kind, await availableTrimsOf(deps, run)),
       initialPrompt: typedPrompt === undefined ? prompt : undefined,
       channel: kind === 'claude' && config.claudeChannel,
       ...(sessionId ? { sessionId } : {}),
@@ -2576,6 +2583,58 @@ const mergePr = async (
 
 // ---------- checks: a seat's merge-plan checks, run or reused, and recorded (DROVE-122) ----------
 
+export type SetChecksRequest = { checks: string[] }
+
+// The planner may propose the base checkout's merge gate only after its host surface has asked the human to confirm.
+// Require the checked-out base to be clean, and commit only .drove.json so a worker cannot set its own gate.
+export const setChecks = async (deps: Deps, identity: Identity, ref: RunRef, request: SetChecksRequest): Promise<CommandResult> => {
+  if (identity.role !== 'planner' || process.env[ENV.role] !== 'planner') return failed('forbidden', 'only a confirmed planner tool call may change the merge checks')
+  if (!Array.isArray(request.checks) || request.checks.length > 20 || request.checks.some(check => typeof check !== 'string' || !check.trim() || check.trim().length > 512 || /[\0\r\n]/.test(check))) {
+    return failed('usage', 'checks must be a list of up to 20 non-empty single-line commands, each at most 512 characters')
+  }
+  const checksList = request.checks.map(check => check.trim())
+  const located = await locateRun(deps, ref, 'up')
+  if ('error' in located) return located.error
+  const { run } = located
+  const expectedBranch = run.base.replace(/^origin\//, '')
+  const branch = await git.headBranch(deps.exec, run.repo)
+  if (branch !== expectedBranch) return failed('wrong-base', `the main checkout is on ${branch ?? 'detached HEAD'}, not the run's base branch ${expectedBranch}; nothing changed`)
+  const unsaved = await git.dirtyLines(deps.exec, run.repo)
+  if (unsaved.length) return failed('dirty-base', `the base checkout has changes; nothing changed. Commit or discard them before setting checks. ${unsaved.slice(0, 5).join('; ')}`)
+
+  return withLock(join(runDir(deps.home, run.id), 'set-checks.lock'), async () => {
+    const path = join(run.repo, '.drove.json')
+    const originalText = await readFile(path, 'utf8').catch(error => (error as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : Promise.reject(error))
+    let config: Record<string, unknown> = {}
+    if (originalText !== undefined) {
+      try {
+        const parsed: unknown = JSON.parse(originalText)
+        if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) throw new Error('expected a JSON object')
+        config = parsed as Record<string, unknown>
+      } catch (error) {
+        return failed('invalid-config', `.drove.json is not valid JSON (${(error as Error).message}); nothing changed`)
+      }
+    }
+    const next = { ...config, checks: checksList }
+    await writeJsonAtomic(path, next, 0o644)
+    const added = await deps.exec(['git', '-C', run.repo, 'add', '--', '.drove.json'], { timeoutMs: 30_000 })
+    const committed = added.code === 0 ? await deps.exec(['git', '-C', run.repo, 'commit', '-m', 'chore: configure Drove merge checks'], { timeoutMs: 60_000 }) : added
+    if (committed.code !== 0) {
+      const now = await readFile(path, 'utf8').catch(() => undefined)
+      if (now === `${JSON.stringify(next, null, 2)}\n`) {
+        await deps.exec(['git', '-C', run.repo, 'restore', '--staged', '--', '.drove.json'], { timeoutMs: 30_000 })
+        if (originalText === undefined) await unlink(path).catch(() => undefined)
+        else await writeFile(path, originalText, 'utf8')
+      }
+      return failed('commit-failed', `could not commit the approved checks; the original config was restored when safe. ${(committed.stderr || committed.stdout).trim().slice(0, 300)}`)
+    }
+    const sha = await deps.exec(['git', '-C', run.repo, 'rev-parse', '--short', 'HEAD'], { timeoutMs: 30_000 })
+    const display = checksList.length ? checksList.map(check => `  - ${check}`).join('\n') : '  - (none; the human explicitly declared no checks)'
+    await recordEvent(deps, run.id, { type: 'merge.checks-set', seat: PLANNER_SEAT, data: { checks: checksList, sha: sha.stdout.trim() } })
+    return ok(`Committed .drove.json on ${branch} at ${sha.stdout.trim()} with merge checks:\n${display}`, { checks: checksList, sha: sha.stdout.trim() })
+  })
+}
+
 export const checks = async (deps: Deps, identity: Identity, ref: RunRef, request: { seat: string; fresh?: boolean }): Promise<CommandResult> => {
   const denied = requirePlanner(identity)
   if (denied) return denied
@@ -2867,7 +2926,7 @@ export const up = async (deps: Deps, ref: RunRef, seatName?: string, options: Up
   const sessionId = planner.kind === 'claude' ? planner.sessionId ?? randomUUID() : undefined
   const resumeId = planner.sessionId
   const spec = specFor(
-    launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: plannerRole(run, config, planner.kind, await availableTrimsOf(deps, run)), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
+    launchRequest(deps, { identity, kind: planner.kind, repo: run.repo, cwd: run.repo, model: planner.model, effort: planner.effort, roleText: await plannerRoleForRun(deps, run, config, planner.kind, await availableTrimsOf(deps, run)), channel: planner.kind === 'claude' && config.claudeChannel, ...(resumeId ? { resumeId } : { initialPrompt: planner.kind === 'codex' ? 'The run was resumed. Read the roster and continue.' : undefined, sessionId }) }, config),
   )
   let opened: OpenedWorkspace | undefined
   if (isDetached) {

@@ -152,6 +152,7 @@ export type DroveEventType =
   | 'attention'
   | 'guard.denied'
   | 'merge.passed'
+  | 'merge.checks-set'
   | 'merge.refused'
   | 'merge.pending'
   | 'checks.ran'

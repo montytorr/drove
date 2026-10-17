@@ -9,11 +9,11 @@ import * as roster from './roster.ts'
 import * as store from './store.ts'
 import type { AgentKind, CommandResult, Deps, Effort, HostAgents, Identity, McpTool, ReportInput, SeatRole, SendRequest } from './types.ts'
 
-export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'roster', 'capture', 'set_goal', 'set_owns', 'run_report', 'down'] as const
+export const PLANNER_TOOL_NAMES = ['spawn', 'send', 'verdict', 'prompt', 'promote', 'migrate', 'close', 'merge', 'run_checks', 'set_checks', 'roster', 'capture', 'set_goal', 'set_owns', 'run_report', 'down'] as const
 export const WORKER_TOOL_NAMES = ['report'] as const
 
 export type ToolPorts = {
-  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'checks' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'setOwns' | 'runReport'>
+  commands: Pick<typeof commands, 'spawn' | 'send' | 'prompt' | 'promote' | 'migrate' | 'merge' | 'checks' | 'setChecks' | 'roster' | 'capture' | 'close' | 'down' | 'raiseBudget' | 'setGoal' | 'setOwns' | 'runReport'>
   seatDir: typeof paths.seatDir
   appendJsonl: typeof store.appendJsonl
   loadRun: typeof roster.loadRun
@@ -345,6 +345,26 @@ export const plannerTools = (deps: Deps, identity: Identity, ports: ToolPorts = 
       },
       ['seat'],
       async (args) => asResult(await cmd.checks(deps, identity, await ref(), { seat: seatName(args), fresh: flag(args, 'fresh') })),
+    ),
+    defineTool(
+      'set_checks',
+      'Propose the merge checks that apply to every worker in this repo. Drove shows the exact list to the human; only after they approve does it write and commit .drove.json on the clean base branch. A worker branch cannot change its own gate. Pass [] only when the human explicitly agrees the repo has no checks.',
+      { checks: { type: 'array', minItems: 0, maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 512 }, description: 'Ordered shell commands to run as merge checks; [] declares there are intentionally no checks.' } },
+      ['checks'],
+      async (args) => {
+        const proposed = args.checks
+        if (!Array.isArray(proposed) || proposed.some(check => typeof check !== 'string')) throw new ArgError('checks must be an array of commands')
+        const list = proposed.map(check => check.trim())
+        if (list.length > 20 || list.some(check => !check || check.length > 512 || /[\0\r\n]/.test(check))) throw new ArgError('checks must be up to 20 non-empty single-line commands, each at most 512 characters')
+        if (!ports.elicit) return { text: 'Cannot change the merge gate: this planner host has no human-confirmation dialog. Nothing was written.', isError: true }
+        const run = await ports.loadRun(deps.home, identity.run)
+        if (!run) throw new ArgError(`run ${identity.run} not found under ${deps.home}`)
+        const detail = list.length ? list.map((check, index) => `${index + 1}. ${check}`).join('\n') : 'No checks (explicitly allow merge without local checks)'
+        const approved = await ports.elicit(`Set merge checks on base branch ${run.base} of ${run.repo}?\n\n${detail}\n\nDrove will commit .drove.json on the clean base checkout.`)
+        if (approved === undefined) return { text: 'No confirmation was received; nothing was written.', isError: true }
+        if (!approved) return { text: 'The human declined this merge-check change. Nothing was written.', isError: true }
+        return asResult(await cmd.setChecks(deps, identity, { run: run.id, repo: run.repo }, { checks: list }))
+      },
     ),
     defineTool(
       'roster',

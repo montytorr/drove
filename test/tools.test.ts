@@ -29,6 +29,7 @@ const fakeCommands = () => {
     close: record('close', 2),
     merge: record('merge', 2),
     checks: record('checks', 2),
+    setChecks: record('setChecks', 2),
     down: record('down'),
     raiseBudget: record('raiseBudget'),
     setGoal: record('setGoal'),
@@ -122,6 +123,25 @@ test('set_goal passes the line and the optional Cairn ref for this run, and need
     { name: 'setGoal', args: [ref, { goal: 'Release 0.3.0', cairn: 'DROVE-102' }] },
     { name: 'setGoal', args: [ref, { goal: 'Software factory', cairn: undefined }] },
   ])
+})
+
+test('set_checks requires explicit human confirmation and passes the exact list to the base-branch writer', async () => {
+  const asked: string[] = []
+  const { ctx, fake, tool } = await plannerWith({ elicit: async message => { asked.push(message); return true } })
+  const result = await tool('set_checks').call({ checks: ['  php -l src/*.php  ', 'composer test'] })
+  assert.equal(result.isError, undefined)
+  assert.match(asked[0] ?? '', /1\. php -l src\/\*\.php/)
+  assert.match(asked[0] ?? '', /clean base checkout/)
+  assert.deepEqual(fake.calls.map(call => [call.name, call.args.at(-1)]), [['setChecks', { checks: ['php -l src/*.php', 'composer test'] }]])
+})
+
+test('set_checks writes nothing when the human declines or confirmation is unavailable', async () => {
+  for (const elicit of [async () => false, undefined]) {
+    const { fake, tool } = await plannerWith(elicit ? { elicit } : {})
+    const result = await tool('set_checks').call({ checks: [] })
+    assert.equal(result.isError, true)
+    assert.deepEqual(fake.calls, [])
+  }
 })
 
 test('set_owns passes add or set for the seat and refuses a malformed list', async () => {

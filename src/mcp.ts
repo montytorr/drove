@@ -91,6 +91,7 @@ export type ServeOptions = {
 
 const PLANNER_INSTRUCTIONS = [
   'You are the Drove planner. Workers report through the drove report tool; reports reach you as messages (or at the end of your next drove tool result).',
+  'Before spawning workers, inspect the base checkout for declared or detectable merge checks. If none exist, propose suitable commands with set_checks; Drove asks the human in a confirmation dialog before committing .drove.json on the clean base branch. Never let a worker branch set its own gate.',
   'Never wait, poll or sleep for a worker: after spawn or send, continue with independent work or end your turn. Review diffs read-only, answer with send or verdict, merge approved branches, then close the seat.',
 ].join('\n')
 
@@ -123,7 +124,7 @@ export const serveMcp = async (role: Role, input: NodeJS.ReadableStream = proces
         if (waiting.delete(id)) resolve(fail(id, -32000, 'elicitation timed out'))
       }, ELICIT_TIMEOUT_MS).unref()
     })
-    output.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'elicitation/create', params: { message, requestedSchema: { type: 'object', properties: { approve: { type: 'boolean', title: 'Allow the extra pane', default: true } } } } })}\n`)
+    output.write(`${JSON.stringify({ jsonrpc: '2.0', id, method: 'elicitation/create', params: { message, requestedSchema: { type: 'object', properties: { approve: { type: 'boolean', title: 'Approve this change', default: true } } } } })}\n`)
     const reply = await answer
     if (reply.error) return undefined
     const result = reply.result as { action?: string; content?: { approve?: boolean } } | undefined

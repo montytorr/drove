@@ -324,6 +324,18 @@ export const COMMANDS: Record<string, Spec> = {
     run: async (values, positionals, io) =>
       print(await commands.checks(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { seat: need(positionals[0], '<seat>'), fresh: values.fresh === true }), io),
   },
+  'set-checks': {
+    usage: 'drove set-checks --run ID < checks.json',
+    why: 'internal planner action after the human approves the proposed base-branch merge checks',
+    options: { run: { type: 'string' } },
+    run: async (values, positionals, io) => {
+      if (positionals.length) throw new UsageError('set-checks takes its JSON list on stdin')
+      let input: unknown
+      try { input = JSON.parse(await io.stdin()) } catch { throw new UsageError('stdin must be a JSON array of check commands') }
+      if (!Array.isArray(input)) throw new UsageError('stdin must be a JSON array of check commands')
+      return print(await commands.setChecks(commands.defaultDeps(), commands.identityOrPlanner(), runRef(values), { checks: input as string[] }), io)
+    },
+  },
   board: {
     usage: 'drove board [--once] [--web [--port N]] [--run ID]',
     why: 'live board for a herdr pane (plain when piped or NO_COLOR), or read-only in a browser with --web',

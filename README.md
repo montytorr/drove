@@ -169,6 +169,7 @@ drove board                        # in a spare pane
 | `drove capture <seat> [--lines N] [--run ID]` | read a seat's recent output |
 | `drove merge <seat> [--pr] [--squash] [--fresh] [-m MSG] [--run ID]` | land a worker's branch behind the repo's checks, locally or through a pull request |
 | `drove checks <seat> [--fresh] [--run ID]` | run (or reuse) the merge plan's checks in a seat's worktree; never writes to the repo |
+| `drove set-checks --run ID < checks.json` | internal planner action after the human approves a proposed merge gate; commits only `.drove.json` on the clean base |
 | `drove close <seat> [--remove-worktree]` | stop a worker and close its pane |
 | `drove board [--once] [--web [--port N]] [--run ID]` | the live board in a pane, one frame with `--once` or when piped, or read-only in a browser with `--web` |
 | `drove down [--run ID]` | save every session id and stop the run |
@@ -181,7 +182,7 @@ drove board                        # in a spare pane
 | `drove budget <n> [--run ID]` | raise the pane budget (the human only) |
 | `drove guard <event>`, `drove mcp`, `drove mod attach\|bridge\|report` | entry points for hooks, MCP and the mod |
 
-`drove --help` prints the same list. The planner's MCP tools are `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `merge`, `run_checks`, `roster`, `capture`, `set_goal`, `set_owns`, `run_report` and `down`. A worker has one tool, `report`. They call the same functions as the CLI.
+`drove --help` prints the same list. The planner's MCP tools are `spawn`, `send`, `verdict`, `prompt`, `promote`, `migrate`, `close`, `merge`, `run_checks`, `set_checks`, `roster`, `capture`, `set_goal`, `set_owns`, `run_report` and `down`. A worker has one tool, `report`. They call the same functions as the CLI.
 
 ## Configuration
 

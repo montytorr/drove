@@ -10,6 +10,8 @@ The planner never merges a worker's branch by hand: the guard denies `git merge`
 
 ## Which checks
 
+Before spawning workers, the planner should inspect this gate. If the base repo has no declared or detectable checks, it can propose an ordered list with `set_checks`. Drove presents the exact list (including an explicit empty list) in a human confirmation dialog. On approval, Drove updates and commits only `.drove.json` on the clean base branch; on decline or a dirty/wrong-branch checkout it changes nothing. A worker's branch remains non-authoritative.
+
 1. The `checks` list in the repo's `.drove.json`, run in order with `sh -c`:
 
    ```json

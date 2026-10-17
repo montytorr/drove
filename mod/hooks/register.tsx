@@ -463,6 +463,15 @@ const orchestratorTools = (agents?: HostAgents, useCairn?: boolean) => [
     },
   },
   {
+    name: 'set_checks',
+    description: 'Propose ordered merge-check commands. Drove shows the exact list in a confirmation dialog; only after approval does it commit .drove.json on the clean base branch. Worker branches cannot change their own gate. Pass [] only when you explicitly agree there should be no local checks.',
+    inputSchema: {
+      type: 'object',
+      properties: { checks: { type: 'array', maxItems: 20, items: { type: 'string', minLength: 1, maxLength: 512 }, description: 'Ordered shell commands to run as merge checks; [] explicitly declares there are none.' } },
+      required: ['checks'],
+    },
+  },
+  {
     name: 'set_goal',
     description: 'Orchestrator mode: set the run\'s goal, one plain line of what the run is doing now. Call it when the run has no goal, when it is vague (a bare ref, a fragment), or when the human\'s ask moves on to new work. The board header shows it. cairn is the goal task\'s ref, if there is one.',
     inputSchema: {
@@ -533,6 +542,7 @@ const LEAD_TOOL: Record<string, (input: Record<string, unknown>) => string> = {
   mcp__orchestrator__close_worker: input => `closing ${String(input.name ?? '')}`,
   mcp__orchestrator__merge_worker: input => `merging ${String(input.name ?? '')}`,
   mcp__orchestrator__run_checks: input => `running ${String(input.name ?? '')}’s checks`,
+  mcp__orchestrator__set_checks: () => 'proposing the repo’s merge checks',
   mcp__orchestrator__set_goal: () => 'setting the goal',
   mcp__orchestrator__set_owns: input => `changing what ${String(input.name ?? '')} may edit`,
   mcp__orchestrator__roster: () => 'checking the roster',
@@ -724,6 +734,21 @@ const runChecksTool = async ($: EngineInterface, input: Record<string, unknown>)
   const name = String(input.name ?? '').trim()
   if (!NAME_RE.test(name)) return { deny: `Worker names must match [a-z][a-z0-9_-]{0,31}; got "${name}".` }
   return answerOf(await plannerRun($, drove.checksArgs(name, input.fresh === true), { timeoutMs: MERGE_TIMEOUT_MS }))
+}
+
+const setChecksTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
+  if (!Array.isArray(input.checks) || input.checks.some(check => typeof check !== 'string')) return { deny: 'checks must be a list of command strings.' }
+  const checks = (input.checks as string[]).map(check => check.trim())
+  if (checks.length > 20 || checks.some(check => !check || check.length > 512 || /[\0\r\n]/.test(check))) return { deny: 'Give up to 20 non-empty single-line commands, each at most 512 characters.' }
+  const orchestrator = await read($, orchestratorAtom)
+  if (!orchestrator) return { deny: OFF }
+  const detail = checks.length ? checks.map((check, index) => `${index + 1}. ${check}`).join('\n') : 'No local checks (allow merges without a local check command).'
+  let answer = ''
+  try {
+    answer = await $.ui.ask(`Set these merge checks on ${orchestrator.repo}?\n\n${detail}\n\nDrove will commit .drove.json on the clean base checkout.`, { header: 'Merge checks', options: ['Set checks', 'Not now'] })
+  } catch {}
+  if (answer !== 'Set checks') return { deny: 'You declined or dismissed the merge-check change; nothing was written.' }
+  return answerOf(await plannerRun($, drove.setChecksArgs(orchestrator.run), { stdin: JSON.stringify(checks), timeoutMs: 60_000 }))
 }
 
 const setGoalTool = async ($: EngineInterface, input: Record<string, unknown>): Promise<ToolAnswer> => {
@@ -1719,6 +1744,7 @@ export const register: Register = (on, options) => {
   on('tool.call', { tool: 'mcp__orchestrator__run_checks' as never }, async ($, e): Promise<ToolAnswer> =>
     (await read($, orchestratorAtom)) ? runChecksTool($, e as Record<string, unknown>) : { deny: OFF },
   ).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
+  on('tool.call', { tool: 'mcp__orchestrator__set_checks' as never }, async ($, e): Promise<ToolAnswer> => setChecksTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__set_goal' as never }, async ($, e): Promise<ToolAnswer> => setGoalTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__set_owns' as never }, async ($, e): Promise<ToolAnswer> => setOwnsTool($, e as Record<string, unknown>)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))
   on('tool.call', { tool: 'mcp__orchestrator__roster' as never }, async ($): Promise<ToolAnswer> => rosterTool($)).catch(($, e, next) => ({ deny: toolFailure(next.error) }))

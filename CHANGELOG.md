@@ -4,6 +4,8 @@ All notable changes to Drove are listed here. The format follows [Keep a Changel
 
 ## [Unreleased]
 
+- Planners now inspect the merge gate before spawning workers. When no checks are declared or detected, `set_checks` proposes the ordered commands in a human confirmation dialog, then commits only `.drove.json` on the clean base branch; a worker branch cannot change its own gate.
+
 ## [0.10.1] - 2026-10-16
 
 A Codex worker in a repo whose name contains "openclaw" can use Cairn again: every seat tells Cairn its own runtime.

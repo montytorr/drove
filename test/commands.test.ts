@@ -1688,6 +1688,9 @@ test('plan creates a run, writes the planner files and returns the exec plan', a
   assert.deepEqual([run?.status, run?.base, run?.hasRemote, run?.planner.paneId, run?.goal], ['up', 'main', false, 'w1:p5', 'Ship the thing'])
   assert.ok(run?.planner.sessionId)
   assert.ok(existsSync(join(deps.home, 'runs', id, 'planner', 'settings.json')))
+  const rolePromptArg = plan.argv[plan.argv.indexOf('--append-system-prompt-file') + 1]
+  assert.ok(rolePromptArg)
+  assert.match(await readFile(rolePromptArg, 'utf8'), /Drove detected that this base repo has no declared or detectable merge checks/)
 })
 
 test('plan for codex has an initial prompt and no session id yet; it needs a herdr pane and a repo', async () => {

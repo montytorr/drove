@@ -75,6 +75,7 @@ export const mergeArgs = (input: { name: string; pr?: boolean; squash?: boolean;
 export const isCutOff = (ran: Ran): boolean => ran.exitCode === -1 && /aborted: still running after/.test(ran.stderr)
 
 export const checksArgs = (name: string, fresh?: boolean): string[] => ['checks', name, ...(fresh ? ['--fresh'] : [])]
+export const setChecksArgs = (run: string): string[] => ['set-checks', '--run', run]
 
 export const rosterArgs = (run: string): string[] => ['roster', '--run', run]
 export const rosterJsonArgs = (run: string): string[] => ['roster', '--json', '--run', run]
